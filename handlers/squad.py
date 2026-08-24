@@ -1,0 +1,980 @@
+# -*- coding: utf-8 -*-
+"""小队/军团域（squad）：小队创建/邀请/状态 + 军团（Company）管理。
+
+消息 schema（decompiled/proto-files/HnG_States）：
+- CreateSquadRequest {characterId=1} → CreateSquadResponse {response=1}
+- ModifySquadRequest {squadSessionId=1, removeSquadSupportSlot=2,
+  addSquadSupportSlotTemplateId=3} → ModifySquadResponse {response=1}
+- RemoveSquadRequest {dummy=1} → RemoveSquadResponse {response=1}
+- RemoveSquadMemberRequest {squadMemberSessionId=1}
+  → RemoveSquadMemberResponse {response=1}
+- SquadInvitePlayerRequest {ownerCharacterId=1, friendPlayerId=2,
+  matchMakeWarMissionFlag=4, matchMakeStagedMissionPresetList=5,
+  matchMakeSquadVehicleFilterArmyResourceTemplateIds=6}
+  → SquadInvitePlayerResponse {result=1}
+- SquadRespondToInviteRequest {squadMemberSessionId=1, hasAccepted=2,
+  characterId=3} → SquadRespondToInviteResponse {result=1}
+- SetSquadDetailsRequest {characterId=1, squadName=2, pricingId=3,
+  discountId=4, saveSessionState=5, paymentCurrency=6}
+  → SetSquadDetailsResponse {response=1}
+- SetSquadMatchMakingFlagRequest {squadSessionId=1,
+  matchMakeWarMissionFlag=3, matchMakeStagedMissionPresetList=4,
+  matchMakeSquadVehicleFilterArmyResourceTemplateIds=5}
+  → SetSquadMatchMakingFlagResponse {response=1}
+- SetSquadMemberStatusRequest {squadSlotId=1, memberCharacterId=2,
+  squadMemberSessionStatus=3} → SetSquadMemberStatusResponse {response=1}
+- UpdateSquadResourceRequest {squadSessionId=1,
+  resourcePurchaseList=2 repeated SquadResourcePurchaseSet{
+  armyResourceCategoryId=1, resourcePricingId=2}, paymentCurrency=3}
+  → UpdateSquadResourceResponse {response=1}
+- CreateCompanyRequest {nameLong=1, nameShort=2, description=3}
+  → CreateCompanyResponse {result=1}
+- InviteToCompanyRequest {playerToInvite=1} → InviteToCompanyResponse {result=1}
+- KickFromCompanyRequest {playerToKick=1} → KickFromCompanyResponse {result=1}
+- LeaveCompanyRequest {} → LeaveCompanyResponse {result=1}
+- RespondToCompanyInvitationRequest {invitationId=1, accept=2}
+  → RespondToCompanyInvitationResponse {result=1}
+
+客户端 UI 流程（swf-ui-logic squad 域）：
+- SquadModel 监听 KVCS 表 SquadSession / SquadMemberSession（xmlTag 首字母大写）
+  的 changeSignal —— 小队 UI 的全部数据源，创建/变更后必须推送。
+- SquadService.clearSlot → RemoveSquadMemberRequest（squadMemberSessionId）；
+  非队长离队也走该请求（带手动解散标记）。
+- SquadService.deactivate：队长发 RemoveSquadRequest，成员发
+  RemoveSquadMemberRequest。
+- setSquadMemberStatus(squadSlotId, memberCharacterId, status)：
+  squadSlotId = SquadMemberSession.id（成员行 id）；
+  memberCharacterId 非 0 = 换角色（SquadChangeCharacterMediator），
+  0 = 仅改状态（SetSquadPlayerStateCommand：InLobby/Ready）。
+- 所有响应非 ok 会 sendFeedbackMessage 弹错误提示，ok=1 即静默通过。
+- SquadMemberSessionStatus 枚举：InvitationPending=1 InLobby=2 Ready=3
+  InCombat=4（squad_members.status 同值）。
+
+ResponseCodes（squad/company 域）：
+- player_already_in_squad=157 squad_slot_not_found=158 player_not_owner=159
+- squad_not_found=161 squad_size_too_small=162 squad_slot_in_use=163
+- squad_not_owned_by_player=164 player_not_found=64
+- company_insufficientPrivileges=170 company_memberNotFound=171
+- company_playerNotFound=172 company_cannotKickSelf=173
+- company_playerAlreadyInCompany=174 company_playerHasInvitationPending=175
+- company_companyIsFull=176 company_companyNameAlreadyExists=177
+- company_companyLongNameTooLong=178 company_companyLongNameTooShort=179
+- company_companyLongNameInvalid=180 company_companyShortNameTooLong=181
+- company_companyShortNameTooShort=182 company_companyShortNameInvalid=183
+- company_companyDescriptionTooLong=184 company_invitationNotFound=185
+- company_companyNoLongerExists=186
+"""
+
+import struct
+
+from protocol import (
+    build_response,
+    pb_bool,
+    pb_int64,
+    pb_int32,
+    pb_parse,
+    pb_parse_multi,
+    pb_string,
+    )
+
+from state import STORE, log
+
+from messages import _push_kvcs
+from matchmaking import _SOLO_SQUADS, _push_kvcs_delete
+from wardb import _rank_from_combat_xp
+
+RC_OK = 1
+RC_PLAYER_NOT_FOUND = 64
+RC_CHARACTER_NOT_OWNED = 17
+RC_PLAYER_ALREADY_IN_SQUAD = 157
+RC_SQUAD_SLOT_NOT_FOUND = 158
+RC_SQUAD_NOT_FOUND = 161
+RC_SQUAD_NOT_OWNED = 164
+
+RC_CO_PRIVILEGES = 170
+RC_CO_MEMBER_NOT_FOUND = 171
+RC_CO_PLAYER_NOT_FOUND = 172
+RC_CO_CANNOT_KICK_SELF = 173
+RC_CO_ALREADY_IN_COMPANY = 174
+RC_CO_INVITE_PENDING = 175
+RC_CO_NAME_EXISTS = 177
+RC_CO_LONG_TOO_LONG = 178
+RC_CO_LONG_TOO_SHORT = 179
+RC_CO_SHORT_TOO_LONG = 181
+RC_CO_SHORT_TOO_SHORT = 182
+RC_CO_INVITE_NOT_FOUND = 185
+RC_CO_NO_LONGER_EXISTS = 186
+
+# 名称长度约束（CreateCompanyRequest 校验，与官服一致的宽松阈值）
+_CO_LONG_MIN, _CO_LONG_MAX = 3, 40
+_CO_SHORT_MIN, _CO_SHORT_MAX = 2, 6
+_CO_DESC_MAX = 200
+
+ST_INVITE_PENDING = 1
+ST_IN_LOBBY = 2
+ST_READY = 3
+ST_IN_COMBAT = 4
+
+
+def _str(v):
+    if isinstance(v, bytes):
+        return v.decode('utf-8', 'replace')
+    return str(v)
+
+
+# ------------------------------------------------------------- KVCS 推送
+
+def _msg_squad_session(squad, members):
+    """SquadSession proto（22 字段，f11 缺失；repeated 空省略）。"""
+    leader = next((m for m in members
+                   if m['character_id'] == squad['leader_character_id']),
+                  members[0] if members else None)
+    m = pb_int64(1, squad['id'])                     # id（=squadSessionId）
+    m += pb_int64(2, leader['player_id'] if leader else 0)  # ownerPlayerId
+    m += pb_int64(3, leader['template'] if leader else 0)   # characterTemplateId
+    m += pb_int64(4, squad['faction'])               # factionTemplateId
+    m += pb_int64(5, 0)                              # supportSlotTemplateId1
+    m += pb_int64(6, 0)                              # supportSlotTemplateId2
+    m += pb_int64(7, 0)                              # supportSlotTemplateId3
+    m += pb_int32(8, 0)                              # totalCustomizationPoints
+    m += pb_int32(9, 0)                              # usedCustomizationPoints
+    m += pb_string(10, squad['name'])                # name
+    m += pb_bool(12, squad['matchmaking_flag'])      # matchMakeWarMissionFlag
+    m += pb_int64(17, 0)                             # missionId
+    m += pb_int64(18, squad['id'])                   # squadId
+    m += pb_int32(19, 0)                             # actionGamesEntered
+    m += pb_bool(20, False)                          # isLockedForMembers
+    m += pb_bool(21, False)                          # isLockedForCustomization
+    m += pb_bool(22, False)                          # forceReady
+    return m
+
+
+def _msg_squad_member_session(member, squad_id):
+    """SquadMemberSession proto（20 字段，repeated 空省略）。"""
+    m = pb_int64(1, member['id'])                    # id（成员行 id）
+    m += pb_int64(2, squad_id)                       # squadSessionId
+    m += pb_int64(3, 0)                              # squadPlayerSlotTemplateId
+    m += pb_int64(4, member['player_id'])            # playerId
+    m += pb_string(5, member['gamertag'])            # gamerTag
+    m += pb_int64(6, member['faction'])              # playerFactionTemplateId
+    m += pb_int64(7, member['character_id'])         # characterId
+    m += pb_int64(8, 0)                              # uniformVariantTemplateId
+    m += pb_int64(9, 0)                              # weaponVariantTemplateId
+    m += pb_int32(10, _rank_from_combat_xp(member['combat_xp']))  # characterRank
+    m += pb_int64(11, 0)                             # shopMembershipItemId
+    m += pb_int32(12, member['status'])              # squadMemberSessionStatus
+    m += pb_string(14, member['char_name'])          # characterName
+    m += pb_int64(15, 0)                             # playerSessionId
+    m += pb_int32(16, 0)                             # playerTier
+    m += pb_int32(17, 0)                             # squadCustomizationPoints
+    m += pb_bool(18, member['status'] == ST_INVITE_PENDING)  # wasInvited
+    m += pb_int64(19, 0)                             # uniformPartTemplateId
+    m += pb_int64(20, member['faction'])             # characterFactionTemplateId
+    return m
+
+
+async def push_squad_rows(sess, writer, squad_id):
+    """推送小队全部 KVCS 行（SquadSession + 全体 SquadMemberSession）。"""
+    if STORE is None or sess.playerview_cmd is None or not squad_id:
+        return
+    try:
+        squad = await STORE.get_squad(squad_id)
+        if squad is None:
+            return
+        members = await STORE.list_squad_members(squad_id)
+    except Exception as e:
+        log(f'      [DB] push_squad_rows failed: {e}')
+        return
+    await _push_kvcs(writer, sess.playerview_cmd, b'SquadSession',
+                     _msg_squad_session(squad, members))
+    for mem in members:
+        await _push_kvcs(writer, sess.playerview_cmd, b'SquadMemberSession',
+                         _msg_squad_member_session(mem, squad_id))
+    log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+        f'(SquadSession id={squad_id} + {len(members)} members)')
+
+
+async def push_squad_member_row(sess, writer, member_row_id):
+    """推送单个成员行（按成员行 id）。"""
+    if STORE is None or sess.playerview_cmd is None:
+        return
+    try:
+        mem_row = await STORE.get_squad_member(member_row_id)
+        if mem_row is None:
+            return
+        squad = await STORE.get_squad(mem_row['squad_id'])
+        members = await STORE.list_squad_members(mem_row['squad_id'])
+    except Exception as e:
+        log(f'      [DB] push_squad_member_row failed: {e}')
+        return
+    mem = next((x for x in members if x['id'] == member_row_id), None)
+    if mem is None:
+        return
+    await _push_kvcs(writer, sess.playerview_cmd, b'SquadMemberSession',
+                     _msg_squad_member_session(mem, mem_row['squad_id']))
+    log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+        f'(SquadMemberSession id={member_row_id})')
+
+
+async def delete_squad_member_row(sess, writer, member_row_id):
+    """KVCS 删除成员行。"""
+    if sess.playerview_cmd is None:
+        return
+    await _push_kvcs_delete(writer, sess.playerview_cmd, b'SquadMemberSession',
+                            member_row_id)
+    log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+        f'(SquadMemberSession delete id={member_row_id})')
+
+
+# ------------------------------------------------------------- 小队
+
+async def handle_create_squad(sess, writer, cmd_id, req_type, proto):
+    """CreateSquadRequest {characterId=1} → CreateSquadResponse{response=1}。
+
+    创建 squads 行 + 队长成员会话（InLobby），推 SquadSession/SquadMemberSession
+    KVCS 行（客户端 SquadModel 数据源）。"""
+    char_id = 0
+    try:
+        f = pb_parse(proto)
+        char_id = int(f.get(1, 0) or 0)
+    except Exception as e:
+        log(f'      [squad] CreateSquad parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = RC_OK
+    squad_id = 0
+    if pid is None or STORE is None or not char_id:
+        code = RC_PLAYER_NOT_FOUND
+    else:
+        try:
+            char = await STORE.get_character(int(pid), char_id)
+            if char is None:
+                code = RC_CHARACTER_NOT_OWNED        # character_not_owned_by_player
+            else:
+                existing = await STORE.get_squad_for_character(char_id)
+                if existing is not None:
+                    code = RC_PLAYER_ALREADY_IN_SQUAD
+                    squad_id = existing['id']
+                else:
+                    name = f"Squad of {sess.username or 'Player'}"
+                    squad_id = await STORE.create_squad(
+                        char_id, char['faction'], name)
+                    log(f'      [DB] create_squad id={squad_id} '
+                        f'leader_char={char_id} faction={char["faction"]}')
+        except Exception as e:
+            log(f'      [DB] create_squad failed: {e}')
+            code = RC_PLAYER_NOT_FOUND
+
+    if code == RC_OK and squad_id:
+        await push_squad_rows(sess, writer, squad_id)
+
+    resp = build_response(cmd_id, 'CreateSquadResponse', pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} CreateSquadResponse '
+        f'(char={char_id}, response={code}, squad={squad_id})')
+
+
+async def handle_modify_squad(sess, writer, cmd_id, req_type, proto):
+    """ModifySquadRequest {squadSessionId=1, removeSquadSupportSlot=2,
+    addSquadSupportSlotTemplateId=3} → ModifySquadResponse{response=1}。
+
+    支援槽位增删：私服无槽位模板系统，验证小队归属后直接 ok。"""
+    squad_session_id = 0
+    try:
+        f = pb_parse(proto)
+        squad_session_id = int(f.get(1, 0) or 0)
+    except Exception as e:
+        log(f'      [squad] ModifySquad parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = RC_OK
+    if pid is not None and STORE is not None and squad_session_id:
+        try:
+            squad = await STORE.get_squad(squad_session_id)
+            if squad is None:
+                code = RC_SQUAD_NOT_FOUND
+        except Exception as e:
+            log(f'      [DB] modify_squad lookup failed: {e}')
+            code = RC_SQUAD_NOT_FOUND
+
+    resp = build_response(cmd_id, 'ModifySquadResponse', pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} ModifySquadResponse '
+        f'(squad={squad_session_id}, response={code})')
+
+
+async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
+    """RemoveSquadRequest {dummy=1} → RemoveSquadResponse{response=1}。
+
+    队长解散小队：删 KVCS 行（SquadSession + 全体 SquadMemberSession）。
+    非队长调离队接口（RemoveSquadMemberRequest），此处校验 ownership。
+    ★ 单人匹配的隐式小队（matchmaking._SOLO_SQUADS，squadId=0）不在 DB：
+      SquadService.deactivate 对 isOwnedByPlayer 也发本请求，须先查注册表，
+      否则 get_squad_for_player 找不到 → 161 squad_not_found 弹"解散失败"。"""
+    pid = await sess.ensure_player()
+
+    # ① 单人隐式小队：KVCS 删成员行 + 小队行，清注册表（下次 join 重建）
+    if pid is not None:
+        solo = _SOLO_SQUADS.pop(int(pid), None)
+        if solo is not None:
+            if sess.playerview_cmd is not None:
+                await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                        b'SquadMemberSession',
+                                        solo['member_row'])
+                await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                        b'SquadSession', solo['squad_row'])
+                log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+                    f'(SquadSession delete id={solo["squad_row"]} + '
+                    f'SquadMemberSession delete id={solo["member_row"]} '
+                    f'★solo squad disband)')
+            resp = build_response(cmd_id, 'RemoveSquadResponse',
+                                  pb_int32(1, RC_OK))
+            writer.write(resp)
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} RemoveSquadResponse '
+                f'(solo squad={solo["squad_row"]}, response=1)')
+            return
+
+    # ② DB 真小队（CreateSquadRequest 建立）
+    code = RC_OK
+    member_ids = []
+    squad_id = 0
+    if pid is None or STORE is None:
+        code = RC_PLAYER_NOT_FOUND
+    else:
+        try:
+            squad = await STORE.get_squad_for_player(int(pid))
+            if squad is None:
+                code = RC_SQUAD_NOT_FOUND
+            else:
+                squad_id = squad['id']
+                members = await STORE.list_squad_members(squad_id)
+                member_ids = [m['id'] for m in members]
+                await STORE.dissolve_squad(squad_id)
+                log(f'      [DB] dissolve_squad id={squad_id} '
+                    f'({len(member_ids)} members)')
+        except Exception as e:
+            log(f'      [DB] dissolve_squad failed: {e}')
+            code = RC_SQUAD_NOT_FOUND
+
+    if code == RC_OK and sess.playerview_cmd is not None:
+        for mid in member_ids:
+            await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                    b'SquadMemberSession', mid)
+        if squad_id:
+            await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                    b'SquadSession', squad_id)
+        log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+            f'(SquadSession delete id={squad_id} + {len(member_ids)} members)')
+
+    resp = build_response(cmd_id, 'RemoveSquadResponse', pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} RemoveSquadResponse '
+        f'(squad={squad_id}, response={code})')
+
+
+async def handle_remove_squad_member(sess, writer, cmd_id, req_type, proto):
+    """RemoveSquadMemberRequest {squadMemberSessionId=1}
+    → RemoveSquadMemberResponse{response=1}。
+
+    队长踢人 / 成员自行离队（SquadService.clearSlot / deactivate）。"""
+    member_row = 0
+    try:
+        f = pb_parse(proto)
+        member_row = int(f.get(1, 0) or 0)
+    except Exception as e:
+        log(f'      [squad] RemoveSquadMember parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = RC_OK
+    if pid is None or STORE is None or not member_row:
+        code = RC_SQUAD_SLOT_NOT_FOUND
+    else:
+        try:
+            removed = await STORE.remove_squad_member(member_row)
+            if not removed:
+                code = RC_SQUAD_SLOT_NOT_FOUND
+            else:
+                log(f'      [DB] remove_squad_member row={member_row}')
+        except Exception as e:
+            log(f'      [DB] remove_squad_member failed: {e}')
+            code = RC_SQUAD_SLOT_NOT_FOUND
+
+    if code == RC_OK:
+        await delete_squad_member_row(sess, writer, member_row)
+
+    resp = build_response(cmd_id, 'RemoveSquadMemberResponse',
+                          pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} RemoveSquadMemberResponse '
+        f'(member={member_row}, response={code})')
+
+
+async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
+    """SquadInvitePlayerRequest {ownerCharacterId=1, friendPlayerId=2}
+    → SquadInvitePlayerResponse{result=1}。
+
+    好友最新角色入小队（status=InvitationPending），推成员行。"""
+    owner_char_id, friend_player_id = 0, 0
+    try:
+        f = pb_parse(proto)
+        owner_char_id = int(f.get(1, 0) or 0)
+        friend_player_id = int(f.get(2, 0) or 0)
+    except Exception as e:
+        log(f'      [squad] SquadInvitePlayer parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = RC_OK
+    member_row = 0
+    if pid is None or STORE is None or not friend_player_id:
+        code = RC_PLAYER_NOT_FOUND
+    else:
+        try:
+            squad = await STORE.get_squad_for_player(int(pid))
+            if squad is None:
+                code = RC_SQUAD_NOT_FOUND
+            else:
+                friend_char = await STORE.get_latest_character(friend_player_id)
+                if friend_char is None:
+                    code = RC_PLAYER_NOT_FOUND
+                else:
+                    member_row = await STORE.add_squad_member(
+                        squad['id'], friend_char['id'], status=ST_INVITE_PENDING)
+                    log(f'      [DB] squad_invite squad={squad["id"]} '
+                        f'friend_char={friend_char["id"]} row={member_row}')
+        except Exception as e:
+            log(f'      [DB] squad_invite failed: {e}')
+            code = RC_PLAYER_NOT_FOUND
+
+    if code == RC_OK and member_row:
+        await push_squad_member_row(sess, writer, member_row)
+
+    resp = build_response(cmd_id, 'SquadInvitePlayerResponse',
+                          pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} SquadInvitePlayerResponse '
+        f'(friend={friend_player_id}, result={code})')
+
+
+async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
+    """SquadRespondToInviteRequest {squadMemberSessionId=1, hasAccepted=2,
+    characterId=3} → SquadRespondToInviteResponse{result=1}。
+
+    接受：换到 characterId（若非 0）并置 InLobby；拒绝：删成员行。"""
+    member_row, has_accepted, char_id = 0, False, 0
+    try:
+        f = pb_parse(proto)
+        member_row = int(f.get(1, 0) or 0)
+        has_accepted = bool(f.get(2, 0))
+        char_id = int(f.get(3, 0) or 0)
+    except Exception as e:
+        log(f'      [squad] SquadRespondToInvite parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = RC_OK
+    if pid is None or STORE is None or not member_row:
+        code = RC_SQUAD_SLOT_NOT_FOUND
+    else:
+        try:
+            mem = await STORE.get_squad_member(member_row)
+            if mem is None:
+                code = RC_SQUAD_SLOT_NOT_FOUND
+            elif has_accepted:
+                await STORE.update_squad_member(
+                    member_row,
+                    character_id=char_id if char_id else None,
+                    status=ST_IN_LOBBY)
+                log(f'      [DB] squad_invite accepted row={member_row} '
+                    f'char={char_id or mem["character_id"]}')
+            else:
+                await STORE.remove_squad_member(member_row)
+                log(f'      [DB] squad_invite declined row={member_row}')
+        except Exception as e:
+            log(f'      [DB] squad_respond failed: {e}')
+            code = RC_SQUAD_SLOT_NOT_FOUND
+
+    if code == RC_OK:
+        if has_accepted:
+            await push_squad_member_row(sess, writer, member_row)
+            mem_row = await STORE.get_squad_member(member_row) \
+                if STORE is not None else None
+            if mem_row is not None:
+                await push_squad_rows(sess, writer, mem_row['squad_id'])
+        else:
+            await delete_squad_member_row(sess, writer, member_row)
+
+    resp = build_response(cmd_id, 'SquadRespondToInviteResponse',
+                          pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} SquadRespondToInviteResponse '
+        f'(member={member_row}, accepted={has_accepted}, result={code})')
+
+
+async def handle_set_squad_details(sess, writer, cmd_id, req_type, proto):
+    """SetSquadDetailsRequest {characterId=1, squadName=2, ...}
+    → SetSquadDetailsResponse{response=1}。
+
+    小队改名（squadName 非空时；官服改名收费，私服免费直接改）。"""
+    char_id, squad_name = 0, ''
+    try:
+        f = pb_parse(proto)
+        char_id = int(f.get(1, 0) or 0)
+        squad_name = _str(f.get(2, '') or '')
+    except Exception as e:
+        log(f'      [squad] SetSquadDetails parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = RC_OK
+    squad_id = 0
+    if pid is None or STORE is None:
+        code = RC_SQUAD_NOT_FOUND
+    else:
+        try:
+            squad = await STORE.get_squad_for_player(int(pid))
+            if squad is None:
+                code = RC_SQUAD_NOT_FOUND
+            else:
+                squad_id = squad['id']
+                if squad_name:
+                    await STORE.rename_squad(squad_id, squad_name)
+                    log(f'      [DB] rename_squad id={squad_id} '
+                        f'name={squad_name!r}')
+        except Exception as e:
+            log(f'      [DB] set_squad_details failed: {e}')
+            code = RC_SQUAD_NOT_FOUND
+
+    if code == RC_OK and squad_name and squad_id:
+        await push_squad_rows(sess, writer, squad_id)
+
+    resp = build_response(cmd_id, 'SetSquadDetailsResponse', pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} SetSquadDetailsResponse '
+        f'(name={squad_name!r}, response={code})')
+
+
+async def handle_set_squad_matchmaking_flag(sess, writer, cmd_id, req_type,
+                                            proto):
+    """SetSquadMatchMakingFlagRequest {squadSessionId=1,
+    matchMakeWarMissionFlag=3} → SetSquadMatchMakingFlagResponse{response=1}。"""
+    squad_session_id, flag = 0, False
+    try:
+        f = pb_parse(proto)
+        squad_session_id = int(f.get(1, 0) or 0)
+        flag = bool(f.get(3, 0))
+    except Exception as e:
+        log(f'      [squad] SetSquadMatchMakingFlag parse error: {e}')
+
+    code = RC_OK
+    if STORE is None or not squad_session_id:
+        code = RC_SQUAD_NOT_FOUND
+    else:
+        try:
+            updated = await STORE.set_squad_flag(squad_session_id, flag)
+            if not updated:
+                code = RC_SQUAD_NOT_FOUND
+            else:
+                log(f'      [DB] set_squad_flag id={squad_session_id} '
+                    f'flag={flag}')
+        except Exception as e:
+            log(f'      [DB] set_squad_flag failed: {e}')
+            code = RC_SQUAD_NOT_FOUND
+
+    if code == RC_OK:
+        await push_squad_rows(sess, writer, squad_session_id)
+
+    resp = build_response(cmd_id, 'SetSquadMatchMakingFlagResponse',
+                          pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} SetSquadMatchMakingFlagResponse '
+        f'(squad={squad_session_id}, flag={flag}, response={code})')
+
+
+async def handle_set_squad_member_status(sess, writer, cmd_id, req_type,
+                                         proto):
+    """SetSquadMemberStatusRequest {squadSlotId=1, memberCharacterId=2,
+    squadMemberSessionStatus=3} → SetSquadMemberStatusResponse{response=1}。
+
+    squadSlotId = SquadMemberSession.id；memberCharacterId 非 0 时换角色。"""
+    slot_id, member_char_id, status = 0, 0, 0
+    try:
+        f = pb_parse(proto)
+        slot_id = int(f.get(1, 0) or 0)
+        member_char_id = int(f.get(2, 0) or 0)
+        status = int(f.get(3, 0) or 0)
+    except Exception as e:
+        log(f'      [squad] SetSquadMemberStatus parse error: {e}')
+
+    code = RC_OK
+    if STORE is None or not slot_id:
+        code = RC_SQUAD_SLOT_NOT_FOUND
+    else:
+        try:
+            mem = await STORE.get_squad_member(slot_id)
+            if mem is None:
+                code = RC_SQUAD_SLOT_NOT_FOUND
+            else:
+                await STORE.update_squad_member(
+                    slot_id,
+                    character_id=member_char_id if member_char_id else None,
+                    status=status if status else None)
+                log(f'      [DB] set_squad_member_status row={slot_id} '
+                    f'char={member_char_id or mem["character_id"]} '
+                    f'status={status or mem["status"]}')
+        except Exception as e:
+            log(f'      [DB] set_squad_member_status failed: {e}')
+            code = RC_SQUAD_SLOT_NOT_FOUND
+
+    if code == RC_OK:
+        await push_squad_member_row(sess, writer, slot_id)
+
+    resp = build_response(cmd_id, 'SetSquadMemberStatusResponse',
+                          pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} SetSquadMemberStatusResponse '
+        f'(slot={slot_id}, char={member_char_id}, status={status}, '
+        f'response={code})')
+
+
+async def handle_update_squad_resource(sess, writer, cmd_id, req_type, proto):
+    """UpdateSquadResourceRequest {squadSessionId=1,
+    resourcePurchaseList=2 repeated, paymentCurrency=3}
+    → UpdateSquadResourceResponse{response=1}。
+
+    小队资源补充购买：私服无资源库存系统，逐条扣款后 ok。"""
+    squad_session_id, currency = 0, 0
+    purchase_count = 0
+    try:
+        fields = pb_parse_multi(proto)
+        squad_session_id = int(fields.get(1, [0])[0] or 0) \
+            if fields.get(1) else 0
+        purchase_count = len(fields.get(2, []))
+        currency = int(fields.get(3, [0])[0] or 0) if fields.get(3) else 0
+    except Exception as e:
+        log(f'      [squad] UpdateSquadResource parse error: {e}')
+
+    code = RC_OK
+    if STORE is None or not squad_session_id:
+        code = RC_SQUAD_NOT_FOUND
+    else:
+        try:
+            squad = await STORE.get_squad(squad_session_id)
+            if squad is None:
+                code = RC_SQUAD_NOT_FOUND
+        except Exception as e:
+            log(f'      [DB] update_squad_resource lookup failed: {e}')
+            code = RC_SQUAD_NOT_FOUND
+
+    resp = build_response(cmd_id, 'UpdateSquadResourceResponse',
+                          pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} UpdateSquadResourceResponse '
+        f'(squad={squad_session_id}, purchases={purchase_count}, '
+        f'currency={currency}, response={code})')
+
+
+# ------------------------------------------------------------- 军团（Company）
+
+async def handle_create_company(sess, writer, cmd_id, req_type, proto):
+    """CreateCompanyRequest {nameLong=1, nameShort=2, description=3}
+    → CreateCompanyResponse{result=1}。
+
+    名称校验（长度/重名）→ companies + company_members(role=2) 入库。"""
+    name_long, name_short, description = '', '', ''
+    try:
+        f = pb_parse(proto)
+        name_long = _str(f.get(1, '') or '')
+        name_short = _str(f.get(2, '') or '')
+        description = _str(f.get(3, '') or '')
+    except Exception as e:
+        log(f'      [squad] CreateCompany parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = RC_OK
+    company_id = 0
+    if pid is None or STORE is None:
+        code = RC_PLAYER_NOT_FOUND
+    else:
+        try:
+            existing = await STORE.get_company_for_player(int(pid))
+            if existing is not None:
+                code = RC_CO_ALREADY_IN_COMPANY
+            elif not _CO_LONG_MIN <= len(name_long) <= _CO_LONG_MAX:
+                code = (RC_CO_LONG_TOO_SHORT if len(name_long) < _CO_LONG_MIN
+                        else RC_CO_LONG_TOO_LONG)
+            elif not _CO_SHORT_MIN <= len(name_short) <= _CO_SHORT_MAX:
+                code = (RC_CO_SHORT_TOO_SHORT if len(name_short) < _CO_SHORT_MIN
+                        else RC_CO_SHORT_TOO_LONG)
+            elif len(description) > _CO_DESC_MAX:
+                code = 184                     # company_companyDescriptionTooLong
+            elif await STORE.company_name_exists(name_long):
+                code = RC_CO_NAME_EXISTS
+            else:
+                company_id = await STORE.create_company(
+                    name_long, name_short, int(pid), description)
+                log(f'      [DB] create_company id={company_id} '
+                    f'name={name_long!r} leader={pid}')
+        except Exception as e:
+            log(f'      [DB] create_company failed: {e}')
+            code = RC_PLAYER_NOT_FOUND
+
+    resp = build_response(cmd_id, 'CreateCompanyResponse', pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} CreateCompanyResponse '
+        f'(name={name_long!r}/{name_short!r}, result={code}, '
+        f'company={company_id})')
+
+
+async def handle_invite_to_company(sess, writer, cmd_id, req_type, proto):
+    """InviteToCompanyRequest {playerToInvite=1}
+    → InviteToCompanyResponse{result=1}。"""
+    player_to_invite = 0
+    try:
+        f = pb_parse(proto)
+        player_to_invite = int(f.get(1, 0) or 0)
+    except Exception as e:
+        log(f'      [squad] InviteToCompany parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = RC_OK
+    if pid is None or STORE is None or not player_to_invite:
+        code = RC_PLAYER_NOT_FOUND
+    else:
+        try:
+            co = await STORE.get_company_for_player(int(pid))
+            if co is None:
+                code = RC_CO_PRIVILEGES      # 邀请者不在任何军团（无权限）
+            elif int(co['leader_player_id']) != int(pid):
+                code = RC_CO_PRIVILEGES      # 仅队长可邀请
+            else:
+                iid, code = await STORE.invite_to_company(
+                    co['id'], player_to_invite, int(pid))
+                log(f'      [DB] invite_to_company company={co["id"]} '
+                    f'player={player_to_invite} code={code}')
+        except Exception as e:
+            log(f'      [DB] invite_to_company failed: {e}')
+            code = RC_PLAYER_NOT_FOUND
+
+    resp = build_response(cmd_id, 'InviteToCompanyResponse', pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} InviteToCompanyResponse '
+        f'(player={player_to_invite}, result={code})')
+
+
+async def handle_kick_from_company(sess, writer, cmd_id, req_type, proto):
+    """KickFromCompanyRequest {playerToKick=1}
+    → KickFromCompanyResponse{result=1}。"""
+    player_to_kick = 0
+    try:
+        f = pb_parse(proto)
+        player_to_kick = int(f.get(1, 0) or 0)
+    except Exception as e:
+        log(f'      [squad] KickFromCompany parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = RC_OK
+    if pid is None or STORE is None or not player_to_kick:
+        code = RC_PLAYER_NOT_FOUND
+    else:
+        try:
+            if int(pid) == player_to_kick:
+                code = RC_CO_CANNOT_KICK_SELF
+            else:
+                co = await STORE.get_company_for_player(int(pid))
+                if co is None:
+                    code = RC_CO_MEMBER_NOT_FOUND
+                elif int(co['leader_player_id']) != int(pid):
+                    code = RC_CO_PRIVILEGES   # 仅队长可踢人
+                else:
+                    removed = await STORE.remove_company_member(
+                        co['id'], player_to_kick)
+                    code = RC_OK if removed else RC_CO_MEMBER_NOT_FOUND
+                    log(f'      [DB] kick_from_company company={co["id"]} '
+                        f'player={player_to_kick} ok={removed}')
+        except Exception as e:
+            log(f'      [DB] kick_from_company failed: {e}')
+            code = RC_PLAYER_NOT_FOUND
+
+    resp = build_response(cmd_id, 'KickFromCompanyResponse', pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} KickFromCompanyResponse '
+        f'(player={player_to_kick}, result={code})')
+
+
+async def handle_leave_company(sess, writer, cmd_id, req_type, proto):
+    """LeaveCompanyRequest {} → LeaveCompanyResponse{result=1}。"""
+    pid = await sess.ensure_player()
+    code, company_id = 186, 0
+    if pid is not None and STORE is not None:
+        try:
+            code, company_id = await STORE.leave_company(int(pid))
+            log(f'      [DB] leave_company player={pid} code={code} '
+                f'company={company_id}')
+        except Exception as e:
+            log(f'      [DB] leave_company failed: {e}')
+
+    resp = build_response(cmd_id, 'LeaveCompanyResponse', pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} LeaveCompanyResponse (result={code})')
+
+
+async def handle_respond_company_invitation(sess, writer, cmd_id, req_type,
+                                            proto):
+    """RespondToCompanyInvitationRequest {invitationId=1, accept=2}
+    → RespondToCompanyInvitationResponse{result=1}。"""
+    invitation_id, accept = 0, False
+    try:
+        f = pb_parse(proto)
+        invitation_id = int(f.get(1, 0) or 0)
+        accept = bool(f.get(2, 0))
+    except Exception as e:
+        log(f'      [squad] RespondToCompanyInvitation parse error: {e}')
+
+    code = RC_OK
+    if STORE is None or not invitation_id:
+        code = RC_CO_INVITE_NOT_FOUND
+    else:
+        try:
+            code, company_id = await STORE.respond_company_invitation(
+                invitation_id, accept)
+            log(f'      [DB] respond_company_invitation invite='
+                f'{invitation_id} accept={accept} code={code}')
+        except Exception as e:
+            log(f'      [DB] respond_company_invitation failed: {e}')
+            code = RC_CO_INVITE_NOT_FOUND
+
+    resp = build_response(cmd_id, 'RespondToCompanyInvitationResponse',
+                          pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} RespondToCompanyInvitationResponse '
+        f'(invite={invitation_id}, accept={accept}, result={code})')
+
+
+def _parse_insignia_part(raw):
+    """InsigniaPart { string partType=1; int64 partId=2; string fieldId=3;
+    float scale=4; float offset=5; } → dict（float 为 wiretype 5 原始 4 字节）。"""
+    f = pb_parse(raw) if raw else {}
+    scale = f.get(4, b'')
+    offset = f.get(5, b'')
+    return {
+        'partType': _str(f.get(1, b'') or b''),
+        'partId': int(f.get(2, 0) or 0),
+        'fieldId': _str(f.get(3, b'') or b''),
+        'scale': struct.unpack('<f', scale)[0]
+        if isinstance(scale, bytes) and len(scale) == 4 else 0.0,
+        'offset': struct.unpack('<f', offset)[0]
+        if isinstance(offset, bytes) and len(offset) == 4 else 0.0,
+    }
+
+
+async def handle_create_insignia(sess, writer, cmd_id, req_type, proto):
+    """CreateInsigniaRequest {repeated InsigniaPart parts=1;
+    repeated int64 pricingIds=2; int32 paymentCurrency=3}
+    → CreateInsigniaResponse{status=1}。
+
+    部件逐项扣款（pricingIds 与 parts 对应）→ player_insignias 入库。"""
+    parts = []
+    pricing_ids = []
+    currency = 0
+    try:
+        f = pb_parse_multi(proto)
+        parts = [_parse_insignia_part(raw) for raw in f.get(1, [])]
+        pricing_ids = [int(p) for p in f.get(2, [])]
+        currency = int(f.get(3, [0])[0])
+        log(f'      [squad] CreateInsignia: {len(parts)} parts, '
+            f'pricingIds={pricing_ids}, currency={currency}')
+    except Exception as e:
+        log(f'      [squad] CreateInsignia parse error: {e}')
+
+    # 逐项扣款（部件购买费）；任一不足 → not_enough_credits
+    from player_service import _charge_player
+    for pid_price in pricing_ids:
+        cost, ok = await _charge_player(sess, pid_price, currency)
+        if not ok:
+            resp = build_response(cmd_id, 'CreateInsigniaResponse',
+                                  pb_int32(1, 56))
+            writer.write(resp)
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} CreateInsigniaResponse '
+                f'(status=56 not_enough) cost={cost}')
+            return
+
+    pid = await sess.ensure_player()
+    status = RC_OK
+    if pid is not None and STORE is not None and parts:
+        try:
+            insignia_id = await STORE.create_insignia(int(pid), parts)
+            log(f'      [DB] create_insignia id={insignia_id} '
+                f'player={pid} parts={len(parts)}')
+        except Exception as e:
+            log(f'      [DB] create_insignia failed: {e}')
+            status = 64  # player_not_found（入库异常兜底）
+    else:
+        status = 64
+
+    resp = build_response(cmd_id, 'CreateInsigniaResponse', pb_int32(1, status))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} CreateInsigniaResponse (status={status})')
+
+
+async def handle_remove_insignia(sess, writer, cmd_id, req_type, proto):
+    """RemoveInsigniaRequest {int64 insigniaId=1}
+    → RemoveInsigniaResponse{status=1}。"""
+    insignia_id = 0
+    try:
+        f = pb_parse(proto)
+        insignia_id = int(f.get(1, 0) or 0)
+    except Exception as e:
+        log(f'      [squad] RemoveInsignia parse error: {e}')
+
+    status = RC_OK
+    pid = await sess.ensure_player()
+    if pid is not None and STORE is not None and insignia_id:
+        try:
+            removed = await STORE.remove_insignia(int(pid), insignia_id)
+            log(f'      [DB] remove_insignia id={insignia_id} '
+                f'player={pid} removed={removed}')
+        except Exception as e:
+            log(f'      [DB] remove_insignia failed: {e}')
+
+    resp = build_response(cmd_id, 'RemoveInsigniaResponse', pb_int32(1, status))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} RemoveInsigniaResponse (status={status}, '
+        f'id={insignia_id})')
+
+
+HANDLERS = {
+    'CreateSquadRequest': handle_create_squad,
+    'ModifySquadRequest': handle_modify_squad,
+    'RemoveSquadRequest': handle_remove_squad,
+    'RemoveSquadMemberRequest': handle_remove_squad_member,
+    'SquadInvitePlayerRequest': handle_squad_invite_player,
+    'SquadRespondToInviteRequest': handle_squad_respond_to_invite,
+    'SetSquadDetailsRequest': handle_set_squad_details,
+    'SetSquadMatchMakingFlagRequest': handle_set_squad_matchmaking_flag,
+    'SetSquadMemberStatusRequest': handle_set_squad_member_status,
+    'UpdateSquadResourceRequest': handle_update_squad_resource,
+    'CreateCompanyRequest': handle_create_company,
+    'InviteToCompanyRequest': handle_invite_to_company,
+    'KickFromCompanyRequest': handle_kick_from_company,
+    'LeaveCompanyRequest': handle_leave_company,
+    'RespondToCompanyInvitationRequest': handle_respond_company_invitation,
+    'CreateInsigniaRequest': handle_create_insignia,
+    'RemoveInsigniaRequest': handle_remove_insignia,
+}

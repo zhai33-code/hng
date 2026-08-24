@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 日志
+*.log
+client_logs.txt
+
+# 临时脚本与产物（约定存放于 tmp/）
+tmp/
+
+# zig 编译缓存与调试符号（eos_stub.dll/lib 保留，可用 eos_stub.c 重建）
+.zigcache/
+*.pdb
+
+# 证书（首次运行 eos_fake_backend.py 自动生成，用 eos_fake_setup.ps1 装入系统）
+certs/
