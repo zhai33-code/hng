@@ -23,7 +23,53 @@
    - player.dll 已打二进制补丁（EAC 服务端校验禁用），`player.dll.bak_*` 为补丁前备份
    - `start_server.bat` 为手动调试入口（常规测试无需运行，匹配后自动拉起）
 
-## 二、环境要求
+## 二、功能进度（更新：2026-08-25）
+
+### 已完成 ✅
+
+**认证与会话**
+- 登录/注销/keepalive 全链路（logout 响应回显防请求队列卡死）
+- OIDC/JWT 本地签发（iss/aud/sub/exp 与客户端校验完全对齐）+ EOS 假后端
+- 双连接拓扑支持：Flash UI 连接 + hng.exe 游戏连接（FLASH_SESSIONS 注册表跨连接推送）
+
+**角色系统**
+- PostgreSQL 持久化角色（players/characters/weapons/vehicles + 8 张装备表）
+- 新兵初始装备发放（starting_gear.py：按国家×兵种配置，步兵武器/侦察瞄具/坦克兵坦克/飞行员侦察机）
+- tutorialsCompleted 持久化（修复新手免费招募模式卡死）
+
+**经济与商店（全部原子事务）**
+- 三币种（credits/warfunds/gold）+ 42 用例事务测试（并发扣款/防双领/回滚/幂等）
+- 武器/载具/皮肤变体/配件/弹药购买，捆绑包、勋带等级购买
+- 每日登录奖励、兑换券、战争债券、军令奖励领取、战斗通行证
+
+**解锁系统（2026-08-25 重构完成）**
+- unlockSequence 统一白名单：可购买物品类 uid 不随默认序列授予，只走起始装备/勋带 XP/购买三条正路
+- 修复武器、载具、战斗徽章的解锁位图多重泄漏（新号零徽章、PPD/Bazooka 正确锁定）
+
+**匹配与战局**
+- 完整匹配流程：GetMissionList → JoinMission → 拉起专用战斗服 → BattleFieldSettings 握手 → PMS 推送
+- 离开战局/退出登录全链路（PlayerExitBatch 跨连接推送 + AbandonMission + PMS DELETE）
+- 单人隐式小队（SquadSession/SquadMemberSession KVCS 全时序，含解散）
+- 战局结算入库 + 战报界面读取（battle_reports 表）
+- 开局倒计时覆盖（专用服启动参数 controllers.overrideStartCountdown）
+
+**社交与生涯**
+- 玩家搜索/好友响应、军团邀请响应、军团离开
+- CareerOrder 46 种大厅动作进度 + 奖励领取 + BattlePass 四赛季延期可用
+
+**协议层**
+- 全部未知请求返回 HandlerErrorResponse（防客户端请求队列阻塞）
+- KVCS 表推送路由（客户端 DataModelProxy 按表名自动注册）
+- 协议回归测试 33 项 + 真库测试 57 项 + 事务测试 42 项全部通过
+
+### 已知限制 / 待办 ⏳
+- 战局热身时间：missionpreset 客户端文件修改未生效，已改道专用服启动参数覆盖（待实测）
+- BattlePass 赛季为延期模拟（模板行 2099），非真实赛季轮换
+- 会员体系（Veteran）相关请求恒返回 ok，无实际会员逻辑
+
+---
+
+## 三、环境要求
 
 | 项 | 要求 |
 |---|---|
@@ -149,12 +195,13 @@ powershell -ExecutionPolicy Bypass -File admin_restart_server.ps1
 ```powershell
 powershell -ExecutionPolicy Bypass -File run_selftest.ps1     # 登录+订阅自测
 .venv\Scripts\python tests\test_regression.py    # 协议回归（33 项）
-.venv\Scripts\python tests\test_realdb.py        # 数据库读写（47 项）
+.venv\Scripts\python tests\test_realdb.py        # 数据库读写（57 项）
+.venv\Scripts\python tests\test_transactions.py  # 数据库事务（42 项）
 .venv\Scripts\python tests\test_e2e.py           # 端到端（需服务器运行中）
 .venv\Scripts\python tests\test_autorepair.py    # 自动维修三态（需服务器运行中）
 ```
 
-## 七、常用工具（tools/）
+## 八、常用工具（tools/）
 
 ```powershell
 .venv\Scripts\python tools\add_user.py <用户名> <密码>       # 手动添加账号
@@ -173,7 +220,7 @@ powershell -ExecutionPolicy Bypass -File run_selftest.ps1     # 登录+订阅自
 | 战局卡加载/校验失败 | WarDatabase 被改动后需重启服务器（校验清单是启动时生成的） |
 | 战斗服务器没拉起 | 看 realtest_game.log 的 `launching combat server` 行；单独调试用 combat-server\start_server.bat |
 
-## 九、日志
+## 十、日志
 
 - Python 服务器：`hng-server\realtest_game.log`（全部协议收发记录）
 - 战斗服务器：`combat-server\combat-server-N.log`（每局一个，N 递增）+ `hng_boot.log`
