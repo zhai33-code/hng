@@ -12,13 +12,13 @@
 
 《Heroes & Generals》客户端的私服服务器模拟器，包含两大组件：
 
-1. **hng-server/**（Python）：协议服务器
+1. **hng-server/**（本仓库，Python）：协议服务器
    - TCP 游戏服务器（端口 15110）：登录、角色/武器/载具、商店、任务、匹配、战局推送
    - HTTP 服务器（端口 80）：客户端静态资源、账号注册页 `http://127.0.0.1/register`
    - OIDC/JWT 本地签发（eos_oidc 密钥对，供战斗服 EOS token）
    - Ping 响应器（端口 20201，TCP+UDP）
    - 匹配成功后自动拉起战斗服务器（combat-server）
-2. **combat-server/**（C++ 引擎，hng.exe /D 专用服）：承载实际战局
+2. **combat-server/**（不在本仓库，C++ 引擎，hng.exe /D 专用服）：承载实际战局
    - UDP 5678 承载战斗流量，回连 warserver（15110）完成 BattleFieldSettings 握手
    - player.dll 已打二进制补丁（EAC 服务端校验禁用），`player.dll.bak_*` 为补丁前备份
    - `start_server.bat` 为手动调试入口（常规测试无需运行，匹配后自动拉起）
@@ -78,21 +78,26 @@
 | 数据库 | PostgreSQL 13+（本机 Docker 或 WSL Docker 均可） |
 | 客户端 | 完整的 HnG 客户端目录（含 WarDatabase、images 等，见"部署"） |
 
-## 三、部署方式
+## 四、部署方式
 
-**把 zip 直接解压到客户端根目录**（与客户端的 WarDatabase、images 同级）：
+**git clone 本仓库到客户端根目录**（与客户端的 WarDatabase、images 同级）：
+
+```powershell
+cd d:\HnG-test
+git clone https://gitee.com/zcmk123/hng-re.git hng-server
+```
 
 ```
 d:\HnG-test\               ← 客户端根目录（已存在的游戏文件）
 ├── WarDatabase\           ← 客户端自带
 ├── images\                ← 客户端自带
 ├── HeroesAndGeneralsDesktop.exe   ← 客户端启动器
-├── hng-server\            ← 解压得到（Python 服务器）
-└── combat-server\         ← 解压得到（战斗服务器，含全部运行数据 _packed 等）
+├── hng-server\            ← git clone 得到（本仓库，Python 服务器）
+└── combat-server\         ← 战斗服务器（不在本仓库，需另行部署；含全部运行数据 _packed 等）
 ```
 
 服务器启动时**自动探测**客户端根目录与 combat-server 位置（探测特征：WarDatabase + images），
-无需改代码。若解压在其他位置，用环境变量指定：
+无需改代码。若克隆在其他位置，用环境变量指定：
 
 | 环境变量 | 作用 | 示例 |
 |---|---|---|
@@ -100,7 +105,7 @@ d:\HnG-test\               ← 客户端根目录（已存在的游戏文件）
 | `HNG_COMBAT_SERVER_DIR` | 战斗服务器目录 | `D:\MyHnG\combat-server` |
 | `HNG_DATABASE_URL` | PostgreSQL 连接串 | `postgresql://hng:hng_password@192.168.1.5:5432/hng` |
 
-## 四、首次部署步骤
+## 五、首次部署步骤
 
 ### 1. 安装 Python 依赖（仅 hng-server）
 
@@ -141,7 +146,7 @@ CREATE DATABASE hng OWNER hng;
 
 并把 hosts 文件加入 **Windows Defender 排除项**（否则条目会被当 DNS 劫持清除）。
 
-## 五、日常使用
+## 六、日常使用
 
 ### 启动
 
@@ -173,9 +178,11 @@ launching combat server: /D 5678 /S session-... /M T01M08_Mill /W 127.0.0.1:1511
 combat server #N handshake ok (pid=...)
 ```
 
-### 重启（改代码后必须重启才生效）
+### 更新与重启（改代码后必须重启才生效）
 
 ```powershell
+cd hng-server
+git pull                                              # 拉取最新代码
 powershell -ExecutionPolicy Bypass -File admin_restart_server.ps1
 ```
 
@@ -183,7 +190,7 @@ powershell -ExecutionPolicy Bypass -File admin_restart_server.ps1
 
 关掉服务器控制台窗口，或 `taskkill /F /PID <监听 15110 的进程>`（提权启动时需管理员）。
 
-## 六、测试账号与验证
+## 七、测试账号与验证
 
 | 账号 | 密码 | 说明 |
 |---|---|---|
@@ -208,7 +215,7 @@ powershell -ExecutionPolicy Bypass -File run_selftest.ps1     # 登录+订阅自
 .venv\Scripts\python tools\set_password.py <用户名> <新密码>  # 改密码
 ```
 
-## 八、常见问题
+## 九、常见问题
 
 | 现象 | 处理 |
 |---|---|
