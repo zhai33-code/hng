@@ -611,3 +611,73 @@ def _load_preset(preset_id):
     _PRESET_CACHE[preset_id] = row
     return row
 
+
+# ===== 匹配池地图数据链（missionpreset → gamemap → scenefile / battlefield 行）=====
+_GAMEMAP_SCENE_CACHE = {}       # gamemap_id -> scenefile str
+_BATTLEFIELD_ENTITY_CACHE = {}  # gamemap_id -> battlefield 表行 id
+
+
+def _load_gamemap_row(gamemap_id):
+    """读 WarDatabase/gamemap 行（缓存）。gamemap 表字段（实测 dump 确认）：
+    f1=id f2=gamemapname f3=identifier f4=scenefile（如 13 → 'T01M08_Mill.scn'）。"""
+    if gamemap_id in _GAMEMAP_SCENE_CACHE:
+        return _GAMEMAP_SCENE_CACHE[gamemap_id]
+    row = None
+    try:
+        for r in _parse_wardb_table('gamemap'):
+            if int(r.get(1, 0) or 0) == int(gamemap_id):
+                row = r
+                break
+    except Exception as e:
+        log(f'[!] gamemap parse failed: {e}')
+    _GAMEMAP_SCENE_CACHE[gamemap_id] = row
+    return row
+
+
+def _load_gamemap_scene(gamemap_id):
+    """gamemap → 场景名（combat server /M 启动参数，不含 .scn 后缀）。
+
+    WarDatabase 存 'T01M08_Mill.scn'，启动参数为 'T01M08_Mill'
+    （start_server.bat 实测）。查不到回退 Mill。
+    """
+    row = _load_gamemap_row(gamemap_id)
+    scene = ''
+    if row is not None:
+        v = row.get(4, b'')         # f4 = scenefile
+        if isinstance(v, bytes) and v:
+            scene = v.decode('utf-8', 'replace')
+    if scene.endswith('.scn'):
+        scene = scene[:-4]
+    if not scene:
+        log(f'[!] gamemap {gamemap_id} scenefile missing, '
+            f'fallback to T01M08_Mill')
+        return 'T01M08_Mill'
+    return scene
+
+
+def preset_scene(preset_id):
+    """missionpreset → gamemap → scenefile（combat server /M 单一来源）。"""
+    preset = _load_preset(preset_id)
+    gamemap_id = int(preset.get(3, 0) or 0) or 13
+    return _load_gamemap_scene(gamemap_id)
+
+
+def battlefield_entity_for_gamemap(gamemap_id):
+    """battlefield 表 f7==gamemap 的行 id（MissionInfo f5 mapEntityId）。
+
+    无对应行时回退 MISSION_MAP_ENTITY_ID 常量值（112741325='Benoit Village'，
+    Mill 图实测行），保证客户端简报查表可用。
+    """
+    if gamemap_id in _BATTLEFIELD_ENTITY_CACHE:
+        return _BATTLEFIELD_ENTITY_CACHE[gamemap_id]
+    entity_id = 112741325
+    try:
+        for r in _parse_wardb_table('battlefield'):
+            if int(r.get(7, 0) or 0) == int(gamemap_id):
+                entity_id = int(r.get(1, 0) or 0) or entity_id
+                break
+    except Exception as e:
+        log(f'[!] battlefield parse failed: {e}')
+    _BATTLEFIELD_ENTITY_CACHE[gamemap_id] = entity_id
+    return entity_id
+

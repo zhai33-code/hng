@@ -33,7 +33,7 @@ d = get('https://api.epicgames.dev/epic/oauth/v2/.well-known/jwks.json')
 print('阶段2 JWKS: kid=%s kty=%s' % (d['keys'][0]['kid'], d['keys'][0]['kty']))
 
 # 阶段3: token (jwt-bearer)
-import oidc_issuer
+from eos import oidc_issuer
 oidc_issuer.configure('xyza7891uO05dmOamk2giEDkkLHD6Taj')
 tok = oidc_issuer.make_id_token('DoubleBird', subject='300001')
 req = urllib.request.Request(

@@ -2,7 +2,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 2026-08-21 归档至 tools/
-from hngserver import Chunk
+from protocol import Chunk
 
 raw = open(r'd:\HnG-test\WarDatabase\factiontemplate', 'rb').read()
 c, _ = Chunk.parse(raw, 0)

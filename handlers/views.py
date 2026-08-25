@@ -16,7 +16,7 @@ from protocol import (
     pb_string,
     )
 
-from state import FLASH_SESSIONS, log
+from state import FLASH_SESSIONS, PUBLIC_HOST, log
 
 from wardb import (
     SHOP_TABLE_FILES,
@@ -50,8 +50,8 @@ from .social import (
 # 返回 rtt>=1ms 才进入 getSortedHostingCenterList，否则弹 "unable to ping game server"。
 # daemon 的 CMD_PING 只收一个 "hostname" 参数：不带端口，固定 ping 到 20201 端口
 # （带 ":port" 会被整体当主机名解析失败 → 超时；实测 50010/80/50080 都 Timeout）。
-# 20201 由 _start_ping_responder 监听并应答。
-_HC_HOST = '127.0.0.1'
+# 20201 由 _start_ping_responder 监听并应答。地址取 PUBLIC_HOST（外网开服=公网 IP）。
+_HC_HOST = PUBLIC_HOST
 
 
 async def handle_subscribe(sess, writer, cmd_id, req_type, proto):

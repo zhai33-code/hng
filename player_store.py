@@ -1977,6 +1977,17 @@ class PlayerStore:
                 int(mission_id), int(state))
         return _rowcount(n) > 0
 
+    async def close_stale_missions(self):
+        """服务器启动清理：所有 state IN (0,1) 的任务置为 state=2（结束）。
+
+        重启后内存态（COMBAT_INSTANCES / 匹配池）已丢失，DB 里的组队中/
+        运行中记录不可能再推进——不清掉会被 GetMissionList 当活局展示
+        （玩家点进去是空壳）。返回清理行数。"""
+        async with self.pool.acquire() as conn:
+            n = await conn.execute(
+                'UPDATE mission_records SET state = 2 WHERE state IN (0, 1)')
+        return _rowcount(n)
+
     async def list_missions_by_state(self, states, limit=50):
         """按状态查任务记录。"""
         if not states:

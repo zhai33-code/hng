@@ -20,3 +20,9 @@ tmp/
 
 # 证书（首次运行 eos_fake_backend.py 自动生成，用 eos_fake_setup.ps1 装入系统）
 certs/
+
+# 环境变量（真实部署配置，模板见 .env.example）
+.env
+
+# 历史日志（按天轮转产物）
+realtest_game.log.*.log

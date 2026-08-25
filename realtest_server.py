@@ -42,6 +42,7 @@ from protocol import (
 from state import (
     FLASH_SESSIONS,
     GAME_DIR,
+    PUBLIC_HOST,
     STORE,
     Session,
     WARDDB_DIR,
@@ -145,7 +146,20 @@ def _localization_body():
 
 # ================================================================ HTTP server
 
-SETTINGS_JS = b"flash_dynhttp=\"127.0.0.1:15110\";\nunique_file_servers=\"127.0.0.1\";\nlocalizerFile=\"BattlEyeTlm/HnG_Strategy_en.xml\";\nversion=\"173293\";\ndistribution=\"live\";\nlanguage=\"en\";\nreleasename=\"QQ\";\nircserver=\"127.0.0.1:6667\";\naccount_url=\"http://127.0.0.1/account\";\nuniqueversionfilename=\"hng_unique_v173293\";\nsiteonly=\"false\";\n"
+# 对外地址统一取 state.PUBLIC_HOST（HNG_PUBLIC_HOST 环境变量 / .env）：
+# flash_dynhttp=客户端连 warserver 的 TCP、unique_file_servers=HTTP 静态资源、
+# account_url=账号页、ircserver=聊天（irc 服务未实现，仅占位）。
+SETTINGS_JS = (f"flash_dynhttp=\"{PUBLIC_HOST}:15110\";\n"
+               f"unique_file_servers=\"{PUBLIC_HOST}\";\n"
+               "localizerFile=\"BattlEyeTlm/HnG_Strategy_en.xml\";\n"
+               "version=\"173293\";\n"
+               "distribution=\"live\";\n"
+               "language=\"en\";\n"
+               "releasename=\"QQ\";\n"
+               f"ircserver=\"{PUBLIC_HOST}:6667\";\n"
+               f"account_url=\"http://{PUBLIC_HOST}/account\";\n"
+               "uniqueversionfilename=\"hng_unique_v173293\";\n"
+               "siteonly=\"false\";\n").encode()
 
 # hng_unique_v173293: 静态数据文件清单，客户端登录成功后请求
 # 格式: <root><list id="WarDatabase" uniquefile="wardb_unique"/><list id="Flash_Resources" uniquefile="flashres_unique"/></root>
@@ -516,6 +530,12 @@ async def handle_tcp(reader, writer):
         # Flash 连接注册表注销（仅当注册的就是本连接；重登录已被覆盖时不动）
         if sess.username and FLASH_SESSIONS.get(sess.username) is sess:
             del FLASH_SESSIONS[sess.username]
+        # 匹配排队清理：断线玩家出池（防幽灵条目虚增人数/被撮合成局；
+        # 已成局的不动，战局照常进行）
+        try:
+            matchmaking.drop_player(sess.player_id)
+        except Exception as e:
+            log(f'[drop_player] {type(e).__name__}: {e}')
         writer.close()
 
 
@@ -528,15 +548,31 @@ async def dispatch(sess, chunk, writer):
     log(f'C->S cmd={cmd_id:<4} type={req_type:<45} proto={len(proto)}B'
         + (f' hex={proto[:32].hex()}' if proto else ''))
 
-    if await handlers.dispatch(sess, writer, cmd_id, req_type, proto):
-        return
-    if req_type in ('JoinMatchMakingRequest', 'CancelJoinMatchMakingRequest',
-                    'GetMissionDetailsRequest'):
-        # 战斗匹配：匹配请求 / 取消匹配 / 战局详情（简报部署界面），独立模块实现
-        await matchmaking.handle_request(sess, writer, cmd_id, req_type, proto)
-        return
-    if await game_server.handle_request(sess, writer, cmd_id, req_type, proto):
-        # 游戏进程(warserver)握手请求：GetPlayerSettings 等由独立模块处理
+    # 单请求处理异常兜底：任何 handler 抛异常只记日志 + 回 HandlerErrorResponse，
+    # 绝不让异常冒泡到 handle_tcp 杀掉整条连接（客户端请求队列串行，
+    # 无响应会永久堵塞；连接断开则会话全丢——一个 handler 的 bug
+    # 不应等于玩家掉线）。
+    try:
+        if await handlers.dispatch(sess, writer, cmd_id, req_type, proto):
+            return
+        if req_type in ('JoinMatchMakingRequest', 'CancelJoinMatchMakingRequest',
+                        'GetMissionDetailsRequest'):
+            # 战斗匹配：匹配请求 / 取消匹配 / 战局详情（简报部署界面），独立模块实现
+            await matchmaking.handle_request(sess, writer, cmd_id, req_type, proto)
+            return
+        if await game_server.handle_request(sess, writer, cmd_id, req_type, proto):
+            # 游戏进程(warserver)握手请求：GetPlayerSettings 等由独立模块处理
+            return
+    except Exception as e:
+        import traceback
+        log(f'[dispatch] HANDLER-ERR {req_type}: {type(e).__name__}: {e}')
+        log(traceback.format_exc())
+        try:
+            resp = build_response(cmd_id, 'HandlerErrorResponse', b'')
+            writer.write(resp)
+            await writer.drain()
+        except Exception:
+            pass                    # 连接已断：handle_tcp 会收尾
         return
     # 未知请求：必须回复 HandlerErrorResponse 解锁客户端请求队列！
     # 客户端 ServiceHandler 串行发送请求，未收到响应的请求会永久堵塞队列
@@ -620,7 +656,7 @@ async def main():
     # OpenID provider：audience = EOS client_id（私服抓包确认）
     # ★ 私服 JWT aud = "xyza7891uO05dmOamk2giEDkkLHD6Taj"，非 Epic Deployment ID
     try:
-        import oidc_issuer
+        from eos import oidc_issuer
         oidc_issuer.configure('xyza7891uO05dmOamk2giEDkkLHD6Taj')
         log('[oidc] configured (audience=xyza7891uO05dmOamk2giEDkkLHD6Taj)')
     except Exception as e:
@@ -631,6 +667,14 @@ async def main():
     try:
         await STORE.start()
         log(f'[DB] PostgreSQL ready: {STORE.dsn.split("@")[-1]}')
+        # 重启孤儿清理：上一次运行遗留的组队中/运行中任务全部置为结束
+        #（内存态已丢，不清会被 GetMissionList 当活局展示空壳局）
+        try:
+            n = await STORE.close_stale_missions()
+            if n:
+                log(f'[DB] closed {n} stale mission_records (server restart)')
+        except Exception as e:
+            log(f'[DB] close_stale_missions failed: {e}')
     except Exception as e:
         log(f'[DB] PostgreSQL UNAVAILABLE ({e}) -- 持久化已禁用')
     # 记录主 loop：HTTP 线程的 /register 经它投递 create_player 协程
@@ -639,8 +683,28 @@ async def main():
     http_thread = threading.Thread(target=start_http, daemon=True)
     http_thread.start()
     log(f'[HTTP] register page: http://127.0.0.1/register')
+    # TCP / ping 监听异常不死进程：内层异常重启服务（端口瞬时占用等场景），
+    # 连续快速失败 5 次才放弃（避免错误配置下无限重启刷日志）。
+    async def _supervise(name, factory):
+        failures = 0
+        while True:
+            try:
+                await factory()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                failures += 1
+                log(f'[{name}] CRASHED ({type(e).__name__}: {e}), '
+                    f'restart {failures}/5')
+                if failures >= 5:
+                    log(f'[{name}] giving up after 5 consecutive failures')
+                    raise
+                await asyncio.sleep(min(2 ** failures, 10))
+            else:
+                failures = 0        # 正常退出（不应发生）→ 也重启
     try:
-        await asyncio.gather(start_tcp(), start_ping_responder())
+        await asyncio.gather(_supervise('TCP', start_tcp),
+                             _supervise('PING', start_ping_responder))
     finally:
         await STORE.close()
 

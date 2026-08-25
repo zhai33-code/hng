@@ -17,7 +17,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hngserver import Chunk, build_response
+from protocol import Chunk, build_response
 from player_store import PlayerStore
 
 
@@ -217,8 +217,10 @@ async def main():
     print(f'[i] 使用角色 id={char_id} ({chars[0]["name"]})')
 
     # ---- 1. JoinMatchMakingRequest ----
+    # 匹配池改造后：gamemode=1（训练，min_players=1）单人立即成局；
+    # 旧 gamemode=0 走 DEFAULT（min=2）需等 30s AI 补位，不再适用冒烟流程。
     jreq = pb_varint(1, char_id) + pb_varint(2, 0) + pb_bool(4, True) + \
-        pb_varint(7, 0) + pb_bool(8, True)
+        pb_varint(7, 1) + pb_bool(8, True)
     msgs = await request(r, w, 12, 'JoinMatchMakingRequest', jreq)
     rsp = find_response(msgs, 'JoinMatchMakingResponse')
     check('Join 响应 ok', rsp is not None and rsp.get(1) == 1)
@@ -227,13 +229,16 @@ async def main():
           f'isMatchmaking={pmm.get(10) if pmm else None}')
 
     # ---- 2. 等 ~5s 匹配成功 ----
-    msgs = await collect(r, 5.5)
-    pms = find_kvcs(msgs, 'PlayerMissionSession')
+    # （模拟/快速 combat 握手下 Admitted 可能落在 join 首窗口 msgs 内，
+    #  与 collect 窗口合并判定；Armed=f14:3 在 5s 后到达属正常）
+    msgs2 = await collect(r, 5.5)
+    all_msgs = msgs + msgs2
+    pms = find_kvcs(all_msgs, 'PlayerMissionSession')
     check('PlayerMissionSession 推送（Admitted=2 拉起 hng.exe 的触发器）',
           pms is not None and pms.get(14) == 2,
           f'connectionState={pms.get(14) if pms else None}')
     mission_id = int(pms[8]) if pms else None
-    del_row = find_delete(msgs, 'PlayerMatchMaking')
+    del_row = find_delete(all_msgs, 'PlayerMatchMaking')
     check('PlayerMatchMaking delete（退出匹配中）', del_row is not None)
     if pmm is not None and del_row is not None:
         check('delete id 匹配', struct.unpack('<q', del_row)[0] == int(pmm[1]))
@@ -245,14 +250,17 @@ async def main():
         rsp = find_response(msgs, 'GetMissionDetailsResponse')
         check('战局详情响应 ok', rsp is not None and rsp.get(1) == 0)  # 他服实测 response=0
         info = read_fields(rsp[2]) if rsp and rsp.get(2) else None
-        check('MissionInfo 有效（missionpreset=10 AI 模式）',
-              info is not None and info.get(3) == 10,
+        check('MissionInfo 有效（missionpreset ∈ 训练兜底池 9/10/11）',
+              info is not None and info.get(3) in (9, 10, 11),
               f'missionId={info.get(1) if info else None}')
         check('factions 参战方存在', rsp is not None and 3 in rsp)
         check('accessPoints 部署点', rsp is not None and 6 in rsp)
 
     # ---- 4. Join 后立即 Cancel ----
-    msgs = await request(r, w, 14, 'JoinMatchMakingRequest', jreq)
+    # gamemode=5（min=2）：单人入池不成局，cancel 必然作用于排队态
+    jreq2 = pb_varint(1, char_id) + pb_varint(2, 0) + pb_bool(4, True) + \
+        pb_varint(7, 5) + pb_bool(8, True)
+    msgs = await request(r, w, 14, 'JoinMatchMakingRequest', jreq2)
     pmm2 = find_kvcs(msgs, 'PlayerMatchMaking')
     check('再次 Join 成功', pmm2 is not None)
     creq = pb_varint(1, char_id)

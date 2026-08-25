@@ -13,7 +13,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hngserver import Chunk, build_response
+from protocol import Chunk, build_response
 
 
 def pb_varint(field, value):

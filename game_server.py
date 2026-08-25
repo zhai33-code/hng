@@ -18,7 +18,7 @@ GetPlayerSettings 请求 field1=playerMissionSessionId(300001) 属于请求消�
 import uuid
 
 # OpenID provider 集成：warserver 本地签发 id_token，Epic 后端用 JWKS 公钥验证
-import oidc_issuer
+from eos import oidc_issuer
 # matchmaking 的运行时状态（PMS 会话 / 动态 id 发号 / COMBAT_READY）
 import matchmaking
 
@@ -36,6 +36,7 @@ from state import STORE, log
 
 from player_service import _load_db_loadout
 from warserver_messages import (
+    BF_DEFENDER_FACTION_ID,
     MISSION_PRESET_ID,
     _load_preset,
     _msg_player_settings,
@@ -453,21 +454,45 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         # 10s 超时 → "#error3 Couldn't GetBattleFieldSettings()" → 专用服退出。
         missionid = 0
         try:
-            missionid = pb_parse_loose(proto).get(1, 0)
+            missionid = int(pb_parse_loose(proto).get(1, 0) or 0)
         except Exception:
             pass
-        resp_proto = _msg_response_battlefield_settings()
+        # 匹配池成局：按 missionid 取成局 preset / 攻防 faction（多局并行时
+        # 每场战局地图/布局各不相同）；查不到（旧路径/异常）回退全局默认。
+        # 防御：若 field1 实测为 pms_id（协议文档 §B.7 之外的备选情形），
+        # 经 PMS_TO_MISSION 反查 mission_id 再取详情。
+        det = matchmaking._MM_MISSION_DETAILS.get(missionid)
+        if not det and missionid:
+            mid2 = matchmaking.PMS_TO_MISSION.get(missionid)
+            if mid2:
+                det = matchmaking._MM_MISSION_DETAILS.get(mid2)
+        if det and 'preset' in det:
+            preset_id = int(det['preset'])
+            defender_faction = int(det.get('defender_faction', 2) or 2)
+            attacker_faction = int(det.get('attacker_faction', 3) or 3)
+            enable_bots = bool(det.get('enable_bots', True))
+        else:
+            preset_id = MISSION_PRESET_ID
+            defender_faction = BF_DEFENDER_FACTION_ID
+            attacker_faction = 3
+            enable_bots = True
+        resp_proto = _msg_response_battlefield_settings(
+            preset_id, defender_faction, attacker_faction, enable_bots)
         resp = build_response(cmd_id, 'ResponseBattleFieldSettings', resp_proto)
         writer.write(resp)
         await writer.drain()
-        preset = _load_preset(MISSION_PRESET_ID)
+        preset = _load_preset(preset_id)
         _name = preset.get(5, b'')
         if isinstance(_name, bytes):
             _name = _name.decode('utf-8', 'replace')
         log(f'GAME S->C cmd={cmd_id:<4} ResponseBattleFieldSettings '
             f'(mission={missionid}, preset={int(preset.get(1, 0))}, '
-            f'map gamemap={int(preset.get(3, 0))}, {_name!r}, {len(resp_proto)}B)')
-        # 通知 matchmaking：专用服握手完成，可以推 PlayerMissionSession Admitted
-        matchmaking.COMBAT_READY.set()
+            f'map gamemap={int(preset.get(3, 0))}, {_name!r}, '
+            f'bots={enable_bots}, {len(resp_proto)}B)')
+        # 通知 matchmaking：该 missionid 的专用服握手完成，可推 Admitted
+        ready_mid = missionid
+        if not (det and 'preset' in det) and missionid:
+            ready_mid = matchmaking.PMS_TO_MISSION.get(missionid, missionid)
+        matchmaking.notify_combat_ready(ready_mid or None)
         return True
     return False

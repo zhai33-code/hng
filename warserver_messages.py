@@ -368,7 +368,9 @@ BF_RES_CATS = (
 )
 
 
-def _accesspoint_layout():
+def _accesspoint_layout(preset_id=MISSION_PRESET_ID,
+                        defender_faction=BF_DEFENDER_FACTION_ID,
+                        attacker_faction=3):
     """本局通道点布局：[(accesspointtemplate, owner factionId), ...]（最多 4 点 A-D）。
 
     通道点模板按 gamemap 分组动态取自 WarDatabase/accesspointtemplate
@@ -376,24 +378,28 @@ def _accesspoint_layout():
     owner 交替 defender/attacker。combat.py 的
     ActiveMissionRequestEventListResponse f3 归属状态与此同源
     （ReportMissionStatusRequest f4 捕获上报可覆盖 combat._CAPTURE_OWNERS）。
+    preset_id 由匹配池成局时下发（不同地图 → 不同模板组）。
     """
-    preset = _load_preset(MISSION_PRESET_ID)
+    preset = _load_preset(preset_id)
     gamemap_id = int(preset.get(3, 0) or 0)      # preset f3 → gamemap 表行
     ap_templates = _load_accesspoint_templates(gamemap_id)
     layout = []
     for i, tmpl in enumerate(ap_templates[:4]):   # 最多 4 点（A-D）
-        owner = BF_DEFENDER_FACTION_ID if (i % 2 == 0) else 3
+        owner = defender_faction if (i % 2 == 0) else attacker_faction
         layout.append((tmpl, owner))
     return layout
 
 
-def _msg_army_resource_list():
+def _msg_army_resource_list(preset_id=MISSION_PRESET_ID,
+                            defender_faction=BF_DEFENDER_FACTION_ID,
+                            attacker_faction=3):
     """ActionGameArmyResourceDefinition 条目列表：每 (faction, accesspointtemplate) × 7 类资源。
 
     ResponseBattleFieldSettings f14 与 ActiveMissionRequestEventListResponse f2
     共用同一构建（单源，见 warserver-battlefield-settings.md §5.3/§6.1）。"""
     res_msgs = []
-    for tmpl, owner in _accesspoint_layout():
+    for tmpl, owner in _accesspoint_layout(preset_id, defender_faction,
+                                           attacker_faction):
         for cat, in_air, cnt in BF_RES_CATS:
             r = b''
             r += pb_int64(1, owner)        # factionTemplateId（1US/2GE/3SU）
@@ -415,7 +421,10 @@ def _msg_battlefield_settings_faction(faction_id, template_id):
     return m
 
 
-def _msg_response_battlefield_settings():
+def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
+                                        defender_faction=BF_DEFENDER_FACTION_ID,
+                                        attacker_faction=3,
+                                        enable_bots=True):
     """构建 ResponseBattleFieldSettings（31 字段，spbc 描述符 @0x1807B1120）。
 
     schema：decompiled/proto-files/HnG_States/ResponseBattleFieldSettings.proto。
@@ -428,9 +437,14 @@ def _msg_response_battlefield_settings():
         → "UpdateAvailableLives: 0,0,0" + "%s has run out of resources"。
       通道点模板按 gamemap 分组动态取自 WarDatabase/accesspointtemplate
       （f2 == gamemap id；Mill=13 → 模板 8/15 = A/B 点，坐标在图内）。
+    参数由 game_server 按匹配池成局 preset 下发（多人局攻防 faction 亦可配）：
+      preset_id        missionpreset 行 id（地图链入口）
+      defender_faction 防守方 factionTemplateId（1US/2GE/3SU）
+      attacker_faction 进攻方 factionTemplateId
+      enable_bots      AI 局（超时补位 / 单人训练）；双方都有真人时 False
     """
-    preset = _load_preset(MISSION_PRESET_ID)
-    preset_id = int(preset.get(1, MISSION_PRESET_ID))
+    preset = _load_preset(preset_id)
+    preset_id = int(preset.get(1, preset_id))
     name = preset.get(5, b'')
     if isinstance(name, bytes):
         name = name.decode('utf-8', 'replace')
@@ -441,7 +455,8 @@ def _msg_response_battlefield_settings():
     # accesspointid 为运行时 id（真实局由 warserver 生成，私服固定自增段），
     # 低 32 位必须非零（sub_1803A7350 以低 32 位做非零校验后查 type25 树）。
     ap_msgs = []
-    for i, (tmpl, owner) in enumerate(_accesspoint_layout()):
+    for i, (tmpl, owner) in enumerate(_accesspoint_layout(
+            preset_id, defender_faction, attacker_faction)):
         ap = b''
         ap += pb_int64(1, owner)          # accesspointowner（factionId）
         ap += pb_int64(2, 880001 + i)     # accesspointid ★动态构建（非回放值）
@@ -450,12 +465,13 @@ def _msg_response_battlefield_settings():
         ap_msgs.append(ap)
 
     # f14 armyResourceList（与 ActiveMissionRequestEventListResponse f2 同源）
-    res_msgs = _msg_army_resource_list()
+    res_msgs = _msg_army_resource_list(preset_id, defender_faction,
+                                       attacker_faction)
 
     m = b''
     m += pb_int64(1, 1)                            # 1 battlefieldid（battlefield 表行 1）
     m += pb_int64(2, preset_id)                    # 2 missionPresetId ★地图链入口
-    m += pb_int64(3, BF_DEFENDER_FACTION_ID)       # 3 defender（factionId）
+    m += pb_int64(3, defender_faction)             # 3 defender（factionId）
     m += pb_float(4, 0.0)                          # 4 friendlyfire
     m += pb_string(5, name)                        # 5 gamemode（preset 名）
     m += pb_float(6, timelimit)                    # 6 timelimit
@@ -470,10 +486,10 @@ def _msg_response_battlefield_settings():
     m += pb_int32(16, 0)                           # 16 daysSinceWarStarted
     m += pb_bool(17, False)                        # 17 isCampaignMission
     m += pb_message(18, _msg_battlefield_settings_faction(1, 1))  # 18 US
-    m += pb_message(18, _msg_battlefield_settings_faction(2, 2))  # 18 GE（防守方，defender=2）
-    m += pb_message(18, _msg_battlefield_settings_faction(3, 3))  # 18 SU（玩家阵营；factions 表必须含 factionId=3，否则 AddTeam team=3 越界崩溃）
+    m += pb_message(18, _msg_battlefield_settings_faction(2, 2))  # 18 GE
+    m += pb_message(18, _msg_battlefield_settings_faction(3, 3))  # 18 SU（factions 表必须含 factionId=3，否则 AddTeam team=3 越界崩溃）
     m += pb_int32(19, max_players)                 # 19 maxTotalPlayers
-    m += pb_bool(20, True)                         # 20 enableBots（AI 局）
+    m += pb_bool(20, enable_bots)                  # 20 enableBots（AI 补位局 True）
     m += pb_int32(21, 0)                           # 21 weatherTimeOfDay
     m += pb_int32(22, 0)                           # 22 weatherCondition
     m += pb_string(23, name)                       # 23 metricsMissionName

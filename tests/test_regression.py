@@ -23,7 +23,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hngserver import Chunk, build_response
+from protocol import Chunk, build_response
 from player_store import PlayerStore
 
 # 静态数据（WarDatabase 推导；import 时会做模块级初始化）

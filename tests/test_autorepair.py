@@ -17,7 +17,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from hngserver import Chunk, build_response  # noqa: E402
+from protocol import Chunk, build_response  # noqa: E402
 
 
 def pb_varint(field, value):

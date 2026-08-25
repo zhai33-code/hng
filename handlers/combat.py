@@ -32,12 +32,12 @@ from protocol import (
     pb_message,
     pb_string,
 )
-from state import FLASH_SESSIONS, STORE, log
+from state import FLASH_SESSIONS, PUBLIC_HOST, STORE, log
 from wardb import _RIBBON_LEVEL_XP, _rank_from_combat_xp
 from warserver_messages import _accesspoint_layout, _msg_army_resource_list
 
-# 与 matchmaking._handle_join 的 game_connect 同源（mission.py _GAME_CONNECT）
-_GAME_CONNECT = '127.0.0.1:5678'
+# 与 matchmaking 成局 game_connect 同源（PUBLIC_HOST；mission.py _GAME_CONNECT）
+_GAME_CONNECT = f'{PUBLIC_HOST}:5678'
 
 
 # 据点归属覆盖表：ReportMissionStatusRequest f4 上报的
@@ -727,8 +727,11 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
             except Exception as e:
                 log(f'      [DB] char result stats (pid={pid}) failed: {e}')
 
-    # 战局结束：清空据点归属覆盖（下局从布局重新开始）
+    # 战局结束：清空据点归属覆盖（下局从布局重新开始）+
+    # 释放本场 combat server 实例（杀进程/释放端口，触发排队战局拉起）
     _CAPTURE_OWNERS.clear()
+    if mission_id:
+        matchmaking.release_match(mission_id)
 
     resp_proto = pb_int64(1, mission_session_id)     # f1 missionSessionId
     resp_proto += pb_int32(2, 1)                     # f2 response=1

@@ -13,6 +13,31 @@ from player_store import PlayerStore
 STORE = PlayerStore()
 
 DEMO_PASSWORD = b'demodemo123'
+
+
+# ------------------------------------------------------------- .env 加载
+def _load_dotenv(path):
+    """极简 .env 解析：KEY=VALUE 逐行读，# 注释、空行跳过，不做变量展开。
+
+    已存在的环境变量不覆盖（shell 导出的优先级高于文件）。
+    解析失败静默跳过该行——.env 是便利设施不是关键配置。"""
+    try:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, _, v = line.partition('=')
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass                          # 无 .env：全部走默认值，正常场景
+
+
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_load_dotenv(os.path.join(_PKG_DIR, '.env'))
+
 # 私服客户端目录（images/rank、BattlEyeTlm 本地化、HTTP 静态资源均取自这里；
 # 注意：不要指向 D:\Program Files\HnG 个人正式客户端）
 #
@@ -21,7 +46,6 @@ DEMO_PASSWORD = b'demodemo123'
 #   2. 包目录的父级/上两级探测（存在 WarDatabase + images 即视为客户端根目录，
 #      把 zip 解压到客户端根目录下时自动命中，如 d:\HnG-test\hng-server）
 #   3. 兜底开发机默认路径 d:\HnG-test
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _detect_game_dir():
@@ -38,6 +62,14 @@ def _detect_game_dir():
 
 GAME_DIR = _detect_game_dir()
 WARDDB_DIR = os.path.join(GAME_DIR, 'WarDatabase')
+
+# 服务器对外地址（下发给客户端的连接地址）：
+# - Settings.js 的 flash_dynhttp / unique_file_servers / account_url 等
+# - 匹配成局后 PMS 的 game_connect（客户端 hng.exe 连战斗服）
+# - HostingCenter ping 地址
+# 外网开服 = 填服务器公网 IP；默认 127.0.0.1（本机单机/局域网内可用机器 IP）。
+# 监听地址不受此影响（始终 0.0.0.0）。
+PUBLIC_HOST = os.environ.get('HNG_PUBLIC_HOST', '127.0.0.1').strip() or '127.0.0.1'
 
 
 class Session:
@@ -69,7 +101,67 @@ class Session:
 FLASH_SESSIONS = {}
 
 
-LOG_FILE = os.path.join(os.path.dirname(__file__), 'realtest_game.log')
+LOG_FILE = os.path.join(_PKG_DIR, 'realtest_game.log')
+
+
+def _env_int(name, default, minimum=1):
+    v = os.environ.get(name, '')
+    try:
+        n = int(v)
+        return n if n >= minimum else default
+    except ValueError:
+        if v:                         # 设了但非法 → 用默认并告警
+            sys.stderr.write(f'[env] {name}={v!r} invalid, using {default}\n')
+        return default
+
+
+LOG_KEEP_DAYS = _env_int('LOG_KEEP_DAYS', 3)   # 保留天数（含当天）
+
+
+def _date_tag(t=None):
+    return time.strftime('%Y-%m-%d', time.localtime(t))
+
+
+def _rotate_daily(fh, path, today):
+    """按天滚动：当前文件 mtime 不是今天 → 改名为带日期的历史文件，
+    重开新句柄继续写。返回新句柄；任何 OSError 吞掉（不影响主流程）。"""
+    try:
+        if os.path.exists(path):
+            mtime_tag = _date_tag(os.path.getmtime(path))
+            if mtime_tag == today:
+                return fh                  # 还在今天，不滚
+            os.replace(path, f'{path}.{mtime_tag}.log')
+        try:
+            fh.close()
+        except OSError:
+            pass
+        return open(path, 'a', encoding='utf-8', buffering=1)
+    except OSError:
+        return fh
+
+
+def _purge_old_logs(path, keep_days):
+    """删除超过保留天数的历史日志（按文件名日期判断）。"""
+    import re
+    base = os.path.basename(path)
+    pat = re.compile(re.escape(base) + r'\.(\d{4}-\d{2}-\d{2})\.log$')
+    cutoff = time.mktime(time.strptime(
+        _date_tag(time.time() - keep_days * 86400), '%Y-%m-%d'))
+    try:
+        for name in os.listdir(os.path.dirname(path) or '.'):
+            m = pat.match(name)
+            if not m:
+                continue
+            try:
+                t = time.mktime(time.strptime(m.group(1), '%Y-%m-%d'))
+                if t < cutoff:
+                    os.remove(os.path.join(os.path.dirname(path), name))
+            except (OSError, ValueError):
+                pass                        # 删不掉就留着，不影响运行
+    except OSError:
+        pass
+
+
 _LOG_FH = open(LOG_FILE, 'a', encoding='utf-8', buffering=1)
 
 
@@ -78,11 +170,16 @@ class _Tee:
 
     2026-08-21：启动脚本不再重定向 stdout（服务器窗口需实时显示日志），
     裸 print（HTTP 访问日志 / 初始化信息等不经 log() 的输出）经此落盘，
-    文件日志保持完整。"""
+    文件日志保持完整。
+    2026-08-25：按天滚动，保留 LOG_KEEP_DAYS 天（见 _rotate_daily）。"""
 
-    def __init__(self, fh):
+    def __init__(self, fh, path):
         self._fh = fh
+        self._path = path
+        self._day = None            # None → 首次 maybe_rotate 强制检查
         self._stdout = sys.__stdout__
+        # 启动即检查：上次运行遗留的昨日日志当场滚动（否则要等运行中跨天）
+        self.maybe_rotate()
 
     def write(self, s):
         self._stdout.write(s)
@@ -92,9 +189,19 @@ class _Tee:
         self._stdout.flush()
         self._fh.flush()
 
+    def maybe_rotate(self):
+        """跨天检查（log() 每条调用；纯字符串比较，开销可忽略）。"""
+        today = _date_tag()
+        if today == self._day:
+            return
+        self._day = today
+        self._fh = _rotate_daily(self._fh, self._path, today)
+        _purge_old_logs(self._path, LOG_KEEP_DAYS)
 
-sys.stdout = _Tee(_LOG_FH)
+
+sys.stdout = _Tee(_LOG_FH, LOG_FILE)
 
 
 def log(msg):
+    sys.stdout.maybe_rotate()
     print(f'[{time.strftime("%H:%M:%S")}] {msg}')
