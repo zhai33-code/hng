@@ -31,6 +31,7 @@ import time
 import game_server
 import handlers
 import matchmaking
+import statistics_server
 
 from protocol import (
     Chunk,
@@ -157,6 +158,10 @@ SETTINGS_JS = (f"flash_dynhttp=\"{PUBLIC_HOST}:15110\";\n"
                "language=\"en\";\n"
                "releasename=\"QQ\";\n"
                f"ircserver=\"{PUBLIC_HOST}:6667\";\n"
+               # 战斗内勋带弹窗：statistics_client.dll GetTotals 统计服务器
+               # （swf 将 settings.js 变量转发进 hngsync CMD_RUN_HNG -> hng.exe /R）
+               f"statserver=\"{PUBLIC_HOST}\";\n"
+               "statserverport=\"15115\";\n"
                f"account_url=\"http://{PUBLIC_HOST}/account\";\n"
                "uniqueversionfilename=\"hng_unique_v173293\";\n"
                "siteonly=\"false\";\n").encode()
@@ -704,7 +709,8 @@ async def main():
                 failures = 0        # 正常退出（不应发生）→ 也重启
     try:
         await asyncio.gather(_supervise('TCP', start_tcp),
-                             _supervise('PING', start_ping_responder))
+                             _supervise('PING', start_ping_responder),
+                             _supervise('STATS', statistics_server.start))
     finally:
         await STORE.close()
 

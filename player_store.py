@@ -230,7 +230,10 @@ ALTER TABLE weapons ADD COLUMN IF NOT EXISTS condition DOUBLE PRECISION NOT NULL
 ALTER TABLE weapons ADD COLUMN IF NOT EXISTS clip_count INT NOT NULL DEFAULT 0;
 ALTER TABLE weapon_modifiers ADD COLUMN IF NOT EXISTS condition DOUBLE PRECISION NOT NULL DEFAULT 1.0;
 ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS condition DOUBLE PRECISION NOT NULL DEFAULT 100.0;
-ALTER TABLE vehicle_ammo ADD COLUMN IF NOT EXISTS spawn_clip_count INT NOT NULL DEFAULT 16;
+-- 载具弹药出生弹夹数：官方恒等于 WarDatabase VehicleAmmoStorage.f2 clipCount
+-- （回放锚点 T-38=21 / Yak-9D=1 / R-Z=1），下发时由
+-- wardb.vehicle_ammo_spawn_clips(equipped_storage_id) 推导，本列仅存档不参与下发
+ALTER TABLE vehicle_ammo ADD COLUMN IF NOT EXISTS spawn_clip_count INT NOT NULL DEFAULT 1;
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS squad_points INT NOT NULL DEFAULT 0;
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS receive_daily_bonus BOOLEAN NOT NULL DEFAULT TRUE;
 
@@ -859,6 +862,15 @@ class PlayerStore:
                 'FROM character_ribbon_xp r JOIN characters c ON c.id = r.character_id '
                 'WHERE c.id = $1 AND c.player_id = $2',
                 character_id, player_id)
+            return {int(r['ribbon_template_id']): float(r['total_xp']) for r in rows}
+
+    async def get_ribbon_xp_by_char(self, character_id):
+        """按角色 id 直接取勋带 XP（统计服务器用：客户端 GetTotals 只报 charId）。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT ribbon_template_id, total_xp FROM character_ribbon_xp '
+                'WHERE character_id = $1',
+                character_id)
             return {int(r['ribbon_template_id']): float(r['total_xp']) for r in rows}
 
     async def set_ribbon_xp_floor(self, player_id, character_id,

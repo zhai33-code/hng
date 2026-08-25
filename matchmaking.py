@@ -34,7 +34,11 @@ from protocol import (
     pb_float, pb_int32, pb_int64, pb_message, pb_string, pb_uint32, pb_varint,
 )
 from state import PUBLIC_HOST
-from wardb import _rank_from_combat_xp, _load_preset, battlefield_entity_for_gamemap, preset_scene
+from wardb import (
+    _load_accesspoint_templates, _load_capturepoint_templates, _load_preset,
+    _rank_from_combat_xp, battlefield_entity_for_gamemap, battlefield_pos,
+    commandnode_template, preset_scene,
+)
 import mm_config
 import mm_pool
 
@@ -90,6 +94,26 @@ COMBAT_INSTANCES = {}          # mission_id -> CombatInstance
 PENDING_MATCHES = []           # 并发上限排队中的成局 [match, ...]（FIFO）
 _combat_seq = 0
 COMBAT_READY = asyncio.Event()  # 兼容回退：无法按 missionid 定位实例时置位
+# 实测（realtest_game.log 全量历史）专用服 RequestBattleFieldSettings 的
+# proto 为空（无 field1=missionid），无法自报归属 → 按启动顺序 FIFO 认领。
+_PENDING_HANDSHAKE = []        # 已拉起、等待握手认领的 mission_id（启动顺序）
+
+
+def claim_pending_combat_instance():
+    """空 proto 握手认领：返回最早一个「已拉起且未 ready」实例的 mission_id。
+
+    跳过已就绪/已释放的陈旧条目（懒清理）；全部无效返回 None。
+    每个专用服连接只发一次 RequestBattleFieldSettings，认领即出队。
+    """
+    while _PENDING_HANDSHAKE:
+        mid = _PENDING_HANDSHAKE[0]
+        inst = COMBAT_INSTANCES.get(mid)
+        if inst is None or inst['ready'].is_set():
+            _PENDING_HANDSHAKE.pop(0)
+            continue
+        _PENDING_HANDSHAKE.pop(0)
+        return mid
+    return None
 
 
 def _spawn(coro, label=''):
@@ -185,6 +209,7 @@ def release_match(mission_id):
              f'(mission={mission_id}, udp/{inst["port"]})')
         _spawn(_stop_instance(inst), f'stop_instance#{inst["seq"]}')
     _MM_MISSION_DETAILS.pop(int(mission_id), None)
+    release_mission_resources(mission_id)
     _drain_pending_matches()
     # 端口/坑位已释放：池内可能有待撮合的玩家（如端口耗尽时回池的局）
     _spawn(_try_form_all(), 'try_form_all(release)')
@@ -280,7 +305,11 @@ async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
             '/M', combat_map,
             '/W', COMBAT_WARSERVER,
             '/R', 'disable_eac=1',
-            '/R', f'boot.logfile=combat-server-{_combat_seq}.log']
+            '/R', f'boot.logfile=combat-server-{_combat_seq}.log',
+            # 战斗服进程 player.dll 进图时 GetTotals 初始化勋带状态（a2[7]），
+            # 失败→整局无 XP 累加→无 Statistics_Update→客户端无升级弹窗
+            '/R', f'statserver={PUBLIC_HOST}',
+            '/R', 'statserverport=15115']
     if COMBAT_START_COUNTDOWN_OVERRIDE is not None:
         # 开局等待时间覆盖（秒），见文件头 COMBAT_START_COUNTDOWN_OVERRIDE 注释
         args += ['/R',
@@ -326,6 +355,9 @@ async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
     # 进程退出监视（崩溃/被杀兜底回收坑位；正常关服路径幂等 no-op）
     _spawn(_watch_proc_exit(inst, mission_id),
            f'watch_proc#{inst["seq"]}')
+    # 登记待认领队列：专用服回连握手 proto 为空（无 field1），
+    # game_server 按 FIFO 认领本实例并回正确的 preset/地图。
+    _PENDING_HANDSHAKE.append(int(mission_id))
 
     try:
         await asyncio.wait_for(inst['ready'].wait(), timeout)
@@ -370,11 +402,12 @@ METRICS_DEVICE_ID = 'Flash;HnG;WIN 32,0,0,170;mozilla/5.0 (windows; u; zh-cn) ap
 # 每次服务器启动生成新 id = 开一场新战争；faction 表行 f5 war 与 PMS f15 warId 同源用它
 _WAR_ID = random.getrandbits(63)
 # mission_info f5 mapEntityId：必须是客户端 WarDatabase battlefield 表真实行 id
-# （112741325 = 'Benoit Village'，战斗简报按它查战场名，与 combat-server 地图固定对应）
+# （112741325 = 'Benoit Village'）。Mill 等遭遇战图在 battlefield 表无行时用它兜底，
+# 客户端简报按它查战场名（battlefield_entity_for_gamemap 动态匹配的回退值）。
 MISSION_MAP_ENTITY_ID = 112741325
 # mission_info f10 hostingCenterId：服务器侧基础设施 id（WarDatabase 无对应表，
-# 客户端仅存储不查表），本服固定值
-MISSION_HOSTING_CENTER_ID = 1372296842609220124
+# 客户端仅存储不查表）→ 每次启动生成（原值为他服回放 id）
+MISSION_HOSTING_CENTER_ID = random.getrandbits(63)
 
 # ===== 他服私服 AI 战局实测值（2026-08-18 抓包：双人局 ai_battle_15130.pcapng / 单人局 match_to_game.pcapng）=====
 # 单人局（match_to_game.pcapng, 2026-08-18 21:23, DoubleBird 单人 vs AI 苏德）：
@@ -382,17 +415,18 @@ MISSION_HOSTING_CENTER_ID = 1372296842609220124
 #   我方 6 队（303×2/320×2/316×2）+ AI 6 队（203×2/220×2/216×2），资源 20 条
 #   资源总量：步兵 90×4+36×2=432、汽车 30×2=60、摩托 12×2=24（与游戏内一致）
 
-# faction 表行 id（solo_kvcs_dump2.txt S2C#17 实测，KVS 'faction' 表 3 行）：
-#   客户端 FactionTable(xmlTag='faction') 只有收到这些 set 才有数据，
-#   GetMissionDetailsResponse 的 f3/f4/f5 field1 必须用这些行 id（不是 1/2/3 小整数），
-#   否则 FactionTable.getFromId 返回 null → setPlayersInMatch TypeError #1009。
-FACTION_ROW_IDS = {1: 6448548224124117503, 2: 4276172879838885802, 3: 5710705133153479289}
-FACTION_SUPREME_COMMANDS = {1: 6830426875598306067, 2: 1943451612924160207,
-                            3: 493364945307697992}
+# faction 表行 id / supremecommand：服务器侧运行时实体（客户端无本地表可查，
+# 任意值行为一致，仅要求 faction 行与 GMD/PMS/社交列表引用同源）→ 每次启动生成，
+# 与 _WAR_ID 同策略（原值为他服 solo_kvcs_dump2 回放 id，已清除）。
+# 客户端 FactionTable(xmlTag='faction') 只有收到这些 set 才有数据，
+# GetMissionDetailsResponse 的 f3/f4/f5 field1 必须用这些行 id（不是 1/2/3 小整数），
+# 否则 FactionTable.getFromId 返回 null → setPlayersInMatch TypeError #1009。
+FACTION_ROW_IDS = {tmpl: random.getrandbits(63) for tmpl in (1, 2, 3)}
+FACTION_SUPREME_COMMANDS = {tmpl: random.getrandbits(63) for tmpl in (1, 2, 3)}
 
 
 def _msg_faction_rows():
-    """KVS 'faction' 表 3 行（US/GE/SU，他服 solo_kvcs_dump2 S2C#17 逐字节复刻）。"""
+    """KVS 'faction' 表 3 行（US/GE/SU，结构按他服 solo_kvcs_dump2 S2C#17 复刻）。"""
     rows = []
     for tmpl, fid in FACTION_ROW_IDS.items():
         m = pb_int64(1, fid)                                   # id
@@ -403,30 +437,152 @@ def _msg_faction_rows():
         m += pb_float(7, 1.0)                                  # underdogBonusWarfundsMultiplier
         rows.append(m)
     return rows
-AI_OPPONENT_ID = 4276172879838885802   # f3 第二方队长 id（AI 方，无成员名单）
 AI_MISSIONPRESET = 10                   # mission_info f3（AI 模式=10；多人模式=29）
 AI_PLAYER_COUNT = 2                     # mission_info f9（他服单人AI局实测=2）
-AI_POS_X = 9808.4873046875              # f8 posX（他服私服 AI 战局坐标，单人/双人局相同）
-AI_POS_Y = 5261.232421875               # f9 posY
-# f4 突击队序列 ×12（单人AI局实测）：(is_ai_owner, unitId, faction) — 我方6队 faction=8, AI方6队 faction=15
-AI_ASSAULT_TEAMS = [
-    (False, 303, 8), (False, 303, 8),
-    (False, 320, 8), (False, 320, 8),
-    (False, 316, 8), (False, 316, 8),
-    (True, 203, 15), (True, 203, 15),
-    (True, 220, 15), (True, 220, 15),
-    (True, 216, 15), (True, 216, 15),
+
+# ---- 战局天气/时段预设池（成局时随机抽取，简报与战斗服同源）----
+# 枚举取自客户端 proto（decompiled proto-as3-classes/HnG_States）：
+#   WeatherTimeOfDay 0=夜晚 1=黎明 2=白天 3=黄昏
+#   WeatherCondition 0=少云 1=阴天 2=雾
+# 三元组 = (weatherTimeOfDay, weatherCondition, timeofday 小时制)；
+# timeofday 为 BattleFieldSettings f9（战斗内光照/太阳角度，24 小时浮点）。
+# 同一组合重复列出 = 提高出现权重（白天·少云最常见，夜雾不设）。
+WEATHER_PRESETS = [
+    (2, 0, 12.0),   # 白天·少云
+    (2, 0, 12.0),   # 白天·少云（权重加倍）
+    (2, 1, 12.0),   # 白天·阴天
+    (2, 2, 12.0),   # 白天·雾
+    (1, 0, 6.0),    # 黎明·少云
+    (1, 1, 6.0),    # 黎明·阴天
+    (3, 0, 18.0),   # 黄昏·少云
+    (3, 1, 18.0),   # 黄昏·阴天
+    (0, 0, 0.0),    # 夜晚·少云
+    (0, 1, 0.0),    # 夜晚·阴天
 ]
-# f5 资源序列 ×20（单人AI局实测，非每队2条）：(is_ai_owner, resId, amount)
+
+
+def roll_weather():
+    """成局时随机抽一套天气/时段（存入 _MM_MISSION_DETAILS，全链路共用）。
+
+    返回 dict 直接并入 mission details：weather_tod / weather_condition /
+    timeofday（战斗服 BattleFieldSettings f9/f21/f22 与简报 MissionInfo
+    f12/f13 均从这里取，保证简报图标与实际战斗一致）。"""
+    tod, cond, hour = random.choice(WEATHER_PRESETS)
+    return {'weather_tod': tod, 'weather_condition': cond, 'timeofday': hour}
+# f4 突击队构成（单人AI局实测：每侧 6 队 = 三兵种各 ×2）。模板 id 是【阵营相关】
+# 库值（commandnodetemplate f2 兵种名 × f3 阵营：infantry US=103/GE=203/SU=303），
+# 按参战阵营现查 WarDatabase。
+ASSAULT_TEAM_NODE_NAMES = ('infantry', 'motorized_infantry', 'motorized_guard')
+
+
+def _assault_team_nodes(faction):
+    """阵营突击队 commandNode 模板 id 序列（三兵种 ×2 = 每侧 6 队）。"""
+    faction = int(faction) if int(faction) in (1, 2, 3) else 3
+    ids = [commandnode_template(faction, n) for n in ASSAULT_TEAM_NODE_NAMES]
+    return [nid for nid in ids for _ in range(2)]
+
+
+def _mission_accesspoints(gamemap_id):
+    """本图出兵点模板（WarDatabase/accesspointtemplate f2==gamemap 分组，升序
+    = A/B 点攻防序）。"""
+    return _load_accesspoint_templates(int(gamemap_id))
+
+
+def _mission_capturepoints(gamemap_id):
+    """本图据点模板（WarDatabase/CapturepointTemplate f2==gamemap 分组）。
+    初始归属 0=中立（他服实测 f4=0）。"""
+    return _load_capturepoint_templates(int(gamemap_id))
+
+
+# f5 资源序列（单人AI局实测 20 条，非每队2条）：(is_ai_owner, resId, amount)
 # resId: 1=步兵 15=汽车 11=摩托；两侧总量 432/60/24
+# 2026-08-25 追加空军资源（WarDatabase/armyresourcecategory）：
+#   2=fighter_pilot 3=heavy_fighter_plane 20=fighter_plane
+#   21=recon_plane 10=transport_plane
+# 2026-08-26 追加伞兵资源（回放 pvt_gmd_response.bin 实锤：cat=4 count=72
+#   spawnInAir=1 与 cat=10 transport_plane 成对 —— 伞兵从运输机跳伞出生）。
+# 部署界面按 f5 判定各兵种可用生命数 —— 缺空军条目时飞行员即使有飞机也
+# 不显示乘机槽（只能徒步部署）。与 warserver_messages.BF_RES_CATS 同源。
 AI_TEAM_RESOURCES = [
     (False, 1, 90), (False, 1, 90), (False, 1, 90), (False, 15, 30),
     (False, 1, 90), (False, 15, 30), (False, 1, 36), (False, 11, 12),
     (False, 1, 36), (False, 11, 12),
+    (False, 4, 60), (False, 10, 15),
+    (False, 2, 30), (False, 3, 10), (False, 20, 10), (False, 21, 10), (False, 10, 10),
     (True, 1, 90), (True, 1, 90), (True, 15, 30),
     (True, 1, 90), (True, 15, 30), (True, 1, 90),
     (True, 1, 36), (True, 11, 12), (True, 1, 36), (True, 11, 12),
+    (True, 4, 60), (True, 10, 15),
+    (True, 2, 30), (True, 3, 10), (True, 20, 10), (True, 21, 10), (True, 10, 10),
 ]
+# f5 field5 spawnInAir：空军类别置 true（armyresourcecategory.f3==3 的机类 +
+# fighter_pilot 随机出生 + 伞兵跳伞），与 ActionGameArmyResourceDefinition.spawnInAir 同义。
+_AIR_RES_CATS = {2, 3, 4, 10, 20, 21}
+
+# ---------------------------------------------------------------- 每局资源池（单一事实源）
+# 2026-08-26：匹配界面（GetMissionDetailsResponse f5）与战斗内部署界面
+# （ResponseBattleFieldSettings f14 / ActiveMissionRequestEventListResponse f2）
+# 此前各用 AI_TEAM_RESOURCES 与 warserver_messages.BF_RES_CATS 两张互不相干的
+# 静态表 → 两界面数字不一致（infantry 90/36 vs 1800）且消耗后不递减。
+# 现改为每局资源池：成局时按 MISSION_RESOURCE_CATS 建池，出生消耗由
+# ReportMissionStatusRequest f2 statuslist（§8.1 ReportArmyResourceSpawnCount
+# {f1 ap, f2 cat, f5 count, f6 faction}，实测每 10s 增量上报，AI/玩家出生
+# 均含）按兵种扣减，f5/f2/f14 全部从池渲染。
+# 数值以 BF_RES_CATS 为基准（战斗侧原值），另保留 AI 局实测的
+# 15 terrain_vehicle / 11 motorcycle 两类（仅在 f5 匹配界面显示）。
+MISSION_RESOURCE_CATS = [
+    (1, False, 1800),    # infantryman（主力生命池）
+    (6, False, 60),      # recon
+    (5, False, 60),      # tank_crew
+    (4, True, 60),       # paratrooper（运输机跳伞出生）
+    (2, True, 30),       # fighter_pilot
+    (3, True, 10),       # heavy_fighter_plane
+    (20, True, 10),      # fighter_plane
+    (21, True, 10),      # recon_plane
+    (10, True, 18),      # transport_plane（伞兵载机）
+    (15, False, 30),     # terrain_vehicle（AI 局实测，仅匹配界面显示）
+    (11, False, 12),     # motorcycle（AI 局实测，仅匹配界面显示）
+]
+# 战斗侧（f2/f14）允许下发的类别集合（与 BF_RES_CATS 一致；15/11 战斗服
+# 未经校验不下发）。
+_COMBAT_RES_CATS = {1, 2, 3, 4, 5, 6, 10, 20, 21}
+_MISSION_RESOURCES = {}   # mission_id -> {factionId(runtime=模板id): {cat: count}}
+
+
+def _init_mission_resources(mission_id, attacker, defender):
+    """成局时建立资源池（攻防双方同初始量）。"""
+    init = {cat: cnt for cat, _air, cnt in MISSION_RESOURCE_CATS}
+    _MISSION_RESOURCES[int(mission_id)] = {int(attacker): dict(init),
+                                           int(defender): dict(init)}
+
+
+def mission_resource_pool(mission_id):
+    """读本局资源池；无池返回 None（调用方回退初始表）。"""
+    return _MISSION_RESOURCES.get(int(mission_id or 0))
+
+
+def _pool_counts(pool, faction):
+    """池中某阵营各类剩余；池/阵营缺失回退初始表（AI 回退局）。"""
+    if pool and int(faction) in pool:
+        return pool[int(faction)]
+    return {cat: cnt for cat, _air, cnt in MISSION_RESOURCE_CATS}
+
+
+def consume_mission_resource(mission_id, faction, cat, n=1):
+    """玩家出生消耗资源（按兵种类别扣 n）。返回扣后余量；池/类别缺失返回 None。"""
+    pool = _MISSION_RESOURCES.get(int(mission_id or 0))
+    if pool is None:
+        return None
+    counts = pool.get(int(faction))
+    if counts is None or int(cat) not in counts:
+        return None
+    counts[int(cat)] = max(0, int(counts[int(cat)]) - int(n))
+    return counts[int(cat)]
+
+
+def release_mission_resources(mission_id):
+    """局结束清理（与 _MM_MISSION_DETAILS 同生命周期）。"""
+    _MISSION_RESOURCES.pop(int(mission_id or 0), None)
 
 
 def _msg_battle_info(battle_id, pos_x, pos_y):
@@ -691,10 +847,10 @@ def _msg_mission_info(mission_id, player_id, zulu_time):
     m += pb_int64(2, 0)                        # battleId
     m += pb_int64(3, AI_MISSIONPRESET)         # missionpreset（AI=10, 多人=29）
     m += pb_int64(5, MISSION_MAP_ENTITY_ID)    # mapEntityId（WarDatabase battlefield 表 'Benoit Village' 行 id）
-    m += pb_int64(6, 1)                        # mapEntityTypeId（1=battlefield）
-    m += pb_int32(7, 1)                        # isAutogenerated
-    m += pb_int64(8, player_id)                # 创建者 playerId（他服私服=队长 playerId）
-    m += pb_int32(9, AI_PLAYER_COUNT)          # playerCount（他服单人AI局实测=2）
+    m += pb_int64(6, 1)                            # mapEntityTypeId（1=battlefield）
+    m += pb_int32(7, 1)                            # isAutogenerated
+    m += pb_int64(8, 2)                            # defenderFactionId（AI 局防守方=GE=2）
+    m += pb_int32(9, AI_PLAYER_COUNT)              # playerCount（他服单人AI局实测=2）
     m += pb_int64(10, MISSION_HOSTING_CENTER_ID)  # hostingCenterId（服务器侧基础设施 id，本服固定）
     m += pb_string(11, zulu_time)              # activationTimeStamp
     m += pb_int32(12, 1)                       # weatherTimeOfDay（他服单人AI局实测=1）
@@ -703,7 +859,7 @@ def _msg_mission_info(mission_id, player_id, zulu_time):
 
 
 def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
-                                  player_faction=3):
+                                  player_faction=3, gamemap_id=13):
     """GetMissionDetailsResponse proto（AI 模式，字段映射按客户端 SWC 描述符）。
 
     客户端 schema（proto_all/HnG_States）：
@@ -717,12 +873,14 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
       f7 capturePointStatuses | f8 posX f32 | f9 posY f32
     ★ f3/f4/f5 的 factionId 是 KVS 'faction' 表的行 id（FACTION_ROW_IDS 大数），
       客户端 FactionTable.getFromId(行id) 解引用，行 id 不存在即 TypeError #1009。
-    他服抓包数值复用：突击队 commandNode 303/320/316(我方) 203/220/216(AI)，
-    出兵点 accessPoint 我方=8 AI=15，资源类别 1=步兵 15=汽车 11=摩托。
+    出兵点/据点模板按 gamemap 查 WarDatabase（缺省 Mill=13）；突击队模板按
+    参战阵营查 commandnodetemplate。
     """
     ai_faction = 2 if player_faction != 2 else 3
     rfid = FACTION_ROW_IDS[player_faction]   # 我方 faction 行 id
     afid = FACTION_ROW_IDS[ai_faction]       # AI 方 faction 行 id
+    aps = _mission_accesspoints(gamemap_id)
+    ours_ap, theirs_ap = aps[0], aps[1]
     m = b''
     m += pb_int32(1, 0)  # 他服私服实测 = 0（非 ResponseCodes.ok=1）
     m += pb_message(2, _msg_mission_info(mission_id, player_id, zulu_time))
@@ -730,23 +888,38 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
     m += pb_message(3, pb_int64(1, rfid) +
                     pb_message(2, pb_string(1, gamertag)))
     m += pb_message(3, pb_int64(1, afid))
-    # f4 突击队 ×12：(is_ai, commandNodeTemplateId, accessPointTemplateId)
-    for is_ai, cmd_node, ap in AI_ASSAULT_TEAMS:
-        m += pb_message(4, pb_int64(1, afid if is_ai else rfid) +
-                        pb_int64(2, cmd_node) + pb_int64(3, ap) + pb_int64(4, 0))
-    # f5 资源 ×20：(is_ai, armyResourceCategoryId, count)
-    for is_ai, res_cat, amount in AI_TEAM_RESOURCES:
-        ap = 15 if is_ai else 8
-        m += pb_message(5, pb_int64(1, afid if is_ai else rfid) +
-                        pb_int64(2, res_cat) + pb_int64(3, ap) +
-                        pb_int64(4, amount) + pb_int64(5, 0))
-    # f6 出兵点归属：accessPoint 8=我方, 15=AI（f2 为 factionTemplateId 1/2/3）
-    m += pb_message(6, pb_int64(1, 8) + pb_int64(2, player_faction))
-    m += pb_message(6, pb_int64(1, 15) + pb_int64(2, ai_faction))
-    # f7（他服私服实测 {3:120, 4:0}）
-    m += pb_message(7, pb_int32(3, 120) + pb_int32(4, 0))
-    m += pb_float(8, AI_POS_X)   # posX
-    m += pb_float(9, AI_POS_Y)   # posY
+    # f4 突击队 ×12：我方/AI 各 6 队（模板按阵营查库）
+    for cmd_node in _assault_team_nodes(player_faction):
+        m += pb_message(4, pb_int64(1, rfid) + pb_int64(2, cmd_node) +
+                        pb_int64(3, ours_ap) + pb_int64(4, 0))
+    for cmd_node in _assault_team_nodes(ai_faction):
+        m += pb_message(4, pb_int64(1, afid) + pb_int64(2, cmd_node) +
+                        pb_int64(3, theirs_ap) + pb_int64(4, 0))
+    # f5 资源：从本局资源池渲染（与战斗内 f2/f14 同源同值，消耗后递减）；
+    # 每方每类一条挂该方出兵点（客户端跨点求和 → 显示即池剩余量）
+    pool = mission_resource_pool(mission_id)
+    ours_counts = _pool_counts(pool, player_faction)
+    theirs_counts = _pool_counts(pool, ai_faction)
+    for res_cat, _air, _cnt in MISSION_RESOURCE_CATS:
+        m += pb_message(5, pb_int64(1, rfid) + pb_int64(2, res_cat) +
+                        pb_int64(3, ours_ap) +
+                        pb_int64(4, ours_counts.get(res_cat, 0)) +
+                        pb_bool(5, res_cat in _AIR_RES_CATS))
+    for res_cat, _air, _cnt in MISSION_RESOURCE_CATS:
+        m += pb_message(5, pb_int64(1, afid) + pb_int64(2, res_cat) +
+                        pb_int64(3, theirs_ap) +
+                        pb_int64(4, theirs_counts.get(res_cat, 0)) +
+                        pb_bool(5, res_cat in _AIR_RES_CATS))
+    # f6 出兵点归属：首个=我方，其余交替（Mill 实测 8=我方, 15=AI）
+    for i, ap in enumerate(aps):
+        m += pb_message(6, pb_int64(1, ap) +
+                        pb_int64(2, ai_faction if i % 2 else player_faction))
+    # f7 据点初始归属：0=中立（他服私服实测 {3:120, 4:0}）
+    for cp in _mission_capturepoints(gamemap_id):
+        m += pb_message(7, pb_int32(3, cp) + pb_int32(4, 0))
+    pos = battlefield_pos(MISSION_MAP_ENTITY_ID)
+    m += pb_float(8, pos[0])   # posX（mapEntityId 对应 battlefield 行坐标）
+    m += pb_float(9, pos[1])   # posY
     return m
 
 
@@ -949,20 +1122,31 @@ async def _start_match(match):
         'ai_fill': bool(match.ai_fill), 'map_entity_id': map_entity_id,
         'attacker_faction': attacker, 'defender_faction': defender,
         'enable_bots': enable_bots,
+        # 本局天气/时段（成局时随机抽取一次，简报 MissionInfo f12/f13 与
+        # 战斗服 BattleFieldSettings f9/f21/f22 同源取值）
+        **roll_weather(),
         'players': [{'player_id': int(e.player_id),
                      'gamertag': s['sess']['gamertag'],
                      'char_id': int(e.char_id),
                      'faction': int(e.faction),
                      'pms_id': s['pms_id']} for s in sessions],
     }
+    # 每局资源池：f5（匹配界面）/ f14（握手）/ f2（轮询）三处单一事实源，
+    # 出生消耗（ReportMissionStatusRequest f2）扣减（与详情同生命周期）
+    _init_mission_resources(mission_id, attacker, defender)
     _log(f'match formed: mission={mission_id}, preset={preset}, map='
          f'{combat_map}, players={len(match.players)}, ai_fill={match.ai_fill}, '
-         f'attacker={attacker}, defender={defender}, udp/{port}')
+         f'attacker={attacker}, defender={defender}, udp/{port}, '
+         f'weather tod={_MM_MISSION_DETAILS[mission_id]["weather_tod"]}/'
+         f'cond={_MM_MISSION_DETAILS[mission_id]["weather_condition"]}')
 
     # 拉起本场专用服（/P 取第一名玩家 pms，仅 boot 参数）
     first_pms = sessions[0]['pms_id'] if sessions else 0
     await _ensure_combat_server(mission_id, port, first_pms, combat_map)
     game_connect = f'{PUBLIC_HOST}:{port}'   # 客户端 hng.exe 连战斗服的地址
+    # 战局位置：mapEntityId 对应 battlefield 行坐标（简报战场名与地图标记一致；
+    # battlefield_entity_for_gamemap 对无行图恒返回有效行 id，无需回退）
+    pos = battlefield_pos(map_entity_id)
 
     # 逐玩家推送进局序列（单玩家失败不影响他人）
     for s in sessions:
@@ -1018,7 +1202,7 @@ async def _start_match(match):
                      f'delete (PlayerMatchMaking id={pmm_id})')
             # BattleInfo 'set'（PMS Armed 后必须推，否则客户端不连 game server）
             await _push_kvcs(w, vc, b'BattleInfo',
-                             _msg_battle_info(mission_id, AI_POS_X, AI_POS_Y))
+                             _msg_battle_info(mission_id, pos[0], pos[1]))
             _log(f'S->C cmd={vc:<4} KeyValueChangeSet (BattleInfo id={mission_id})')
             # ★ private_login.pcapng 复核：Admitted 数秒后再推 f14=3 (Armed)，
             #   KVCS 全走 Flash 连接（game 连接保持静默）。
@@ -1233,12 +1417,16 @@ def _msg_mission_info_multi(mission_id, details, zulu):
     m += pb_int64(5, int(details.get('map_entity_id') or MISSION_MAP_ENTITY_ID))
     m += pb_int64(6, 1)                            # mapEntityTypeId
     m += pb_int32(7, 1)                            # isAutogenerated
-    m += pb_int64(8, creator)                      # 创建者 playerId
+    # f8 defenderFactionId：客户端 UI 攻防判定（factionIdToUse ==
+    # defenderFactionId → 显示 defend）。★曾误填 creator playerId（巨大
+    # id 恒不等于玩家阵营）→ 简报恒显示进攻方，与 BattleFieldSettings f3
+    # （正确阵营）不一致 = "UI 防守、进游戏进攻"错位。
+    m += pb_int64(8, int(details.get('defender_faction') or 2))
     m += pb_int32(9, pcount)                       # playerCount
     m += pb_int64(10, MISSION_HOSTING_CENTER_ID)
     m += pb_string(11, zulu)                       # activationTimeStamp
-    m += pb_int32(12, 1)                           # weatherTimeOfDay
-    m += pb_int32(13, 0)                           # weatherCondition
+    m += pb_int32(12, int(details.get('weather_tod', 1)))    # weatherTimeOfDay
+    m += pb_int32(13, int(details.get('weather_condition', 0)))  # weatherCondition
     return m
 
 
@@ -1247,15 +1435,23 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
 
     - f3 参战方：真人按 faction 分组列 gamertag；防守方无真人（ai_fill / 单侧）
       时保留无成员名单的 AI 方条目
-    - f4/f5 突击队/资源：结构复用 AI_ASSAULT_TEAMS / AI_TEAM_RESOURCES，
-      "我方" = 进攻方（人数最多组），AI 方 = 防守方
-    - f6 出兵点：8=进攻方，15=防守方
+    - f4/f5 突击队/资源：构成沿用 AI_TEAM_RESOURCES（类别为库值），突击队模板
+      按【参战阵营】查 commandnodetemplate，"我方" = 进攻方（人数最多组），
+      AI 方 = 防守方
+    - 出兵点/据点模板按本局 gamemap 查表；f8/f9 战局位置 = mapEntityId 对应
+      battlefield 行坐标（简报战场名与地图标记一致）
     """
     players = details.get('players') or []
     attacker = int(details.get('attacker_faction') or 3)
     defender = int(details.get('defender_faction') or 2)
     rfid = FACTION_ROW_IDS.get(attacker, FACTION_ROW_IDS[3])
     afid = FACTION_ROW_IDS.get(defender, FACTION_ROW_IDS[2])
+    preset = int(details.get('preset') or 0) or AI_MISSIONPRESET
+    gamemap_id = int(_load_preset(preset).get(3, 0) or 0) or 13
+    aps = _mission_accesspoints(gamemap_id)
+    ours_ap, theirs_ap = aps[0], aps[1]
+    pos = battlefield_pos(int(details.get('map_entity_id') or 0)
+                          or MISSION_MAP_ENTITY_ID)
 
     by_faction = {}
     for p in players:
@@ -1274,23 +1470,38 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     for tag in dtag:
         dfd += pb_message(2, pb_string(1, tag))
     m += pb_message(3, dfd)
-    # f4 突击队 ×12：（is_ai, commandNodeTemplateId, accessPointTemplateId）
-    for is_ai, cmd_node, ap in AI_ASSAULT_TEAMS:
-        m += pb_message(4, pb_int64(1, afid if is_ai else rfid) +
-                        pb_int64(2, cmd_node) + pb_int64(3, ap) + pb_int64(4, 0))
-    # f5 资源 ×20：（is_ai, armyResourceCategoryId, count）
-    for is_ai, res_cat, amount in AI_TEAM_RESOURCES:
-        ap = 15 if is_ai else 8
-        m += pb_message(5, pb_int64(1, afid if is_ai else rfid) +
-                        pb_int64(2, res_cat) + pb_int64(3, ap) +
-                        pb_int64(4, amount) + pb_int64(5, 0))
-    # f6 出兵点归属：accessPoint 8=进攻方, 15=防守方（f2 为 factionTemplateId）
-    m += pb_message(6, pb_int64(1, 8) + pb_int64(2, attacker))
-    m += pb_message(6, pb_int64(1, 15) + pb_int64(2, defender))
-    # f7（他服私服实测 {3:120, 4:0}）
-    m += pb_message(7, pb_int32(3, 120) + pb_int32(4, 0))
-    m += pb_float(8, AI_POS_X)   # posX
-    m += pb_float(9, AI_POS_Y)   # posY
+    # f4 突击队 ×12：进攻方/防守方各 6 队（模板按阵营查库）
+    for cmd_node in _assault_team_nodes(attacker):
+        m += pb_message(4, pb_int64(1, rfid) + pb_int64(2, cmd_node) +
+                        pb_int64(3, ours_ap) + pb_int64(4, 0))
+    for cmd_node in _assault_team_nodes(defender):
+        m += pb_message(4, pb_int64(1, afid) + pb_int64(2, cmd_node) +
+                        pb_int64(3, theirs_ap) + pb_int64(4, 0))
+    # f5 资源：从本局资源池渲染（与战斗内 f2/f14 同源同值，消耗后递减）；
+    # 每方每类一条挂该方出兵点（客户端跨点求和 → 显示即池剩余量）
+    pool = mission_resource_pool(mission_id)
+    atk_counts = _pool_counts(pool, attacker)
+    dfd_counts = _pool_counts(pool, defender)
+    for res_cat, _air, _cnt in MISSION_RESOURCE_CATS:
+        m += pb_message(5, pb_int64(1, rfid) + pb_int64(2, res_cat) +
+                        pb_int64(3, ours_ap) +
+                        pb_int64(4, atk_counts.get(res_cat, 0)) +
+                        pb_bool(5, res_cat in _AIR_RES_CATS))
+    for res_cat, _air, _cnt in MISSION_RESOURCE_CATS:
+        m += pb_message(5, pb_int64(1, afid) + pb_int64(2, res_cat) +
+                        pb_int64(3, theirs_ap) +
+                        pb_int64(4, dfd_counts.get(res_cat, 0)) +
+                        pb_bool(5, res_cat in _AIR_RES_CATS))
+    # f6 出兵点归属：首个=进攻方，其余交替（Mill 实测 8=进攻, 15=防守；
+    # f2 为 factionTemplateId）
+    for i, ap in enumerate(aps):
+        m += pb_message(6, pb_int64(1, ap) +
+                        pb_int64(2, defender if i % 2 else attacker))
+    # f7 据点初始归属：0=中立（他服私服实测 {3:120, 4:0}）
+    for cp in _mission_capturepoints(gamemap_id):
+        m += pb_message(7, pb_int32(3, cp) + pb_int32(4, 0))
+    m += pb_float(8, pos[0])   # posX（battlefield 行坐标）
+    m += pb_float(9, pos[1])   # posY
     return m
 
 

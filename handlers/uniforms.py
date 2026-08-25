@@ -177,7 +177,12 @@ async def handle_setuniformvariantrequest(sess, writer, cmd_id, req_type, proto)
                                                 ch.get('combat_badge_1', 0),
                                                 int(time.time() * 1000),
                                                 ch.get('uniform_variant_id', 0),
-                                                ch.get('headgear_id', 0)))
+                                                ch.get('headgear_id', 0),
+                                                1 if ch.get('is_deleted') else 0,
+                                                ch.get('previous_template', 0),
+                                                ch.get('head_id', 0),
+                                                0,
+                                                1 if ch.get('is_on_leave') else 0))
                 log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
                     f'{ch["name"]} re-pushed after uniform set)')
         except Exception as e:
@@ -326,7 +331,12 @@ async def handle_setuniformpartrequest(sess, writer, cmd_id, req_type, proto):
                                                 ch.get('combat_badge_1', 0),
                                                 int(time.time() * 1000),
                                                 ch.get('uniform_variant_id', 0),
-                                                ch.get('headgear_id', 0)))
+                                                ch.get('headgear_id', 0),
+                                                1 if ch.get('is_deleted') else 0,
+                                                ch.get('previous_template', 0),
+                                                ch.get('head_id', 0),
+                                                0,
+                                                1 if ch.get('is_on_leave') else 0))
                 log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
                     f'{ch["name"]} re-pushed after headgear set)')
         except Exception as e:

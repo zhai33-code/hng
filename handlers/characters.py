@@ -387,7 +387,12 @@ async def handle_set_combatbadge_request(sess, writer, cmd_id, req_type, proto):
                                                 ch.get('combat_badge_1', 0),
                                                 0,
                                                 ch.get('uniform_variant_id', 0),
-                                                ch.get('headgear_id', 0)))
+                                                ch.get('headgear_id', 0),
+                                                1 if ch.get('is_deleted') else 0,
+                                                ch.get('previous_template', 0),
+                                                ch.get('head_id', 0),
+                                                0,
+                                                1 if ch.get('is_on_leave') else 0))
                 log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
                     f'{ch["name"]} re-pushed after badge set)')
         except Exception as e:

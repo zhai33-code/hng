@@ -112,7 +112,7 @@ def main():
                          'condition': 1.0}]},
         'v_ammo': {409: [{'id': 603, 'ammo_template_id': 93, 'vehicle_id': 409,
                           'equipped_storage_id': 71, 'slot_index': 1,
-                          'condition': 2000.0, 'spawn_clip_count': 16}]},
+                          'condition': 2000.0, 'spawn_clip_count': 3}]},
         'uv_tmpl': {701: 1},
         'u_parts': {3: [90, 94]},
     }
@@ -158,13 +158,13 @@ def main():
     vu = fields(v[5][0])
     check('载具升级 f1=501 f2=11', vu[1][0] == 501 and vu[2][0] == 11)
     va = fields(v[6][0])
-    check('载具弹药 f2仓=71 f3槽=1 f4模板=93 f6出生弹夹=16',
+    check('载具弹药 f2仓=71 f3槽=1 f4模板=93 f6出生弹夹=3(VehicleAmmoStorage.f2)',
           va[2][0] == 71 and va[3][0] == 1 and va[4][0] == 93
-          and abs(va[6][0] - 16.0) < 1e-6)
+          and abs(va[6][0] - 3.0) < 1e-6)
     check('f6 战斗徽章=[110]', e[6] == [110])
     rank = _rank_from_combat_xp(50000)
-    check(f'f7=f8=军衔({rank})（combat_xp 推导）',
-          e[7][0] == rank and e[8][0] == rank)
+    check(f'f7=兵种actionid(2,rifleman) / f8=军衔({rank})（combat_xp 推导）',
+          e[7][0] == 2 and e[8][0] == rank)
     check('f9 军服迷彩模板=1（uniform_variant_id 701 → uv_tmpl）',
           e[9][0] == 1)
     check('f10 军装部件=[90, 94]', e[10] == [90, 94])
@@ -198,8 +198,8 @@ def main():
     check('f4 载具条目数=0（无载具则整体省略）', 4 not in e)
     check('f9 默认军服变体=21（GE 步兵 Field Grey 41）', e[9][0] == 21)
     rank_h = _rank_from_combat_xp(250000)
-    check(f'f7=f8=军衔({rank_h})（xp 推导仍正常）',
-          e[7][0] == rank_h and e[8][0] == rank_h)
+    check(f'f7=兵种actionid(2,rifleman) / f8=军衔({rank_h})（xp 推导仍正常）',
+          e[7][0] == 2 and e[8][0] == rank_h)
 
     print('== 4. 整帧 _msg_player_settings（全动态构建）==')
     full = _msg_player_settings(
@@ -245,6 +245,41 @@ def main():
           e[1][0] == 1 and e[2][0] == b'Alexei')
     check('f3/f4 空装备（无回放克隆）', 3 not in e and 4 not in e)
     check('f9 默认军服=28（loadout=None 仍兜底）', e[9][0] == 28)
+
+    print('== 7. 飞行员 f7=actionid(11)（部署兵种识别，回放 Yaroslav 锚点）==')
+    pilot = {'id': 126, 'name': 'Yaroslav', 'faction': 3, 'template': 2,
+             'combat_xp': 60000, 'combat_badge_0': 321, 'combat_badge_1': 0,
+             'uniform_variant_id': 0, 'squad_points': 4,
+             'receive_daily_bonus': False}
+    pilot_loadout = {
+        'weapons': {}, 'w_ammo': {}, 'w_mods': {},
+        'vehicles': {126: [
+            {'id': 900, 'vehicle_variant_template_id': 206,
+             'character_id': 126, 'equipped_in_slot': 1, 'variant_id': 0,
+             'condition': 100.0},
+            {'id': 901, 'vehicle_variant_template_id': 57,
+             'character_id': 126, 'equipped_in_slot': 2, 'variant_id': 0,
+             'condition': 100.0}]},
+        'v_ups': {}, 'v_ammo': {}, 'uv_tmpl': {}, 'u_parts': {}}
+    entry = _msg_character_entry(pilot, loadout=pilot_loadout)
+    e = fields(pb_field_payload(entry))
+    check('f7=11（fighterpilot actionid → 游戏端空军部署）', e[7][0] == 11)
+    check('f8=军衔（combat_xp 推导）', e[8][0] == _rank_from_combat_xp(60000))
+    check('f4 载具条目数=2（两架飞机已装备）', len(e[4]) == 2)
+    v0 = fields(e[4][0])
+    v1 = fields(e[4][1])
+    check('载具 vvt=206(R-Z recon)/57(La-7 fighter) 槽位 1/2',
+          v0[2][0] == 206 and v0[4][0] == 1
+          and v1[2][0] == 57 and v1[4][0] == 2)
+    check('f9 默认军服=32（SU 飞行员）', e[9][0] == 32)
+    # 坦克兵对照：actionid=10
+    tanker = {'id': 130, 'name': 'Arkady', 'faction': 3, 'template': 5,
+              'combat_xp': 0, 'combat_badge_0': 0, 'combat_badge_1': 0,
+              'uniform_variant_id': 0, 'squad_points': 0,
+              'receive_daily_bonus': True}
+    entry = _msg_character_entry(tanker, loadout=None)
+    e = fields(pb_field_payload(entry))
+    check('坦克兵 f7=10（tankcrew actionid）', e[7][0] == 10)
 
     print()
     print('ALL PASS' if ok else 'SOME CHECKS FAILED')

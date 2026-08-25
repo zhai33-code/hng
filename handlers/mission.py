@@ -54,6 +54,7 @@ from matchmaking import (
     MISSION_MAP_ENTITY_ID,
     PMS_TO_MISSION,
     PMS_TO_SESSION,
+    WEATHER_PRESETS,
     _MM_MISSION_DETAILS,
     _MM_QUEUES,
     _SOLO_SQUADS,
@@ -78,7 +79,10 @@ def _str(v):
 
 
 def _msg_mission_info_from_record(rec, zulu):
-    """mission_records 行 → MissionInfo proto。"""
+    """mission_records 行 → MissionInfo proto。
+
+    天气/时段：记录无天气列，按行 id 从预设池稳定取模（同 id 恒同天气，
+    列表反复刷新不跳变）。"""
     m = pb_int64(1, int(rec['id']))              # missionId
     m += pb_int64(2, 0)                          # battleId
     m += pb_int64(3, int(rec['preset'] or AI_MISSIONPRESET))   # missionpreset
@@ -89,8 +93,9 @@ def _msg_mission_info_from_record(rec, zulu):
     m += pb_int32(9, int(rec['state']))          # status
     m += pb_int64(10, MISSION_HOSTING_CENTER_ID)
     m += pb_string(11, zulu)                     # activationTimeStamp
-    m += pb_int32(12, 1)                         # weatherTimeOfDay
-    m += pb_int32(13, 0)                         # weatherCondition
+    tod, cond, _ = WEATHER_PRESETS[int(rec['id']) % len(WEATHER_PRESETS)]
+    m += pb_int32(12, tod)                       # weatherTimeOfDay
+    m += pb_int32(13, cond)                      # weatherCondition
     return m
 
 
@@ -112,8 +117,8 @@ def _msg_mission_info_live(mission_id, faction, zulu):
         m += pb_int32(9, len(det.get('players') or []))   # playerCount
         m += pb_int64(10, MISSION_HOSTING_CENTER_ID)
         m += pb_string(11, zulu)
-        m += pb_int32(12, 1)                         # weatherTimeOfDay
-        m += pb_int32(13, 0)                         # weatherCondition
+        m += pb_int32(12, int(det.get('weather_tod', 1)))    # weatherTimeOfDay
+        m += pb_int32(13, int(det.get('weather_condition', 0)))  # weatherCondition
         return m
     m = pb_int64(1, int(mission_id))             # missionId
     m += pb_int64(2, 0)                          # battleId

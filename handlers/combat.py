@@ -33,7 +33,7 @@ from protocol import (
     pb_string,
 )
 from state import FLASH_SESSIONS, PUBLIC_HOST, STORE, log
-from wardb import _RIBBON_LEVEL_XP, _rank_from_combat_xp
+from wardb import _RIBBON_LEVEL_XP, _rank_from_combat_xp, commandnode_template
 from warserver_messages import _accesspoint_layout, _msg_army_resource_list
 
 # 与 matchmaking 成局 game_connect 同源（PUBLIC_HOST；mission.py _GAME_CONNECT）
@@ -163,12 +163,51 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
     except Exception:
         mission_id = 0
 
+    # ★ 按本局 mission 取 preset/阵营（与 BattleFieldSettings 握手同源）：
+    #   不传参时两个 builder 默认 preset 10（Mill 模板 8/15）——换图后战斗服
+    #   校验 "New Resource Invalid accesspoint for resource"（m_AccesspointId
+    #   是 Mill 的 8/15 而本图无此点）。
+    #   实测战斗服本请求 mission_id=0（proto 无 field1，与握手同款）：
+    #   用握手时记在连接上的 sess.combat_mission 定位本局。
+    # 解析本局 mission id：proto f1 → PMS_TO_MISSION 反查 → 连接记录
+    # （战斗服 combat_mission / 玩家游戏进程 game_mission，实测两者轮询均 f1=0）
+    mid = int(mission_id or 0)
+    det = matchmaking._MM_MISSION_DETAILS.get(mid)
+    if not det and mid:
+        mid2 = int(matchmaking.PMS_TO_MISSION.get(mid, 0) or 0)
+        if mid2:
+            mid = mid2
+            det = matchmaking._MM_MISSION_DETAILS.get(mid)
+    if not det:
+        cm = int(getattr(sess, 'combat_mission', 0) or 0) or \
+            int(getattr(sess, 'game_mission', 0) or 0)
+        if cm:
+            mid = cm
+            det = matchmaking._MM_MISSION_DETAILS.get(cm)
+    if det and 'preset' in det:
+        mm_preset = int(det['preset'])
+        mm_defender = int(det.get('defender_faction', 2) or 2)
+        mm_attacker = int(det.get('attacker_faction', 3) or 3)
+    else:
+        mm_preset = None      # 走 builder 默认（兼容旧路径）
+        mm_defender = None
+        mm_attacker = None
+
+    def _layout_args():
+        if mm_preset is None:
+            return ()
+        return (mm_preset, mm_defender, mm_attacker)
+
     resp_proto = pb_string(1, '')                    # f1 msg
-    res_msgs = _msg_army_resource_list()
+    # f2 资源：从本局资源池渲染（与 f14 握手 / 匹配界面 f5 同源同值，
+    # ReportMissionStatusRequest f2 出生上报扣减后此处轮询即递减）
+    res_msgs = _msg_army_resource_list(*_layout_args(),
+                                       counts_by_faction=matchmaking.
+                                       mission_resource_pool(mid))
     for r in res_msgs:                               # f2 armyResourceList
         resp_proto += pb_message(2, r)
 
-    layout = _accesspoint_layout()
+    layout = _accesspoint_layout(*_layout_args())
     sent = getattr(sess, 'ap_owners_sent', None)
     if sent is None or getattr(sess, 'ap_sync_layout', None) != layout:
         # 新连接 / 布局变化：重置增量状态。战斗服连接初值已知（BFSettings
@@ -188,19 +227,20 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
         resp_proto += pb_message(3, pb_int32(1, int(tmpl)) + pb_int32(2, team))
         ap_count += 1
 
-    # f5 assaultTeams：每局一个突击队（commandNode 303 = 我方步兵突击队模板，
-    # 与 matchmaking.AI_ASSAULT_TEAMS / 战局详情 f4 同源；mapEntityId 用
-    # mission_info f5 同款 WarDatabase battlefield 真实行 id）。
+    # f5 assaultTeams：每局一个突击队（commandNode 模板按玩家阵营查
+    # WarDatabase/commandnodetemplate：infantry US=103/GE=203/SU=303；
+    # 与 matchmaking._assault_team_nodes / 战局详情 f4 同源；
+    # mapEntityId 用 mission_info f5 同款 WarDatabase battlefield 真实行 id）。
     at_count = 0
-    layout = _accesspoint_layout()
     home_ap = int(layout[0][0]) if layout else 0
     for s in matchmaking.PMS_TO_SESSION.values():
+        fac = int(s.get('faction', 3) or 3)
         at = b''
         at += pb_int64(1, int(s.get('battle_session_id', 0) or 0))  # assaultTeamId
         at += pb_int64(2, int(s.get('player_id', 0) or 0))          # ownerPlayerId
         at += pb_string(3, s.get('gamertag') or 'Player')           # ownerGamertag
-        at += pb_int64(4, int(s.get('faction', 3) or 3))            # factionId(runtime)
-        at += pb_int64(5, 303)                                      # commandNodeTemplateId
+        at += pb_int64(4, fac)                                      # factionId(runtime)
+        at += pb_int64(5, commandnode_template(fac, 'infantry'))  # commandNodeTemplateId
         at += pb_int64(6, matchmaking.MISSION_MAP_ENTITY_ID)        # mapEntityId
         at += pb_int64(7, 1)                                        # mapEntityTypeId(1=battlefield)
         at += pb_bool(8, False)                                     # inTransit
@@ -299,8 +339,11 @@ async def handle_report_mission_status(sess, writer, cmd_id, req_type, proto):
     """ReportMissionStatusRequest（战局中每 10s）→ HandlerErrorResponse。
 
     §8.1：f1 missionSessionId / f2 资源消耗 / f3 击杀记录 / f4 据点归属 /
-    f5 小队资源 / f6 成就。f4 写 _CAPTURE_OWNERS（覆盖 ActiveMissionResponse
-    f3 归属）；f3 击杀按 playerId→会话角色 写 character_stats('kills')。
+    f5 小队资源 / f6 成就。f2 statuslist（ReportArmyResourceSpawnCount
+    {f1 ap, f2 cat, f5 count, f6 faction}，每 10s 增量上报，AI/玩家出生均含）
+    按兵种扣减每局资源池 → f5/f2/f14 同步递减；f4 写 _CAPTURE_OWNERS
+    （覆盖 ActiveMissionResponse f3 归属）；f3 击杀按 playerId→会话角色
+    写 character_stats('kills')。
     """
     try:
         items = _split_fields(proto)
@@ -309,6 +352,27 @@ async def handle_report_mission_status(sess, writer, cmd_id, req_type, proto):
         items = []
 
     msid = _get(items, 1)
+
+    # f2 资源消耗 → 扣每局资源池（mission：msid→会话→PMS 反查，回退连接记录）
+    mm_sess = _session_by_msid(msid) if msid else None
+    mid = int(matchmaking.PMS_TO_MISSION.get(
+        int(mm_sess.get('pms_id', 0) or 0), 0) or 0) if mm_sess else 0
+    if not mid:
+        mid = int(getattr(sess, 'combat_mission', 0) or 0) or \
+            int(getattr(sess, 'game_mission', 0) or 0)
+    spawned_total = 0
+    for raw in _all(items, 2):
+        sub = _split_fields(raw)
+        cat = int(_get(sub, 2, 0) or 0)
+        cnt = int(_get(sub, 5, 0) or 0)
+        fac = int(_get(sub, 6, 0) or 0)
+        if not (mid and cat and cnt and fac):
+            continue
+        left = matchmaking.consume_mission_resource(mid, fac, cat, cnt)
+        spawned_total += cnt
+        if left is not None:
+            log(f'      [combat] resource spawn: faction={fac} cat={cat} '
+                f'count={cnt} -> pool left={left}')
 
     # f4 据点归属：ReportCapturepointStatus { f1 capturepointTemplateId, f2 ownerFactionId }
     for raw in _all(items, 4):
@@ -341,7 +405,8 @@ async def handle_report_mission_status(sess, writer, cmd_id, req_type, proto):
     n_res = len(_all(items, 2)) + len(_all(items, 5))
     if msid or kill_total or n_res:
         log(f'      [combat] ReportMissionStatus msid={msid} kills={kill_total} '
-            f'resources={n_res} captures_tracked={len(_CAPTURE_OWNERS)}')
+            f'spawned={spawned_total} resources={n_res} '
+            f'captures_tracked={len(_CAPTURE_OWNERS)}')
 
     await _ack_error(writer, cmd_id, 'ReportMissionStatus acknowledged')
 
@@ -462,7 +527,10 @@ async def _push_pms_admitted(sess, writer, mm_sess):
 
 
 async def handle_report_character_spawned(sess, writer, cmd_id, req_type, proto):
-    """ReportCharacterSpawned（实测 2B：f2 varint 1/2/3）→ HandlerErrorResponse。"""
+    """ReportCharacterSpawned（实测 2B：f2 varint 1/2/3）→ HandlerErrorResponse。
+
+    仅通知类；资源池扣减不走此消息（用 ReportMissionStatusRequest f2
+    statuslist，含阵营/兵种/数量，见 handle_report_mission_status），避免双扣。"""
     try:
         items = _split_fields(proto)
         note = ' '.join(f'f{f}={_as_str(v) if isinstance(v, bytes) else v}'

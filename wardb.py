@@ -239,6 +239,20 @@ for _f in _parse_wardb_table('VehicleWeaponSlot'):
         (int(_f.get(3, 0)), int(_f.get(6, 0))))
 
 
+# VehicleAmmoStorage { id=1, clipCount=2, storageSlots=3 }：弹药仓默认出生弹夹数。
+# 官方回放锚点（pvt_player_settings.bin）：T-38 同轴 DT（storage 56）spawnClipCount=21、
+# Yak-9D ShVAK（storage 72）=1、R-Z 后机枪（storage 114）=1，均等于本表 f2 clipCount。
+# 客户端备弹 = spawnClipCount × weapontemplate f20 clipsize × 炮数
+# （La-7 B-20：1 × 100 × 3 = 300 发；此前误发 16 → 4800 发）。
+_VEHICLE_AMMO_STORAGE_CLIPS = {int(f.get(1, 0)): int(f.get(2, 0) or 1)
+                               for f in _parse_wardb_table('VehicleAmmoStorage')}
+
+
+def vehicle_ammo_spawn_clips(storage_id):
+    """弹药仓默认出生弹夹数（VehicleAmmoStorage f2 clipCount）；未知仓返回 1。"""
+    return _VEHICLE_AMMO_STORAGE_CLIPS.get(int(storage_id), 1)
+
+
 def _vehicle_supports_ammo(parent_vehicle_tid, ammo_template_id):
     """载具基础模板是否能装指定弹药（驾驶员主武器经 weaponAmmoMapping 推导）。"""
     for (wt, _storage) in _VEHICLE_WEAPON_SLOTS.get(int(parent_vehicle_tid), ()):
@@ -387,6 +401,22 @@ def default_uniform_variant(character_template_id, faction_template_id):
     """(兵种, 阵营) 默认军服变体模板 id；角色无 DB 军服实例时 f9 兜底，未知组合返回 0。"""
     return _DEFAULT_UNIFORM_VARIANT.get(
         (int(character_template_id or 0), int(faction_template_id or 0)), 0)
+
+
+# CharacterTemplate { id=1, name=2, cost=3, actionid=4, ... deployPool*=9-11 }
+# 兵种 → 游戏引擎实体类型（actionid）：rifleman=2 / fighterpilot=11 /
+# paratrooper=7 / tankcrew=10 / recon=6 / general=7。
+# 回放实测锚点（pvt_player_settings.bin）：charactersetting f7 恒等于
+# charactertemplate.actionid —— Yaroslav(飞行员) f7=11、Kaspar(步兵) f7=2、
+# Arkady(坦克) f7=10。游戏端按 f7 识别兵种决定部署方式（飞行员只能空中
+# 出生、飞机才显示在部署槽位），f7≠actionid 时角色被当步兵 → 徒步部署。
+_CHAR_TMPL_ACTIONID = {int(f.get(1, 0)): int(f.get(4, 0))
+                      for f in _parse_wardb_table('charactertemplate')}
+
+
+def charactertemplate_actionid(character_template_id):
+    """兵种模板 → 引擎 actionid（charactersetting.f7）；未知模板返回 0。"""
+    return _CHAR_TMPL_ACTIONID.get(int(character_template_id or 0), 0)
 
 
 # 武器模板 → 勋带模板 id：从 progressionUnlock（配件 type=3 / 弹药 type=10）
@@ -591,6 +621,56 @@ def _load_accesspoint_templates(gamemap_id):
     return ids
 
 
+_CAPTUREPOINT_TMPL_CACHE = {}
+
+
+def _load_capturepoint_templates(gamemap_id):
+    """本图据点模板 id 列表（CapturepointTemplate 表 f2 == gamemap id 分组，
+    返回按 id 升序）。Mill(13) → [120]；换图据点集合随表变化
+    （Town(70439) 22 个、Mountain(201) 17 个）。"""
+    if gamemap_id in _CAPTUREPOINT_TMPL_CACHE:
+        return _CAPTUREPOINT_TMPL_CACHE[gamemap_id]
+    ids = []
+    try:
+        for r in _parse_wardb_table('CapturepointTemplate'):
+            f2 = r.get(2, 0)
+            if isinstance(f2, (bytes, bytearray)):
+                continue                      # 非分组键行（如 f2=名字）
+            if int(f2 or 0) == int(gamemap_id) and int(r.get(1, 0) or 0):
+                ids.append(int(r.get(1, 0)))
+    except Exception as e:
+        log(f'[!] CapturepointTemplate parse failed: {e}')
+    ids.sort()
+    _CAPTUREPOINT_TMPL_CACHE[gamemap_id] = ids
+    return ids
+
+
+_COMMANDNODE_NAME_CACHE = {}     # factionTemplateId -> {兵种名: 行 id}
+
+
+def commandnode_template(faction, name):
+    """阵营兵种的 commandNode 模板 id（commandnodetemplate 表 f2 名字 ×
+    f3 factionTemplateId 匹配）。
+
+    突击队模板是【阵营相关】库值：US=101-124 / GE=201-224 / SU=301-324 段，
+    同名兵种每阵营一行（infantry: US 103 / GE 203 / SU 303）。
+    查不到返回 0。"""
+    faction = int(faction)
+    if faction not in _COMMANDNODE_NAME_CACHE:
+        by_name = {}
+        try:
+            for r in _parse_wardb_table('commandnodetemplate'):
+                if int(r.get(3, 0) or 0) != faction:
+                    continue
+                nm = r.get(2, b'')
+                if isinstance(nm, (bytes, bytearray)) and nm:
+                    by_name[nm.decode('utf-8', 'replace')] = int(r.get(1, 0) or 0)
+        except Exception as e:
+            log(f'[!] commandnodetemplate parse failed: {e}')
+        _COMMANDNODE_NAME_CACHE[faction] = by_name
+    return _COMMANDNODE_NAME_CACHE[faction].get(name, 0)
+
+
 def _load_preset(preset_id):
     """读 WarDatabase/missionpreset 行（缓存）。查不到回退 preset 10 硬编码值。"""
     if preset_id in _PRESET_CACHE:
@@ -665,8 +745,10 @@ def preset_scene(preset_id):
 def battlefield_entity_for_gamemap(gamemap_id):
     """battlefield 表 f7==gamemap 的行 id（MissionInfo f5 mapEntityId）。
 
-    无对应行时回退 MISSION_MAP_ENTITY_ID 常量值（112741325='Benoit Village'，
-    Mill 图实测行），保证客户端简报查表可用。
+    battlefield 表只覆盖战役地图（f7 ∈ {70439 Town, 201 Mountain, 203 Factory,
+    204 Airfield, 205 Forward Airfield}）；Mill(13) 等遭遇战/训练图无行，
+    回退 MISSION_MAP_ENTITY_ID 常量值（112741325='Benoit Village'），
+    保证客户端简报查表可用。
     """
     if gamemap_id in _BATTLEFIELD_ENTITY_CACHE:
         return _BATTLEFIELD_ENTITY_CACHE[gamemap_id]
@@ -680,4 +762,31 @@ def battlefield_entity_for_gamemap(gamemap_id):
         log(f'[!] battlefield parse failed: {e}')
     _BATTLEFIELD_ENTITY_CACHE[gamemap_id] = entity_id
     return entity_id
+
+
+_BATTLEFIELD_POS_CACHE = {}      # battlefield 行 id -> (posX, posY)
+
+
+def battlefield_pos(entity_id):
+    """battlefield 表行坐标 (posX, posY)（f5/f6 float，战役地图上的城镇位置）。
+
+    GMD f8/f9 与 BattleInfo 的战局位置用：与 mapEntityId 同行取值，
+    简报战场名与地图标记保持一致。行不存在/字段缺失返回 None。"""
+    if entity_id in _BATTLEFIELD_POS_CACHE:
+        return _BATTLEFIELD_POS_CACHE[entity_id]
+    pos = None
+    try:
+        for r in _parse_wardb_table('battlefield'):
+            if int(r.get(1, 0) or 0) != int(entity_id):
+                continue
+            x, y = r.get(5), r.get(6)
+            if (isinstance(x, (bytes, bytearray)) and len(x) == 4 and
+                    isinstance(y, (bytes, bytearray)) and len(y) == 4):
+                pos = (struct.unpack('<f', bytes(x))[0],
+                       struct.unpack('<f', bytes(y))[0])
+            break
+    except Exception as e:
+        log(f'[!] battlefield pos parse failed: {e}')
+    _BATTLEFIELD_POS_CACHE[entity_id] = pos
+    return pos
 

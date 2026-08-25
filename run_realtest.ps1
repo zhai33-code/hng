@@ -1,4 +1,4 @@
-# HnG real-machine test launcher
+﻿# HnG real-machine test launcher
 # Requires: Administrator (for port 80) + hosts entries (managed manually)
 #   hosts需手动添加：
 #     127.0.0.1 game.hng-group.com
@@ -17,6 +17,15 @@ $hng_server_dir = $hng_root
 
 # 客户端根目录探测（与 state.py _detect_game_dir 同逻辑：WarDatabase + images 特征）
 $hng_game_dir = $env:HNG_GAME_DIR
+if (-not $hng_game_dir) {
+    # .env 回退（state.py 同源：server 目录下 HNG_GAME_DIR=...）
+    $hng_env_file = Join-Path $hng_root '.env'
+    if (Test-Path $hng_env_file) {
+        foreach ($hng_line in Get-Content $hng_env_file) {
+            if ($hng_line -match '^\s*HNG_GAME_DIR\s*=\s*(.+?)\s*$') { $hng_game_dir = $Matches[1]; break }
+        }
+    }
+}
 if (-not $hng_game_dir) {
     $hng_game_dir = ''
     foreach ($hng_c in @((Split-Path $hng_root -Parent), (Split-Path (Split-Path $hng_root -Parent) -Parent))) {

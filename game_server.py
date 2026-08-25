@@ -128,6 +128,13 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                 f'(pms_id={pms_id}), ids generated, player fields zeroed')
         # missionId 必须与客户端启动参数 /M 一致（否则客户端校验失败挂起→20s 超时断开）
         mission_id = matchmaking.PMS_TO_MISSION.get(pms_id, 100001)
+        # ★ 记在连接上：玩家游戏进程的 ActiveMissionRequestEventList 轮询
+        #   实测不带 mission_id（f1=0，与战斗服同款），combat.py 用它定位
+        #   本局资源池/布局（否则回退 Mill 模板 → 资源数字错局）。
+        try:
+            sess.game_mission = int(mission_id)
+        except AttributeError:
+            pass
 
         username = gamertag
         try:
@@ -466,18 +473,45 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             mid2 = matchmaking.PMS_TO_MISSION.get(missionid)
             if mid2:
                 det = matchmaking._MM_MISSION_DETAILS.get(mid2)
+        if not det:
+            # ★ 实测专用服本请求 proto 为空（无 field1，日志全量可证）：
+            #   按启动顺序 FIFO 认领最早未握手实例，取其 preset/地图/阵营，
+            #   否则回退默认 preset=10(Mill) → 专用服加载错图 + inst['ready']
+            #   永不置位 → 120s 握手超时 → 客户端卡匹配 UI。
+            claimed = matchmaking.claim_pending_combat_instance()
+            if claimed:
+                missionid = claimed
+                det = matchmaking._MM_MISSION_DETAILS.get(missionid)
         if det and 'preset' in det:
             preset_id = int(det['preset'])
             defender_faction = int(det.get('defender_faction', 2) or 2)
             attacker_faction = int(det.get('attacker_faction', 3) or 3)
             enable_bots = bool(det.get('enable_bots', True))
+            # 本局天气/时段（成局时随机抽取，与简报 MissionInfo f12/f13 同源）
+            weather_tod = int(det.get('weather_tod', 1))
+            weather_condition = int(det.get('weather_condition', 0))
+            timeofday = det.get('timeofday')
+            # ★ 记在连接上：战斗服后续 ActiveMissionRequestEventList 轮询
+            #   请求同样不带 mission_id（实测 mission=0），combat.py 用它
+            #   定位本局 preset/布局，否则回退 Mill 模板 8/15 →
+            #   "New Resource Invalid accesspoint"（图上无此通道点）。
+            try:
+                sess.combat_mission = int(missionid)
+            except AttributeError:
+                pass
         else:
             preset_id = MISSION_PRESET_ID
             defender_faction = BF_DEFENDER_FACTION_ID
             attacker_faction = 3
             enable_bots = True
+            weather_tod = 1
+            weather_condition = 0
+            timeofday = None
+        # f14 资源从本局资源池渲染（与匹配界面 f5 / 轮询 f2 同源同值）
         resp_proto = _msg_response_battlefield_settings(
-            preset_id, defender_faction, attacker_faction, enable_bots)
+            preset_id, defender_faction, attacker_faction, enable_bots,
+            weather_tod, weather_condition, timeofday,
+            counts_by_faction=matchmaking.mission_resource_pool(missionid))
         resp = build_response(cmd_id, 'ResponseBattleFieldSettings', resp_proto)
         writer.write(resp)
         await writer.drain()
@@ -488,7 +522,8 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         log(f'GAME S->C cmd={cmd_id:<4} ResponseBattleFieldSettings '
             f'(mission={missionid}, preset={int(preset.get(1, 0))}, '
             f'map gamemap={int(preset.get(3, 0))}, {_name!r}, '
-            f'bots={enable_bots}, {len(resp_proto)}B)')
+            f'bots={enable_bots}, weather tod={weather_tod}/'
+            f'cond={weather_condition} @{timeofday}h, {len(resp_proto)}B)')
         # 通知 matchmaking：该 missionid 的专用服握手完成，可推 Admitted
         ready_mid = missionid
         if not (det and 'preset' in det) and missionid:

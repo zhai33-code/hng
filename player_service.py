@@ -391,6 +391,8 @@ async def _push_stored_soldier_data(sess, writer):
                                            up['uniform_part_type']))
     for ch in chars:
         bits = await _char_unlock_bits_for(sess, ch['template'], ch['faction'], ch['id'])
+        # ★尾部字段必须传全：漏传 head_id（f22）时换头保存被抹回默认头
+        #  （Appearance "无法保存"根因——DB 已存 89，回放却发 0）
         await _push_kvcs(writer, cmd, b'character',
                          _msg_character(ch['name'], ch['faction'], ch['template'],
                                         _rank_from_combat_xp(ch.get('combat_xp', 0)),
@@ -399,7 +401,12 @@ async def _push_stored_soldier_data(sess, writer):
                                         ch.get('combat_badge_1', 0),
                                         int(time.time() * 1000),
                                         ch.get('uniform_variant_id', 0),
-                                        ch.get('headgear_id', 0)))
+                                        ch.get('headgear_id', 0),
+                                        1 if ch.get('is_deleted') else 0,
+                                        ch.get('previous_template', 0),
+                                        ch.get('head_id', 0),
+                                        0,
+                                        1 if ch.get('is_on_leave') else 0))
         log(f'S->C cmd={cmd:<4} KeyValueChangeSet (character {ch["name"]} id={ch["id"]} '
             f'unlockBits={sum(bits)} true)')
     for vv in weapon_variants:

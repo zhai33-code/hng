@@ -30,8 +30,10 @@ from wardb import (
     _load_preset,
     _rank_from_combat_xp,
     _ribbon_level_from_xp,
+    charactertemplate_actionid,
     default_uniform_variant,
     spawn_clips_for,
+    vehicle_ammo_spawn_clips,
     )
 
 
@@ -207,7 +209,8 @@ def _msg_character_entry(ch, loadout=None):
     """PlayerSettings f12 角色条目（charactersetting，§7.2）—— 100% 账号库构建。
 
       f1 id / f2 name / f3 武器(含弹药/配件/耐久/出生弹夹) / f4 载具(含升级/弹药)
-      f6 战斗徽章 / f7+f8 军衔(combat_xp 推导；f7 兼容旧读法 f8=文档字段)
+      f6 战斗徽章 / f7 兵种 actionid(charactertemplate.f4，游戏端部署方式判定) /
+      f8 军衔(combat_xp 推导)
       f9 军服迷彩模板 / f10 军装部件 / f11 squadPoints / f12 receiveDailyBonus
     ★ f3 只下发已装备武器（weapons.container_slot>0，槽位用真实值）；
       f4 只下发已装备载具（vehicles.equipped_in_slot>0）——
@@ -251,9 +254,13 @@ def _msg_character_entry(ch, loadout=None):
     for b in (ch.get('combat_badge_0', 0), ch.get('combat_badge_1', 0)):
         if int(b or 0):
             out += pb_int32(6, int(b))
-    # f7/f8 军衔：f7 保持既有读法（部署流程验证），f8 为文档字段
-    #（回放对照：Artyom f8=13 == PMS characterRank）
-    out += pb_int32(7, rank)
+    # f7 兵种 actionid（charactertemplate.f4：rifleman=2/fighterpilot=11/
+    # paratrooper=7/tankcrew=10/recon=6/general=7）—— 游戏端按此识别兵种：
+    # 飞行员(11)只能空中出生且飞机才显示在部署槽位；此前误发 rank 导致
+    # 飞行员被当步兵 → 徒步部署、飞机不显示（2026-08-25 回放对照修复：
+    # Yaroslav(飞行员) f7=11 / Kaspar(步兵) f7=2 / Arkady(坦克) f7=10）
+    # f8 军衔（回放对照：Artyom f8=13 == PMS characterRank）
+    out += pb_int32(7, charactertemplate_actionid(ch.get('template', 1)))
     out += pb_int32(8, rank)
     # f9 军服迷彩模板（characters.uniform_variant_id 实例 id → uniform_variants 模板；
     # 无实例时回退 (兵种,阵营) 默认变体 —— 回放里官方服每个角色 f9 恒非零，
@@ -317,13 +324,20 @@ def _msg_vehicle_setting(v, ups, vammos):
         um += pb_int64(2, int(u['upgrade_template_id']))
         um += pb_float(3, float(u['condition'] or 1.0))
         m += pb_message(5, um)
+    # f6 只下发已装备弹药（equipped_storage_id>0）——官方回放（pvt_player_settings.bin
+    # Yaroslav 载具）f6 仅含 storage=72 slot=1 一条；未装备弹药（storage=0，车库库存）
+    # 下发会被客户端判无效移除并刷 #error2 Removing Invalid Vehicle Ammo
     for a in vammos:
+        if int(a.get('equipped_storage_id') or 0) <= 0:
+            continue
         am = pb_int64(1, int(a['id']))
-        am += pb_int64(2, int(a['equipped_storage_id'] or 0))
+        am += pb_int64(2, int(a['equipped_storage_id']))
         am += pb_int32(3, int(a['slot_index'] or 0))
         am += pb_int64(4, int(a['ammo_template_id']))
         am += pb_float(5, float(a['condition'] or 0))
-        am += pb_float(6, float(a.get('spawn_clip_count', 16) or 0))
+        # f6 spawnClipCount：按弹药仓取 WarDatabase VehicleAmmoStorage.f2（官方回放
+        # 锚点全部吻合），DB 旧默认 16 会导致备弹 16×clipsize×炮数（La-7=4800 发）
+        am += pb_float(6, float(vehicle_ammo_spawn_clips(a.get('equipped_storage_id') or 0)))
         m += pb_message(6, am)
     return pb_message(4, m)
 
@@ -355,16 +369,21 @@ BF_DEFENDER_FACTION_ID = 2    # 防守方 runtime factionId（必须在 battlefi
 
 # f14 armyResourceList 资源类别（resourceCategoryId == WarDatabase/armyresourcecategory.f1）：
 #   1=infantryman 2=fighter_pilot 4=paratrooper 5=tank_crew 6=recon
-#   10=transport_plane 20=fighter_plane
+#   3=heavy_fighter_plane 10=transport_plane 20=fighter_plane 21=recon_plane
 # 空军类 spawnInAir=True。count=可用生命数（infantry 按满员局给足）。
+# 与 matchmaking.AI_TEAM_RESOURCES 同源（GMD f5 / 战斗服 f14 单一事实）。
+# 伞兵 spawnInAir=True（回放 pvt_gmd_response.bin 实锤：cat=4 count=72 spawnInAir=1，
+# 与 cat=10 transport_plane 成对 —— 伞兵从运输机跳伞出生）。
 BF_RES_CATS = (
     (1, False, 1800),    # infantryman（主力生命池）
     (6, False, 60),      # recon
     (5, False, 60),      # tank_crew
-    (4, False, 60),      # paratrooper
+    (4, True, 60),       # paratrooper（运输机跳伞出生）
     (2, True, 30),       # fighter_pilot
+    (3, True, 10),       # heavy_fighter_plane
     (20, True, 10),      # fighter_plane
-    (10, True, 10),      # transport_plane
+    (21, True, 10),      # recon_plane
+    (10, True, 18),      # transport_plane（伞兵载机，4:1 比例配 60 伞兵）
 )
 
 
@@ -392,15 +411,23 @@ def _accesspoint_layout(preset_id=MISSION_PRESET_ID,
 
 def _msg_army_resource_list(preset_id=MISSION_PRESET_ID,
                             defender_faction=BF_DEFENDER_FACTION_ID,
-                            attacker_faction=3):
+                            attacker_faction=3,
+                            counts_by_faction=None):
     """ActionGameArmyResourceDefinition 条目列表：每 (faction, accesspointtemplate) × 7 类资源。
 
     ResponseBattleFieldSettings f14 与 ActiveMissionRequestEventListResponse f2
-    共用同一构建（单源，见 warserver-battlefield-settings.md §5.3/§6.1）。"""
+    共用同一构建（单源，见 warserver-battlefield-settings.md §5.3/§6.1）。
+    counts_by_faction：每局资源池 {factionTemplateId: {cat: count}}（
+    matchmaking.mission_resource_pool），给定则覆盖静态 BF_RES_CATS 数值——
+    匹配界面 f5 / 战斗内 f2/f14 同源同值、消耗后递减；None 回退静态初始表。"""
     res_msgs = []
     for tmpl, owner in _accesspoint_layout(preset_id, defender_faction,
                                            attacker_faction):
+        pool_counts = counts_by_faction.get(int(owner)) \
+            if counts_by_faction else None
         for cat, in_air, cnt in BF_RES_CATS:
+            if pool_counts is not None:
+                cnt = int(pool_counts.get(int(cat), cnt))
             r = b''
             r += pb_int64(1, owner)        # factionTemplateId（1US/2GE/3SU）
             r += pb_int64(2, tmpl)         # accesspointtemplate（资源挂载点）
@@ -421,11 +448,26 @@ def _msg_battlefield_settings_faction(faction_id, template_id):
     return m
 
 
+# 战局时段（weatherTimeOfDay 枚举）→ timeofday 小时（BattleFieldSettings f9，
+# 24 小时制浮点，战斗内光照/太阳角度）：0=夜 1=黎明 2=白天 3=黄昏
+_TOD_HOURS = {0: 0.0, 1: 6.0, 2: 12.0, 3: 18.0}
+
+
 def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
                                         defender_faction=BF_DEFENDER_FACTION_ID,
                                         attacker_faction=3,
-                                        enable_bots=True):
+                                        enable_bots=True,
+                                        weather_time_of_day=1,
+                                        weather_condition=0,
+                                        timeofday=None,
+                                        counts_by_faction=None):
     """构建 ResponseBattleFieldSettings（31 字段，spbc 描述符 @0x1807B1120）。
+
+    天气/时段：weather_time_of_day / weather_condition 取客户端枚举
+    （WeatherTimeOfDay 0=夜 1=黎明 2=白天 3=黄昏；WeatherCondition
+    0=少云 1=阴 2=雾），timeofday 未显式给定时按时段枚举推导小时。
+    调用方（game_server）应传成局时抽取的 _MM_MISSION_DETAILS 天气，
+    与简报 MissionInfo f12/f13 同源（避免"简报白天、进图黑夜"错位）。
 
     schema：decompiled/proto-files/HnG_States/ResponseBattleFieldSettings.proto。
     ★ 2026-08-20 补 f12 accesspoints + f14 armyResourceList（逆向 sub_1800B6600
@@ -450,6 +492,11 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
         name = name.decode('utf-8', 'replace')
     timelimit = float(preset.get(7, 0) or 0)     # preset f7（Training=0 不限时）
     max_players = int(preset.get(11, 24) or 24)  # preset f11
+    weather_time_of_day = int(weather_time_of_day)
+    weather_condition = int(weather_condition)
+    if timeofday is None:
+        timeofday = _TOD_HOURS.get(weather_time_of_day, 12.0)
+    timeofday = float(timeofday)
 
     # f12 accesspoints：每个模板一个点，owner 交替 defender/attacker。
     # accesspointid 为运行时 id（真实局由 warserver 生成，私服固定自增段），
@@ -464,9 +511,11 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
         ap += pb_int64(4, 1)              # accesspointbattlefieldid
         ap_msgs.append(ap)
 
-    # f14 armyResourceList（与 ActiveMissionRequestEventListResponse f2 同源）
+    # f14 armyResourceList（与 ActiveMissionRequestEventListResponse f2 同源；
+    # counts_by_faction=每局资源池 → 与匹配界面 f5 同值，消耗后递减）
     res_msgs = _msg_army_resource_list(preset_id, defender_faction,
-                                       attacker_faction)
+                                       attacker_faction,
+                                       counts_by_faction=counts_by_faction)
 
     m = b''
     m += pb_int64(1, 1)                            # 1 battlefieldid（battlefield 表行 1）
@@ -477,7 +526,7 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     m += pb_float(6, timelimit)                    # 6 timelimit
     m += pb_uint32(7, 0)                           # 7 fraglimit
     m += pb_uint32(8, 0)                           # 8 deathlimit
-    m += pb_float(9, 12.0)                         # 9 timeofday（正午）
+    m += pb_float(9, timeofday)                    # 9 timeofday（按本局时段枚举推导/下发）
     for ap in ap_msgs:                             # 12 accesspoints ★动态构建
         m += pb_message(12, ap)
     for r in res_msgs:                             # 14 armyResourceList ★动态构建
@@ -490,8 +539,8 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     m += pb_message(18, _msg_battlefield_settings_faction(3, 3))  # 18 SU（factions 表必须含 factionId=3，否则 AddTeam team=3 越界崩溃）
     m += pb_int32(19, max_players)                 # 19 maxTotalPlayers
     m += pb_bool(20, enable_bots)                  # 20 enableBots（AI 补位局 True）
-    m += pb_int32(21, 0)                           # 21 weatherTimeOfDay
-    m += pb_int32(22, 0)                           # 22 weatherCondition
+    m += pb_int32(21, weather_time_of_day)         # 21 weatherTimeOfDay
+    m += pb_int32(22, weather_condition)           # 22 weatherCondition
     m += pb_string(23, name)                       # 23 metricsMissionName
     m += pb_int64(24, 0)                           # 24 supplyLineId
     m += pb_float(25, 0.0)                         # 25 supplyLineOffsetFromAP1
