@@ -1,4 +1,4 @@
-﻿# HnG real-machine test launcher
+# HnG real-machine test launcher
 # Requires: Administrator (for port 80) + hosts entries (managed manually)
 #   hosts需手动添加：
 #     127.0.0.1 game.hng-group.com
@@ -6,7 +6,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-# 私服静态资源目录由 state.py 自动探测（HNG_GAME_DIR 环境变量 > 包父级 > 默认）；
+# 私服静态资源目录由 state.py 自动探测（HNG_GAME_DIR 环境变量 > 包父级探测，无默认兜底）；
 # 客户端 AIR 启动器在正式客户端目录 D:\Program Files\HnG（hosts 已导向本机）
 # 变量名带 hng_ 前缀，避免被 powershell profile 变量污染（fnm 等工具）
 $hng_root = $PSScriptRoot
@@ -18,9 +18,14 @@ $hng_server_dir = $hng_root
 # 客户端根目录探测（与 state.py _detect_game_dir 同逻辑：WarDatabase + images 特征）
 $hng_game_dir = $env:HNG_GAME_DIR
 if (-not $hng_game_dir) {
-    $hng_game_dir = 'd:\HnG-test'
-    foreach ($hng_c in @((Split-Path $hng_root -Parent), (Split-Path (Split-Path $hng_root -Parent) -Parent), 'd:\HnG-test')) {
+    $hng_game_dir = ''
+    foreach ($hng_c in @((Split-Path $hng_root -Parent), (Split-Path (Split-Path $hng_root -Parent) -Parent))) {
         if ((Test-Path (Join-Path $hng_c 'WarDatabase')) -and (Test-Path (Join-Path $hng_c 'images'))) { $hng_game_dir = $hng_c; break }
+    }
+    if (-not $hng_game_dir) {
+        Write-Host '[!] 未能自动探测客户端根目录（父级目录无 WarDatabase + images）。' -ForegroundColor Red
+        Write-Host '    请把本仓库克隆到客户端根目录下，或设置环境变量 HNG_GAME_DIR。' -ForegroundColor Red
+        exit 1
     }
 }
 

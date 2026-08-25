@@ -44,8 +44,8 @@ _load_dotenv(os.path.join(_PKG_DIR, '.env'))
 # 路径解析顺序（打包部署友好）：
 #   1. 环境变量 HNG_GAME_DIR（显式指定，最高优先级）
 #   2. 包目录的父级/上两级探测（存在 WarDatabase + images 即视为客户端根目录，
-#      把 zip 解压到客户端根目录下时自动命中，如 d:\HnG-test\hng-server）
-#   3. 兜底开发机默认路径 d:\HnG-test
+#      仓库克隆到客户端根目录下时自动命中，如 d:\HnG-test\hng-server）
+#   3. 探测失败：启动时打印警告并要求显式设置 HNG_GAME_DIR（无硬编码兜底路径）
 
 
 def _detect_game_dir():
@@ -57,7 +57,10 @@ def _detect_game_dir():
         if (os.path.isdir(os.path.join(cand, 'WarDatabase'))
                 and os.path.isdir(os.path.join(cand, 'images'))):
             return cand
-    return r'd:\HnG-test'
+    print('[warn] 未能自动探测客户端根目录（父级目录无 WarDatabase + images）。\n'
+          '       请把本仓库克隆到客户端根目录下，或设置环境变量 HNG_GAME_DIR 指向客户端根目录。',
+          file=sys.stderr)
+    return ''
 
 
 GAME_DIR = _detect_game_dir()

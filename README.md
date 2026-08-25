@@ -222,6 +222,7 @@ powershell -ExecutionPolicy Bypass -File run_selftest.ps1     # 登录+订阅自
 | 启动报 80 端口绑定失败 | 用管理员身份运行（start_server.ps1 需管理员 PowerShell） |
 | 启动报 PostgreSQL 连接失败 | 确认 Docker 容器在跑；远程库检查 `HNG_DATABASE_URL` |
 | 客户端连不上 game.hng-group.com | 检查 hosts 条目是否还在（Defender 排除项是否配置） |
+| 启动警告「未能自动探测客户端根目录」 | 仓库未克隆在客户端根目录下；设置环境变量 `HNG_GAME_DIR` 指向客户端根目录（或在 hng-server\.env 里写 `HNG_GAME_DIR=...`） |
 | 改了代码没生效 | 必须 `admin_restart_server.ps1` 重启 |
 | 登录提示密码错误 | demo 密码是 `demodemo123`；其他账号用 set_password.py 重置 |
 | 战局卡加载/校验失败 | WarDatabase 被改动后需重启服务器（校验清单是启动时生成的） |
