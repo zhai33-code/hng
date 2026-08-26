@@ -52,19 +52,35 @@ async def handle_set_equipmentselection(sess, writer, cmd_id, req_type, proto):
         equip_slot = 0
         eq_char_id = 1
 
-    w = sess.weapons.get(equip_id) if hasattr(sess, 'weapons') else None
+    # 装备（含挤槽）：客户端替换槽位武器时只发本请求（新武器），不发
+    # remove_equipmentselection（旧武器）——set_weapon_equipment 会把同容器
+    # 同槽位的旧武器挤回军械库（container 归零）并一并返回，供 KVCS 重推。
+    # 否则旧武器 container_slot 仍非 0：军械库列表（右侧）不显示它、
+    # 装备点数（左侧）却按新旧两把重复计算。
+    affected = []
     pid = await sess.ensure_player()
     if pid is not None:
         try:
-            await STORE.update_weapon_container(pid, equip_id, eq_char_id, equip_slot)
-            # 回读数据库行，保证推送内容与持久化状态一致
-            weapons = await STORE.list_weapons(pid)
-            w = next((x for x in weapons if x['id'] == equip_id), w)
+            affected = await STORE.set_weapon_equipment(
+                pid, equip_id, eq_char_id, equip_slot)
         except Exception as e:
-            log(f'[DB] update_weapon_container failed: {e}')
-    if w is not None:
-        w['container_id'] = eq_char_id
-        w['container_slot'] = equip_slot
+            log(f'[DB] set_weapon_equipment failed: {e}')
+    if not affected:
+        # 无 DB / 查不到行：退回会话缓存内存更新（仅本次会话可见）
+        w = sess.weapons.get(equip_id) if hasattr(sess, 'weapons') else None
+        if w is not None:
+            w['container_id'] = eq_char_id
+            w['container_slot'] = equip_slot
+            affected = [w]
+    else:
+        # 同步会话缓存（新装备 + 被挤掉的旧武器）
+        if hasattr(sess, 'weapons') and sess.weapons is not None:
+            for wa in affected:
+                if int(wa['id']) in sess.weapons:
+                    sess.weapons[int(wa['id'])]['container_id'] = wa['container_id']
+                    sess.weapons[int(wa['id'])]['container_slot'] = wa['container_slot']
+                else:
+                    sess.weapons[int(wa['id'])] = dict(wa)
 
     # 返回 msg=1 (ok)
     resp_proto = pb_int32(1, 1)
@@ -73,14 +89,20 @@ async def handle_set_equipmentselection(sess, writer, cmd_id, req_type, proto):
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} set_equipmentselection_response (msg=1 ok)')
 
-    # 推送更新后的 weapon 行（containerId/containerSlot），客户端刷新槽位显示
-    if w is not None and sess.soldier_view_cmd is not None:
-        wproto = _msg_weapon(equip_id, w['name'], w['template_id'], w['character_id'],
-                             w['container_id'], w['container_slot'], w['variant_id'],
-                             w.get('clip_count', 0), w.get('auto_repair', 0),
-                             w.get('condition', 100.0))
-        await _push_kvcs(writer, sess.soldier_view_cmd, b'weapon', wproto)
-        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (weapon id={equip_id} slot={equip_slot})')
+    # 推送所有受影响 weapon 行（先被挤掉的旧武器归库，再新武器进槽），
+    # 客户端刷新槽位显示 + 军械库列表 + 装备点数
+    if sess.soldier_view_cmd is not None:
+        others = [wa for wa in affected if int(wa['id']) != int(equip_id)]
+        target = [wa for wa in affected if int(wa['id']) == int(equip_id)]
+        for wa in others + target:
+            wproto = _msg_weapon(wa['id'], wa['name'], wa['template_id'],
+                                 wa['character_id'], wa['container_id'],
+                                 wa['container_slot'], wa['variant_id'],
+                                 wa.get('clip_count', 0), wa.get('auto_repair', 0),
+                                 wa.get('condition', 100.0))
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'weapon', wproto)
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                f'(weapon id={wa["id"]} slot={wa["container_slot"]})')
 
 
 
@@ -158,6 +180,13 @@ async def handle_remove_equipmentselection(sess, writer, cmd_id, req_type, proto
     if w is not None:
         w['container_id'] = 0
         w['container_slot'] = 0
+        # 同步会话缓存：w 可能已被 DB 回读的新 dict 覆盖，上面两行改不到
+        # sess.weapons 里的旧对象；不同步的话，后续 clipCount/variant 等
+        # re-push 会把旧 container 值发回客户端，已卸下的武器
+        # "自动装备"回旧槽位
+        if getattr(sess, 'weapons', None) and int(unequip_id) in sess.weapons:
+            sess.weapons[int(unequip_id)]['container_id'] = 0
+            sess.weapons[int(unequip_id)]['container_slot'] = 0
 
     # 返回 msg=1 (ok)
     resp_proto = pb_int32(1, 1)

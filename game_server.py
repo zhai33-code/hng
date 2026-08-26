@@ -85,6 +85,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             # 会话缺失时现场发号 —— 绝不回退他服回放值
             squad_id = int(mm_sess.get('squad_id', 0) or 0) or \
                 matchmaking._next_match_id(matchmaking._MM_SQUAD_ID)
+            squad_slot = int(mm_sess.get('squad_slot', 0) or 0)
             metrics_uid = mm_sess.get('metrics_uid') or str(uuid.uuid4())
             metrics_session_id = int(mm_sess.get('metrics_session_id', 0) or 0) \
                 or matchmaking._next_match_id(matchmaking._MM_METRICS_SESSION_ID)
@@ -119,6 +120,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             player_id = 0
             gamertag = 'Player'
             squad_id = matchmaking._next_match_id(matchmaking._MM_SQUAD_ID)
+            squad_slot = 0
             metrics_uid = str(uuid.uuid4())
             metrics_session_id = matchmaking._next_match_id(
                 matchmaking._MM_METRICS_SESSION_ID)
@@ -127,7 +129,8 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             log(f'      [WARN] GetPlayerSettings: no PMS session '
                 f'(pms_id={pms_id}), ids generated, player fields zeroed')
         # missionId 必须与客户端启动参数 /M 一致（否则客户端校验失败挂起→20s 超时断开）
-        mission_id = matchmaking.PMS_TO_MISSION.get(pms_id, 100001)
+        mission_id = matchmaking.PMS_TO_MISSION.get(
+            pms_id, matchmaking._MM_MISSION_ID[0])
         # ★ 记在连接上：玩家游戏进程的 ActiveMissionRequestEventList 轮询
         #   实测不带 mission_id（f1=0，与战斗服同款），combat.py 用它定位
         #   本局资源池/布局（否则回退 Mill 模板 → 资源数字错局）。
@@ -165,6 +168,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             metrics_session_id=metrics_session_id,
             mission_session_id=mission_session_id,
             squad_id=squad_id,
+            squad_slot=squad_slot,
             faction=faction if faction is not None else 3,
             db_chars=db_chars,
             loadout=loadout,
@@ -408,8 +412,6 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         team_runtime_faction_id = sess_faction   # ∈ BattleFieldSettings f18 factionId
         squad_template_id = 1                # WarDatabase/SquadTemplate 第一行 id=1
         faction_template_id = sess_faction    # 1=US 2=GE 3=SU（与 f18 行对齐）
-        owner_char_id = sess_char_id
-        squad_leader_char_id = sess_char_id
         # ★ f1 squadId 必须命中 ZServer squad 树里 PlayerSettings f16 注册的键：
         #   优先回显请求的 squadId（即客户端持有的 f16 值），无则用会话动态
         #   squad_id（与 PlayerSettings f16 同源生成），最后现场发号。
@@ -417,17 +419,38 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             int(mm_sess.get('squad_id', 0) or 0) if mm_sess else 0) or \
             matchmaking._next_match_id(matchmaking._MM_SQUAD_ID)
 
-        # playerSlots: 1 个突击步兵位（slotTemplateId 与 SquadPlayerSlotTemplate 对齐，
-        # WarDatabase/SquadPlayerSlotTemplate 对 squadTemplateId=1 有记录）
-        slot_def = b''
-        slot_def += pb_int64(1, 1)           # slotTemplateId
-        slot_def += pb_int32(2, 0)            # index=0
+        # ★ 局内小队定义：成局时 matchmaking 按分组登记（真实小队用大厅
+        #   传入的队名/队长；单人匹配自动凑队，rank 最高任队长）。
+        #   队内全体成员共享 squad_id（PlayerSettings f16 同源），每人占一个
+        #   playerSlot（index 与各自 PlayerSettings f17 squadSlotIndex 对齐）。
+        #   会话不在登记表（理论不可达，如重启残留）→ 回退单人单槽定义。
+        mission_id = int(mm_sess.get('mission_id', 0) or 0) if mm_sess else 0
+        sq_info = matchmaking._MM_MISSION_SQUADS.get(
+            mission_id, {}).get(squad_runtime_id) if mission_id else None
+        if sq_info is not None:
+            members = sq_info.get('members') or []
+            squad_name = str(sq_info.get('name') or 'PlayerSquad')
+            squad_leader_char_id = int(sq_info.get('leader_char_id', 0) or 0) \
+                or (int(members[0]['char_id']) if members else sess_char_id)
+            owner_char_id = squad_leader_char_id
+            # playerSlots：每名成员一个槽（slotTemplateId=1 突击步兵位，
+            # 与 SquadPlayerSlotTemplate 对齐；index=成员在队内槽位）
+            slots = b''.join(
+                pb_message(5, pb_int64(1, 1) + pb_int32(2, int(m['slot'])))
+                for m in members)
+            slot_count = len(members)
+        else:
+            squad_name = 'PlayerSquad'
+            owner_char_id = sess_char_id
+            squad_leader_char_id = sess_char_id
+            slots = pb_message(5, pb_int64(1, 1) + pb_int32(2, 0))
+            slot_count = 1
         squad_def = b''
         squad_def += pb_int64(1, team_runtime_faction_id)  # f1 missionSquadId (=team)
         squad_def += pb_int64(2, squad_template_id)        # f2 squadTemplateId
         squad_def += pb_int64(3, faction_template_id)      # f3 factionTemplateId (非零!)
-        squad_def += pb_string(4, 'PlayerSquad')           # f4 name
-        squad_def += pb_message(5, slot_def)                # f5 playerSlots ×1
+        squad_def += pb_string(4, squad_name)              # f4 name（大厅传入/队长名）
+        squad_def += slots                                  # f5 playerSlots ×N
         # f6 supportSlots: 空 repeated
         # f7 resources: 空 repeated
         squad_def += pb_int64(8, owner_char_id)            # f8 ownerCharacterId
@@ -444,7 +467,8 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             f'(pms_req={mission_session_id_req}, squadId_req={requested_squad_id}, '
             f'team/factionId={team_runtime_faction_id}, '
             f'squadTemplate={squad_template_id}, factionTemplate={faction_template_id}, '
-            f'playerSlots=1, {len(resp_proto)}B)')
+            f'name={squad_name!r}, leader_char={squad_leader_char_id}, '
+            f'playerSlots={slot_count}, {len(resp_proto)}B)')
         return True
 
     if req_type == 'RequestBattleFieldSettings':

@@ -77,7 +77,7 @@ from protocol import (
     pb_string,
     )
 
-from state import STORE, log
+from state import FLASH_SESSIONS, STORE, log
 
 from messages import _push_kvcs
 from matchmaking import _SOLO_SQUADS, _push_kvcs_delete
@@ -124,7 +124,7 @@ def _str(v):
 
 # ------------------------------------------------------------- KVCS 推送
 
-def _msg_squad_session(squad, members):
+def _msg_squad_session(squad, members, mission_id=0, entered=0):
     """SquadSession proto（22 字段，f11 缺失；repeated 空省略）。"""
     leader = next((m for m in members
                    if m['character_id'] == squad['leader_character_id']),
@@ -140,9 +140,9 @@ def _msg_squad_session(squad, members):
     m += pb_int32(9, 0)                              # usedCustomizationPoints
     m += pb_string(10, squad['name'])                # name
     m += pb_bool(12, squad['matchmaking_flag'])      # matchMakeWarMissionFlag
-    m += pb_int64(17, 0)                             # missionId
+    m += pb_int64(17, int(mission_id or 0))          # missionId
     m += pb_int64(18, squad['id'])                   # squadId
-    m += pb_int32(19, 0)                             # actionGamesEntered
+    m += pb_int32(19, int(entered or 0))             # actionGamesEntered
     m += pb_bool(20, False)                          # isLockedForMembers
     m += pb_bool(21, False)                          # isLockedForCustomization
     m += pb_bool(22, False)                          # forceReady
@@ -173,9 +173,12 @@ def _msg_squad_member_session(member, squad_id):
     return m
 
 
-async def push_squad_rows(sess, writer, squad_id):
-    """推送小队全部 KVCS 行（SquadSession + 全体 SquadMemberSession）。"""
-    if STORE is None or sess.playerview_cmd is None or not squad_id:
+async def push_squad_rows_to_writer(writer, view_cmd, squad_id, mission_id=0):
+    """整队 KVCS 行推给指定连接（底层；状态读 DB 实时值）。
+
+    matchmaking 进战局序列复用：真实小队成员各自的连接收到同一份
+    SquadSession(f17=missionId) + 全体 SquadMemberSession。"""
+    if STORE is None or view_cmd is None or not squad_id:
         return
     try:
         squad = await STORE.get_squad(squad_id)
@@ -183,15 +186,24 @@ async def push_squad_rows(sess, writer, squad_id):
             return
         members = await STORE.list_squad_members(squad_id)
     except Exception as e:
-        log(f'      [DB] push_squad_rows failed: {e}')
+        log(f'      [DB] push_squad_rows_to_writer failed: {e}')
         return
-    await _push_kvcs(writer, sess.playerview_cmd, b'SquadSession',
-                     _msg_squad_session(squad, members))
+    await _push_kvcs(writer, view_cmd, b'SquadSession',
+                     _msg_squad_session(squad, members, mission_id))
     for mem in members:
-        await _push_kvcs(writer, sess.playerview_cmd, b'SquadMemberSession',
+        await _push_kvcs(writer, view_cmd, b'SquadMemberSession',
                          _msg_squad_member_session(mem, squad_id))
-    log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
-        f'(SquadSession id={squad_id} + {len(members)} members)')
+    log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet '
+        f'(SquadSession id={squad_id} + {len(members)} members, '
+        f'mission={mission_id or 0})')
+
+
+async def push_squad_rows(sess, writer, squad_id, mission_id=0):
+    """推送小队全部 KVCS 行（SquadSession + 全体 SquadMemberSession）。"""
+    if sess.playerview_cmd is None:
+        return
+    await push_squad_rows_to_writer(writer, sess.playerview_cmd, squad_id,
+                                    mission_id)
 
 
 async def push_squad_member_row(sess, writer, member_row_id):
@@ -224,6 +236,82 @@ async def delete_squad_member_row(sess, writer, member_row_id):
                             member_row_id)
     log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
         f'(SquadMemberSession delete id={member_row_id})')
+
+
+def _online_member_sessions(members):
+    """成员列表 → 在线 Flash 会话列表（去重；仅含已订阅 playerview 的连接）。"""
+    seen, out = set(), []
+    for m in members:
+        s = FLASH_SESSIONS.get(m['gamertag'] or '')
+        if s is None or s.playerview_cmd is None:
+            continue
+        key = id(s)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+async def push_squad_rows_to_all_members(squad_id, mission_id=0):
+    """向全体在线成员的 Flash 连接推送整队 KVCS 行（跨会话同步）。
+
+    邀请接受/踢人/改名/排队/进战局等任何整队数据变化后调用，
+    否则其他成员要重登才能看到变化。"""
+    if STORE is None or not squad_id:
+        return
+    try:
+        squad = await STORE.get_squad(squad_id)
+        if squad is None:
+            return
+        members = await STORE.list_squad_members(squad_id)
+    except Exception as e:
+        log(f'      [DB] push_squad_rows_to_all_members failed: {e}')
+        return
+    for s in _online_member_sessions(members):
+        try:
+            await push_squad_rows(s, s.writer, squad_id, mission_id)
+        except Exception as e:
+            log(f'      [squad] push to {s.username!r} failed: {e}')
+
+
+async def push_squad_deletes_to_sessions(sessions, member_ids, squad_id):
+    """解散小队：向给定在线会话推 SquadSession + 全体成员行 DELETE。
+
+    sessions 必须在 dissolve_squad 落库前收集（解散后查库为空）。"""
+    for s in sessions:
+        if s.playerview_cmd is None:
+            continue
+        try:
+            for mid in member_ids:
+                await _push_kvcs_delete(s.writer, s.playerview_cmd,
+                                        b'SquadMemberSession', mid)
+            await _push_kvcs_delete(s.writer, s.playerview_cmd,
+                                    b'SquadSession', squad_id)
+            log(f'S->C cmd={s.playerview_cmd:<4} KeyValueChangeSet '
+                f'(SquadSession delete id={squad_id} + {len(member_ids)} '
+                f'members ★cross-session)')
+        except Exception as e:
+            log(f'      [squad] delete push to {s.username!r} failed: {e}')
+
+
+async def delete_squad_member_row_everywhere(member_row_id, squad_id):
+    """成员行 DELETE 推给该队全体在线成员（踢人/离队/拒绝邀请后）。"""
+    if STORE is None or not squad_id:
+        return
+    try:
+        members = await STORE.list_squad_members(squad_id)
+    except Exception as e:
+        log(f'      [DB] delete_squad_member_row_everywhere failed: {e}')
+        return
+    for s in _online_member_sessions(members):
+        if s.playerview_cmd is None:
+            continue
+        try:
+            await _push_kvcs_delete(s.writer, s.playerview_cmd,
+                                    b'SquadMemberSession', member_row_id)
+        except Exception as e:
+            log(f'      [squad] delete push to {s.username!r} failed: {e}')
 
 
 # ------------------------------------------------------------- 小队
@@ -341,6 +429,7 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
     code = RC_OK
     member_ids = []
     squad_id = 0
+    live_sessions = []
     if pid is None or STORE is None:
         code = RC_PLAYER_NOT_FOUND
     else:
@@ -352,6 +441,8 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
                 squad_id = squad['id']
                 members = await STORE.list_squad_members(squad_id)
                 member_ids = [m['id'] for m in members]
+                # 解散后查库为空 → 先收集在线会话再 dissolve
+                live_sessions = _online_member_sessions(members)
                 await STORE.dissolve_squad(squad_id)
                 log(f'      [DB] dissolve_squad id={squad_id} '
                     f'({len(member_ids)} members)')
@@ -360,12 +451,16 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
             code = RC_SQUAD_NOT_FOUND
 
     if code == RC_OK and sess.playerview_cmd is not None:
-        for mid in member_ids:
-            await _push_kvcs_delete(writer, sess.playerview_cmd,
-                                    b'SquadMemberSession', mid)
-        if squad_id:
-            await _push_kvcs_delete(writer, sess.playerview_cmd,
-                                    b'SquadSession', squad_id)
+        # 解散行推给全体在线成员（含解散者本人的连接）
+        await push_squad_deletes_to_sessions(live_sessions, member_ids,
+                                             squad_id)
+        if sess not in live_sessions:
+            for mid in member_ids:
+                await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                        b'SquadMemberSession', mid)
+            if squad_id:
+                await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                        b'SquadSession', squad_id)
         log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
             f'(SquadSession delete id={squad_id} + {len(member_ids)} members)')
 
@@ -390,13 +485,17 @@ async def handle_remove_squad_member(sess, writer, cmd_id, req_type, proto):
 
     pid = await sess.ensure_player()
     code = RC_OK
+    removed_squad_id = 0
     if pid is None or STORE is None or not member_row:
         code = RC_SQUAD_SLOT_NOT_FOUND
     else:
         try:
+            mem = await STORE.get_squad_member(member_row)
+            removed_squad_id = int(mem['squad_id']) if mem else 0
             removed = await STORE.remove_squad_member(member_row)
             if not removed:
                 code = RC_SQUAD_SLOT_NOT_FOUND
+                removed_squad_id = 0
             else:
                 log(f'      [DB] remove_squad_member row={member_row}')
         except Exception as e:
@@ -405,6 +504,8 @@ async def handle_remove_squad_member(sess, writer, cmd_id, req_type, proto):
 
     if code == RC_OK:
         await delete_squad_member_row(sess, writer, member_row)
+        # 队长/其他成员实时看到成员移除；被移除者若在线也收到
+        await delete_squad_member_row_everywhere(member_row, removed_squad_id)
 
     resp = build_response(cmd_id, 'RemoveSquadMemberResponse',
                           pb_int32(1, code))
@@ -452,6 +553,18 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
 
     if code == RC_OK and member_row:
         await push_squad_member_row(sess, writer, member_row)
+        # 被邀请方实时收邀请（整队行含其 pending 成员行 → 弹邀请提示）；
+        # 不推则对方要重登才能看到邀请
+        if STORE is not None:
+            invited_tag = await STORE.get_username(int(friend_player_id))
+            invited_sess = FLASH_SESSIONS.get(invited_tag or '')
+            if invited_sess is not None and invited_sess.playerview_cmd is not None:
+                try:
+                    await push_squad_rows(invited_sess, invited_sess.writer,
+                                          squad['id'])
+                except Exception as e:
+                    log(f'      [squad] invite push to {invited_tag!r} '
+                        f'failed: {e}')
 
     resp = build_response(cmd_id, 'SquadInvitePlayerResponse',
                           pb_int32(1, code))
@@ -477,6 +590,7 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
 
     pid = await sess.ensure_player()
     code = RC_OK
+    declined_squad_id = 0
     if pid is None or STORE is None or not member_row:
         code = RC_SQUAD_SLOT_NOT_FOUND
     else:
@@ -492,6 +606,7 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
                 log(f'      [DB] squad_invite accepted row={member_row} '
                     f'char={char_id or mem["character_id"]}')
             else:
+                declined_squad_id = int(mem['squad_id'])
                 await STORE.remove_squad_member(member_row)
                 log(f'      [DB] squad_invite declined row={member_row}')
         except Exception as e:
@@ -505,8 +620,13 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
                 if STORE is not None else None
             if mem_row is not None:
                 await push_squad_rows(sess, writer, mem_row['squad_id'])
+                # 队长等在线成员实时看到新成员入队
+                await push_squad_rows_to_all_members(mem_row['squad_id'])
         else:
             await delete_squad_member_row(sess, writer, member_row)
+            # 队长的待确认列表实时移除该行
+            await delete_squad_member_row_everywhere(member_row,
+                                                     declined_squad_id)
 
     resp = build_response(cmd_id, 'SquadRespondToInviteResponse',
                           pb_int32(1, code))
@@ -551,6 +671,8 @@ async def handle_set_squad_details(sess, writer, cmd_id, req_type, proto):
 
     if code == RC_OK and squad_name and squad_id:
         await push_squad_rows(sess, writer, squad_id)
+        # 改名同步给全体在线成员
+        await push_squad_rows_to_all_members(squad_id)
 
     resp = build_response(cmd_id, 'SetSquadDetailsResponse', pb_int32(1, code))
     writer.write(resp)
@@ -588,6 +710,8 @@ async def handle_set_squad_matchmaking_flag(sess, writer, cmd_id, req_type,
 
     if code == RC_OK:
         await push_squad_rows(sess, writer, squad_session_id)
+        # 匹配开关同步给全体在线成员（小队界面状态一致）
+        await push_squad_rows_to_all_members(squad_session_id)
 
     resp = build_response(cmd_id, 'SetSquadMatchMakingFlagResponse',
                           pb_int32(1, code))
@@ -634,6 +758,11 @@ async def handle_set_squad_member_status(sess, writer, cmd_id, req_type,
 
     if code == RC_OK:
         await push_squad_member_row(sess, writer, slot_id)
+        # 成员状态变化（Ready/换角色）同步给全体在线成员
+        if STORE is not None:
+            mem = await STORE.get_squad_member(slot_id)
+            if mem is not None:
+                await push_squad_rows_to_all_members(int(mem['squad_id']))
 
     resp = build_response(cmd_id, 'SetSquadMemberStatusResponse',
                           pb_int32(1, code))

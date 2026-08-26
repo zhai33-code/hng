@@ -222,17 +222,32 @@ async def main():
     mark('生涯军令进度', p1 == 1 and s1 == 1 and p2 == 2 and s2 == 1,
          f' progress={p2} status={s2}')
 
-    # 5.4 好友（a→b 请求 → b→a 转正 → 列表 → 删除）
+    # 5.4 好友（a→b 请求 → 双向 pending 可见 → 重复邀请幂等 → b→a 转正 → 删除）
     r = await st.add_friend(ta, tb)
     rows = await st.list_friend_rows(ta)
+    rows_b = await st.list_friend_rows(tb)
+    r_dup = await st.add_friend(ta, tb)          # 重复邀请不得单方面转正
+    rows_dup = await st.list_friend_rows(ta)
+    mark('好友pending双向可见',
+         len(rows_b) == 1 and rows_b[0]['id'] == int(ta)
+         and not rows_b[0]['also_friend']
+         and not rows_b[0]['initiated_by_me']
+         and len(rows) == 1 and rows[0]['initiated_by_me']
+         and not rows[0]['also_friend']
+         and r_dup == 'ok' and len(rows_dup) == 1
+         and not rows_dup[0]['also_friend'])
     r2 = await st.add_friend(tb, ta)
     rows2 = await st.list_friend_rows(ta)
+    rows2_b = await st.list_friend_rows(tb)
     good = (r == 'ok' and r2 == 'accepted' and len(rows2) == 1
-            and rows2[0]['id'] == int(tb) and rows2[0]['also_friend'])
+            and rows2[0]['id'] == int(tb) and rows2[0]['also_friend']
+            and len(rows2_b) == 1 and rows2_b[0]['also_friend'])
     mark('好友请求→转正→列表', good)
     deleted = await st.remove_friend(ta, tb)
     rows3 = await st.list_friend_rows(ta)
     mark('好友删除(双向)', deleted and not rows3)
+    name_a = await st.get_username(ta)
+    mark('id反查用户名', name_a == 'u9db_a', f' {name_a!r}')
 
     # 5.5 邮件（发送 → 线程组装 → 回复继承线程）
     (m1,) = await st.send_mail(ta, [tb], 'U9 subject', 'U9 body')
@@ -266,6 +281,29 @@ async def main():
     mark('门票 购/列/限时激活', trow is not None and trow['expires_at'] is None
          and tcode == 1 and any(t['id'] == tid for t in trows))
 
+    # 5.7 武器槽位替换（挤槽：set_weapon_equipment 须把同容器同槽位旧武器归零）
+    w_a = await st.create_weapon(ta, 'U9GunA', 5, ca['id'], 0)
+    w_b = await st.create_weapon(ta, 'U9GunB', 5, ca['id'], 0)
+    aff1 = await st.set_weapon_equipment(ta, w_a['id'], ca['id'], 1)
+    aff2 = await st.set_weapon_equipment(ta, w_b['id'], ca['id'], 1)
+    after = {w['id']: w for w in await st.list_weapons(ta)}
+    good = (len(aff1) == 1 and len(aff2) == 2
+            and after[w_a['id']]['container_id'] == 0
+            and after[w_a['id']]['container_slot'] == 0
+            and after[w_b['id']]['container_id'] == ca['id']
+            and after[w_b['id']]['container_slot'] == 1
+            and {int(a['id']) for a in aff2} == {int(w_a['id']), int(w_b['id'])})
+    mark('武器挤槽（同槽新武器顶掉旧武器）', good,
+         f" A=({after[w_a['id']]['container_id']},{after[w_a['id']]['container_slot']})"
+         f" B=({after[w_b['id']]['container_id']},{after[w_b['id']]['container_slot']})")
+    # 卸下路径：set_weapon_equipment(ta, w_b, 0, 0) 后两把均归库
+    aff3 = await st.set_weapon_equipment(ta, w_b['id'], 0, 0)
+    after3 = {w['id']: w for w in await st.list_weapons(ta)}
+    good = (len(aff3) == 1
+            and after3[w_b['id']]['container_id'] == 0
+            and after3[w_b['id']]['container_slot'] == 0)
+    mark('武器卸下归库', good)
+
     # 收尾清理（测试账号保留，行数据清除）
     async with st.pool.acquire() as conn:
         await conn.execute('DELETE FROM mail_messages WHERE sender_id IN ($1,$2) '
@@ -275,6 +313,8 @@ async def main():
         await conn.execute('DELETE FROM character_stats WHERE character_id = $1',
                            int(ca['id']))
         await conn.execute('DELETE FROM career_orders WHERE player_id = $1', int(ta))
+        await conn.execute("DELETE FROM weapons WHERE player_id = $1 "
+                           "AND name IN ('U9GunA','U9GunB')", int(ta))
     print('  [cleanup] U9 测试行已清理')
 
     await st.close()

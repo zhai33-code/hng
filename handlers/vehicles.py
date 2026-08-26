@@ -23,7 +23,7 @@ from wardb import (
     _E_VEHICLE,
     _E_VEHICLES_VARIANT,
     _E_VEHICLE_UPGRADE_MAPPING,
-    _UNLOCK_BY_ITEM,
+    _REQ_UNLOCK_BY_ITEM,
     _VEHICLE_UPGRADE_MAXCOND,
     _VEHICLE_UPGRADE_SLOT,
     _VEHICLE_VARIANT_PARENT,
@@ -86,8 +86,10 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
 
     # 解锁校验：买新载具判定用 eVehicle(4) + eVehiclesVariant(15)；
     # 给已有载具买皮肤判定用皮肤模板的 eVehiclesVariant(15)。需求为空视为无门槛。
-    req4 = _UNLOCK_BY_ITEM.get((vv_template_id, _E_VEHICLE), set())
-    req15 = _UNLOCK_BY_ITEM.get(
+    # 用 _REQ_UNLOCK_BY_ITEM：level=0 条目是专属勋带关联（如 Yak-9 Specialist），
+    # 不是购买门槛，全量映射会误拒（2026-08-26 Yak-9 variant 215 被拒事故）。
+    req4 = _REQ_UNLOCK_BY_ITEM.get((vv_template_id, _E_VEHICLE), set())
+    req15 = _REQ_UNLOCK_BY_ITEM.get(
         ((vv_extra_template_id if is_skin_purchase else vv_template_id),
          _E_VEHICLES_VARIANT), set())
     need4 = await _unlock_need_for_char(sess, vv_char_id, req4)
@@ -417,7 +419,8 @@ async def handle_createvehicleupgraderequest(sess, writer, cmd_id, req_type, pro
 
     # 解锁校验：客户端用 canCharacterUseItem(slotId,...,eVehicleUpgradeMapping) 判定，
     # 服务端一致——角色 bits 需包含该槽位的需求 uid（按角色阵营/职业过滤后；需求为空视为无门槛）
-    req = _UNLOCK_BY_ITEM.get((slot_id, _E_VEHICLE_UPGRADE_MAPPING), set())
+    # 同样用 _REQ_UNLOCK_BY_ITEM 剔除 level=0 关联条目（type=8 有 185 条）
+    req = _REQ_UNLOCK_BY_ITEM.get((slot_id, _E_VEHICLE_UPGRADE_MAPPING), set())
     need = await _unlock_need_for_char(sess, vu_char_id, req)
     if need:
         char_uids = await _char_bits_for(sess, vu_char_id)

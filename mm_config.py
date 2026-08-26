@@ -70,6 +70,17 @@ def gamemode_cfg(gamemode_id):
     return GAMEMODES.get(int(gamemode_id), DEFAULT_GAMEMODE)
 
 
+# 等待期中途加入窗口（秒）：战局成局后该窗口内，新排队玩家可直接加入
+# 同模式、选图兼容、未满员的现有战局（仍在开局等待/倒计时阶段），而不是
+# 另开新局。窗口从成局时刻起算（含专用服加载地图 + 客户端加载 + 开局倒计时
+# 的并行时间）。0 = 禁用中途加入（每人/每组固定撮合开新局）。
+# MM_JOIN_WINDOW 环境变量覆盖。
+JOIN_WINDOW = _int_env('MM_JOIN_WINDOW', 90)
+if JOIN_WINDOW < 0:
+    print(f'[mm_config] WARNING: MM_JOIN_WINDOW={JOIN_WINDOW} < 0, '
+          f'using 0 (disabled)')
+    JOIN_WINDOW = 0
+
 # combat server 并发上限：达到上限时成组的战局排队等待（不拉起进程），
 # 有实例释放（release_match）后按成局先后顺序拉起。0 = 不限制。
 MAX_CONCURRENT_COMBAT_SERVERS = _int_env('MM_MAX_COMBAT_SERVERS', 4)

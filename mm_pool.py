@@ -28,6 +28,7 @@ class QueueEntry:
     gamemode_id: int
     presets: tuple = ()          # 玩家选图（int preset id），空 = 不限
     enqueued_at: float = field(default_factory=time.monotonic)
+    group_key: int = 0           # 整队入池键（=squad_id）；0 = 单人
 
 
 @dataclass
@@ -110,13 +111,32 @@ class MatchPool:
 
     # ---- 内部 ----
     def _collect_group(self, entries, min_p, max_p):
-        """以最早 entry 为锚点收集同图兼容组；不足 min_p 返回 None。"""
+        """以最早 entry 为锚点收集同图兼容组；不足 min_p 返回 None。
+
+        整队（group_key 非 0）原子进出：锚点所在队先全员进组（同队
+        选图由入池方保证一致，跳过兼容判断）；其他队要么整队收编
+        （全队兼容且装得下），要么整队跳过——绝不拆队。"""
         anchor = entries[0]
         group = [anchor]
+        if anchor.group_key:
+            for e in entries[1:]:
+                if (e.group_key == anchor.group_key
+                        and len(group) < max_p and e not in group):
+                    group.append(e)
         for e in entries[1:]:
             if len(group) >= max_p:
                 break
-            if self._compatible(anchor, e):
+            if e in group:
+                continue
+            if e.group_key:
+                mates = [x for x in entries
+                         if x.group_key == e.group_key and x not in group]
+                if not mates or len(group) + len(mates) > max_p:
+                    continue           # 装不下整队 → 跳过（不拆队）
+                if not all(self._compatible(anchor, x) for x in mates):
+                    continue
+                group.extend(mates)
+            elif self._compatible(anchor, e):
                 group.append(e)
         if len(group) < min_p:
             return None

@@ -16,7 +16,7 @@ from protocol import (
     pb_string,
     )
 
-from state import FLASH_SESSIONS, PUBLIC_HOST, log
+from state import FLASH_SESSIONS, PUBLIC_HOST, STORE, log
 
 from wardb import (
     SHOP_TABLE_FILES,
@@ -39,11 +39,14 @@ from .career import (
     push_career_order_row,
     push_season_templates,
     )
+from .characters import push_tutorial_row
 from .economy import push_economy_rows
 from .social import (
+    notify_friends_of,
     push_friend_rows,
     push_ignored_rows,
     )
+from .squad import push_squad_rows
 
 
 # HostingCenter ping 地址：客户端 HostingCenterTable 收到行后经 hngsync 测时 ping 该地址，
@@ -146,10 +149,27 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
             await push_career_order_row(sess, writer, int(pid))
             await push_season_templates(sess, writer)
             await push_battle_pass_row(sess, writer, int(pid))
+            # Tutorial 行（已触发教程集）：客户端 TutorialTable 只认 KVCS 行，
+            # 不推则战报关闭后 wasTriggered(CAREER_ORDER_TUTORIAL_ID=2) 恒
+            # false → 每次都切士兵界面重播生涯军令引导
+            await push_tutorial_row(sess, writer, int(pid))
             # 好友列表 + 屏蔽名单（friendinfo / ignoredplayerwithname 表）：
             # 好友界面数据源，不推则列表恒空。
             await push_friend_rows(sess, writer, int(pid))
             await push_ignored_rows(sess, writer, int(pid))
+            # 上线广播：在线好友的好友列表里把我的 onlinestatus 刷成 1，
+            # 否则对方要重登才能看到我在线
+            await notify_friends_of(int(pid))
+            # 真实小队行（SquadSession + SquadMemberSession）：重登录成员的
+            # 小队界面数据源，不推则重登后小队 UI 为空（整队匹配的前提）
+            if STORE is not None:
+                try:
+                    squad = await STORE.get_squad_for_player(int(pid))
+                except Exception as e:
+                    log(f'      [DB] get_squad_for_player failed: {e}')
+                    squad = None
+                if squad is not None:
+                    await push_squad_rows(sess, writer, squad['id'])
             # 经济道具行（PlayerMembershipItem / Booster / Ticket / TicketTimed）：
             # 会员/加成/修理票 UI 数据源，不推则购买记录重启后丢失。
             await push_economy_rows(sess, writer, int(pid))

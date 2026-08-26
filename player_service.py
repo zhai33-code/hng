@@ -28,6 +28,7 @@ from wardb import (
     _ITEM_UNLOCK_UIDS,
     _MOD_MAPPING_IDS,
     _PRICING_MAP,
+    _RANK_META_LEVEL,
     _RIBBON_META_LEVEL,
     _UNLOCK_BY_ITEM,
     _UNLOCK_UID_META,
@@ -185,6 +186,25 @@ async def _char_unlock_bits_for(sess, template, faction, char_id=0):
                 for (uid, meta_lv) in _RIBBON_META_LEVEL.get(str(ribbon_id), set()):
                     if meta_lv <= lv:
                         ids.add(uid)
+            # eRank（军衔）解锁：unlockType=2、metaName 恒 '0' 哨兵——
+            # First Blood badge（rank 1）、职业模板（rank 5/6/8/9）、
+            # 小队自定义点数（rank 12+）等 26 条。旧实现漏掉此路径，
+            # 这些条目永锁。faction/charType 过滤同勋带路径语义。
+            if char_id:
+                _xp = 0
+                for ch in await STORE.list_characters(pid):
+                    if int(ch['id']) == int(char_id):
+                        _xp = int(ch.get('combat_xp', 0) or 0)
+                        break
+                _rank = _rank_from_combat_xp(_xp)
+                for (uid, meta_lv, _itype) in _RANK_META_LEVEL:
+                    if meta_lv > _rank:
+                        continue
+                    _fac, _ct = _UNLOCK_UID_META.get(uid, (0, 0))
+                    if (_fac and _fac != int(faction)) or \
+                       (_ct and _ct != int(template)):
+                        continue
+                    ids.add(uid)
             # ★已购物品按角色查询（官方解锁按士兵独立）：store 层 character_id
             # 过滤（SQL 级），账号级不过滤会把其他角色（含已删号）的武器解锁
             # uid 泄漏进当前角色位图 —— 例如已删旧号的 t24 PPD-40 / t52 Bazooka

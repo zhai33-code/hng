@@ -12,8 +12,10 @@ from protocol import (
     Chunk,
     build_response,
     pb_int32,
+    pb_int64,
     pb_message,
     pb_parse,
+    pb_string,
     )
 
 from state import (
@@ -801,6 +803,34 @@ async def handle_setdepotitemviewedrequest(sess, writer, cmd_id, req_type, proto
     log(f'S->C cmd={cmd_id:<4} SetDepotItemViewedResponse (response=1 ok)')
 
 
+# 教程已触发默认集：与 PlayerSettings f28 triggeredTutorialTemplateIds 同源
+# （[1,2,3,4]+6..29，跳过 5）。客户端 TutorialTable.wasTriggered 只认
+# KVCS Tutorial 行（id/playerId/triggeredTutorialTemplateIds 逗号串），
+# 不推该行则 wasTriggered 恒 false：战报关闭时 MissionBattleReportMediator
+# 每次 dispatch CAREER_ORDER_TUTORIAL_ID(=2) → 生涯军令引导反复弹出。
+_DEFAULT_TRIGGERED_TUTORIALS = [1, 2, 3, 4] + list(range(6, 30))
+
+
+async def push_tutorial_row(sess, writer, pid):
+    """推玩家 Tutorial KVCS 行（id=playerId，单行聚合已触发教程集）。
+
+    triggeredTutorialTemplateIds = 默认集 ∪ player_tutorials_triggered 持久化集。"""
+    if sess.playerview_cmd is None:
+        return
+    triggered = set(_DEFAULT_TRIGGERED_TUTORIALS)
+    if STORE is not None:
+        try:
+            triggered.update(await STORE.list_tutorials_triggered(int(pid)))
+        except Exception as e:
+            log(f'[DB] list_tutorials_triggered failed: {e}')
+    m = pb_int64(1, int(pid))                      # id
+    m += pb_int64(2, int(pid))                     # playerId
+    m += pb_string(3, ','.join(str(t) for t in sorted(triggered)))
+    await _push_kvcs(writer, sess.playerview_cmd, b'Tutorial', m)
+    log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+        f'(Tutorial id={pid}, {len(triggered)} triggered templates)')
+
+
 async def handle_marktutorialtriggeredrequest(sess, writer, cmd_id, req_type, proto):
     # 教程已触发（幂等；完成态走 SetTutorialCompletedRequest）
     # MarkTutorialTriggeredRequest { int64 tutoriaTemplateId=1; int64 playerId=2; }
@@ -819,6 +849,9 @@ async def handle_marktutorialtriggeredrequest(sess, writer, cmd_id, req_type, pr
             await STORE.mark_tutorial_triggered(pid, int(mt_tutorial_id))
         except Exception as e:
             log(f'[DB] mark_tutorial_triggered failed: {e}')
+        # 重推 Tutorial 行（客户端 TutorialTable 只认 KVCS 行，
+        # 不重推则 wasTriggered 恒 false → 战报关闭后重复弹生涯军令引导）
+        await push_tutorial_row(sess, writer, pid)
 
     resp_proto = pb_int32(1, 1)  # response = 1 (ok)
     resp = build_response(cmd_id, 'MarkTutorialTriggeredResponse', resp_proto)

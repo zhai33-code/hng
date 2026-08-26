@@ -23,6 +23,9 @@ DB 落点（player_store，2026-08-21 U1 建表）：
 - CareerOrderActionGame → career_orders.progress
 """
 
+import time
+import zlib
+
 import matchmaking
 from protocol import (
     build_response,
@@ -35,6 +38,9 @@ from protocol import (
 from state import FLASH_SESSIONS, PUBLIC_HOST, STORE, log
 from wardb import _RIBBON_LEVEL_XP, _rank_from_combat_xp, commandnode_template
 from warserver_messages import _accesspoint_layout, _msg_army_resource_list
+
+# career 只依赖 protocol/state/messages/player_service/wardb，无回指 combat
+from .career import _ACTIVE_SEASON as _BP_ACTIVE_SEASON
 
 # 与 matchmaking 成局 game_connect 同源（PUBLIC_HOST；mission.py _GAME_CONNECT）
 _GAME_CONNECT = f'{PUBLIC_HOST}:5678'
@@ -108,6 +114,35 @@ def _all(items, fn):
 def _as_str(v):
     return v.decode('utf-8', 'replace') if isinstance(v, (bytes, bytearray)) else \
         (str(v) if v is not None else '')
+
+
+def _earnings_value(raw):
+    """BattleReportEarnings 嵌套消息 → valueEarned（f1；f2-f7 加成实测恒 0）。
+
+    BattleReportCharacter f10 creditEarnings / f11 warfundEarnings 是嵌套消息
+    （BattleReportEarnings，0x1807b3e58），不是整数——2026-08-26 结算崩溃
+    ValueError 即 int(bytes) 所致。"""
+    if not isinstance(raw, (bytes, bytearray)) or not raw:
+        return 0
+    try:
+        return int(_get(_split_fields(raw), 1, 0) or 0)
+    except Exception:
+        return 0
+
+
+def _report_ribbon_end(br_players):
+    """(playerId, characterId) → {ribbonTemplateId: endValue}（f13 战后勋带 XP）。"""
+    out = {}
+    for p in br_players:
+        pid = int(p.get('player_id', 0) or 0)
+        for ch in p.get('characters') or []:
+            ends = {}
+            for rb in ch.get('ribbons') or []:
+                if isinstance(rb, dict) and rb.get('id'):
+                    ends[int(rb['id'])] = int(rb.get('end', 0) or 0)
+            if ends:
+                out[(pid, int(ch.get('characterId', 0) or 0))] = ends
+    return out
 
 
 def _session_by_player(player_id):
@@ -620,8 +655,10 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
       BattleReportFaction{f1 factionId, f2 repeated BattleReportPlayer}, f7 capturepoints }
     BattleReportPlayer { f1 playerId, f4 score, f5 captures, f6 kills, f7 deaths,
       f8 squadName, f9 gamertag, f10 isBot, f11 repeated BattleReportCharacter }
-    BattleReportCharacter { f1 characterId, f2 startXp, f3 endXp, f10 creditEarnings,
-      f11 warfundEarnings, f13 ribbons }
+    BattleReportCharacter { f1 characterId, f2 startXp, f3 endXp,
+      f10/f11 嵌套 BattleReportEarnings{f1 valueEarned, f2-f7 加成, f8 statValues,
+      f9 anyFactionQuickplay}（warserver-battlefield-settings.md §8.2 实测：
+      顶层 181b22a036… 的 f10 是 0x08… 嵌套消息，非整数），f13 ribbons }
     PlayerBattleResult { f1 playerId, f2 creditsEarned, f3 warfundsEarned,
       f4 skillScore, f5 playerScore, f6 repeated CharacterBattleResult{f1 characterId,
       f2 totalCharacterXp, f3 playerDamage, f4 vehicleDamage, f5 capturepointsCaptured,
@@ -631,7 +668,13 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
     DB 落点：battle_reports + battle_report_players（按 missionSessionId 幂等）、
     characters.combat_xp += (endXp-startXp)、character_ribbon_xp（达成等级取阈值
     下限）、players.credits/warfunds += 结算收益、character_stats(kills/deaths/
-    score/captures/damage)。响应恒 response=1（DB 异常仅记日志不阻塞客户端）。
+    score/captures/damage)。响应恒 response=1 且必发（解析/DB 异常仅记日志，
+    不回滚收尾——否则战斗服 pending wait 超时、大厅卡 rejoin、无结算）。
+
+    战局结束收尾（_finish_mission_sessions）：对局内每名玩家的 Flash 连接推
+    solo squad 重置 + PlayerMissionSession DELETE（清 rejoin）+
+    Notification(NewBattleReport)（客户端自动 GetBattleReport → 弹出
+    MissionBattleReportWindow 结算界面 + 对局记录入托盘）。
     """
     try:
         items = _split_fields(proto)
@@ -642,6 +685,11 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
     mission_id = int(_get(items, 1, 0) or 0)
     mission_session_id = int(_get(items, 2, 0) or 0)
     mission_preset_id = int(_get(items, 3, 0) or 0)
+    # 实测 earnings 顶层 f1 missionId 缺省（proto 首字段是 f3 preset）——
+    # 用握手时记录在连接上的本局 mission 兜底，否则 release/收尾找不到局
+    if not mission_id:
+        mission_id = int(getattr(sess, 'combat_mission', 0) or 0) or \
+            int(getattr(sess, 'game_mission', 0) or 0)
 
     # ---- BattleReport（f4）
     br_players = []          # save_battle_report 的 players 行
@@ -652,69 +700,109 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
         'winner_faction_id': 0, 'defender_faction_id': 0,
         'mission_time_seconds': 0, 'battle_start_time': 0,
     }
-    br_raw = _get(items, 4, b'')
-    if isinstance(br_raw, (bytes, bytearray)) and br_raw:
-        br = _split_fields(br_raw)
-        report['mission_session_id'] = int(_get(br, 1, mission_session_id) or 0)
-        report['defender_faction_id'] = int(_get(br, 2, 0) or 0)
-        report['winner_faction_id'] = int(_get(br, 3, 0) or 0)
-        report['mission_time_seconds'] = int(_get(br, 4, 0) or 0)
-        report['battle_start_time'] = int(_get(br, 5, 0) or 0)
-        for fac_raw in _all(br, 6):                  # BattleReportFaction
-            fac = _split_fields(fac_raw)
-            faction_id = int(_get(fac, 1, 0) or 0)
-            for p_raw in _all(fac, 2):               # BattleReportPlayer
-                p = _split_fields(p_raw)
-                chars = []
-                for c_raw in _all(p, 11):            # BattleReportCharacter
-                    c = _split_fields(c_raw)
-                    chars.append({
-                        'characterId': int(_get(c, 1, 0) or 0),
-                        'startXp': int(_get(c, 2, 0) or 0),
-                        'endXp': int(_get(c, 3, 0) or 0),
-                        'creditEarned': int(_get(c, 10, 0) or 0),
-                        'warfundEarned': int(_get(c, 11, 0) or 0),
-                        'ribbons': [int(_get(_split_fields(r), 1, 0) or 0)
-                                    for r in _all(c, 13)],
-                        'factionId': faction_id,
+    try:
+        br_raw = _get(items, 4, b'')
+        if isinstance(br_raw, (bytes, bytearray)) and br_raw:
+            br = _split_fields(br_raw)
+            report['mission_session_id'] = int(_get(br, 1, mission_session_id) or 0)
+            report['defender_faction_id'] = int(_get(br, 2, 0) or 0)
+            report['winner_faction_id'] = int(_get(br, 3, 0) or 0)
+            report['mission_time_seconds'] = int(_get(br, 4, 0) or 0)
+            report['battle_start_time'] = int(_get(br, 5, 0) or 0)
+            for fac_raw in _all(br, 6):                  # BattleReportFaction
+                fac = _split_fields(fac_raw)
+                faction_id = int(_get(fac, 1, 0) or 0)
+                for p_raw in _all(fac, 2):               # BattleReportPlayer
+                    p = _split_fields(p_raw)
+                    chars = []
+                    for c_raw in _all(p, 11):            # BattleReportCharacter
+                        c = _split_fields(c_raw)
+                        # f13 ribbons：PlayerBattleReportRibbon{f1 模板id,
+                        # f2 startValue, f3 endValue}——战报界面勋带进度条
+                        # 直接用这两个值画（客户端 start==end 会跳过不显示）
+                        ribbons = []
+                        for r_raw in _all(c, 13):
+                            rf = _split_fields(r_raw)
+                            ribbons.append({
+                                'id': int(_get(rf, 1, 0) or 0),
+                                'start': int(_get(rf, 2, 0) or 0),
+                                'end': int(_get(rf, 3, 0) or 0),
+                            })
+                        credit = _earnings_value(_get(c, 10, b''))
+                        warfund = _earnings_value(_get(c, 11, b''))
+                        chars.append({
+                            'characterId': int(_get(c, 1, 0) or 0),
+                            'startXp': int(_get(c, 2, 0) or 0),
+                            'endXp': int(_get(c, 3, 0) or 0),
+                            'creditEarned': credit,
+                            'creditVetBonus': credit * 25 // 100,
+                            'warfundEarned': warfund,
+                            'warfundVetBonus': warfund * 25 // 100,
+                            'ribbons': ribbons,
+                            'factionId': faction_id,
+                        })
+                    br_players.append({
+                        'player_id': int(_get(p, 1, 0) or 0),
+                        'score': int(_get(p, 4, 0) or 0),
+                        'captures': int(_get(p, 5, 0) or 0),
+                        'kills': int(_get(p, 6, 0) or 0),
+                        'deaths': int(_get(p, 7, 0) or 0),
+                        'squad_name': _as_str(_get(p, 8, b'')),
+                        'gamertag': _as_str(_get(p, 9, b'')),
+                        'is_bot': bool(_get(p, 10, 0)),
+                        'characters': chars,
                     })
-                br_players.append({
-                    'player_id': int(_get(p, 1, 0) or 0),
-                    'score': int(_get(p, 4, 0) or 0),
-                    'captures': int(_get(p, 5, 0) or 0),
-                    'kills': int(_get(p, 6, 0) or 0),
-                    'deaths': int(_get(p, 7, 0) or 0),
-                    'squad_name': _as_str(_get(p, 8, b'')),
-                    'gamertag': _as_str(_get(p, 9, b'')),
-                    'is_bot': bool(_get(p, 10, 0)),
-                    'characters': chars,
-                })
+    except Exception as e:
+        log(f'      [combat] BattleReport parse error: {e}')
+
+    # msid=0（本地战斗服不发 BattleReport f1）时合成唯一幂等键：
+    # 同局重复结算键值稳定（幂等保留），不同局互不覆盖——否则所有
+    # msid=0 战报挤同一行，后一局会把前一局的 players 全部擦掉。
+    # 取负数区间，避开真实 msid（大正数）。
+    # 键来源：battle_start_time（首选，局唯一）；缺省时用结算内容指纹
+    # （时长/胜方/玩家集合），同局重复结算内容一致 → 键一致。
+    if not report['mission_session_id']:
+        if report['battle_start_time']:
+            key = (f"{report['mission_id']}:{report['battle_start_time']}:"
+                   f"{report['mission_time_seconds']}")
+        else:
+            key = (f"{report['mission_id']}:{report['mission_time_seconds']}:"
+                   f"{report['winner_faction_id']}:"
+                   f"{sorted(p['player_id'] for p in br_players)}:"
+                   f"{sum(p['score'] for p in br_players)}")
+        report['mission_session_id'] = -(zlib.crc32(key.encode()) or 1)
+        log(f'      [combat] msid missing, synthesized '
+            f'{report["mission_session_id"]} (mission={report["mission_id"]}, '
+            f'start={report["battle_start_time"]})')
 
     # ---- PlayerBattleResult（f5）：货币 + 角色战斗明细
     currency_ops = []       # (player_id, credits, warfunds)
     char_results = []       # (player_id, char_dict)
-    for pr_raw in _all(items, 5):
-        pr = _split_fields(pr_raw)
-        pr_pid = int(_get(pr, 1, 0) or 0)
-        credits = int(_get(pr, 2, 0) or 0)
-        warfunds = int(_get(pr, 3, 0) or 0)
-        if pr_pid:
-            currency_ops.append((pr_pid, credits, warfunds))
-        for c_raw in _all(pr, 6):                    # CharacterBattleResult
-            c = _split_fields(c_raw)
-            entry = {
-                'characterId': int(_get(c, 1, 0) or 0),
-                'totalCharacterXp': int(_get(c, 2, 0) or 0),
-                'playerDamage': int(_get(c, 3, 0) or 0),
-                'vehicleDamage': int(_get(c, 4, 0) or 0),
-                'capturepointsCaptured': int(_get(c, 5, 0) or 0),
-                'capturepointsNeutralized': int(_get(c, 6, 0) or 0),
-                'timeActive': int(_get(c, 7, 0) or 0),
-                'ribbons': [(int(_get(_split_fields(r), 1, 0) or 0),
-                             int(_get(_split_fields(r), 2, 0) or 0))
-                            for r in _all(c, 9)],
-            }
-            char_results.append((pr_pid, entry))
+    try:
+        for pr_raw in _all(items, 5):
+            pr = _split_fields(pr_raw)
+            pr_pid = int(_get(pr, 1, 0) or 0)
+            credits = int(_get(pr, 2, 0) or 0)
+            warfunds = int(_get(pr, 3, 0) or 0)
+            if pr_pid:
+                currency_ops.append((pr_pid, credits, warfunds))
+            for c_raw in _all(pr, 6):                    # CharacterBattleResult
+                c = _split_fields(c_raw)
+                entry = {
+                    'characterId': int(_get(c, 1, 0) or 0),
+                    'totalCharacterXp': int(_get(c, 2, 0) or 0),
+                    'playerDamage': int(_get(c, 3, 0) or 0),
+                    'vehicleDamage': int(_get(c, 4, 0) or 0),
+                    'capturepointsCaptured': int(_get(c, 5, 0) or 0),
+                    'capturepointsNeutralized': int(_get(c, 6, 0) or 0),
+                    'timeActive': int(_get(c, 7, 0) or 0),
+                    'ribbons': [(int(_get(_split_fields(r), 1, 0) or 0),
+                                 int(_get(_split_fields(r), 2, 0) or 0))
+                                for r in _all(c, 9)],
+                }
+                char_results.append((pr_pid, entry))
+    except Exception as e:
+        log(f'      [combat] PlayerBattleResult parse error: {e}')
 
     log(f'      [combat] AnnounceBattleFieldEarnings mission={mission_id} '
         f'msid={mission_session_id} preset={mission_preset_id} '
@@ -722,13 +810,28 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
         f'time={report["mission_time_seconds"]}s '
         f'players={len(br_players)} results={len(char_results)}')
 
+    # ---- 响应先行：战斗服 pending wait 立即完成（后续 DB/推送异常不再
+    #      拖垮结算链路——2026-08-26 崩溃事故即解析异常导致无响应）
+    resp_proto = pb_int64(1, mission_session_id)     # f1 missionSessionId
+    resp_proto += pb_int32(2, 1)                     # f2 response=1
+    resp = build_response(cmd_id, 'AnnounceBattleFieldEarningsResponse', resp_proto)
+    writer.write(resp)
+    await writer.drain()
+    log(f'GAME S->C cmd={cmd_id:<4} AnnounceBattleFieldEarningsResponse '
+        f'(msid={mission_session_id}, response=1)')
+
     # ---- DB 持久化（全部 best-effort）
+    # bot 行不入库（省空间）：战报只存真人；bot 也无 DB 账号，
+    # 后续 xp/统计循环按 is_bot 跳过
+    real_players = [p for p in br_players if not p.get('is_bot')]
+    report_id = 0
     if STORE is not None:
         try:
-            report_id = await STORE.save_battle_report(report, br_players)
+            report_id = await STORE.save_battle_report(report, real_players)
             log(f'      [DB] battle_report saved id={report_id} '
                 f'(msid={report["mission_session_id"]}, '
-                f'{len(br_players)} players)')
+                f'{len(real_players)} players, '
+                f'{len(br_players) - len(real_players)} bots skipped)')
         except Exception as e:
             log(f'      [DB] save_battle_report failed: {e}')
 
@@ -736,15 +839,20 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
             if not (credits or warfunds):
                 continue
             try:
-                cur = await STORE.add_currency(pid, credits=credits, warfunds=warfunds)
-                log(f'      [DB] earnings player={pid} +{credits}cr +{warfunds}wf '
+                # 老兵会员 +25%（PlayerSettings f26 恒 2=会员模板 → 人人加成）
+                vet_c = credits * 25 // 100 if credits > 0 else 0
+                vet_w = warfunds * 25 // 100 if warfunds > 0 else 0
+                cur = await STORE.add_currency(pid, credits=credits + vet_c,
+                                               warfunds=warfunds + vet_w)
+                log(f'      [DB] earnings player={pid} +{credits}cr(+{vet_c}vet) '
+                    f'+{warfunds}wf(+{vet_w}vet) '
                     f'-> {cur["credits"]}cr/{cur["warfunds"]}wf')
             except Exception as e:
                 log(f'      [DB] add_currency({pid}) failed: {e}')
 
         for p in br_players:
             pid = p['player_id']
-            if not pid:
+            if not pid or p.get('is_bot'):
                 continue
             try:
                 for ch in p['characters']:
@@ -752,6 +860,13 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                     if xp_delta:
                         await STORE.add_combat_xp(pid, ch['characterId'], xp_delta)
                         log(f'      [DB] char {ch["characterId"]} +{xp_delta} xp')
+                # 战斗通行证分数：本局 battle score 计入当前激活赛季
+                # （未购买也累计，与官服一致；奖励仅已购买行可领）
+                if p['score']:
+                    bp_score = await STORE.add_battle_pass_score(
+                        pid, _BP_ACTIVE_SEASON, p['score'])
+                    log(f'      [DB] battle pass +{p["score"]} -> {bp_score} '
+                        f'(player={pid})')
                 if p['kills'] or p['deaths'] or p['score'] or p['captures']:
                     target = p['characters'][0]['characterId'] if p['characters'] else 0
                     if not target:
@@ -769,6 +884,7 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
             except Exception as e:
                 log(f'      [DB] battle player stats (pid={pid}) failed: {e}')
 
+        ribbon_ends = _report_ribbon_end(br_players)
         for pid, ch in char_results:
             if not pid or not ch['characterId']:
                 continue
@@ -785,29 +901,156 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 if ch['timeActive']:
                     await STORE.add_stat(ch['characterId'], 'time_active',
                                          ch['timeActive'])
-                # 勋带达成（templateId, level）→ XP 补到该等级阈值下限
+                # 勋带达成（templateId, level）→ XP 补到该等级阈值下限；
+                # f13 报告里的 endValue（战后勋带 XP）优先，取两者较大值
+                report_ends = ribbon_ends.get((pid, ch['characterId']), {})
                 for ribbon_id, ribbon_lv in ch['ribbons']:
                     if ribbon_id and ribbon_lv:
                         floor_xp = _RIBBON_LEVEL_XP.get(int(ribbon_lv), 0)
+                        floor_xp = max(floor_xp,
+                                       report_ends.get(int(ribbon_id), 0))
                         if floor_xp:
                             await STORE.set_ribbon_xp_floor(
                                 pid, ch['characterId'], int(ribbon_id), floor_xp)
+                # f13 有 endValue 但 f9 无达成等级的勋带也要落库
+                achieved = {int(r) for r, l in ch['ribbons'] if r}
+                for rid, end_v in report_ends.items():
+                    if end_v and rid not in achieved:
+                        await STORE.set_ribbon_xp_floor(
+                            pid, ch['characterId'], rid, end_v)
             except Exception as e:
                 log(f'      [DB] char result stats (pid={pid}) failed: {e}')
 
-    # 战局结束：清空据点归属覆盖（下局从布局重新开始）+
-    # 释放本场 combat server 实例（杀进程/释放端口，触发排队战局拉起）
+    # 战局结束：清空据点归属覆盖（下局从布局重新开始）+ 会话收尾
+    # （PMS DELETE 清 rejoin + 战报通知触发结算界面）+ 释放本场
+    # combat server 实例（杀进程/释放端口，触发排队战局拉起）
     _CAPTURE_OWNERS.clear()
     if mission_id:
+        try:
+            await _finish_mission_sessions(mission_id, report_id)
+        except Exception as e:
+            log(f'      [combat] finish mission sessions failed: {e}')
         matchmaking.release_match(mission_id)
 
-    resp_proto = pb_int64(1, mission_session_id)     # f1 missionSessionId
-    resp_proto += pb_int32(2, 1)                     # f2 response=1
-    resp = build_response(cmd_id, 'AnnounceBattleFieldEarningsResponse', resp_proto)
-    writer.write(resp)
-    await writer.drain()
-    log(f'GAME S->C cmd={cmd_id:<4} AnnounceBattleFieldEarningsResponse '
-        f'(msid={mission_session_id}, response=1)')
+
+# ---------------------------------------------------------------- 战局结束收尾
+
+# Notification 表行 id 自增（NewBattleReport 通知，KVCS 推送）
+_NOTIF_SEQ = [int(time.time() * 1000) & 0x7FFFFFFF]
+
+# 已推送 Notification 行登记（social.SetNotificationsRead 回读重推用）：
+# notif_id → (player_id, type, type_id, timestamp, expires)。
+# 客户端已读后只发 SetNotificationsReadRequest，本地不刷 NotificationTable；
+# 服务器必须回推 readStatus 更新行，通知托盘角标（newNotificationCount）
+# 才会清零。
+_NOTIF_ROWS = {}
+
+
+def _next_notif_id():
+    _NOTIF_SEQ[0] += 1
+    return _NOTIF_SEQ[0]
+
+
+def _msg_battle_report_notification(notif_id, player_id, report_id):
+    """Notification 行（type=5 NewBattleReport，typeId=战报 id）。
+
+    客户端 NotificationModel.handleNotification：NewBattleReport + 未读 →
+    GetBattleReportRequest{typeId} → MissionBattleReportWindow（大厅结算
+    界面）+ 对局记录入通知托盘。readStatus=0 Unread 才会自动弹窗。"""
+    expires = time.strftime('%Y%m%d%H%M%S',
+                            time.gmtime(time.time() + 7 * 86400)) + 'Z'
+    timestamp = matchmaking._zulu_now()
+    m = pb_int64(1, int(notif_id))                    # id
+    m += pb_int64(2, int(player_id))                  # playerId
+    m += pb_int32(3, 5)                               # type = NewBattleReport
+    m += pb_int64(4, int(report_id))                  # typeId = 战报 id
+    m += pb_int32(5, 0)                               # readStatus = Unread
+    m += pb_string(6, timestamp)                      # timestamp（zulu）
+    m += pb_string(7, expires)                        # expires（7 天）
+    _NOTIF_ROWS[int(notif_id)] = (int(player_id), 5, int(report_id),
+                                  timestamp, expires)
+    return m
+
+
+async def _finish_mission_sessions(mission_id, report_id):
+    """战局正常结束（earnings 已入库）对局内每名玩家收尾。
+
+    与 abandon（mission.py，玩家主动放弃路径）同款收尾序列，区别在触发方是
+    服务器（战斗结束客户端不会发 AbandonMissionRequest——StatusMediator 卡
+    REJOIN、无结算界面的根因）：
+    1. SquadSession mission=0 + SquadMemberSession status=2（solo squad 重置，
+       PMS DELETE 前置——StatusMediator.onLobbySignalUpdates 读 squadSession，
+       null/missionId≠0 会 TypeError #1009 或 LOCKED_IN_COMBAT）；
+    2. PlayerMissionSession DELETE（playerMissionSessionId=null → REJOIN 消失，
+       回 BASE_STATE）；
+    3. Notification(NewBattleReport, typeId=report_id)（战报已入库才推：
+       客户端 GetBattleReport 查不到会静默跳过弹窗）；
+    4. 清理 PMS_TO_SESSION / PMS_TO_MISSION / _MM_QUEUES 内部状态。
+    """
+    my_pms = [pms for pms, mid in matchmaking.PMS_TO_MISSION.items()
+              if int(mid or 0) == int(mission_id)]
+    # 真实小队整队重置必须先于 PMS DELETE（StatusMediator 在 PMS DELETE 的
+    # lobbySignal 里读 squadSession.missionId，非 0 → LOCKED_IN_COMBAT）：
+    # 先预扫描收集本局涉及的小队，重置后再逐玩家推 PMS DELETE
+    real_squads = sorted({int((matchmaking.PMS_TO_SESSION.get(p) or {})
+                              .get('squad_db_id', 0) or 0)
+                          for p in my_pms} - {0})
+    for sid in real_squads:
+        try:
+            await matchmaking.reset_real_squad_to_lobby(sid)
+        except Exception as e:
+            log(f'      [combat] squad reset failed (squad={sid}): {e}')
+    for pms_id in my_pms:
+        mm_sess = matchmaking.PMS_TO_SESSION.get(pms_id)
+        if mm_sess is None:
+            matchmaking.PMS_TO_MISSION.pop(pms_id, None)
+            continue
+        pid = int(mm_sess.get('player_id', 0) or 0)
+        gamertag = mm_sess.get('gamertag') or ''
+        squad_db_id = int(mm_sess.get('squad_db_id', 0) or 0)
+        flash = FLASH_SESSIONS.get(gamertag)
+        if flash is None or flash.playerview_cmd is None:
+            log(f'      [combat] battle end: no live Flash session for '
+                f'{gamertag!r}; PMS delete/notification NOT pushed')
+            continue
+        solo = matchmaking._SOLO_SQUADS.get(pid)
+        try:
+            if solo is not None and not squad_db_id:
+                solo['mission_id'] = 0
+                await matchmaking._push_kvcs(
+                    flash.writer, flash.playerview_cmd, b'SquadSession',
+                    matchmaking._msg_solo_squad_session(
+                        solo['squad_row'], pid, solo['template'],
+                        solo['faction'], 0, solo.get('entered', 0)))
+                await matchmaking._push_kvcs(
+                    flash.writer, flash.playerview_cmd, b'SquadMemberSession',
+                    matchmaking._msg_solo_squad_member_session(
+                        solo['member_row'], solo['squad_row'], pid,
+                        solo['gamertag'], solo['char_id'], solo['char_name'],
+                        solo['rank'], 2,
+                        solo.get('metrics_session_id', 0), solo['faction']))
+            await matchmaking._push_kvcs_delete(
+                flash.writer, flash.playerview_cmd,
+                b'PlayerMissionSession', pms_id)
+            log(f'S->C cmd={flash.playerview_cmd:<4} KeyValueChangeSet '
+                f'delete (PlayerMissionSession id={pms_id}) ★battle end')
+            if report_id:
+                await matchmaking._push_kvcs(
+                    flash.writer, flash.playerview_cmd, b'Notification',
+                    _msg_battle_report_notification(
+                        _next_notif_id(), pid, report_id))
+                log(f'S->C cmd={flash.playerview_cmd:<4} KeyValueChangeSet '
+                    f'(Notification NewBattleReport typeId={report_id} '
+                    f'player={pid} ★结算界面触发)')
+        except Exception as e:
+            log(f'      [combat] battle end push failed '
+                f'(player={pid}): {e}')
+    # 内部状态清理（无论 Flash 连接是否在线）
+    for pms_id in my_pms:
+        s = matchmaking.PMS_TO_SESSION.pop(pms_id, None)
+        matchmaking.PMS_TO_MISSION.pop(pms_id, None)
+        if s is not None:
+            matchmaking._MM_QUEUES.pop(int(s.get('player_id', 0) or 0), None)
 
 
 # ---------------------------------------------------------------- 注册表

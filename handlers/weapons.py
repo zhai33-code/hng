@@ -26,7 +26,7 @@ from wardb import (
     _E_WEAPON,
     _MOD_MAPPING_IDS,
     _MOD_REQ_LEVEL,
-    _UNLOCK_BY_ITEM,
+    _REQ_UNLOCK_BY_ITEM,
     _default_ammo_for,
     weapon_template_clipcount,
     )
@@ -88,8 +88,10 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
     # 解锁校验：角色 bits 需已包含需求 uid。
     # - 买新武器判定用 eWeapon(2)（商店 hasCharacterUnlockedItem）
     # - 买武器皮肤变体判定用 eWeaponVariant(14)
-    req2 = _UNLOCK_BY_ITEM.get((weapon_template_id, _E_WEAPON), set()) if weapon_template_id else set()
-    req14 = _UNLOCK_BY_ITEM.get((variant_template_id, 14), set()) if variant_template_id else set()
+    # 用 _REQ_UNLOCK_BY_ITEM 剔除 level=0 专属勋带关联条目（type=14 有 185 条，
+    # 与载具 Yak-9 被拒同构，详见 wardb._REQ_UNLOCK_BY_ITEM 注释）
+    req2 = _REQ_UNLOCK_BY_ITEM.get((weapon_template_id, _E_WEAPON), set()) if weapon_template_id else set()
+    req14 = _REQ_UNLOCK_BY_ITEM.get((variant_template_id, 14), set()) if variant_template_id else set()
     need2 = await _unlock_need_for_char(sess, char_id, req2)
     need14 = await _unlock_need_for_char(sess, char_id, req14)
     if need2 or need14:
@@ -357,13 +359,17 @@ async def handle_setweaponvariantrequest(sess, writer, cmd_id, req_type, proto):
     log(f'S->C cmd={cmd_id:<4} SetWeaponVariantResponse (response=1 ok, '
         f'weaponVariantId={sw_variant_id})')
 
-    # 重推 weapon（equippedWeaponVariantId 字段15 更新 → 客户端刷新皮肤显示）
-    w = sess.weapons.get(int(sw_weapon_id)) if getattr(sess, 'weapons', None) else None
-    if w is None and pid is not None:
+    # 重推 weapon（equippedWeaponVariantId 字段15 更新 → 客户端刷新皮肤显示）；
+    # 优先用 DB 行（会话缓存的 container 值可能已过期，会把已卸下的武器
+    # "自动装备"回旧槽位）
+    w = None
+    if pid is not None:
         try:
             w = await STORE.get_weapon(pid, int(sw_weapon_id))
         except Exception as e:
             log(f'[DB] get_weapon failed: {e}')
+    if w is None:
+        w = sess.weapons.get(int(sw_weapon_id)) if getattr(sess, 'weapons', None) else None
     if w is not None and sess.soldier_view_cmd is not None:
         wproto = _msg_weapon(int(sw_weapon_id), w['name'], w['template_id'],
                              w['character_id'], w['container_id'], w['container_slot'],
@@ -389,6 +395,11 @@ async def handle_setweaponclipcountrequest(sess, writer, cmd_id, req_type, proto
         f = pb_parse(proto)
         swc_weapon_id = f.get(1, 0)
         swc_clip_count = int(f.get(2, 0))
+        # 客户端（Flash protobuf）把 int32 负数编码为 32 位补码 varint：
+        # -9 -> 4294967287（0xFFFFFFF7）。pb_parse 按无符号解码，这里必须
+        # 转回有符号，否则减备弹到最少（-(T-1)）会被当 42 亿越界拒掉
+        if 0x80000000 <= swc_clip_count <= 0xFFFFFFFF:
+            swc_clip_count -= 0x100000000
         log(f'      SetWeaponClipCount: weaponId={swc_weapon_id}, clipCount={swc_clip_count}')
     except Exception as e:
         log(f'      SetWeaponClipCount parse error: {e}')
@@ -406,6 +417,12 @@ async def handle_setweaponclipcountrequest(sess, writer, cmd_id, req_type, proto
             and int(swc_weapon_id) not in sess.weapons:
         # DB 命中但会话缓存缺失 → 补进缓存（后续 re-push 用）
         sess.weapons[int(swc_weapon_id)] = dict(swc_w)
+    elif swc_w is not None and getattr(sess, 'weapons', None):
+        # 缓存已有条目也须用 DB 行刷新 container 字段——缓存里的旧 container
+        # 值（卸下/换槽后未同步）会让 re-push 把已卸下的武器"自动装备"回旧槽位
+        sess.weapons[int(swc_weapon_id)].update(
+            {k: swc_w[k] for k in
+             ('container_id', 'container_slot', 'character_id', 'variant_id')})
     if swc_w is not None:
         t_max = weapon_template_clipcount(swc_w['template_id'])
         limit = max(t_max - 1, 0)

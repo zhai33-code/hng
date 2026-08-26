@@ -64,6 +64,7 @@ from matchmaking import (
     _push_kvcs_delete,
     _zulu_now,
     release_match,
+    reset_real_squad_to_lobby,
     )
 
 RC_OK = 1
@@ -317,6 +318,22 @@ async def handle_abandon_mission(sess, writer, cmd_id, req_type, proto):
             #    missionId=0 → isOwnedByPlayer → BASE_STATE；非零则
             #    LOCKED_IN_COMBAT，null 则 TypeError #1009 卡 processing）
             solo = _SOLO_SQUADS.get(int(pid)) if pid is not None else None
+            # 真实小队成员放弃：整队回 InLobby（mission=0 行先于 PMS DELETE，
+            # 同 solo 重置的 StatusMediator 前置要求）
+            squad_db_id = 0
+            for _p in my_pms:
+                _s = PMS_TO_SESSION.get(_p) or {}
+                if int(_s.get('player_id', 0) or 0) == int(pid or 0):
+                    squad_db_id = int(_s.get('squad_db_id', 0) or 0)
+                    if squad_db_id:
+                        break
+            if squad_db_id:
+                try:
+                    await reset_real_squad_to_lobby(squad_db_id)
+                    log(f'S->C (SquadSession mission=0 + members InLobby '
+                        f'★real squad {squad_db_id} reset before PMS delete)')
+                except Exception as e:
+                    log(f'      [mission] real squad reset failed: {e}')
             if solo is not None:
                 try:
                     solo['mission_id'] = 0

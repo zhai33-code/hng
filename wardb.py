@@ -116,6 +116,22 @@ _UNLOCK_UID_META = {}
 for _f in _parse_wardb_table('progressionUnlock'):
     _UNLOCK_UID_META[int(_f.get(1, 0))] = (int(_f.get(3, 0)), int(_f.get(4, 0)))
 
+# unlockMetaLevel == 0 的条目不是购买门槛：专属勋带关联（如 Yak-9 的 uid 1401
+# ribbon=68 "Yak-9 Specialist" level=0，共 700+ 条遍布武器/载具/军服/升级各类型），
+# 语义是"使用该物品累计这条勋带"，勋带 0 级人人都算有——客户端
+# hasCharacterUnlockedItem 对 level 0 需求恒通过（未拥有物品在商店也显示可购买）。
+# 购买校验一律用 _REQ_UNLOCK_BY_ITEM（剔除 level=0 条目），否则任何飞机的第一架
+# 都会因"未拥有本机专属勋带"被错误拒绝（鸡生蛋问题）；授予位图仍用全量 _UNLOCK_BY_ITEM。
+_LEVEL0_UIDS = {
+    int(_f.get(1, 0)) for _f in _parse_wardb_table('progressionUnlock')
+    if int(_f.get(6, 0)) == 0
+}
+_REQ_UNLOCK_BY_ITEM = {}
+for (_iid, _itype), _uids in _UNLOCK_BY_ITEM.items():
+    _req = _uids - _LEVEL0_UIDS
+    if _req:
+        _REQ_UNLOCK_BY_ITEM[(_iid, _itype)] = _req
+
 # ShopMembershipItems { id=1, identifier=2, durationDays=3, ... }
 # 会员商品时长（天）：AddMembershipRequest membershipTemplateId → durationDays
 # （买 180 天老兵必须按表发 180 天，不能统一 30 天）
@@ -331,6 +347,24 @@ def _build_ribbon_meta_level():
 _RIBBON_META_LEVEL = _build_ribbon_meta_level()
 
 
+# unlockType=2（EUnlockType.eRank 军衔）条目 → (uid, 所需军衔, unlockItemType)。
+# metaName 恒 '0'（哨兵，非勋带 id）：解锁按角色 combat_xp 推导的军衔走，
+# 如 uid 210 First Blood badge（rank 1）、uid 943 ability（rank 6）、
+# uid 280-289 小队自定义点数（rank 12+）。旧实现只推导勋带等级（eRibbon
+# 路径），rank 类全部漏掉 → First Blood 等永锁（2026-08-27 反馈）。
+# 不含 itemType=1（eCharacterType 职业模板，uid 101/102/103/17）：
+# 职业招募占位走 PlayerLevelUnlock（player bits）体系，保持不自动解锁。
+def _build_rank_meta_level():
+    m = set()
+    for f in _parse_wardb_table('progressionUnlock'):
+        if int(f.get(2, 0)) == 2 and int(f.get(7, 0)) != 1:
+            m.add((int(f.get(1, 0)), int(f.get(6, 0)), int(f.get(7, 0))))
+    return m
+
+
+_RANK_META_LEVEL = _build_rank_meta_level()
+
+
 # ribbonlevel { id=1(等级), value=2(该级经验阈值) }：勋带单源 = total_xp 经阈值推导等级
 def _build_ribbon_level_xp():
     m = {}
@@ -417,6 +451,32 @@ _CHAR_TMPL_ACTIONID = {int(f.get(1, 0)): int(f.get(4, 0))
 def charactertemplate_actionid(character_template_id):
     """兵种模板 → 引擎 actionid（charactersetting.f7）；未知模板返回 0。"""
     return _CHAR_TMPL_ACTIONID.get(int(character_template_id or 0), 0)
+
+
+# SquadTemplate（WarDatabase/SquadTemplate 共 5 行）→ 官方小队类型名
+# （客户端 texts/HnG_Strategy_en.xml squadtemplate/NTitle，N=表 name 列）：
+# 1=Infantry Squad / 2=Fighter Squad / 3=Paratrooper Squad / 4=Armor Squad /
+# 5=Recon Squad。大厅 UI 对无小队玩家按兵种显示默认模板名（solo
+# SquadSession f10 name=''，客户端按 f3 characterTemplateId 兵种取模板标题），
+# 局内 SquadResponse f4 name 必须与之同源，否则局内/大厅小队名对不上。
+# 兵种 actionid → 小队模板：rifleman(2)→1 / fighterpilot(11)→2 /
+# paratrooper(7)→3 / tankcrew(10)→4 / recon(6)→5（general 同伞兵=3）。
+_ACTIONID_SQUAD_TEMPLATE = {2: 1, 11: 2, 7: 3, 10: 4, 6: 5}
+SQUAD_TEMPLATE_NAMES = {1: 'Infantry Squad', 2: 'Fighter Squad',
+                        3: 'Paratrooper Squad', 4: 'Armor Squad',
+                        5: 'Recon Squad'}
+
+
+def squad_template_for_character(character_template_id):
+    """兵种模板 → 小队模板 id（1-5）；未知兵种回退 1（Infantry）。"""
+    return _ACTIONID_SQUAD_TEMPLATE.get(
+        charactertemplate_actionid(character_template_id), 1)
+
+
+def squad_template_name(squad_template_id):
+    """小队模板 id → 官方类型名；未知返回 'Infantry Squad'。"""
+    return SQUAD_TEMPLATE_NAMES.get(int(squad_template_id or 0),
+                                    'Infantry Squad')
 
 
 # 武器模板 → 勋带模板 id：从 progressionUnlock（配件 type=3 / 弹药 type=10）

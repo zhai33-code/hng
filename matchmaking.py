@@ -33,11 +33,12 @@ from protocol import Chunk, build_response, pb_parse, pb_bool, pb_parse_multi
 from protocol import (
     pb_float, pb_int32, pb_int64, pb_message, pb_string, pb_uint32, pb_varint,
 )
-from state import PUBLIC_HOST
+from state import FLASH_SESSIONS, PUBLIC_HOST
 from wardb import (
     _load_accesspoint_templates, _load_capturepoint_templates, _load_preset,
     _rank_from_combat_xp, battlefield_entity_for_gamemap, battlefield_pos,
-    commandnode_template, preset_scene,
+    commandnode_template, preset_scene, squad_template_for_character,
+    squad_template_name,
 )
 import mm_config
 import mm_pool
@@ -93,7 +94,8 @@ TTD_OUT_DIR = r'd:\HnG-test\work\ttd-traces'
 # CombatInstance dict：{mission_id, port, proc, ready(asyncio.Event), seq, ttd}
 COMBAT_INSTANCES = {}          # mission_id -> CombatInstance
 PENDING_MATCHES = []           # 并发上限排队中的成局 [match, ...]（FIFO）
-_combat_seq = 0
+_combat_seq = random.randint(100000, 999999)   # combat 实例序号（也用于 combat-server-<seq>.log
+                                               # 文件名，随机起始避免重启后覆盖旧日志）
 COMBAT_READY = asyncio.Event()  # 兼容回退：无法按 missionid 定位实例时置位
 # 实测（realtest_game.log 全量历史）专用服 RequestBattleFieldSettings 的
 # proto 为空（无 field1=missionid），无法自报归属 → 按启动顺序 FIFO 认领。
@@ -210,6 +212,7 @@ def release_match(mission_id):
              f'(mission={mission_id}, udp/{inst["port"]})')
         _spawn(_stop_instance(inst), f'stop_instance#{inst["seq"]}')
     _MM_MISSION_DETAILS.pop(int(mission_id), None)
+    _MM_MISSION_SQUADS.pop(int(mission_id), None)
     release_mission_resources(mission_id)
     _drain_pending_matches()
     # 端口/坑位已释放：池内可能有待撮合的玩家（如端口耗尽时回池的局）
@@ -553,18 +556,28 @@ def _msg_battle_info(battle_id, pos_x, pos_y):
     m += pb_float(3, pos_y)             # posY
     return m
 
-_MM_MISSION_ID = [100001]   # missionId 自增（小整数起始）
-_MM_PMM_ID = [200001]               # PlayerMatchMaking 行 id 自增
-_MM_PMS_ID = [577240230984408944]  # PlayerMissionSession 行 id 自增；首值=他服UDP抓包局 pms
-                                     # (=握手 id1 / hng.exe /P 参数, 快照实体按它绑定, 勿改回小整数)
-_MM_SOLO_SMS_ID = [6970851152698942777 + 1]   # 单人隐式小队 SquadMemberSession 行 id 自增
+# 局内动态 id 发号：基值每次进程启动随机初始化，避免重启后 id 从头复用
+# （客户端可能缓存旧局 id，重启后撞号会导致实体绑定错乱）。
+_MM_MISSION_ID = [random.randint(100001, 999000)]    # missionId 自增（保持 6 位小整数风格）
+_MM_PMM_ID = [random.randint(200001, 999000)]        # PlayerMatchMaking 行 id 自增
+_MM_PMS_ID = [random.getrandbits(63)]  # PlayerMissionSession 行 id 自增
+                                     # (=握手 id1 / hng.exe /P 参数, 快照实体按它绑定, 必须大整数)
+_MM_SOLO_SMS_ID = [random.getrandbits(63)]           # 单人隐式小队 SquadMemberSession 行 id 自增
 # 每局动态 id 自增（2026-08-20：PlayerSettings 回放字段动态化）：
 #   metrics_session_id → PMS f18 / PlayerSettings f23（必须同值）
 #   battle_session_id  → PMS f9  / PlayerSettings f25（同源）
 #   squad_id           → PlayerSettings f16 / SquadResponse f1（ZServer squad 树键）
-_MM_METRICS_SESSION_ID = [1277780177111083931 + 1]   # metricsSessionId 自增
-_MM_BATTLE_SESSION_ID = [8609279182370337975 + 1]    # battle session id 自增
-_MM_SQUAD_ID = [6206023949334542204 + 1]             # squadId 自增
+_MM_METRICS_SESSION_ID = [random.getrandbits(63)]    # metricsSessionId 自增
+_MM_BATTLE_SESSION_ID = [random.getrandbits(63)]     # battle session id 自增
+_MM_SQUAD_ID = [random.getrandbits(63)]              # squadId 自增
+
+# 局内小队分组登记：mission_id -> {squad_id: {
+#   name, leader_char_id, faction, squad_db_id(真小队=DB id / 单人凑队=0),
+#   members: [{player_id, char_id, gamertag, rank, slot}] }}
+# _start_match 成局时写入；game_server SquadResponse 按此构建局内小队定义
+# （队名/队长/每成员槽位）；release_match 清理。
+_MM_MISSION_SQUADS = {}
+_MM_SOLO_SQUAD_MAX = 6        # 单人匹配自动凑队的人数上限
 
 
 def _next_match_id(seq):
@@ -773,7 +786,11 @@ def _msg_player_mission_session(pms_id, player_id, gamertag, char_id, faction_id
     m += pb_int64(2, player_id)               # playerId
     m += pb_string(3, gamertag)               # playerGamerTag
     m += pb_int64(4, char_id)                 # career id（他服实测=JoinMM f1/PlayerSettings f15）
-    m += pb_int64(5, player_id)               # mission 队长 id（他服实测=mission_info f8）
+    m += pb_int64(5, FACTION_ROW_IDS.get(int(faction_id), int(faction_id)))
+    # characterFactionId：必须是 KVS 'faction' 表行 id（FACTION_ROW_IDS 大数），
+    # 客户端 MissionInformationWindowMediator.setAccessPoints 用它
+    # FactionTable.getFromId() 查 faction 行——填 player_id/小整数都会查不到
+    # → null.factiontemplateid → TypeError #1009（切换阵营颜色按钮触发）
     m += pb_string(6, char_name)              # characterName
     m += pb_int32(7, rank)                    # characterRank
     m += pb_int64(8, mission_id)              # missionId（客户端 /M 启动参数）
@@ -1001,11 +1018,173 @@ def drop_player(pid):
     if q.get('mission_id'):
         return                          # 已成局，交由战局生命周期管理
     gamemode = q.get('gamemode', 0)
+    squad_db_id = int((q.get('ctx') or {}).get('squad_db_id') or 0)
+    if squad_db_id:
+        # 整队排队中掉线：整队出池回 InLobby（拆队不可部署）
+        _spawn(_drop_squad_queue(squad_db_id, int(pid)),
+               f'drop_squad:{pid}')
+        return
     _cleanup_queued_player(pid)
     _MATCH_PMM_IDS.pop(pid, None)
     POOL.remove(pid)
     _log(f'mm: player {pid} dropped (disconnect, gamemode={gamemode})')
     _spawn(_try_form_all(), f'try_form_all(drop:{pid})')
+
+
+# ---------------------------------------------------------------- 整队匹配
+# 真实小队（CreateSquad 建立，DB squads 表）整队入池：
+# 任何成员点匹配 → 全体在线 InLobby/Ready 成员作为原子单位入池
+# （QueueEntry.group_key=squad_id，mm_pool 保证不拆队），成局同 mission 部署。
+# 官方对应行为：队长激活小队（SquadSession f12 matchMakeWarMissionFlag）。
+
+async def _squad_eligible_members(pid):
+    """(squad, 可参战成员列表)；非小队场景返回 (None, None)。
+
+    玩家在 DB 真实小队即走小队路径（即使队里只有自己在线——推真实
+    小队行而非 solo 隐式行，避免同一玩家两张 SquadSession 冲突）。
+    可参战成员 = InLobby/Ready 且 Flash 会话在线（离线成员本局不部署）。
+    自己当前 InBattle（如已在局中重复点匹配）→ 返回 (squad, []) 由
+    调用方跳过排队。"""
+    if STORE is None or pid is None:
+        return None, None
+    try:
+        squad = await STORE.get_squad_for_player(int(pid))
+        if squad is None:
+            return None, None
+        members = await STORE.list_squad_members(squad['id'])
+    except Exception as e:
+        _log(f'      [DB] squad lookup failed: {e}')
+        return None, None
+    eligible = [m for m in members
+                if int(m['status']) in (2, 3)
+                and (s := FLASH_SESSIONS.get(m['gamertag'] or '')) is not None
+                and s.playerview_cmd is not None]
+    if not any(int(m['player_id']) == int(pid) for m in eligible):
+        return squad, []         # 自己不在可参战列表（InBattle/离线）
+    return squad, eligible
+
+
+async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
+                         req_mission_id):
+    """全队入池：每名在线成员建排队上下文 + PMM 行；DB 置 Ready +
+    小队 matchmaking_flag；整队 KVCS 行推给全体（跨会话）。"""
+    if not members:
+        return                      # 无可参战成员（如自己已 InBattle）
+    squad_id = int(squad['id'])
+    entries = []
+    for m in members:
+        mpid = int(m['player_id'])
+        flash = FLASH_SESSIONS[m['gamertag']]
+        w, vc = flash.writer, flash.playerview_cmd
+        # 此前单独排队残留清理（行 id 即将更换）
+        old_q = _MM_QUEUES.get(mpid)
+        if old_q is not None and not old_q.get('mission_id'):
+            _cleanup_queued_player(mpid)
+            POOL.remove(mpid)
+            if old_q.get('pmm_id') is not None:
+                await _push_kvcs_delete(w, vc, b'PlayerMatchMaking',
+                                        old_q['pmm_id'])
+        for row in _msg_faction_rows():
+            await _push_kvcs(w, vc, b'faction', row)
+        pmm_id = _next_match_id(_MM_PMM_ID)
+        rank = _rank_from_combat_xp(int(m['combat_xp']))
+        ctx = {'writer': w, 'view_cmd': vc, 'gamertag': m['gamertag'],
+               'char_name': m['char_name'], 'rank': rank,
+               'faction': int(m['faction']),
+               'char_id': int(m['character_id']), 'quickplay': False,
+               'req_mission_id': req_mission_id,
+               'metrics_uid': str(uuid.uuid4()),
+               'metrics_session_id': _next_match_id(_MM_METRICS_SESSION_ID),
+               'squad_db_id': squad_id}
+        _MM_QUEUES[mpid] = {'pmm_id': pmm_id, 'mission_id': 0,
+                            'gamemode': gamemode_id, 'ctx': ctx}
+        _MATCH_PMM_IDS[mpid] = pmm_id
+        await _push_kvcs(w, vc, b'PlayerMatchMaking',
+                         _msg_player_matchmaking(
+                             pmm_id, int(m['character_id']),
+                             int(m['faction']), req_mission_id, _zulu_now(),
+                             POOL.waiting_count(gamemode_id) + 1,
+                             POOL.waiting_count() + 1))
+        entries.append(mm_pool.QueueEntry(
+            player_id=mpid, char_id=int(m['character_id']),
+            faction=int(m['faction']), gamemode_id=gamemode_id,
+            presets=staged_presets, group_key=squad_id))
+    try:
+        for m in members:
+            await STORE.update_squad_member(m['id'], status=3)
+        await STORE.set_squad_flag(squad_id, True)
+    except Exception as e:
+        _log(f'      [DB] squad enqueue status updates failed: {e}')
+    from handlers.squad import push_squad_rows_to_all_members
+    await push_squad_rows_to_all_members(squad_id)
+    _log(f'squad enqueue: squad={squad_id}, players='
+         f'{[e.player_id for e in entries]}, gamemode={gamemode_id}')
+    for e in entries:
+        POOL.enqueue(e)
+    await _try_form_all()
+    for e in entries:
+        if _MM_QUEUES.get(e.player_id, {}).get('mission_id', 0) == 0:
+            _arm_ai_fill(e.player_id, gamemode_id)
+
+
+async def reset_real_squad_to_lobby(squad_db_id, exclude_pids=()):
+    """整队回 InLobby（DB 状态 + 向在线成员推整队行 mission=0）。
+
+    战局结束（combat._finish_mission_sessions）/ 放弃（mission abandon）/
+    整队取消 / 整队掉线共用。排除 exclude_pids 中的玩家推送（连接已断）。"""
+    if STORE is None or not squad_db_id:
+        return
+    try:
+        await STORE.set_squad_flag(int(squad_db_id), False)
+        members = await STORE.list_squad_members(int(squad_db_id))
+        for m in members:
+            await STORE.update_squad_member(m['id'], status=2)
+    except Exception as e:
+        _log(f'      [DB] reset_real_squad_to_lobby failed: {e}')
+        return
+    from handlers.squad import _online_member_sessions, push_squad_rows_to_writer
+    for s in _online_member_sessions(members):
+        if int(s.player_id or 0) in exclude_pids:
+            continue
+        try:
+            await push_squad_rows_to_writer(s.writer, s.playerview_cmd,
+                                            int(squad_db_id), 0)
+        except Exception as e:
+            _log(f'      squad reset push to {s.username!r} failed: {e}')
+
+
+async def _cancel_squad_queue(squad_db_id, exclude_pids=()):
+    """整队取消匹配：全队出池、删 PMM 行、回 InLobby（任何成员取消全队退出）。"""
+    if STORE is None:
+        return
+    try:
+        members = await STORE.list_squad_members(int(squad_db_id))
+    except Exception as e:
+        _log(f'      [DB] _cancel_squad_queue lookup failed: {e}')
+        return
+    for m in members:
+        mpid = int(m['player_id'])
+        q = _MM_QUEUES.get(mpid)
+        if q is None or q.get('mission_id'):
+            continue                     # 不在排队 / 已成局不动
+        _cleanup_queued_player(mpid)
+        POOL.remove(mpid)
+        s = FLASH_SESSIONS.get(m['gamertag'] or '')
+        if (s is not None and s.playerview_cmd is not None
+                and q.get('pmm_id') is not None):
+            try:
+                await _push_kvcs_delete(s.writer, s.playerview_cmd,
+                                        b'PlayerMatchMaking', q['pmm_id'])
+            except Exception as e:
+                _log(f'      PMM delete push failed (player={mpid}): {e}')
+    await reset_real_squad_to_lobby(squad_db_id, exclude_pids)
+    _log(f'squad cancel: squad={squad_db_id}, exclude={list(exclude_pids)}')
+
+
+async def _drop_squad_queue(squad_db_id, gone_pid):
+    """整队排队中成员掉线：全队出池、回 InLobby（不推掉线者连接）。"""
+    await _cancel_squad_queue(squad_db_id, (int(gone_pid),))
+    await _try_form_all()
 
 
 async def _start_match(match):
@@ -1045,6 +1224,7 @@ async def _start_match(match):
 
     # 每名玩家发号登记（发号规则与改造前单人路径一致：PMS f17/f18/f9 与
     # PlayerSettings f22/f23/f25 同源；solo squad 行 id 复用）
+    # 整队成员复用 DB 小队 id（PMS f16 与小队行同源，战斗结束按它重置整队）
     sessions = []
     for e in match.players:
         pid = int(e.player_id)
@@ -1056,7 +1236,8 @@ async def _start_match(match):
         metrics_session_id = int(ctx.get('metrics_session_id', 0) or 0) or \
             _next_match_id(_MM_METRICS_SESSION_ID)
         battle_session_id = _next_match_id(_MM_BATTLE_SESSION_ID)
-        squad_id = _next_match_id(_MM_SQUAD_ID)
+        squad_db_id = int(ctx.get('squad_db_id') or 0)
+        squad_id = squad_db_id or _next_match_id(_MM_SQUAD_ID)
         gamertag = ctx.get('gamertag') or 'Player'
         sess_rec = {'pms_id': pms_id, 'player_id': pid,
                     'char_id': int(e.char_id), 'gamertag': gamertag,
@@ -1065,17 +1246,108 @@ async def _start_match(match):
                     'metrics_session_id': metrics_session_id,
                     'battle_session_id': battle_session_id,
                     'squad_id': squad_id,
+                    'squad_db_id': squad_db_id,
+                    'squad_slot': 0,
+                    'mission_id': mission_id,
                     'quickplay': bool(ctx.get('quickplay', False))}
         PMS_TO_MISSION[pms_id] = mission_id
         PMS_TO_SESSION[pms_id] = sess_rec
         sessions.append({'entry': e, 'ctx': ctx, 'sess': sess_rec,
                          'pms_id': pms_id, 'squad_id': squad_id})
 
+    # ★ 局内小队分组（覆盖上面每人一个 squad_id 的占位发号）：
+    #   - 真实小队（ctx.squad_db_id 相同）共用 DB 小队 id，队名取库
+    #     （大厅 SetSquadDetails 传入），队长取 DB leader_character_id
+    #   - 单人匹配玩家按阵营+兵种自动凑队（每队上限 _MM_SOLO_SQUAD_MAX，
+    #     rank 最高者任队长、占 slot 0），队名用兵种对应官方小队模板名
+    #     （Infantry/Fighter/Paratrooper/Armor/Recon Squad）——大厅 UI 对
+    #     无小队玩家按兵种显示的默认名即此模板标题，局内 SquadResponse
+    #     f4 name 同源才能对上
+    # game_server SquadResponse 按登记表构建小队定义 → 同队成员进同一局内小队。
+    def _register_mission_squad(sq_id, name, leader_char, fac, members,
+                                db_id=0, template=1):
+        members = sorted(members, key=lambda s: 0 if int(
+            s['entry'].char_id) == int(leader_char) else 1)
+        rows = []
+        for slot, s in enumerate(members):
+            s['sess']['squad_id'] = sq_id
+            s['sess']['squad_slot'] = slot
+            rows.append({'player_id': int(s['entry'].player_id),
+                         'char_id': int(s['entry'].char_id),
+                         'gamertag': s['sess']['gamertag'],
+                         'rank': int((s['ctx'] or {}).get('rank', 0) or 0),
+                         'slot': slot})
+        _MM_MISSION_SQUADS.setdefault(mission_id, {})[sq_id] = {
+            'name': name, 'leader_char_id': int(leader_char),
+            'faction': int(fac), 'squad_db_id': int(db_id),
+            'template': int(template), 'members': rows}
+
+    real_ids = sorted({s['sess']['squad_db_id'] for s in sessions
+                       if s['sess']['squad_db_id']})
+    for sid in real_ids:
+        members = [s for s in sessions if s['sess']['squad_db_id'] == sid]
+        squad_row = None
+        try:
+            squad_row = await STORE.get_squad(sid)
+        except Exception as ex:
+            _log(f'      [DB] get_squad for grouping failed ({sid}): {ex}')
+        name = (squad_row['name'] if squad_row else None) or 'PlayerSquad'
+        member_chars = {int(s['entry'].char_id) for s in members}
+        leader_char = int(squad_row['leader_character_id']) \
+            if squad_row else 0
+        if leader_char not in member_chars:
+            leader_char = int(members[0]['entry'].char_id)
+        _register_mission_squad(sid, name, leader_char,
+                                int(members[0]['entry'].faction), members,
+                                db_id=sid)
+    solo_by_faction = {}
+    for s in sessions:
+        if not s['sess']['squad_db_id']:
+            solo_by_faction.setdefault(int(s['entry'].faction), []).append(s)
+    for fac, grp in sorted(solo_by_faction.items()):
+        # 按兵种再分组：同兵种才凑一队（队名=该兵种官方小队模板名，
+        # 与大厅 UI 默认名一致；不同兵种大厅默认名不同，混编会再次对不上）
+        by_branch = {}
+        for s in grp:
+            tmpl = squad_template_for_character(
+                (s['ctx'] or {}).get('char_template'))
+            by_branch.setdefault(int(tmpl), []).append(s)
+        for sq_tmpl, sub in sorted(by_branch.items()):
+            sub.sort(key=lambda s: (-int((s['ctx'] or {}).get('rank', 0) or 0),
+                                    int(s['entry'].player_id)))
+            for i in range(0, len(sub), _MM_SOLO_SQUAD_MAX):
+                chunk = sub[i:i + _MM_SOLO_SQUAD_MAX]
+                leader = chunk[0]
+                _register_mission_squad(
+                    _next_match_id(_MM_SQUAD_ID),
+                    squad_template_name(sq_tmpl),
+                    int(leader['entry'].char_id), fac, chunk,
+                    template=sq_tmpl)
+    if _MM_MISSION_SQUADS.get(mission_id):
+        for sq_id, info in _MM_MISSION_SQUADS[mission_id].items():
+            _log(f'mission={mission_id} squad={sq_id} name={info["name"]!r} '
+                 f'leader_char={info["leader_char_id"]} members='
+                 f'{[(m["gamertag"], m["slot"]) for m in info["members"]]}')
+
+    # 真实小队整队置 InBattle（DB 先行；随后 KVCS 整队行读取该状态）
+    real_squads = sorted({s['sess']['squad_db_id'] for s in sessions
+                          if s['sess']['squad_db_id']})
+    for sid in real_squads:
+        try:
+            for m in await STORE.list_squad_members(sid):
+                await STORE.update_squad_member(m['id'], status=4)
+        except Exception as ex:
+            _log(f'      [DB] squad InBattle updates failed '
+                 f'(squad={sid}): {ex}')
+
     _MM_MISSION_DETAILS[mission_id] = {
         'preset': preset, 'gamemode': gamemode_id,
         'ai_fill': bool(match.ai_fill), 'map_entity_id': map_entity_id,
         'attacker_faction': attacker, 'defender_faction': defender,
         'enable_bots': enable_bots,
+        # 成局时刻（monotonic）：等待期中途加入窗口（mm_config.JOIN_WINDOW）
+        # 从此起算；release_match 随详情一并清理
+        'formed_at': time.monotonic(),
         # 本局天气/时段（成局时随机抽取一次，简报 MissionInfo f12/f13 与
         # 战斗服 BattleFieldSettings f9/f21/f22 同源取值）
         **roll_weather(),
@@ -1104,78 +1376,224 @@ async def _start_match(match):
 
     # 逐玩家推送进局序列（单玩家失败不影响他人）
     for s in sessions:
-        e, ctx, sess_rec = s['entry'], s['ctx'], s['sess']
-        w, vc = ctx.get('writer'), ctx.get('view_cmd')
-        if w is None or vc is None:
-            _log(f'      [WARN] mission={mission_id}: player={e.player_id} '
-                 f'has no writer, skip push')
-            continue
-        pid = int(e.player_id)
-        char_id = int(e.char_id)
-        faction = int(e.faction)
-        gamertag = sess_rec['gamertag']
-        char_name = ctx.get('char_name') or gamertag
-        rank = int(ctx.get('rank', 0) or 0)
-        solo = _SOLO_SQUADS.get(pid) or {}
-        pms_id = s['pms_id']
         try:
-            # PMS Admitted（f14=2 触发客户端拉起 hng.exe）
-            await _push_kvcs(w, vc, b'PlayerMissionSession',
-                             _msg_player_mission_session(
-                                 pms_id, pid, gamertag, char_id, faction,
-                                 char_name, rank, mission_id, _zulu_now(),
-                                 game_connect,
-                                 metrics_uid=sess_rec['metrics_uid'],
-                                 metrics_session_id=sess_rec['metrics_session_id'],
-                                 metrics_device_id=METRICS_DEVICE_ID,
-                                 platform='HnG', connection_state=2,
-                                 battle_session_id=sess_rec['battle_session_id']))
-            _log(f'S->C cmd={vc:<4} KeyValueChangeSet (PlayerMissionSession '
-                 f'id={pms_id}, player={pid}, mission={mission_id}, '
-                 f'state=2 Admitted ★launch trigger)')
-            # solo squad UPDATE（InBattle）
-            if solo:
-                solo['mission_id'] = mission_id
-                solo['entered'] = int(solo.get('entered', 0)) + 1
-                await _push_kvcs(w, vc, b'SquadSession',
-                                 _msg_solo_squad_session(
-                                     solo['squad_row'], pid,
-                                     solo['template'], solo['faction'],
-                                     mission_id, solo['entered']))
-                await _push_kvcs(w, vc, b'SquadMemberSession',
-                                 _msg_solo_squad_member_session(
-                                     solo['member_row'], solo['squad_row'], pid,
-                                     gamertag, char_id, char_name, rank, 4,
-                                     solo.get('metrics_session_id', 0),
-                                     solo['faction']))
-            # PMM delete（退出匹配中界面）
-            pmm_id = _MATCH_PMM_IDS.pop(pid, None)
-            if pmm_id is not None:
-                await _push_kvcs_delete(w, vc, b'PlayerMatchMaking', pmm_id)
-                _log(f'S->C cmd={vc:<4} KeyValueChangeSet '
-                     f'delete (PlayerMatchMaking id={pmm_id})')
-            # BattleInfo 'set'（PMS Armed 后必须推，否则客户端不连 game server）
-            await _push_kvcs(w, vc, b'BattleInfo',
-                             _msg_battle_info(mission_id, pos[0], pos[1]))
-            _log(f'S->C cmd={vc:<4} KeyValueChangeSet (BattleInfo id={mission_id})')
-            # ★ private_login.pcapng 复核：Admitted 数秒后再推 f14=3 (Armed)，
-            #   KVCS 全走 Flash 连接（game 连接保持静默）。
-            await asyncio.sleep(5)
-            await _push_kvcs(w, vc, b'PlayerMissionSession',
-                             _msg_player_mission_session(
-                                 pms_id, pid, gamertag, char_id, faction,
-                                 char_name, rank, mission_id, _zulu_now(),
-                                 game_connect,
-                                 metrics_uid=sess_rec['metrics_uid'],
-                                 metrics_session_id=sess_rec['metrics_session_id'],
-                                 metrics_device_id=METRICS_DEVICE_ID,
-                                 platform='HnG', connection_state=3,
-                                 battle_session_id=sess_rec['battle_session_id']))
-            _log(f'S->C cmd={vc:<4} KeyValueChangeSet (PlayerMissionSession '
-                 f'id={pms_id}, mission={mission_id}, state=3 Armed ★battle arm)')
+            await _push_player_into_mission(s['entry'], s['ctx'], s['sess'],
+                                            s['pms_id'], mission_id,
+                                            game_connect, pos)
         except Exception as ex:
-            _log(f'      match push failed (player={pid}, mission='
-                 f'{mission_id}): {ex}')
+            _log(f'      match push failed (player={s["entry"].player_id}, '
+                 f'mission={mission_id}): {ex}')
+    await _push_queue_counts()
+
+
+async def _push_player_into_mission(e, ctx, sess_rec, pms_id, mission_id,
+                                    game_connect, pos):
+    """单玩家进局 KVCS 序列（成局分发与等待期中途加入共用）。
+
+    PMS Admitted(f14=2，触发客户端拉起 hng.exe) → solo squad InBattle
+    → PMM delete（退出匹配中界面）→ BattleInfo set → 5s 后 PMS Armed
+    (f14=3)。单玩家失败由调用方捕获（不影响其他玩家）。
+    """
+    w, vc = ctx.get('writer'), ctx.get('view_cmd')
+    if w is None or vc is None:
+        _log(f'      [WARN] mission={mission_id}: player={e.player_id} '
+             f'has no writer, skip push')
+        return
+    pid = int(e.player_id)
+    char_id = int(e.char_id)
+    faction = int(e.faction)
+    gamertag = sess_rec['gamertag']
+    char_name = ctx.get('char_name') or gamertag
+    rank = int(ctx.get('rank', 0) or 0)
+    solo = _SOLO_SQUADS.get(pid) or {}
+    squad_db_id = int(ctx.get('squad_db_id') or 0)
+    # PMS Admitted（f14=2 触发客户端拉起 hng.exe）
+    await _push_kvcs(w, vc, b'PlayerMissionSession',
+                     _msg_player_mission_session(
+                         pms_id, pid, gamertag, char_id, faction,
+                         char_name, rank, mission_id, _zulu_now(),
+                         game_connect,
+                         metrics_uid=sess_rec['metrics_uid'],
+                         metrics_session_id=sess_rec['metrics_session_id'],
+                         metrics_device_id=METRICS_DEVICE_ID,
+                         platform='HnG', connection_state=2,
+                         battle_session_id=sess_rec['battle_session_id']))
+    _log(f'S->C cmd={vc:<4} KeyValueChangeSet (PlayerMissionSession '
+         f'id={pms_id}, player={pid}, mission={mission_id}, '
+         f'state=2 Admitted ★launch trigger)')
+    # 整队 UPDATE（InBattle）：真实小队推整队行（f17=本局 missionId、
+    # 成员 InBattle=4，每名成员各自连接收到同一份）；单人推 solo 行
+    if squad_db_id:
+        from handlers.squad import push_squad_rows_to_writer
+        await push_squad_rows_to_writer(w, vc, squad_db_id, mission_id)
+    elif solo:
+        solo['mission_id'] = mission_id
+        solo['entered'] = int(solo.get('entered', 0)) + 1
+        await _push_kvcs(w, vc, b'SquadSession',
+                         _msg_solo_squad_session(
+                             solo['squad_row'], pid,
+                             solo['template'], solo['faction'],
+                             mission_id, solo['entered']))
+        await _push_kvcs(w, vc, b'SquadMemberSession',
+                         _msg_solo_squad_member_session(
+                             solo['member_row'], solo['squad_row'], pid,
+                             gamertag, char_id, char_name, rank, 4,
+                             solo.get('metrics_session_id', 0),
+                             solo['faction']))
+    # PMM delete（退出匹配中界面）
+    pmm_id = _MATCH_PMM_IDS.pop(pid, None)
+    if pmm_id is not None:
+        await _push_kvcs_delete(w, vc, b'PlayerMatchMaking', pmm_id)
+        _log(f'S->C cmd={vc:<4} KeyValueChangeSet '
+             f'delete (PlayerMatchMaking id={pmm_id})')
+    # BattleInfo 'set'（PMS Armed 后必须推，否则客户端不连 game server）
+    await _push_kvcs(w, vc, b'BattleInfo',
+                     _msg_battle_info(mission_id, pos[0], pos[1]))
+    _log(f'S->C cmd={vc:<4} KeyValueChangeSet (BattleInfo id={mission_id})')
+    # ★ private_login.pcapng 复核：Admitted 数秒后再推 f14=3 (Armed)，
+    #   KVCS 全走 Flash 连接（game 连接保持静默）。
+    await asyncio.sleep(5)
+    await _push_kvcs(w, vc, b'PlayerMissionSession',
+                     _msg_player_mission_session(
+                         pms_id, pid, gamertag, char_id, faction,
+                         char_name, rank, mission_id, _zulu_now(),
+                         game_connect,
+                         metrics_uid=sess_rec['metrics_uid'],
+                         metrics_session_id=sess_rec['metrics_session_id'],
+                         metrics_device_id=METRICS_DEVICE_ID,
+                         platform='HnG', connection_state=3,
+                         battle_session_id=sess_rec['battle_session_id']))
+    _log(f'S->C cmd={vc:<4} KeyValueChangeSet (PlayerMissionSession '
+         f'id={pms_id}, mission={mission_id}, state=3 Armed ★battle arm)')
+
+
+def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None):
+    """找一个等待期内可中途加入的战局，返回 (mission_id, inst) 或 None。
+
+    条件（全部满足）：
+    - 战局实例仍在运行（COMBAT_INSTANCES 且 _MM_MISSION_DETAILS 均在）
+    - 同 gamemode；玩家选图兼容（未选图=通配，否则须包含该局 preset）
+    - 玩家阵营属于该局攻防双方（第三方阵营无出生侧，无法进图）
+    - 成局后未超过 mm_config.JOIN_WINDOW 秒（开局等待/倒计时阶段）
+    - 该局人数未达该模式 max_players
+    only_mission 非空时只考虑该 mission_id（JoinMatchMakingRequest f2
+    指定战局加入，战争地图点进行中战斗的路径）。
+    """
+    if mm_config.JOIN_WINDOW <= 0:
+        return None
+    now = time.monotonic()
+    if only_mission:
+        inst = COMBAT_INSTANCES.get(int(only_mission))
+        cands = [(int(only_mission), inst)] if inst is not None else []
+    else:
+        cands = list(COMBAT_INSTANCES.items())
+    for mission_id, inst in cands:
+        det = _MM_MISSION_DETAILS.get(mission_id)
+        if det is None or 'preset' not in det:
+            continue
+        if int(det.get('gamemode', 0) or 0) != int(gamemode_id):
+            continue
+        if presets and int(det.get('preset', 0) or 0) not in presets:
+            continue
+        if faction not in (int(det.get('attacker_faction', 3) or 3),
+                           int(det.get('defender_faction', 2) or 2)):
+            continue
+        if now - float(det.get('formed_at', 0) or 0) > mm_config.JOIN_WINDOW:
+            continue
+        max_p = int(mm_config.gamemode_cfg(gamemode_id).get('max_players', 18))
+        if len(det.get('players') or ()) >= max_p:
+            continue
+        return mission_id, inst
+    return None
+
+
+async def _join_existing_mission(pid, mission_id, e, ctx):
+    """等待期中途加入现有战局：登记 PMS 会话 + 推进局 KVCS 序列。
+
+    与 _start_match 单玩家路径同构：发 pms/metrics/battle_session/squad id、
+    登记 PMS_TO_MISSION/PMS_TO_SESSION（game_server 按 pms 识别会话）、
+    追加进 _MM_MISSION_DETAILS['players']（简报参战方名单/GMD 立即可见），
+    客户端 hng.exe 直连该局 combat server UDP 端口。
+    """
+    q = _MM_QUEUES.pop(pid, None)
+    _cleanup_queued_player(pid)
+    ctx = (q or {}).get('ctx') or ctx
+    det = _MM_MISSION_DETAILS[mission_id]
+    inst = COMBAT_INSTANCES[mission_id]
+    pms_id = _next_match_id(_MM_PMS_ID)
+    metrics_uid = ctx.get('metrics_uid') or str(uuid.uuid4())
+    metrics_session_id = int(ctx.get('metrics_session_id', 0) or 0) or \
+        _next_match_id(_MM_METRICS_SESSION_ID)
+    sess_rec = {'pms_id': pms_id, 'player_id': pid,
+                'char_id': int(e.char_id),
+                'gamertag': ctx.get('gamertag') or 'Player',
+                'faction': int(e.faction),
+                'metrics_uid': metrics_uid,
+                'metrics_session_id': metrics_session_id,
+                'battle_session_id': _next_match_id(_MM_BATTLE_SESSION_ID),
+                'squad_id': 0, 'squad_slot': 0,
+                'mission_id': mission_id,
+                'quickplay': bool(ctx.get('quickplay', False))}
+    # ★ 局内小队归组：单人中途加入优先补进同阵营、同兵种、未满员的单人
+    #   凑成队（不动真实小队）；没有可补的队则自建一队（本人任队长），
+    #   队名=本人兵种官方小队模板名（与大厅 UI 默认名一致）。
+    join_rank = int(ctx.get('rank', 0) or 0)
+    join_tmpl = squad_template_for_character(ctx.get('char_template'))
+    new_member = {'player_id': pid, 'char_id': int(e.char_id),
+                  'gamertag': sess_rec['gamertag'], 'rank': join_rank,
+                  'slot': 0}
+    picked = None
+    for sq_id, info in (_MM_MISSION_SQUADS.get(mission_id) or {}).items():
+        if info.get('squad_db_id'):
+            continue                      # 真实小队不吸收散人
+        if int(info.get('faction', 0) or 0) != int(e.faction):
+            continue
+        if int(info.get('template', 1) or 1) != int(join_tmpl):
+            continue                      # 兵种不同则大厅默认名对不上
+        if len(info.get('members') or []) >= _MM_SOLO_SQUAD_MAX:
+            continue
+        picked = (sq_id, info)
+        break
+    if picked is not None:
+        sq_id, info = picked
+        new_member['slot'] = len(info['members'])
+        info['members'].append(new_member)
+        sess_rec['squad_id'] = sq_id
+        sess_rec['squad_slot'] = new_member['slot']
+    else:
+        sq_id = _next_match_id(_MM_SQUAD_ID)
+        _MM_MISSION_SQUADS.setdefault(mission_id, {})[sq_id] = {
+            'name': squad_template_name(join_tmpl),
+            'leader_char_id': int(e.char_id), 'faction': int(e.faction),
+            'squad_db_id': 0, 'template': int(join_tmpl),
+            'members': [new_member]}
+        sess_rec['squad_id'] = sq_id
+    PMS_TO_MISSION[pms_id] = mission_id
+    PMS_TO_SESSION[pms_id] = sess_rec
+    det.setdefault('players', []).append(
+        {'player_id': pid, 'gamertag': sess_rec['gamertag'],
+         'char_id': int(e.char_id), 'faction': int(e.faction),
+         'pms_id': pms_id})
+    age = time.monotonic() - float(det.get('formed_at', 0) or 0)
+    _log(f'late join: player {pid} -> mission={mission_id} '
+         f'(players={len(det["players"])}, udp/{inst["port"]}, '
+         f'age={age:.0f}s, gamemode={det.get("gamemode")})')
+    # 该局专用服可能仍在加载地图（握手未完成）：有界等待，超时放行——
+    # 客户端 hng.exe 连不上 UDP 会自动重试（与 _start_match 同哲学）
+    try:
+        await asyncio.wait_for(inst['ready'].wait(), 30)
+    except asyncio.TimeoutError:
+        _log(f'late join: mission={mission_id} combat server not ready '
+             f'after 30s - pushing Admitted anyway (client will retry UDP)')
+    game_connect = f'{PUBLIC_HOST}:{inst["port"]}'
+    pos = battlefield_pos(int(det.get('map_entity_id') or 0)
+                          or MISSION_MAP_ENTITY_ID)
+    try:
+        await _push_player_into_mission(e, ctx, sess_rec, pms_id, mission_id,
+                                        game_connect, pos)
+    except Exception as ex:
+        _log(f'      late join push failed (player={pid}, mission='
+             f'{mission_id}): {ex}')
     await _push_queue_counts()
 
 
@@ -1233,6 +1651,16 @@ async def _handle_join(sess, writer, cmd_id, proto):
             await _push_kvcs(writer, view_cmd, b'faction', row)
         _log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet (faction ×3 rows) ★FactionTable fill')
 
+    # ★ 整队入池：玩家在真实小队（DB squads）且队内有其他在线 InLobby/Ready
+    #   成员 → 全队作为原子单位一起排队（group_key=squad_id 不拆队），
+    #   成局后整队同 mission 部署。官方语义：队长激活小队全队进匹配，
+    #   这里任何成员点匹配都带全队（角色取各自小队成员行）。
+    squad, sq_members = await _squad_eligible_members(pid)
+    if squad is not None:
+        await _enqueue_squad(squad, sq_members, gamemode_id,
+                             staged_presets, req_mission_id)
+        return
+
     # 重复排队：删旧 PMM 行（行 id 即将更换，防客户端表残留）
     old_q = _MM_QUEUES.get(pid)
     if old_q is not None and not old_q.get('mission_id'):
@@ -1257,6 +1685,7 @@ async def _handle_join(sess, writer, cmd_id, proto):
            'char_name': char_name, 'rank': rank, 'faction': faction,
            'char_id': int(char_id), 'quickplay': quickplay,
            'req_mission_id': req_mission_id,
+           'char_template': template,
            'metrics_uid': metrics_uid,
            'metrics_session_id': metrics_session_id}
     _MM_QUEUES[pid] = {'pmm_id': pmm_id, 'mission_id': 0,
@@ -1303,11 +1732,22 @@ async def _handle_join(sess, writer, cmd_id, proto):
              f'(SquadSession id={solo["squad_row"]} + SquadMemberSession '
              f'id={solo["member_row"]} status=3 Ready ★solo squad)')
 
+    # 1c. 等待期中途加入：已有同模式、选图兼容、未满员的战局仍处于开局
+    #     等待窗口内（mm_config.JOIN_WINDOW）→ 直接进该局（不另开新局）；
+    #     玩家指定了战局（f2 missionId，战争地图点进行中战斗）则只考虑该局。
+    #     找不到/超窗/满员/阵营不符 → 正常入池撮合。
+    entry = mm_pool.QueueEntry(
+        player_id=pid, char_id=int(char_id), faction=faction,
+        gamemode_id=gamemode_id, presets=staged_presets)
+    joinable = _find_joinable_mission(gamemode_id, staged_presets, faction,
+                                      only_mission=req_mission_id or None)
+    if joinable is not None:
+        await _join_existing_mission(pid, joinable[0], entry, ctx)
+        return
+
     # 2. 入池 + 撮合（训练模式 min=1 立即成组；凑够 min_players 成组；
     #    不足则 _arm_ai_fill 超时 AI 补位）
-    POOL.enqueue(mm_pool.QueueEntry(
-        player_id=pid, char_id=int(char_id), faction=faction,
-        gamemode_id=gamemode_id, presets=staged_presets))
+    POOL.enqueue(entry)
     await _try_form_all()
     if _MM_QUEUES.get(pid, {}).get('mission_id', 0) == 0:
         # 仍在池中 → 启动/重启该玩家的超时 AI 补位计时
@@ -1323,6 +1763,24 @@ async def _handle_cancel(sess, writer, cmd_id, proto):
 
     pid = await sess.ensure_player()
     q = _MM_QUEUES.pop(pid, None) if pid else None
+    # ★ 整队取消：任何成员取消 → 全队出池回 InLobby（响应已回 ok）
+    squad_db_id = int((q or {}).get('ctx', {}).get('squad_db_id') or 0) \
+        if q else 0
+    if squad_db_id:
+        # 本人的队列条目上面已 pop；其余成员由 _cancel_squad_queue 处理
+        POOL.remove(pid)
+        _MATCH_PMM_IDS.pop(pid, None)
+        t = _AI_FILL_TASKS.pop(pid, None)
+        if t is not None:
+            t.cancel()
+        if q and q.get('pmm_id') is not None and sess.playerview_cmd is not None:
+            await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                    b'PlayerMatchMaking', q['pmm_id'])
+            _log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+                 f'delete (PlayerMatchMaking id={q["pmm_id"]})')
+        await _cancel_squad_queue(squad_db_id)
+        await _try_form_all()
+        return
     if pid:
         POOL.remove(pid)                       # 出池（未入池时 no-op）
         _MATCH_PMM_IDS.pop(pid, None)

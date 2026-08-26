@@ -71,10 +71,10 @@ from protocol import (
     pb_string,
     pb_uint32,
     )
-from state import STORE, log
+from state import FLASH_SESSIONS, STORE, log
 
 from messages import _push_kvcs
-from matchmaking import FACTION_ROW_IDS, _WAR_ID
+from matchmaking import FACTION_ROW_IDS
 
 # ResponseCodes（HnG_States.ResponseCodes 枚举）
 RC_OK = 1
@@ -106,7 +106,7 @@ async def push_friend_rows(sess, writer, pid):
     """推送好友列表 KVCS（friendinfo 表，FriendsListTable.xmlTag）。
 
     otherPlayerAlsoFriend=true → 正式好友；false → 待确认（pendingList）。
-    onlinestatus：0 离线 1 在线（私服单会话，其他账号一律离线）。"""
+    onlinestatus：0 离线 1 在线（按 FLASH_SESSIONS 注册表实时判断）。"""
     if STORE is None or sess.playerview_cmd is None:
         return
     try:
@@ -115,14 +115,18 @@ async def push_friend_rows(sess, writer, pid):
         log(f'      [DB] list_friend_rows failed: {e}')
         return
     for r in rows:
+        online = FLASH_SESSIONS.get(r['gamertag']) is not None
         m = pb_int64(1, r['id'])                     # id
         m += pb_string(2, r['gamertag'])             # gamertag
-        m += pb_uint32(3, 0)                         # onlinestatus（离线）
+        m += pb_uint32(3, 1 if online else 0)        # onlinestatus
         m += pb_int64(4, r['faction'])               # factionTemplateId
         m += pb_int64(5, FACTION_ROW_IDS.get(r['faction'], 0))  # factionId（行 id）
         m += pb_int64(6, 0)                          # missionId
         m += pb_int64(7, 0)                          # missionFactionId
-        m += pb_int64(8, _WAR_ID)                    # warId
+        # warId 必须与 war catalogue / player.war 的 id=1 一致：
+        # 客户端邀请好友（小队/战斗）前本地校验 friend.warId == currentWar.id，
+        # 不一致直接提示"不在同一服务器"（此前用 matchmaking._WAR_ID 随机大数）
+        m += pb_int64(8, 1)                          # warId
         m += pb_string(9, _WAR_NAME)                 # warName
         m += pb_bool(10, r['also_friend'])           # otherPlayerAlsoFriend
         m += pb_bool(11, r['initiated_by_me'])       # friendshipInitiatedByMe
@@ -133,6 +137,43 @@ async def push_friend_rows(sess, writer, pid):
     if rows:
         log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
             f'(friendinfo x{len(rows)}, player={pid})')
+
+
+async def push_rows_to_player_if_online(pid):
+    """好友数据变化时实时通知该玩家（在 Flash 会话在线才推；离线下次登录
+    订阅 playerview 时自然拉到最新列表，无需重登的另一半场景就靠这里）。"""
+    if STORE is None:
+        return
+    try:
+        name = await STORE.get_username(int(pid))
+    except Exception as e:
+        log(f'      [DB] get_username failed: {e}')
+        return
+    other = FLASH_SESSIONS.get(name or '')
+    if other is not None and other.playerview_cmd is not None:
+        await push_friend_rows(other, other.writer, int(pid))
+
+
+async def notify_friends_of(pid):
+    """我的上/下线通知：向所有在线好友重推其好友列表，刷新我的 onlinestatus。
+
+    上线：在 FLASH_SESSIONS 注册之后调用（此时我已算在线）；
+    下线：注销之后调用（此时我已算离线）。"""
+    if STORE is None:
+        return
+    try:
+        rows = await STORE.list_friend_rows(int(pid))
+    except Exception as e:
+        log(f'      [DB] list_friend_rows failed: {e}')
+        return
+    for r in rows:
+        other = FLASH_SESSIONS.get(r['gamertag'])
+        if other is None or other.playerview_cmd is None:
+            continue
+        try:
+            await push_friend_rows(other, other.writer, r['id'])
+        except Exception as e:
+            log(f'      [social] notify friend {r["id"]} failed: {e}')
 
 
 async def push_ignored_rows(sess, writer, pid):
@@ -247,6 +288,10 @@ async def handle_add_to_friends_list(sess, writer, cmd_id, req_type, proto):
                     'already': RC_ALREADY_FRIEND,
                     'self': RC_ALREADY_FRIEND}[result]
             log(f'      [DB] add_friend {pid}->{friend_id}: {result}')
+            # 实时通知对方：'ok'=对方收到待确认请求 / 'accepted'=对方转正好友，
+            # 不推则对方要重登才能看到变化
+            if result in ('ok', 'accepted'):
+                await push_rows_to_player_if_online(friend_id)
             await push_friend_rows(sess, writer, int(pid))
         except Exception as e:
             log(f'      [DB] add_friend failed: {e}')
@@ -283,6 +328,8 @@ async def handle_remove_from_friends_list(sess, writer, cmd_id, req_type, proto)
                     await push_ignored_rows(sess, writer, int(pid))
             log(f'      [DB] remove_friend {pid}-x-{friend_id} '
                 f'(also_ignore={add_ignore})')
+            # 对方也要实时掉好友行（双向删除），否则其列表残留到我方重登
+            await push_rows_to_player_if_online(friend_id)
             await push_friend_rows(sess, writer, int(pid))
         except Exception as e:
             log(f'      [DB] remove_friend failed: {e}')
@@ -721,9 +768,12 @@ async def handle_set_message_recipients_deleted(sess, writer, cmd_id, req_type,
 
 async def handle_set_notifications_read(sess, writer, cmd_id, req_type, proto):
     """SetNotificationsReadRequest {notificationIds=1, readStatus=2}
-    → SetNotificationsReadResponse{response=1}。
+    → SetNotificationsReadResponse{response=1} + Notification 行回推。
 
-    通知托盘已读状态纯 ack（客户端本地管理，服务器无需落库）。"""
+    客户端发完请求只在等服务器 KVCS：NotificationModel.refreshNotificationCounter
+    由 NotificationTable.changeSignal（即 Notification 行更新）触发，本地
+    请求路径不刷角标。服务器不回推 readStatus 更新行 → 右上角未读数字
+    （newNotificationCount）看完战报也不清零。"""
     ids, read_status = [], 1
     try:
         fields = pb_parse_multi(proto)
@@ -731,6 +781,25 @@ async def handle_set_notifications_read(sess, writer, cmd_id, req_type, proto):
         read_status = int(fields.get(2, [1])[0]) if fields.get(2) else 1
     except Exception as e:
         log(f'      [social] SetNotificationsRead parse error: {e}')
+
+    # 回推更新行（combat._NOTIF_ROWS 登记了本会话推送过的通知）
+    if ids and sess.playerview_cmd is not None:
+        from .combat import _NOTIF_ROWS
+        pid = await sess.ensure_player()
+        for nid in ids:
+            row = _NOTIF_ROWS.get(int(nid))
+            if row is None or pid is None or int(row[0]) != int(pid):
+                continue
+            m = pb_int64(1, int(nid))                    # id
+            m += pb_int64(2, int(row[0]))                # playerId
+            m += pb_int32(3, int(row[1]))                # type
+            m += pb_int64(4, int(row[2]))                # typeId
+            m += pb_int32(5, int(read_status))           # readStatus（回显）
+            m += pb_string(6, row[3])                    # timestamp
+            m += pb_string(7, row[4])                    # expires
+            await _push_kvcs(writer, sess.playerview_cmd, b'Notification', m)
+            log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+                f'(Notification id={nid}, readStatus={read_status})')
 
     resp = build_response(cmd_id, 'SetNotificationsReadResponse',
                           pb_int32(1, RC_OK))

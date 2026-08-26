@@ -208,8 +208,8 @@ def _msg_battle_pass_row(row_id, pid, season, score, purchased, active,
     return m
 
 
-async def push_battle_pass_row(sess, writer, pid):
-    """推玩家 battle_pass 进度行（当前激活赛季）。
+async def push_battle_pass_row(sess, writer, pid, season_id=_ACTIVE_SEASON):
+    """推玩家 battle_pass 进度行（默认当前激活赛季，可指定其他赛季）。
 
     tier/level 按 score 对 battle_pass_template.requiredScore 推导；
     pending = 已达分数且未领取的模板 id（客户端据此发 ReceiveBattlePassRewardRequest）。"""
@@ -217,20 +217,20 @@ async def push_battle_pass_row(sess, writer, pid):
         return
     bp = None
     try:
-        bp = await STORE.get_battle_pass(pid, _ACTIVE_SEASON)
+        bp = await STORE.get_battle_pass(pid, season_id)
     except Exception as e:
         log(f'      [DB] get_battle_pass failed: {e}')
         return
     if bp is None:
         return                              # 无进度行不推（客户端走赛季默认值）
     score = bp['score']
-    tier, level = _tier_level_for_score(score)
+    tier, level = _tier_level_for_score(score, season_id)
     received = [int(x) for x in bp.get('claimed', [])]
     pending = [t['id'] for t in _bp_templates()
-               if t['season'] == _ACTIVE_SEASON and t['req'] <= score
+               if t['season'] == season_id and t['req'] <= score
                and t['id'] not in received]
-    row_id = pid * 100 + _ACTIVE_SEASON
-    m = _msg_battle_pass_row(row_id, pid, _ACTIVE_SEASON, score,
+    row_id = pid * 100 + season_id
+    m = _msg_battle_pass_row(row_id, pid, season_id, score,
                              bp['purchased'], bp['active'], pending, received,
                              tier, level)
     await _push_kvcs(writer, sess.playerview_cmd, b'battle_pass', m)
@@ -252,7 +252,12 @@ async def push_season_templates(sess, writer):
         m += pb_string(3, s['loc'])
         m += pb_string(4, s['from'])
         m += pb_string(5, s['to'])
-        m += pb_bool(6, s['id'] == _ACTIVE_SEASON)
+        # battle_pass_season_template 运行时 schema（swf-rank 实类）：
+        # 6=startingTier 7=startingLevel 8=startingScore（无 isActive，
+        # KVCS set 为整行替换，写错字段会覆盖客户端本地起始值）
+        m += pb_int32(6, s['s_tier'])
+        m += pb_int32(7, s['s_lvl'])
+        m += pb_int32(8, s['s_score'])
         await _push_kvcs(writer, sess.playerview_cmd,
                          b'battle_pass_season_template', m)
     log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
@@ -260,11 +265,11 @@ async def push_season_templates(sess, writer):
         f'{_SEASON_EXTENDED_TO})')
 
 
-def _tier_level_for_score(score):
-    """分数 → (tier, level)：取 requiredScore<=score 的最大 (tier, level)。"""
+def _tier_level_for_score(score, season_id=_ACTIVE_SEASON):
+    """分数 → (tier, level)：取该赛季 requiredScore<=score 的最大 (tier, level)。"""
     best = (1, 1)
     for t in _bp_templates():
-        if t['season'] == _ACTIVE_SEASON and t['req'] <= score:
+        if t['season'] == season_id and t['req'] <= score:
             if (t['tier'], t['level']) > best:
                 best = (t['tier'], t['level'])
     return best
@@ -398,7 +403,7 @@ async def handle_activate_battle_pass_season(sess, writer, cmd_id, req_type, pro
             log(f'      [DB] activate battle pass season {season_id}: {ok}')
         except Exception as e:
             log(f'      [DB] activate_battle_pass failed: {e}')
-        await push_battle_pass_row(sess, writer, int(pid))
+        await push_battle_pass_row(sess, writer, int(pid), season_id)
 
     resp = build_response(cmd_id, 'ActivateBattlePassSeasonResponse', pb_int32(1, 1))
     writer.write(resp)
@@ -429,7 +434,7 @@ async def handle_purchase_battle_pass_season(sess, writer, cmd_id, req_type, pro
                 f'{ok}, gold={gold}')
         except Exception as e:
             log(f'      [DB] purchase_battle_pass failed: {e}')
-        await push_battle_pass_row(sess, writer, int(pid))
+        await push_battle_pass_row(sess, writer, int(pid), season_id)
 
     resp = build_response(cmd_id, 'PurchaseBattlePassSeasonResponse', pb_int32(1, 1))
     writer.write(resp)
@@ -455,13 +460,14 @@ async def handle_purchase_battle_pass_tier(sess, writer, cmd_id, req_type, proto
         tpl = next((t for t in _bp_templates() if t['id'] == template_id), None)
         if tpl is not None:
             try:
-                score = await STORE.add_battle_pass_score(
+                # 购买层级完成 = score 提升到该模板 requiredScore（只升不降）
+                score = await STORE.set_battle_pass_score(
                     int(pid), tpl['season'], max(0, tpl['req']))
                 log(f'      [DB] purchase tier template {template_id}: '
                     f'score -> {score}')
             except Exception as e:
-                log(f'      [DB] add_battle_pass_score failed: {e}')
-        await push_battle_pass_row(sess, writer, int(pid))
+                log(f'      [DB] set_battle_pass_score failed: {e}')
+            await push_battle_pass_row(sess, writer, int(pid), tpl['season'])
 
     resp = build_response(cmd_id, 'PurchaseBattlePassTierResponse', pb_int32(1, 1))
     writer.write(resp)
@@ -511,7 +517,7 @@ async def handle_receive_battle_pass_reward(sess, writer, cmd_id, req_type, prot
             if granted_ids:
                 log(f'      [MONEY] battle pass rewards granted: {granted_ids}')
                 await _push_player_refresh(sess, writer)
-            await push_battle_pass_row(sess, writer, int(pid))
+            await push_battle_pass_row(sess, writer, int(pid), season_id)
 
     resp = build_response(cmd_id, 'ReceiveBattlePassRewardResponse', resp_proto)
     writer.write(resp)

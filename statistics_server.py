@@ -15,7 +15,9 @@
 
 协议（statistics_client.dll 逆向，vt6_GetTotals sub_18000ADF0 实锤）：
   帧:  [u32 LE len][u32 LE crc32][payload]，len = payload 长度 + 4，
-       crc32 = zlib CRC32(len 的 4 字节小端 || payload 字节)  <- CRC 覆盖长度字段
+       crc32 = raw CRC32(len 的 4 字节小端 || payload 字节)  <- 覆盖长度字段本身
+              init=0、无 final XOR（sub_18000B3E0 发送 / vt6_GetTotals 接收均如此）
+              ≠ Python zlib.crc32()（标准 CRC32，init=0xFFFFFFFF 且 final XOR）
   C->S payload：GetTotals(5)/CreateSession(3) 等为明文（send_buffer 直写），
                 周期上报 type 6 经 msg_envelope(deflate) 压缩 → 收到后先尝试解压。
   S->C payload 为 zlib 压缩（客户端 reader_ctor inflateInit 解压）。
@@ -48,11 +50,25 @@ from wardb import _RIBBON_LEVEL_XP, _ribbon_level_from_xp
 STATS_PORT = 15115
 
 
+def _raw_crc32(data: bytes) -> int:
+    """statistics_client.dll 使用的 raw CRC32（init=0、无 final XOR）。
+
+    sub_18000B3E0（发送）与 vt6_GetTotals（接收）均从此初值起步、且不异或
+    0xFFFFFFFF 收尾；而 Python ``zlib.crc32`` 默认走标准 CRC32（init=0xFFFFFFFF
+    且 final XOR），二者对任何非空输入都不相等 → 必须自己实现 raw 变体。
+
+    推导：zlib.crc32(data, value) 内部为 ``crc = value ^ 0xFFFFFFFF`` 起步、
+    收尾再 ``^ 0xFFFFFFFF``。令 value=0xFFFFFFFF 即得 init=0 的 raw 中间值，
+    再撤销收尾异或即为 raw CRC32。
+    """
+    return (zlib.crc32(data, 0xFFFFFFFF) ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+
 def _frame(payload: bytes) -> bytes:
     """S->C 帧：payload 需 zlib 压缩。"""
     data = zlib.compress(payload)
     ln = len(data) + 4
-    crc = zlib.crc32(struct.pack('<I', ln) + data) & 0xFFFFFFFF
+    crc = _raw_crc32(struct.pack('<I', ln) + data)
     return struct.pack('<II', ln, crc) + data
 
 
@@ -123,7 +139,7 @@ async def _handle_conn(reader, writer):
             if ln < 4 or ln > 16 * 1024 * 1024:
                 break
             payload = await reader.readexactly(ln - 4) if ln > 4 else b''
-            if (zlib.crc32(hdr[:4] + payload) & 0xFFFFFFFF) != crc:
+            if _raw_crc32(hdr[:4] + payload) != crc:
                 log(f'[stats] CRC mismatch from {peer}, dropping frame')
                 break
             if not payload:

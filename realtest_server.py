@@ -49,6 +49,8 @@ from state import (
 
 from messages import _push_kvcs
 
+from handlers.social import notify_friends_of
+
 
 # 客户端连接活性：MainLayoutMediator.pulseTimerTicks 每 5 秒检查一次，
 # 距上次收到服务器数据 >20s（SERVER_SLOW_LIMIT_SECONDS）就显示左上角 loading +
@@ -112,8 +114,17 @@ async def handle_tcp(reader, writer):
     finally:
         log(f'TCP DISCONNECT {addr} (fd={fd})')
         # Flash 连接注册表注销（仅当注册的就是本连接；重登录已被覆盖时不动）
+        went_offline = False
         if sess.username and FLASH_SESSIONS.get(sess.username) is sess:
             del FLASH_SESSIONS[sess.username]
+            went_offline = True
+        # 下线广播：在线好友的好友列表里把我的 onlinestatus 刷回 0
+        # （先注销再广播，此时 onlinestatus 自然算离线）
+        if went_offline and sess.player_id is not None:
+            try:
+                await notify_friends_of(int(sess.player_id))
+            except Exception as e:
+                log(f'[social] offline notify failed: {type(e).__name__}: {e}')
         # 匹配排队清理：断线玩家出池（防幽灵条目虚增人数/被撮合成局；
         # 已成局的不动，战局照常进行）
         try:

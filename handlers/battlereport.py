@@ -10,7 +10,7 @@
     repeated ClientBattleReport battleReports = 2 }
   空请求 → 回玩家最近 10 场战报（通知托盘未推 id 的兜底路径）。
 - RequestBattleReportVeteranBonusRequest { battleReportId = 1 }
-  → Response { result = 1 }（无会员体系，恒 ok）
+  → Response { result = 1 }（老兵 +25% 结算时已入账，无需补领）
 - ClaimBattleReportVeteranBonusRequest {} → Response { result = 1 }
 
 ClientBattleReport 嵌套（required 字段全给，空 repeated 完全省略）：
@@ -20,7 +20,8 @@ ClientBattleReport 嵌套（required 字段全给，空 repeated 完全省略）
   f11 factions{factionId, players{playerId, playerTag, veteranMember,
   playerScore, playerCaptures, playerKills, playerDeaths, squadName,
   characters{characterId, startXp, endXp, ...bonuses=0,
-  creditEarnings{valueEarned}, warfundEarnings{valueEarned}, ribbons}}} /
+  creditEarnings{valueEarned, veteranBonus}, warfundEarnings 同,
+  ribbons{ribbonTemplateId, startValue, endValue}}} /
   f12 capturepoints（空省略）
 """
 
@@ -39,9 +40,15 @@ from protocol import (
 from state import STORE, log
 
 
-def _msg_earnings(value):
-    """ClientBattleReportEarnings：f1 valueEarned，其余加成恒 0。"""
-    return pb_int32(1, int(value))
+def _msg_earnings(value, vet_bonus=0):
+    """ClientBattleReportEarnings：f1 valueEarned，f2 veteranBonus。
+
+    f2 是老兵会员 +25% 加成——客户端 RewardsView 总额 = Σ(valueEarned+
+    veteranBonus)（MissionBattleReportMediator.setDetailedPlayerInfo）。"""
+    m = pb_int32(1, int(value))
+    if vet_bonus:
+        m += pb_int32(2, int(vet_bonus))
+    return m
 
 
 def _msg_report_character(ch):
@@ -56,13 +63,21 @@ def _msg_report_character(ch):
     m += pb_int32(7, 0)                       # xpUnderdogBonus
     m += pb_int32(8, 0)                       # xpSquadVetBonus
     m += pb_int32(9, 0)                       # xpDailyBonus
-    m += pb_message(10, _msg_earnings(ch.get('creditEarned', 0)))
-    m += pb_message(11, _msg_earnings(ch.get('warfundEarned', 0)))
-    for rid in ch.get('ribbons') or []:       # f13 ribbons
-        rb = pb_int64(1, int(rid))
-        rb += pb_int32(2, 0)                  # startValue
-        rb += pb_int32(3, 1)                  # endValue
-        m += pb_message(13, rb)
+    m += pb_message(10, _msg_earnings(ch.get('creditEarned', 0),
+                                      ch.get('creditVetBonus', 0)))
+    m += pb_message(11, _msg_earnings(ch.get('warfundEarned', 0),
+                                      ch.get('warfundVetBonus', 0)))
+    for rb in ch.get('ribbons') or []:        # f13 ribbons
+        if isinstance(rb, dict):              # 新格式：f13 start/end 直通
+            rid, sv, ev = (int(rb.get('id', 0) or 0),
+                           int(rb.get('start', 0) or 0),
+                           int(rb.get('end', 0) or 0))
+        else:                                 # 旧格式（只存 id）
+            rid, sv, ev = int(rb), 0, 1
+        rbm = pb_int64(1, rid)
+        rbm += pb_int32(2, sv)                # startValue
+        rbm += pb_int32(3, ev)                # endValue
+        m += pb_message(13, rbm)
     return m
 
 
@@ -71,7 +86,7 @@ def _msg_report_player(p):
     m = b''
     m += pb_int64(1, int(p.get('player_id', 0) or 0))
     m += pb_string(2, p.get('gamertag') or '')
-    m += pb_bool(3, False)                    # veteranMember
+    m += pb_bool(3, True)                     # veteranMember（+25% 已含）
     m += pb_int32(4, int(p.get('score', 0) or 0))
     m += pb_int32(5, int(p.get('captures', 0) or 0))
     m += pb_int32(6, int(p.get('kills', 0) or 0))

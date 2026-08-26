@@ -176,7 +176,8 @@ def _generate_flashres_unique():
 
 
 FLASHRES_UNIQUE = _generate_flashres_unique()
-log(f'[init] flashres_unique generated: {FLASHRES_UNIQUE.count(chr(10))} files, '
+_flashres_n = FLASHRES_UNIQUE.count(b'\n')
+log(f'[init] flashres_unique generated: {_flashres_n} files, '
     f'{len(FLASHRES_UNIQUE)}B (scanned {os.path.join(GAME_DIR, "images", "Rank")})')
 
 

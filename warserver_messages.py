@@ -100,6 +100,7 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
                          metrics_session_id=0,
                          mission_session_id=0,
                          squad_id=0,
+                         squad_slot=0,
                          faction=3,
                          db_chars=None, loadout=None,
                          quickplay=None, first_action_game=None):
@@ -158,8 +159,10 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     m += b''.join(char_entries)                  # 12 characterlist（账号库角色）
     m += pb_int64(15, char_id)                   # 15 missionCharacterId
     m += pb_int64(16, squad_id)                  # 16 squadId
-    m += pb_int32(17, 0)                         # 17 squadSlotIndex：必须与 SquadResponse
-                                                #    playerSlots 里实际存在的 index 对齐(=0)。
+    m += pb_int32(17, int(squad_slot or 0))      # 17 squadSlotIndex：必须与 SquadResponse
+                                                #    playerSlots 里实际存在的 index 对齐
+                                                #    （成局时 matchmaking 按队内槽位发号；
+                                                #    队长=0，其余成员依次 1..N-1）。
                                                 #    此前=2 而 squad 定义只有 index 0 →
                                                 #    ZServer InitPlayer "#error3 specified squad
                                                 #    character slot not found"，客户端部署逻辑

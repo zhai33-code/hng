@@ -1306,6 +1306,58 @@ class PlayerStore:
                 'WHERE id = $3 AND player_id = $4',
                 container_id, container_slot, weapon_id, player_id)
 
+    async def set_weapon_equipment(self, player_id, weapon_id,
+                                   container_id, container_slot):
+        """装备武器到角色槽位（container_slot>0）或卸下（0, 0）。返回受影响武器
+        列表（含被挤掉同槽位的其他武器，与 set_vehicle_equipment 同构）。
+
+        客户端替换槽位武器时只发 set_equipmentselection（新武器），不发
+        remove_equipmentselection（旧武器）——服务端必须把同容器同槽位的
+        旧武器挤回军械库（container 归零）并推送其 KVCS，否则旧武器既不在
+        军械库列表（container_slot 仍非 0）也不在槽位显示，且装备点数
+        按新旧两把重复计算。"""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    'SELECT id, name, template_id, character_id, container_id, '
+                    'container_slot, variant_template_id, variant_id, condition, '
+                    'clip_count, auto_repair FROM weapons '
+                    'WHERE id = $1 AND player_id = $2',
+                    weapon_id, player_id)
+                if row is None:
+                    return []
+                affected = [dict(row)]
+                if int(container_slot) > 0:
+                    # 挤掉同容器同槽位的其他武器（一个槽位只能一把）
+                    prev = await conn.fetch(
+                        'SELECT id, name, template_id, character_id, container_id, '
+                        'container_slot, variant_template_id, variant_id, condition, '
+                        'clip_count, auto_repair FROM weapons '
+                        'WHERE player_id = $1 AND container_id = $2 '
+                        'AND container_slot = $3 AND id <> $4',
+                        player_id, container_id, int(container_slot), weapon_id)
+                    for p in prev:
+                        await conn.execute(
+                            'UPDATE weapons SET container_id = 0, container_slot = 0 '
+                            'WHERE id = $1', p['id'])
+                        # asyncpg Record 不可变，须先转 dict 副本再改写
+                        pd = dict(p)
+                        pd['container_id'] = 0
+                        pd['container_slot'] = 0
+                        affected.append(pd)
+                await conn.execute(
+                    'UPDATE weapons SET container_id = $1, container_slot = $2 '
+                    'WHERE id = $3 AND player_id = $4',
+                    container_id, container_slot, weapon_id, player_id)
+            # 返回最新状态（affected[0] 是更新前的旧值，须回读）
+            ids = [a['id'] for a in affected]
+            rows = await conn.fetch(
+                'SELECT id, name, template_id, character_id, container_id, '
+                'container_slot, variant_template_id, variant_id, condition, '
+                'clip_count, auto_repair FROM weapons '
+                'WHERE id = ANY($1::bigint[]) ORDER BY id', ids)
+            return [dict(r) for r in rows]
+
     # ---- weapon modifiers ----
 
     async def list_weapon_modifiers(self, player_id, character_id=None):
@@ -1425,22 +1477,26 @@ class PlayerStore:
         players: [{player_id, gamertag, squad_name, score, captures, kills,
                    deaths, is_bot, characters: [dict 任意结构存 JSONB]}]
         按 mission_session_id 幂等：同一局重复结算先删旧 players 再重建。
+        players 为空时（解析失败/乱字节输入）DO NOTHING——绝不覆盖已有
+        战报的表头与玩家行。
         返回 report_id；DB 异常向上抛由调用方记日志。"""
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                conflict = ('ON CONFLICT (mission_session_id) DO UPDATE SET '
+                            'mission_id = EXCLUDED.mission_id, '
+                            'mission_preset_id = EXCLUDED.mission_preset_id, '
+                            'winner_faction_id = EXCLUDED.winner_faction_id, '
+                            'defender_faction_id = EXCLUDED.defender_faction_id, '
+                            'mission_time_seconds = EXCLUDED.mission_time_seconds, '
+                            'battle_start_time = EXCLUDED.battle_start_time, '
+                            'created_at = now() ') if players else \
+                           'ON CONFLICT (mission_session_id) DO NOTHING '
                 rid = await conn.fetchval(
                     'INSERT INTO battle_reports (mission_session_id, mission_id, '
                     'mission_preset_id, winner_faction_id, defender_faction_id, '
                     'mission_time_seconds, battle_start_time) '
                     'VALUES ($1, $2, $3, $4, $5, $6, $7) '
-                    'ON CONFLICT (mission_session_id) DO UPDATE SET '
-                    'mission_id = EXCLUDED.mission_id, '
-                    'mission_preset_id = EXCLUDED.mission_preset_id, '
-                    'winner_faction_id = EXCLUDED.winner_faction_id, '
-                    'defender_faction_id = EXCLUDED.defender_faction_id, '
-                    'mission_time_seconds = EXCLUDED.mission_time_seconds, '
-                    'battle_start_time = EXCLUDED.battle_start_time, '
-                    'created_at = now() '
+                    + conflict +
                     'RETURNING id',
                     int(report['mission_session_id']), int(report.get('mission_id', 0)),
                     int(report.get('mission_preset_id', 0)),
@@ -1448,9 +1504,17 @@ class PlayerStore:
                     int(report.get('defender_faction_id', 0)),
                     int(report.get('mission_time_seconds', 0)),
                     int(report.get('battle_start_time', 0)))
-                await conn.execute(
-                    'DELETE FROM battle_report_players WHERE report_id = $1', rid)
+                if rid is None:
+                    # DO NOTHING 命中冲突：回查已存战报 id（供通知引用）
+                    rid = await conn.fetchval(
+                        'SELECT id FROM battle_reports WHERE mission_session_id = $1',
+                        int(report['mission_session_id']))
+                # 幂等重建：新结算带玩家才删旧重建——空玩家（解析失败/测试
+                # 乱字节）命中旧行时直接跳过，绝不擦掉已有战报数据
                 if players:
+                    await conn.execute(
+                        'DELETE FROM battle_report_players WHERE report_id = $1',
+                        rid)
                     await conn.executemany(
                         'INSERT INTO battle_report_players '
                         '(report_id, player_id, gamertag, squad_name, score, captures, '
@@ -1603,6 +1667,21 @@ class PlayerStore:
                 player_id, int(season_id), int(delta))
         return int(val or 0)
 
+    async def set_battle_pass_score(self, player_id, season_id, score):
+        """通行证分数设值（买层级完成：提升到 requiredScore，只升不降）。
+
+        xp = GREATEST(xp, score)，返回新分数。"""
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval(
+                'INSERT INTO battle_pass_progress (player_id, season_id, xp) '
+                'VALUES ($1, $2, $3) '
+                'ON CONFLICT (player_id, season_id) '
+                'DO UPDATE SET xp = GREATEST(battle_pass_progress.xp, '
+                'EXCLUDED.xp) '
+                'RETURNING xp',
+                player_id, int(season_id), int(score))
+        return int(val or 0)
+
     async def purchase_battle_pass(self, player_id, season_id, gold_cost=0):
         """购买通行证：扣金币 + purchased=true。返回 (ok, 剩余gold)。"""
         async with self.pool.acquire() as conn:
@@ -1671,6 +1750,13 @@ class PlayerStore:
             return None
         return {'id': int(row['id']), 'username': row['username']}
 
+    async def get_username(self, player_id):
+        """按 players.id 反查 username，无则返回 None。"""
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval(
+                'SELECT username FROM players WHERE id = $1', int(player_id))
+        return val
+
     async def get_player_faction(self, player_id):
         """玩家阵营（最新角色 faction），无角色返回 0。"""
         async with self.pool.acquire() as conn:
@@ -1695,11 +1781,13 @@ class PlayerStore:
             reverse = await conn.fetchrow(
                 'SELECT 1 FROM friends WHERE player_id = $2 AND friend_id = $1 '
                 'AND status = 0', int(player_id), int(friend_id))
+            # 无反向请求 → status=0（重复邀请幂等，不单方面转正）；
+            # 有反向请求 → 本行直接置 1，与下方反向行 UPDATE 保持对称
             await conn.execute(
                 'INSERT INTO friends (player_id, friend_id, status) '
-                'VALUES ($1, $2, 0) ON CONFLICT (player_id, friend_id) '
-                'DO UPDATE SET status = 1',
-                int(player_id), int(friend_id))
+                'VALUES ($1, $2, $3) ON CONFLICT (player_id, friend_id) '
+                'DO UPDATE SET status = EXCLUDED.status',
+                int(player_id), int(friend_id), 1 if reverse is not None else 0)
             if reverse is not None:
                 await conn.execute(
                     'UPDATE friends SET status = 1 '
@@ -1720,22 +1808,32 @@ class PlayerStore:
     async def list_friend_rows(self, player_id):
         """好友行（friendinfo KVCS 推送源）：
 
-        我请求的行 friendshipInitiatedByMe=true；对方 status=1 → otherPlayerAlsoFriend。
+        双向查询（我发起的 + 收到的），按对方玩家聚合：
+        - 任一方向 status=1 → otherPlayerAlsoFriend=true（正式好友）
+        - 存在 player_id=我的行 → friendshipInitiatedByMe=true
+        收到的待处理邀请：initiated_by_me=false + also_friend=false，
+        客户端据此显示在待确认列表。
         返回 [{id, gamertag, faction, also_friend, initiated_by_me}]。"""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                'SELECT p.id AS pid, p.username, f.status, '
+                'SELECT p.id AS pid, p.username, '
                 '       (SELECT faction FROM characters c '
                 '        WHERE c.player_id = p.id ORDER BY c.id DESC LIMIT 1) '
-                '   AS faction '
-                'FROM friends f JOIN players p ON p.id = f.friend_id '
-                'WHERE f.player_id = $1', int(player_id))
+                '   AS faction, '
+                '       BOOL_OR(f.status = 1) AS confirmed, '
+                '       BOOL_OR(f.player_id = $1) AS i_initiated '
+                'FROM friends f '
+                'JOIN players p ON p.id = '
+                '     CASE WHEN f.player_id = $1 THEN f.friend_id '
+                '          ELSE f.player_id END '
+                'WHERE f.player_id = $1 OR f.friend_id = $1 '
+                'GROUP BY p.id, p.username', int(player_id))
         return [{
             'id': int(r['pid']),
             'gamertag': r['username'],
             'faction': int(r['faction'] or 0),
-            'also_friend': int(r['status']) == 1,
-            'initiated_by_me': True,
+            'also_friend': bool(r['confirmed']),
+            'initiated_by_me': bool(r['i_initiated']),
         } for r in rows]
 
     async def search_players(self, keyword, limit=20, exclude_id=None):
@@ -2774,6 +2872,14 @@ class PlayerStore:
                 'ON CONFLICT DO NOTHING',
                 int(player_id), int(tutorial_template_id))
         return True
+
+    async def list_tutorials_triggered(self, player_id):
+        """已触发教程模板 id 列表（Tutorial KVCS 行数据源）。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT tutorial_template_id FROM player_tutorials_triggered '
+                'WHERE player_id = $1', int(player_id))
+        return sorted(int(r['tutorial_template_id']) for r in rows)
 
     async def set_player_language(self, player_id, language_code):
         """玩家语言（SetPlayerLanguageRequest）。"""

@@ -288,6 +288,59 @@ async def main():
     rsp = find_response(msgs, 'SetWeaponVariantResponse')
     check('卸下武器皮肤', rsp is not None and rsp.get(2) == 1)
 
+    # ---- 5b. 武器替换/卸下/改携弹量（挤槽 + 缓存同步回归）----
+    # 买第二把同模板武器
+    wreq2 = pb_varint(1, char_id) + pb_varint(3, 5) + pb_string(4, 'RegGun2') + \
+        pb_varint(6, 0) + pb_varint(10, 1)
+    msgs = await request(r, w, 26, 'CreateWeaponVariantRequest', wreq2)
+    rsp = find_response(msgs, 'CreateWeaponVariantResponse')
+    wrow2b = find_kvcs(msgs, 'weapon')
+    weapon_id2 = int(wrow2b[1]) if wrow2b else None
+    check('买第二把武器成功', rsp is not None and rsp.get(1) == 1,
+          f'weaponId2={weapon_id2}')
+
+    if weapon_id2 is not None:
+        # 装备武器1 → slot 1
+        #（注意：登录时发放的初始武器已占槽 1，装备会先推“旧武器降槽 slot=0”
+        #  再推新武器 slot=1 —— 须按 weaponId 过滤，不能取第一行）
+        ereq = pb_varint(1, char_id) + pb_varint(2, weapon_id) + pb_varint(3, 1)
+        msgs = await request(r, w, 27, 'set_equipmentselection', ereq)
+        rsp = find_response(msgs, 'set_equipmentselection_response')
+        wrow = next((x for x in kvcs_all(msgs, 'weapon')
+                     if x.get(1) == weapon_id), None)
+        check('装备武器1到槽1', rsp is not None and rsp.get(1) == 1
+              and wrow is not None and wrow.get(11) == 1)
+
+        # 替换：武器2 装入同一槽位 → 旧武器须被挤回军械库（slot=0）并重推
+        ereq = pb_varint(1, char_id) + pb_varint(2, weapon_id2) + pb_varint(3, 1)
+        msgs = await request(r, w, 28, 'set_equipmentselection', ereq)
+        rsp = find_response(msgs, 'set_equipmentselection_response')
+        rows = kvcs_all(msgs, 'weapon')
+        w1k = next((x for x in rows if x.get(1) == weapon_id), None)
+        w2k = next((x for x in rows if x.get(1) == weapon_id2), None)
+        check('替换武器：旧武器被挤回军械库(slot=0)并重推',
+              w1k is not None and w1k.get(10) == 0 and w1k.get(11) == 0,
+              f'w1 kvcs={len(rows)} 条')
+        check('替换武器：新武器进槽1', w2k is not None and w2k.get(11) == 1)
+
+        # 卸下武器2 → slot=0
+        rreq = pb_varint(1, weapon_id2) + pb_varint(2, 1)
+        msgs = await request(r, w, 29, 'remove_equipmentselection', rreq)
+        rows = kvcs_all(msgs, 'weapon')
+        w2k = next((x for x in rows if x.get(1) == weapon_id2), None)
+        check('卸下武器2（slot=0）', w2k is not None and w2k.get(11) == 0)
+
+        # 改携弹量 → 已卸下的武器不得"自动装备"回旧槽（container 须保持 0）
+        creq = pb_varint(1, weapon_id2) + pb_varint(2, 0)
+        msgs = await request(r, w, 30, 'SetWeaponClipCountRequest', creq)
+        rsp = find_response(msgs, 'SetWeaponClipCountResponse')
+        rows = kvcs_all(msgs, 'weapon')
+        w2k = next((x for x in rows if x.get(1) == weapon_id2), None)
+        check('改携弹量不自动装备（container=0）',
+              rsp is not None and rsp.get(1) == 1
+              and w2k is not None and w2k.get(10) == 0 and w2k.get(11) == 0,
+              f'w2 container=({w2k.get(10) if w2k else "?"},{w2k.get(11) if w2k else "?"})')
+
     # ---- 6. 买载具 variant 26（无解锁需求 + 有默认弹药）----
     vreq = pb_varint(1, char_id) + pb_varint(2, 26) + pb_varint(3, 0) + \
         pb_varint(8, 1)
