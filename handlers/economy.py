@@ -32,7 +32,7 @@
 - ActivateTimedTicketRequest {ticketTimedId=1, playerId=2}
   → ActivateTimedTicketResponse {response=1}
 
-客户端 UI 流程（U0 反编译 + swf-rank/swf-frontend）：
+客户端 UI 流程（U0 反编译 + swf-rankwf-frontend）：
 - RibbonBoosterShopMediator.purchaseRibbonBooster → AddBoosterRequest（勋带加成，
   response==ok 才关窗并发 PurchaseSignal）；purchaseBooster → AddVariousBoosterRequest。
 - WarBondsWindowMediator → AddWarBondRequest（战争债券购买）。

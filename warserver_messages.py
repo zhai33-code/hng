@@ -24,6 +24,7 @@ from protocol import (
 
 from state import log
 
+import force_pool
 from wardb import (
     _RIBBON_LEVEL_XP,
     _load_accesspoint_templates,
@@ -370,8 +371,9 @@ BF_DEFENDER_FACTION_ID = 2    # 防守方 runtime factionId（必须在 battlefi
 # f14 armyResourceList 资源类别（resourceCategoryId == WarDatabase/armyresourcecategory.f1）：
 #   1=infantryman 2=fighter_pilot 4=paratrooper 5=tank_crew 6=recon
 #   3=heavy_fighter_plane 10=transport_plane 20=fighter_plane 21=recon_plane
-# 空军类 spawnInAir=True。count=可用生命数（infantry 按满员局给足）。
-# 与 matchmaking.AI_TEAM_RESOURCES 同源（GMD f5 / 战斗服 f14 单一事实）。
+# 空军类 spawnInAir=True。count=可用生命数。
+# 【无池回退静态表】有资源池（force_pool.init_mission 抽 AT 生成）时类别集
+# 与数值均由池驱动，本表仅作无池旧路径兜底（GMD f5 / 战斗服 f14 单一事实）。
 # 伞兵 spawnInAir=True（回放 pvt_gmd_response.bin 实锤：cat=4 count=72 spawnInAir=1，
 # 与 cat=10 transport_plane 成对 —— 伞兵从运输机跳伞出生）。
 BF_RES_CATS = (
@@ -413,21 +415,26 @@ def _msg_army_resource_list(preset_id=MISSION_PRESET_ID,
                             defender_faction=BF_DEFENDER_FACTION_ID,
                             attacker_faction=3,
                             counts_by_faction=None):
-    """ActionGameArmyResourceDefinition 条目列表：每 (faction, accesspointtemplate) × 7 类资源。
+    """ActionGameArmyResourceDefinition 条目列表：每 (faction, accesspointtemplate) × 池内类别。
 
     ResponseBattleFieldSettings f14 与 ActiveMissionRequestEventListResponse f2
     共用同一构建（单源，见 warserver-battlefield-settings.md §5.3/§6.1）。
     counts_by_faction：每局资源池 {factionTemplateId: {cat: count}}（
-    matchmaking.mission_resource_pool），给定则覆盖静态 BF_RES_CATS 数值——
-    匹配界面 f5 / 战斗内 f2/f14 同源同值、消耗后递减；None 回退静态初始表。"""
+    force_pool.init_mission 抽 AT 生成），给定时类别集与数值均由池驱动
+    （含坦克/载具等池内新增类别）—— 匹配界面 f5 / 战斗内 f2/f14 同源同值、
+    消耗后递减；None 回退静态 BF_RES_CATS 初始表。"""
     res_msgs = []
     for tmpl, owner in _accesspoint_layout(preset_id, defender_faction,
                                            attacker_faction):
         pool_counts = counts_by_faction.get(int(owner)) \
             if counts_by_faction else None
-        for cat, in_air, cnt in BF_RES_CATS:
-            if pool_counts is not None:
-                cnt = int(pool_counts.get(int(cat), cnt))
+        if pool_counts is not None:
+            cat_list = [(cat, air, int(pool_counts.get(int(cat), 0)))
+                        for cat, air in
+                        force_pool.categories(counts_by_faction=counts_by_faction)]
+        else:
+            cat_list = list(BF_RES_CATS)
+        for cat, in_air, cnt in cat_list:
             r = b''
             r += pb_int64(1, owner)        # factionTemplateId（1US/2GE/3SU）
             r += pb_int64(2, tmpl)         # accesspointtemplate（资源挂载点）

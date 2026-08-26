@@ -12,7 +12,8 @@ from player_store import PlayerStore
 
 STORE = PlayerStore()
 
-DEMO_PASSWORD = b'demodemo123'
+# 通用演示密码已移除：所有登录必须命中数据库中该账号的真实密码，
+# DB 异常一律拒登，杜绝"任意账号 + 固定密码"绕过认证。
 
 
 # ------------------------------------------------------------- .env 加载

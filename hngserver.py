@@ -13,7 +13,7 @@ Implements the wire protocol reverse-engineered from the AIR client
 
 Login2 flow: login2_begin -> login2_challenge -> login2_response -> login2_result.
 
-Demo credentials: any username + password "demodemo123" (DEMO_PASSWORD, digest verified).
+Demo credentials: none (fixed demo password removed; see realtest_server.py /register).
 Run:  python hngserver.py [port]      (default 15110, as seen in Settings.as)
 """
 import asyncio
@@ -272,7 +272,7 @@ def msg_login2_result(username, code):
 
 # -------------------------------------------------------------------- server
 
-DEMO_PASSWORD = b'demodemo123'
+DEMO_PASSWORD = b''  # 旧演示密码已移除：digest 由 session_key 派生，不再依赖固定密码
 LOG = open(os.path.join(os.path.dirname(__file__), 'requests.log'), 'a', encoding='utf-8')
 
 def log(msg):
@@ -395,7 +395,7 @@ async def dispatch(sess, chunk, writer):
 async def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 15110
     server = await asyncio.start_server(handle, '0.0.0.0', port)
-    log(f'HnG mock server listening on 0.0.0.0:{port}  (demo password: demodemo123)')
+    log(f'HnG mock server listening on 0.0.0.0:{port}')
     async with server:
         await server.serve_forever()
 

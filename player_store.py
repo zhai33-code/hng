@@ -19,7 +19,6 @@ from contextlib import asynccontextmanager
 import asyncpg
 
 DEFAULT_DSN = 'postgresql://hng:hng_password@127.0.0.1:5432/hng'
-DEFAULT_PASSWORD = 'demodemo123'
 
 
 def _rowcount(status):
@@ -59,7 +58,7 @@ CREATE SEQUENCE IF NOT EXISTS vehicle_variant_id_seq START 1000;
 CREATE TABLE IF NOT EXISTS players (
     id         BIGSERIAL PRIMARY KEY,
     username   TEXT UNIQUE NOT NULL,
-    password   TEXT NOT NULL DEFAULT 'demodemo123',
+    password   TEXT NOT NULL,
     credits    BIGINT NOT NULL DEFAULT 100000,
     warfunds   BIGINT NOT NULL DEFAULT 100000,
     gold       BIGINT NOT NULL DEFAULT 100000,
@@ -67,7 +66,9 @@ CREATE TABLE IF NOT EXISTS players (
 );
 
 -- 迁移：旧库补充 password / 货币列
-ALTER TABLE players ADD COLUMN IF NOT EXISTS password TEXT NOT NULL DEFAULT 'demodemo123';
+ALTER TABLE players ADD COLUMN IF NOT EXISTS password TEXT NOT NULL;
+-- 撤销历史版本的固定默认密码（防新建账号自动获得已知密码）
+ALTER TABLE players ALTER COLUMN password DROP DEFAULT;
 ALTER TABLE players ADD COLUMN IF NOT EXISTS credits  BIGINT NOT NULL DEFAULT 100000;
 ALTER TABLE players ADD COLUMN IF NOT EXISTS warfunds BIGINT NOT NULL DEFAULT 100000;
 ALTER TABLE players ADD COLUMN IF NOT EXISTS gold     BIGINT NOT NULL DEFAULT 100000;

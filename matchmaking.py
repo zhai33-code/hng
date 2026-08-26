@@ -41,6 +41,7 @@ from wardb import (
 )
 import mm_config
 import mm_pool
+import force_pool
 
 # ---------------------------------------------------------------- combat server
 # 真实 warserver 流程：匹配成功 → 按需拉起 combat server 实例（hng.exe /D）→
@@ -304,12 +305,14 @@ async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
             '/PS', f'login-{pms_id}',
             '/M', combat_map,
             '/W', COMBAT_WARSERVER,
-            '/R', 'disable_eac=1',
+            # /R 选项必须用完整注册名（组.选项）：ZOptionSet 按全名查找，
+            # 无组前缀的名字会落入未注册选项桶，游戏代码不会读取
+            '/R', 'boot.disable_eac=1',
             '/R', f'boot.logfile=combat-server-{_combat_seq}.log',
             # 战斗服进程 player.dll 进图时 GetTotals 初始化勋带状态（a2[7]），
             # 失败→整局无 XP 累加→无 Statistics_Update→客户端无升级弹窗
-            '/R', f'statserver={PUBLIC_HOST}',
-            '/R', 'statserverport=15115']
+            '/R', f'boot.statserver={PUBLIC_HOST}',
+            '/R', 'boot.statserverport=15115']
     if COMBAT_START_COUNTDOWN_OVERRIDE is not None:
         # 开局等待时间覆盖（秒），见文件头 COMBAT_START_COUNTDOWN_OVERRIDE 注释
         args += ['/R',
@@ -469,17 +472,19 @@ def roll_weather():
     f12/f13 均从这里取，保证简报图标与实际战斗一致）。"""
     tod, cond, hour = random.choice(WEATHER_PRESETS)
     return {'weather_tod': tod, 'weather_condition': cond, 'timeofday': hour}
-# f4 突击队构成（单人AI局实测：每侧 6 队 = 三兵种各 ×2）。模板 id 是【阵营相关】
-# 库值（commandnodetemplate f2 兵种名 × f3 阵营：infantry US=103/GE=203/SU=303），
-# 按参战阵营现查 WarDatabase。
+# f4 突击队构成：本局 force_pool 抽取的 AT 名单（双侧镜像，名单见
+# force_pool.init_mission 日志）。模板 id 是【阵营相关】库值
+# （commandnodetemplate f2 兵种名 × f3 阵营：infantry US=103/GE=203/SU=303），
+# 按参战阵营现查 WarDatabase。无池回退官方锚点组合（三兵种 ×2）。
 ASSAULT_TEAM_NODE_NAMES = ('infantry', 'motorized_infantry', 'motorized_guard')
 
 
-def _assault_team_nodes(faction):
-    """阵营突击队 commandNode 模板 id 序列（三兵种 ×2 = 每侧 6 队）。"""
+def _assault_team_nodes(faction, mission_id=None):
+    """阵营突击队 commandNode 模板 id 序列（本局 AT 抽取名单跨阵营翻译）。"""
+    names = force_pool.assault_team_names(mission_id) or \
+        list(ASSAULT_TEAM_NODE_NAMES) * 2
     faction = int(faction) if int(faction) in (1, 2, 3) else 3
-    ids = [commandnode_template(faction, n) for n in ASSAULT_TEAM_NODE_NAMES]
-    return [nid for nid in ids for _ in range(2)]
+    return [commandnode_template(faction, n) for n in names]
 
 
 def _mission_accesspoints(gamemap_id):
@@ -494,95 +499,44 @@ def _mission_capturepoints(gamemap_id):
     return _load_capturepoint_templates(int(gamemap_id))
 
 
-# f5 资源序列（单人AI局实测 20 条，非每队2条）：(is_ai_owner, resId, amount)
-# resId: 1=步兵 15=汽车 11=摩托；两侧总量 432/60/24
-# 2026-08-25 追加空军资源（WarDatabase/armyresourcecategory）：
-#   2=fighter_pilot 3=heavy_fighter_plane 20=fighter_plane
-#   21=recon_plane 10=transport_plane
-# 2026-08-26 追加伞兵资源（回放 pvt_gmd_response.bin 实锤：cat=4 count=72
-#   spawnInAir=1 与 cat=10 transport_plane 成对 —— 伞兵从运输机跳伞出生）。
-# 部署界面按 f5 判定各兵种可用生命数 —— 缺空军条目时飞行员即使有飞机也
-# 不显示乘机槽（只能徒步部署）。与 warserver_messages.BF_RES_CATS 同源。
-AI_TEAM_RESOURCES = [
-    (False, 1, 90), (False, 1, 90), (False, 1, 90), (False, 15, 30),
-    (False, 1, 90), (False, 15, 30), (False, 1, 36), (False, 11, 12),
-    (False, 1, 36), (False, 11, 12),
-    (False, 4, 60), (False, 10, 15),
-    (False, 2, 30), (False, 3, 10), (False, 20, 10), (False, 21, 10), (False, 10, 10),
-    (True, 1, 90), (True, 1, 90), (True, 15, 30),
-    (True, 1, 90), (True, 15, 30), (True, 1, 90),
-    (True, 1, 36), (True, 11, 12), (True, 1, 36), (True, 11, 12),
-    (True, 4, 60), (True, 10, 15),
-    (True, 2, 30), (True, 3, 10), (True, 20, 10), (True, 21, 10), (True, 10, 10),
-]
-# f5 field5 spawnInAir：空军类别置 true（armyresourcecategory.f3==3 的机类 +
-# fighter_pilot 随机出生 + 伞兵跳伞），与 ActionGameArmyResourceDefinition.spawnInAir 同义。
-_AIR_RES_CATS = {2, 3, 4, 10, 20, 21}
-
 # ---------------------------------------------------------------- 每局资源池（单一事实源）
-# 2026-08-26：匹配界面（GetMissionDetailsResponse f5）与战斗内部署界面
-# （ResponseBattleFieldSettings f14 / ActiveMissionRequestEventListResponse f2）
-# 此前各用 AI_TEAM_RESOURCES 与 warserver_messages.BF_RES_CATS 两张互不相干的
-# 静态表 → 两界面数字不一致（infantry 90/36 vs 1800）且消耗后不递减。
-# 现改为每局资源池：成局时按 MISSION_RESOURCE_CATS 建池，出生消耗由
+# 2026-08-26：资源池改由 force_pool 模块生成 —— 按模式随机抽取突击队(AT)
+# 编制（WarDatabase/commandnodetemplatearmyresourcetemplaterelation 原值，
+# 乘员:载具天然保持官方 1:1~1.25:1，伞兵:运输机=4:1），池 = Σ AT 编制，
+# 双侧镜像同池。此前手写的 MISSION_RESOURCE_CATS / AI_TEAM_RESOURCES 静态
+# 数值为自造值（非官方），已废弃删除。
+# f5（匹配界面）/ f14（握手）/ f2（轮询）三处单一事实源，出生消耗由
 # ReportMissionStatusRequest f2 statuslist（§8.1 ReportArmyResourceSpawnCount
 # {f1 ap, f2 cat, f5 count, f6 faction}，实测每 10s 增量上报，AI/玩家出生
-# 均含）按兵种扣减，f5/f2/f14 全部从池渲染。
-# 数值以 BF_RES_CATS 为基准（战斗侧原值），另保留 AI 局实测的
-# 15 terrain_vehicle / 11 motorcycle 两类（仅在 f5 匹配界面显示）。
-MISSION_RESOURCE_CATS = [
-    (1, False, 1800),    # infantryman（主力生命池）
-    (6, False, 60),      # recon
-    (5, False, 60),      # tank_crew
-    (4, True, 60),       # paratrooper（运输机跳伞出生）
-    (2, True, 30),       # fighter_pilot
-    (3, True, 10),       # heavy_fighter_plane
-    (20, True, 10),      # fighter_plane
-    (21, True, 10),      # recon_plane
-    (10, True, 18),      # transport_plane（伞兵载机）
-    (15, False, 30),     # terrain_vehicle（AI 局实测，仅匹配界面显示）
-    (11, False, 12),     # motorcycle（AI 局实测，仅匹配界面显示）
-]
-# 战斗侧（f2/f14）允许下发的类别集合（与 BF_RES_CATS 一致；15/11 战斗服
-# 未经校验不下发）。
-_COMBAT_RES_CATS = {1, 2, 3, 4, 5, 6, 10, 20, 21}
-_MISSION_RESOURCES = {}   # mission_id -> {factionId(runtime=模板id): {cat: count}}
+# 均含）按兵种扣减。渲染类别序与 spawnInAir 统一走 force_pool.categories()。
+# 部署界面按资源条目判定各兵种可用生命数 —— 缺空军条目时飞行员即使有
+# 飞机也不显示乘机槽（只能徒步部署）。
 
-
-def _init_mission_resources(mission_id, attacker, defender):
-    """成局时建立资源池（攻防双方同初始量）。"""
-    init = {cat: cnt for cat, _air, cnt in MISSION_RESOURCE_CATS}
-    _MISSION_RESOURCES[int(mission_id)] = {int(attacker): dict(init),
-                                           int(defender): dict(init)}
+def _init_mission_resources(mission_id, gamemode_id, attacker, defender):
+    """成局时建立资源池（按模式抽 AT，攻防双方镜像同编制）。"""
+    force_pool.init_mission(mission_id, gamemode_id, attacker, defender)
 
 
 def mission_resource_pool(mission_id):
     """读本局资源池；无池返回 None（调用方回退初始表）。"""
-    return _MISSION_RESOURCES.get(int(mission_id or 0))
+    return force_pool.pool(mission_id)
 
 
 def _pool_counts(pool, faction):
-    """池中某阵营各类剩余；池/阵营缺失回退初始表（AI 回退局）。"""
+    """池中某阵营各类剩余；池/阵营缺失回退锚点值（官方 Encounter 池）。"""
     if pool and int(faction) in pool:
         return pool[int(faction)]
-    return {cat: cnt for cat, _air, cnt in MISSION_RESOURCE_CATS}
+    return force_pool.counts_for(None, faction)
 
 
 def consume_mission_resource(mission_id, faction, cat, n=1):
     """玩家出生消耗资源（按兵种类别扣 n）。返回扣后余量；池/类别缺失返回 None。"""
-    pool = _MISSION_RESOURCES.get(int(mission_id or 0))
-    if pool is None:
-        return None
-    counts = pool.get(int(faction))
-    if counts is None or int(cat) not in counts:
-        return None
-    counts[int(cat)] = max(0, int(counts[int(cat)]) - int(n))
-    return counts[int(cat)]
+    return force_pool.consume(mission_id, faction, cat, n)
 
 
 def release_mission_resources(mission_id):
     """局结束清理（与 _MM_MISSION_DETAILS 同生命周期）。"""
-    _MISSION_RESOURCES.pop(int(mission_id or 0), None)
+    force_pool.release(mission_id)
 
 
 def _msg_battle_info(battle_id, pos_x, pos_y):
@@ -888,11 +842,11 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
     m += pb_message(3, pb_int64(1, rfid) +
                     pb_message(2, pb_string(1, gamertag)))
     m += pb_message(3, pb_int64(1, afid))
-    # f4 突击队 ×12：我方/AI 各 6 队（模板按阵营查库）
-    for cmd_node in _assault_team_nodes(player_faction):
+    # f4 突击队：本局 AT 抽取名单跨阵营翻译（无池回退官方锚点 ×2）
+    for cmd_node in _assault_team_nodes(player_faction, mission_id):
         m += pb_message(4, pb_int64(1, rfid) + pb_int64(2, cmd_node) +
                         pb_int64(3, ours_ap) + pb_int64(4, 0))
-    for cmd_node in _assault_team_nodes(ai_faction):
+    for cmd_node in _assault_team_nodes(ai_faction, mission_id):
         m += pb_message(4, pb_int64(1, afid) + pb_int64(2, cmd_node) +
                         pb_int64(3, theirs_ap) + pb_int64(4, 0))
     # f5 资源：从本局资源池渲染（与战斗内 f2/f14 同源同值，消耗后递减）；
@@ -900,16 +854,16 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
     pool = mission_resource_pool(mission_id)
     ours_counts = _pool_counts(pool, player_faction)
     theirs_counts = _pool_counts(pool, ai_faction)
-    for res_cat, _air, _cnt in MISSION_RESOURCE_CATS:
+    for res_cat, res_air in force_pool.categories(counts_by_faction=pool):
         m += pb_message(5, pb_int64(1, rfid) + pb_int64(2, res_cat) +
                         pb_int64(3, ours_ap) +
                         pb_int64(4, ours_counts.get(res_cat, 0)) +
-                        pb_bool(5, res_cat in _AIR_RES_CATS))
-    for res_cat, _air, _cnt in MISSION_RESOURCE_CATS:
+                        pb_bool(5, res_air))
+    for res_cat, res_air in force_pool.categories(counts_by_faction=pool):
         m += pb_message(5, pb_int64(1, afid) + pb_int64(2, res_cat) +
                         pb_int64(3, theirs_ap) +
                         pb_int64(4, theirs_counts.get(res_cat, 0)) +
-                        pb_bool(5, res_cat in _AIR_RES_CATS))
+                        pb_bool(5, res_air))
     # f6 出兵点归属：首个=我方，其余交替（Mill 实测 8=我方, 15=AI）
     for i, ap in enumerate(aps):
         m += pb_message(6, pb_int64(1, ap) +
@@ -1133,7 +1087,7 @@ async def _start_match(match):
     }
     # 每局资源池：f5（匹配界面）/ f14（握手）/ f2（轮询）三处单一事实源，
     # 出生消耗（ReportMissionStatusRequest f2）扣减（与详情同生命周期）
-    _init_mission_resources(mission_id, attacker, defender)
+    _init_mission_resources(mission_id, gamemode_id, attacker, defender)
     _log(f'match formed: mission={mission_id}, preset={preset}, map='
          f'{combat_map}, players={len(match.players)}, ai_fill={match.ai_fill}, '
          f'attacker={attacker}, defender={defender}, udp/{port}, '
@@ -1435,9 +1389,9 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
 
     - f3 参战方：真人按 faction 分组列 gamertag；防守方无真人（ai_fill / 单侧）
       时保留无成员名单的 AI 方条目
-    - f4/f5 突击队/资源：构成沿用 AI_TEAM_RESOURCES（类别为库值），突击队模板
-      按【参战阵营】查 commandnodetemplate，"我方" = 进攻方（人数最多组），
-      AI 方 = 防守方
+    - f4/f5 突击队/资源：本局 force_pool 抽取的 AT 名单与资源池（类别为
+      库值），突击队模板按【参战阵营】查 commandnodetemplate，
+      "我方" = 进攻方（人数最多组），AI 方 = 防守方
     - 出兵点/据点模板按本局 gamemap 查表；f8/f9 战局位置 = mapEntityId 对应
       battlefield 行坐标（简报战场名与地图标记一致）
     """
@@ -1470,11 +1424,11 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     for tag in dtag:
         dfd += pb_message(2, pb_string(1, tag))
     m += pb_message(3, dfd)
-    # f4 突击队 ×12：进攻方/防守方各 6 队（模板按阵营查库）
-    for cmd_node in _assault_team_nodes(attacker):
+    # f4 突击队：本局 AT 抽取名单跨阵营翻译（无池回退官方锚点 ×2）
+    for cmd_node in _assault_team_nodes(attacker, mission_id):
         m += pb_message(4, pb_int64(1, rfid) + pb_int64(2, cmd_node) +
                         pb_int64(3, ours_ap) + pb_int64(4, 0))
-    for cmd_node in _assault_team_nodes(defender):
+    for cmd_node in _assault_team_nodes(defender, mission_id):
         m += pb_message(4, pb_int64(1, afid) + pb_int64(2, cmd_node) +
                         pb_int64(3, theirs_ap) + pb_int64(4, 0))
     # f5 资源：从本局资源池渲染（与战斗内 f2/f14 同源同值，消耗后递减）；
@@ -1482,16 +1436,16 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     pool = mission_resource_pool(mission_id)
     atk_counts = _pool_counts(pool, attacker)
     dfd_counts = _pool_counts(pool, defender)
-    for res_cat, _air, _cnt in MISSION_RESOURCE_CATS:
+    for res_cat, res_air in force_pool.categories(counts_by_faction=pool):
         m += pb_message(5, pb_int64(1, rfid) + pb_int64(2, res_cat) +
                         pb_int64(3, ours_ap) +
                         pb_int64(4, atk_counts.get(res_cat, 0)) +
-                        pb_bool(5, res_cat in _AIR_RES_CATS))
-    for res_cat, _air, _cnt in MISSION_RESOURCE_CATS:
+                        pb_bool(5, res_air))
+    for res_cat, res_air in force_pool.categories(counts_by_faction=pool):
         m += pb_message(5, pb_int64(1, afid) + pb_int64(2, res_cat) +
                         pb_int64(3, theirs_ap) +
                         pb_int64(4, dfd_counts.get(res_cat, 0)) +
-                        pb_bool(5, res_cat in _AIR_RES_CATS))
+                        pb_bool(5, res_air))
     # f6 出兵点归属：首个=进攻方，其余交替（Mill 实测 8=进攻, 15=防守；
     # f2 为 factionTemplateId）
     for i, ap in enumerate(aps):

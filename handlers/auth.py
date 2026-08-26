@@ -25,7 +25,6 @@ from protocol import (
     )
 
 from state import (
-    DEMO_PASSWORD,
     STORE,
     log,
     )
@@ -85,18 +84,19 @@ async def handle_login2_begin(sess, writer, cmd_id, req_type, proto):
         username = pb_parse(proto).get(1, b'').decode('utf-8', 'replace')
     except Exception:
         username = 'DemoPlayer'
-    # 从数据库加载该账号密码；账号不存在则标记 user_exists=False（响应阶段直接拒登）
-    pw = DEMO_PASSWORD
-    user_exists = True
+    # 从数据库加载该账号密码；账号不存在或 DB 异常一律标记 user_exists=False
+    # （响应阶段直接拒登）——不再回退任何固定密码，防止绕过认证。
+    user_exists = False
+    pw = b''  # 未命中时占位，响应阶段不会走到密码校验
     try:
         stored = await STORE.get_password(username)
         if stored is None:
-            user_exists = False
             log(f'      [auth] user {username!r} NOT in database, will reject')
         else:
             pw = stored.encode('utf-8')
+            user_exists = True
     except Exception as e:
-        log(f'[DB] auth lookup failed ({e}), fallback DEMO_PASSWORD')
+        log(f'[DB] auth lookup failed ({e}), rejecting login')
     sess.username = username
     sess.pw = pw
     sess.user_exists = user_exists
