@@ -291,7 +291,15 @@ def _msg_weapon_setting(w, ammos, mods, slot):
     m = b''
     m += pb_int64(1, int(w['id']))
     m += pb_int64(2, int(w['template_id']))
+    # f3 只下发已装备弹药（slot_index>0）——官方回放（pvt_player_settings.bin
+    # Artyom/Kaspar/Arkady 等所有角色 weapon f3 ammos 均只含 1 条已装备弹药，
+    # 无 equippedAmmoSlotIndex 字段，客户端按"列表中所有 ammo 均视为已装备"处理）。
+    # 若把武器名下全部弹药（含未装备 slot=0 的）都下发，客户端会把列表里第一条
+    # 当作已装备 → 用户改子弹后战局仍显示旧弹药（2026-08-27 修复，与 f4 载具弹药
+    # equipped_storage_id>0 过滤同原则）
     for a in ammos:
+        if int(a.get('slot_index') or 0) <= 0:
+            continue
         am = pb_int64(1, int(a['id']))
         am += pb_int64(2, int(a['ammo_template_id']))
         am += pb_float(3, float(a['condition'] or 1.0))
@@ -493,7 +501,8 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
       preset_id        missionpreset 行 id（地图链入口）
       defender_faction 防守方 factionTemplateId（1US/2GE/3SU）
       attacker_faction 进攻方 factionTemplateId
-      enable_bots      AI 局（超时补位 / 单人训练）；双方都有真人时 False
+      enable_bots      非战争模式恒 True（超时补位/单侧/双侧真人均带 AI）；
+                      战争模式（gamemode 10）False（纯真人）
     """
     preset = _load_preset(preset_id)
     preset_id = int(preset.get(1, preset_id))

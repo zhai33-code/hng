@@ -35,6 +35,8 @@ from protocol import (
     pb_message,
     pb_string,
 )
+from messages import _msg_character, _push_kvcs
+from player_service import _char_unlock_bits_for
 from state import FLASH_SESSIONS, PUBLIC_HOST, STORE, log
 from wardb import _RIBBON_LEVEL_XP, _rank_from_combat_xp, commandnode_template
 from warserver_messages import _accesspoint_layout, _msg_army_resource_list
@@ -829,9 +831,8 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
         f'(msid={mission_session_id}, response=1)')
 
     # ---- DB 持久化（全部 best-effort）
-    # bot 行不入库（省空间）：战报只存真人；bot 也无 DB 账号，
-    # 后续 xp/统计循环按 is_bot 跳过
-    real_players = [p for p in br_players if not p.get('is_bot')]
+    # 战报全量入库（含 bot 行，人机局战报需显示 bot）；bot 无 DB 账号，
+    # 下方收益/xp/统计循环仍按 is_bot 名单过滤
     # f5 PlayerBattleResult 里 bot 也带 playerId，且编号可能与真实账号
     # id 撞号（实测 bot 3 ≠ 玩家 3，错发货币到真实账号）——收益/统计
     # 循环统一按 BattleReport 的 is_bot 名单过滤；不在 BattleReport
@@ -846,11 +847,10 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
     report_id = 0
     if STORE is not None:
         try:
-            report_id = await STORE.save_battle_report(report, real_players)
+            report_id = await STORE.save_battle_report(report, br_players)
             log(f'      [DB] battle_report saved id={report_id} '
                 f'(msid={report["mission_session_id"]}, '
-                f'{len(real_players)} players, '
-                f'{len(br_players) - len(real_players)} bots skipped)')
+                f'{len(br_players)} players)')
         except Exception as e:
             log(f'      [DB] save_battle_report failed: {e}')
 
@@ -1005,6 +1005,11 @@ async def _finish_mission_sessions(mission_id, report_id):
     3. Notification(NewBattleReport, typeId=report_id)（战报已入库才推：
        客户端 GetBattleReport 查不到会静默跳过弹窗）；
     4. 清理 PMS_TO_SESSION / PMS_TO_MISSION / _MM_QUEUES 内部状态。
+
+    另一调用方：matchmaking._watch_proc_exit（战斗服未走 earnings 即退出，
+    report_id=None → 跳过通知推送，只做 1/2/4——否则客户端 closing 流程收
+    不到会话结束信号，轮询 GetMissionDetails 到超时才自行 Abandon）。
+    末尾统一清 PMS 映射，重复调用空转，天然幂等。
     """
     my_pms = [pms for pms, mid in matchmaking.PMS_TO_MISSION.items()
               if int(mid or 0) == int(mission_id)]
@@ -1064,6 +1069,46 @@ async def _finish_mission_sessions(mission_id, report_id):
         except Exception as e:
             log(f'      [combat] battle end push failed '
                 f'(player={pid}): {e}')
+        # 结算角色行重推：rank 用已入库的新 combat_xp 推导 + statUpdateTimeStamp
+        # 取当前毫秒。客户端 CharacterModel.checkStatsWasUpdated 比较新时间戳与
+        # 上次 ResponseReadCharacterStats 入库时的旧时间戳，不同即自动重发
+        # RequestReadCharacterStats → 人物界面勋带/XP/等级无需重登即刷新
+        # （客户端 activeCharacterStatRequests 会话级缓存不会主动失效，不推则
+        # 只显示登录时的旧值）；rank 提升时 checkRankWasUpdated 另弹升级窗口。
+        # 尾部字段必须传全：客户端 setObject 整体替换 schema，漏传 head_id 等
+        # 会被抹回默认值（外观回退根因）。
+        char_id = int(mm_sess.get('char_id', 0) or 0)
+        if char_id and STORE is not None and flash.soldier_view_cmd is not None:
+            try:
+                for ch in await STORE.list_characters(pid):
+                    if int(ch['id']) != char_id:
+                        continue
+                    bits = await _char_unlock_bits_for(
+                        flash, ch['template'], ch['faction'], ch['id'])
+                    new_ts = int(time.time() * 1000)
+                    new_rank = _rank_from_combat_xp(ch.get('combat_xp', 0))
+                    await _push_kvcs(
+                        flash.writer, flash.soldier_view_cmd, b'character',
+                        _msg_character(
+                            ch['name'], ch['faction'], ch['template'],
+                            new_rank, ch['id'], bits,
+                            ch.get('combat_badge_0', 0),
+                            ch.get('combat_badge_1', 0),
+                            new_ts,
+                            ch.get('uniform_variant_id', 0),
+                            ch.get('headgear_id', 0),
+                            1 if ch.get('is_deleted') else 0,
+                            ch.get('previous_template', 0),
+                            ch.get('head_id', 0),
+                            0,
+                            1 if ch.get('is_on_leave') else 0))
+                    log(f'S->C cmd={flash.soldier_view_cmd:<4} KeyValueChangeSet '
+                        f'(character {ch["name"]} id={ch["id"]} re-pushed, '
+                        f'rank={new_rank}, statTs={new_ts} ★settlement refresh)')
+                    break
+            except Exception as e:
+                log(f'      [combat] settlement character re-push failed '
+                    f'(player={pid}): {e}')
     # 内部状态清理（无论 Flash 连接是否在线）
     for pms_id in my_pms:
         s = matchmaking.PMS_TO_SESSION.pop(pms_id, None)

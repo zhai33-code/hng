@@ -14,14 +14,20 @@ router = APIRouter(prefix='/api/players', tags=['players'],
 async def list_players(page: int = Query(1, ge=1),
                        page_size: int = Query(20, ge=1, le=100),
                        q: str = Query('', max_length=64),
-                       order: str = Query('created_desc')):
-    """玩家分页列表（q 按用户名包含匹配）。"""
+                       order: str = Query('created_desc'),
+                       state: str = Query('active')):
+    """玩家分页列表（q 按用户名包含匹配；state=active/deleted/all 软删除筛选）。"""
     assert db.pool is not None
-    where = ''
+    conds: list[str] = []
     args: list = []
     if q:
         args.append(f'%{q}%')
-        where = f'WHERE username ILIKE ${len(args)}'
+        conds.append(f'username ILIKE ${len(args)}')
+    if state == 'active':
+        conds.append('deleted_at IS NULL')
+    elif state == 'deleted':
+        conds.append('deleted_at IS NOT NULL')
+    where = ('WHERE ' + ' AND '.join(conds)) if conds else ''
     order_sql = {
         'created_desc': 'created_at DESC',
         'created_asc': 'created_at ASC',
@@ -32,7 +38,8 @@ async def list_players(page: int = Query(1, ge=1),
         total = await conn.fetchval(
             f'SELECT count(*) FROM players {where}', *args)
         rows = await conn.fetch(
-            f'SELECT id, username, credits, warfunds, gold, banned, created_at '
+            f'SELECT id, username, credits, warfunds, gold, banned, '
+            f'deleted_at, created_at '
             f'FROM players {where} ORDER BY {order_sql} '
             f'LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}',
             *args, page_size, (page - 1) * page_size)
@@ -40,6 +47,48 @@ async def list_players(page: int = Query(1, ge=1),
         'total': total,
         'items': [dict(r) for r in rows],
     }
+
+
+class BatchDeleteBody(BaseModel):
+    ids: list[int]
+    hard: bool = False
+
+
+@router.post('/batch-delete', dependencies=[Depends(auth.write_guard)])
+async def batch_delete(body: BatchDeleteBody, request: Request,
+                       admin: auth.AdminUser = Depends(auth.current_admin)):
+    """批量删除账号（多选）。
+
+    软删除：players.deleted_at 置为 now()，账号数据保留，登录侧拒登；
+    硬删除：DELETE players，经 FK ON DELETE CASCADE 级联清掉角色/装备等
+    全部关联数据（战报 battle_report_players 无外键，历史战报保留）。
+    """
+    # 去重 + 上限（防误粘贴超大列表）
+    ids = list(dict.fromkeys(body.ids))
+    if not ids:
+        raise HTTPException(400, '未选择任何账号')
+    if len(ids) > 500:
+        raise HTTPException(400, '单次最多操作 500 个账号')
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
+        if body.hard:
+            rows = await conn.fetch(
+                'DELETE FROM players WHERE id = ANY($1) '
+                'RETURNING username', ids)
+        else:
+            rows = await conn.fetch(
+                'UPDATE players SET deleted_at = now() '
+                'WHERE id = ANY($1) AND deleted_at IS NULL '
+                'RETURNING username', ids)
+    if not rows:
+        raise HTTPException(404, '账号不存在（或已软删除）')
+    names = [r['username'] for r in rows]
+    await audit.record(admin, request,
+                       'hard_delete' if body.hard else 'soft_delete',
+                       ', '.join(names),
+                       {'count': len(names), 'ids': ids})
+    return {'ok': True, 'count': len(names),
+            'usernames': names}
 
 
 @router.get('/{player_id}')

@@ -19,6 +19,7 @@
 启动：main() 里 web_server.init(main_loop) 后 threading.Thread(start_http)。
 """
 import asyncio
+import bz2
 import hashlib
 import json
 import mimetypes
@@ -36,11 +37,12 @@ from state import (
     GAME_DIR,
     PUBLIC_HOST,
     STORE,
+    TEXTS_DIR,
     WARDDB_DIR,
     log,
     )
 
-from wardb import WARDB_UNIQUE
+from wardb import WARDB_CAS_MAP, WARDB_SYNC_UNIQUE, WARDB_UNIQUE
 
 # fs 同步 CAS 文件目录：改动过的客户端文件以 <sha256>-<size>_<flag> 为名放入，
 # 供 hngsync GET /<sha256>-<size>_<flag> 下载（见 do_GET 内 CAS 路由）
@@ -228,7 +230,54 @@ SETTINGS_JS = (f"flash_dynhttp=\"{PUBLIC_HOST}:15110\";\n"
 
 # hng_unique_v173293: 静态数据文件清单，客户端登录成功后请求
 # 格式: <root><list id="WarDatabase" uniquefile="wardb_unique"/><list id="Flash_Resources" uniquefile="flashres_unique"/></root>
-UNIQUE_FILE_XML = b'<?xml version="1.0" encoding="utf-8"?>\n<root>\n<list id="WarDatabase" uniquefile="wardb_unique"/>\n<list id="Flash_Resources" uniquefile="flashres_unique"/>\n</root>\n'
+# desktop_client list：swf 登录时让 hngsync 发 CMD_DOWNLOADNAMED
+# (set:desktop_client,...)（LocalCallsService.syncGameAssets →
+# GameClientAssets.desktop_clientAssestToSync），hngsync 按该清单
+# 校验/修复远程客户端的 WarDatabase 表 → 远程改表推送通道。
+UNIQUE_FILE_XML = (b'<?xml version="1.0" encoding="utf-8"?>\n<root>\n'
+                   b'<list id="WarDatabase" uniquefile="wardb_unique"/>\n'
+                   b'<list id="desktop_client" uniquefile="wardb_sync"/>\n'
+                   b'<list id="Flash_Resources" uniquefile="flashres_unique"/>\n'
+                   b'</root>\n')
+# 清单类文件同时提供 .bz2 变体（hngsync 拉清单优先 bz2，见
+# hng-client-file-integrity.md §2.5.2）
+UNIQUE_FILE_XML_BZ2 = bz2.compress(UNIQUE_FILE_XML)
+
+
+# texts/ 语言文件并入 hngsync desktop_client 同步清单（远程客户端推送）：
+# 官方 currentfiles.txt L17514+ 同样登记 texts/HnG_Strategy_*.xml。
+# 推送源 = state.TEXTS_DIR（combat-server\texts，服务器权威副本），逐文件原样
+# 登记——客户端本地旧文件哈希/大小不匹配 → hngsync 走 CAS 拉新版写回客户端。
+# 注意：HTTP /HnG_Strategy_en.xml 路由读的是 GAME_DIR\texts（客户端侧副本）
+# + LOCALIZATION_EXTRA 运行时注入，与本清单互不影响。
+def _generate_texts_sync():
+    lines = []
+    cas = {}
+    if os.path.isdir(TEXTS_DIR):
+        first = True
+        for name in sorted(os.listdir(TEXTS_DIR)):
+            fpath = os.path.join(TEXTS_DIR, name)
+            if not os.path.isfile(fpath):
+                continue
+            with open(fpath, 'rb') as f:
+                data = f.read()
+            sha = hashlib.sha256(data).hexdigest()
+            size = len(data)
+            # 目录切换：上一节 cur_dir=WarDatabase/，须用 ../ 回退再进 texts/
+            # （官方清单同法，如 ../DevIL.dll）；后续条目裸文件名即可
+            rel = f'../texts/{name}' if first else name
+            first = False
+            lines.append(f'"{rel}",{sha}-{size}_0,{size}')
+            cas[f'{sha}-{size}_0'] = data
+    body = ('\n'.join(lines) + '\n').encode('utf-8') if lines else b''
+    return body, cas
+
+
+TEXTS_SYNC_UNIQUE, TEXTS_CAS_MAP = _generate_texts_sync()
+
+# 完整 desktop_client 清单 = WarDatabase 表 + texts 语言文件
+WARDB_SYNC_FULL = WARDB_SYNC_UNIQUE + TEXTS_SYNC_UNIQUE
+WARDB_SYNC_BZ2 = bz2.compress(WARDB_SYNC_FULL)
 
 # Flash_Resources 文件：列出 images/Rank 目录下军衔图标的清单映射。
 # 客户端 HnGGUIRankIcon/HnGGUIButtonRank 用 settings.uniqueUrlExists(path) 判断图标是否可加载，
@@ -528,18 +577,42 @@ class HttpHandler(SimpleHTTPRequestHandler):
             # 返回 XML 包含 WarDatabase 和 Flash_Resources 的 uniquefile
             self.send_response(200)
             self.send_header('Content-Type', 'application/xml')
+            self.send_header('Content-Length', str(len(UNIQUE_FILE_XML)))
             self.end_headers()
             self.wfile.write(UNIQUE_FILE_XML)
             log(f'[HTTP] served /hng_unique_v173293 ({len(UNIQUE_FILE_XML)}B)')
+            return
+        if path == '/hng_unique_v173293.bz2' or path == '//hng_unique_v173293.bz2':
+            # hngsync 拉清单优先 bz2 变体
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(len(UNIQUE_FILE_XML_BZ2)))
+            self.end_headers()
+            self.wfile.write(UNIQUE_FILE_XML_BZ2)
+            log(f'[HTTP] served /hng_unique_v173293.bz2 ({len(UNIQUE_FILE_XML_BZ2)}B)')
             return
         if path == '/wardb_unique' or path == '//wardb_unique':
             # WarDatabase manifest: 列出所有静态表文件（表名,sha256-size）
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(WARDB_UNIQUE)))
             self.end_headers()
             self.wfile.write(WARDB_UNIQUE)
             tbl_count = WARDB_UNIQUE.count(b'\n')
             log(f'[HTTP] served /wardb_unique ({len(WARDB_UNIQUE)}B, {tbl_count} tables)')
+            return
+        if path in ('/wardb_sync', '//wardb_sync', '/wardb_sync.bz2',
+                    '//wardb_sync.bz2'):
+            # hngsync（set:desktop_client）用清单：官方 3 列 wire 格式，
+            # 覆盖 WarDatabase 表 + texts 语言文件（远程改表/语言文件推送通道）。
+            # hngsync 解析响应依赖 Content-Length（Http_FileDownload），必须显式下发。
+            body = WARDB_SYNC_BZ2 if path.endswith('.bz2') else WARDB_SYNC_FULL
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            log(f'[HTTP] served {path} ({len(body)}B)')
             return
         if path.startswith('/WarDatabase/') or path.startswith('//WarDatabase/'):
             # 服务单个静态表文件（如 /WarDatabase/factiontemplate）
@@ -592,19 +665,33 @@ class HttpHandler(SimpleHTTPRequestHandler):
                 log(f'[HTTP] served patched HnG_Strategy_en.xml ({len(body)}B)')
                 return
         # fs 同步 CAS 下发：hngsync 以 GET /<sha256>-<size>_<flag> 拉文件本体。
-        # 把改动过的客户端文件（如 IP 版 HeroesAndGeneralsDesktop.swf）以 CAS 名
-        # 放入 hng-re/cas/ 即可被下载——与 currentfiles.txt 登记的哈希保持一致，
-        # 客户端 hngsync 校验/自愈时下到的就是改后版本。
+        # 三个来源：
+        #   1. cas/ 目录：手工放入的改动文件（如 IP 版 HeroesAndGeneralsDesktop.swf）
+        #      —— 与 currentfiles.txt 登记的哈希保持一致；
+        #   2. WARDB_CAS_MAP 回源：hngsync 按 wardb_sync 清单修复远程客户端的
+        #      WarDatabase 表时，CAS 名即当前表文件的 sha256-size_0，直接回源
+        #      WarDatabase 目录（改表后无需手工生成 cas 文件，重启服务器即可）；
+        #   3. TEXTS_CAS_MAP 回源：texts 语言文件（en 为补丁版字节，与
+        #      /HnG_Strategy_en.xml 路由同源），直接回内存字节。
         # 注意：hngsync 解析响应依赖 Content-Length（Http_FileDownload 0x1400410F0），
         # 此处必须显式下发该头。
         m = re.fullmatch(r'/([0-9a-f]{64}-\d+_\d+)', path)
         if m:
             cas_name = m.group(1)
             cas_path = os.path.realpath(os.path.join(CAS_DIR, cas_name))
+            body = None
             if (cas_path.startswith(os.path.realpath(CAS_DIR) + os.sep)
                     and os.path.isfile(cas_path)):
                 with open(cas_path, 'rb') as f:
                     body = f.read()
+            if body is None:
+                wb = WARDB_CAS_MAP.get(cas_name)
+                if wb and os.path.isfile(wb):
+                    with open(wb, 'rb') as f:
+                        body = f.read()
+            if body is None:
+                body = TEXTS_CAS_MAP.get(cas_name)
+            if body is not None:
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/octet-stream')
                 self.send_header('Content-Length', str(len(body)))
@@ -615,7 +702,7 @@ class HttpHandler(SimpleHTTPRequestHandler):
                 self.send_response(404)
                 self.send_header('Content-Length', '0')
                 self.end_headers()
-                log(f'[HTTP] 404 CAS /{cas_name} (not in cas dir)')
+                log(f'[HTTP] 404 CAS /{cas_name} (not in cas dir / wardb / texts)')
             return
         # 安全校验：目录列表与敏感扩展名一律 404（统一在静态回退前拦截）
         if _deny_static(path):

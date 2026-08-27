@@ -42,6 +42,8 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_created
 
 -- 封禁标记（游戏登录侧配合检查后实时生效）
 ALTER TABLE players ADD COLUMN IF NOT EXISTS banned BOOL NOT NULL DEFAULT FALSE;
+-- 软删除标记（游戏登录侧 get_password 排除已删除账号 → 拒登；置空即恢复）
+ALTER TABLE players ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 """
 
 

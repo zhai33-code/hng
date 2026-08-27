@@ -32,11 +32,18 @@
   GetTotals 请求: [u8 5][u32 n][i64xn charIds][i64 ?][u32 a5][a5x32B][u32 a7][a7x16B]
   GetTotals 响应（解压后）:
     [i64 sessionId][u32 numChars]
-    每角色: [i64 charId][u32 numStats][u32 numRibbons]
+    每角色: [i64 charId][u32 numStats]
             + numStats  x 28B: [u32 statId][i64][i64][i64]
+            + [u32 numRibbons]
             + numRibbonsx 28B: [i64 ribbonTemplateId][f64 currentValue]
                                 [u32 currentLevel][f64 nextValue]
-    （两个数组顺序内联，客户端自行分配指针；等级为 1 基，客户端存 level-1）
+    （numRibbons 必须在 stats 数组之后！客户端 sub_18000ADF0 读取顺序为
+     charId→numStats→stats→numRibbons→ribbons。2026-08-27 双人进战局
+     崩溃事故：旧布局 numStats/numRibbons 相邻导致流错位 4 字节，
+     第二个角色的 numStats 从勋带浮点字节读出 ~10 亿 → saturated_mul
+     4GB 分配失败 → 分配器 __debugbreak fail-fast（exit 0xC0000409）。
+     单角色查询恰好不崩（错位后垃圾条目被客户端白名单校验跳过），
+     双角色同请求必崩。等级为 1 基，客户端存 level-1）
 
 客户端注入（launch_hng.ps1）：/R "statserver=127.0.0.1" /R "statserverport=15115"
 
@@ -302,12 +309,17 @@ def _build_totals(session_id: int, char_data) -> bytes:
     stats_entries: [(statId, ctx1, ctx2, value)]，与 type-6 上报同布局
     （u32 statId + i64 ctx1 + i64 ctx2 + i64 value，客户端读取端
     sub_18038D550 按 ctx 段位取 16/32 位子字段）。
+
+    每角色字段顺序：charId → numStats → stats 数组 → numRibbons →
+    ribbons 数组（客户端 sub_18000ADF0 读取顺序，见模块 docstring
+    2026-08-27 崩溃分析；numRibbons 放 stats 前会错位 4 字节）。
     """
     out = struct.pack('<qI', session_id, len(char_data))
     for cid, stats, ribbons in char_data:
-        out += struct.pack('<qII', int(cid), len(stats), len(ribbons))
+        out += struct.pack('<qI', int(cid), len(stats))
         for wid, c1, c2, val in stats:
             out += struct.pack('<Iqqq', int(wid), int(c1), int(c2), int(val))
+        out += struct.pack('<I', len(ribbons))
         for rid, cur, lv, nxt in ribbons:
             out += struct.pack('<qdId', int(rid), float(cur), int(lv), float(nxt))
     return out

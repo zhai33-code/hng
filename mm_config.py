@@ -9,7 +9,8 @@ gamemodeId 取值来源：客户端 GamemodesView.as（反编译实测）：
   min_players    成局所需最少玩家数（达到即撮合）
   max_players    单局玩家上限（超出部分留在池中等下一局）
   ai_fill_after  排队等待超时（秒）：超时后不足的人数由 AI 补位开局；
-                 0 = 立即成局（训练模式单人直开）
+                 0 = 不启用超时补位（训练模式 min=1 立即成局；战争模式
+                 纯真人，凑够 min_players 才开局）
 
 环境变量覆盖（便于测试压低等待时间，不改变代码默认值）：
   MM_AI_FILL_AFTER       覆盖所有模式的 ai_fill_after（秒）
@@ -50,17 +51,21 @@ def _mode(name, min_players, max_players, ai_fill_after, fallback_presets=None):
 
 # 每模式匹配配置（gamemodeId → 参数）
 # fallback_presets：组内无人勾选地图时的随机兜底池（模式专属地图，
-# 数据源 missionpreset 表名称归类，preset → gamemap → scenefile 链见 wardb.py）
+# 数据源 missionpreset 表名称归类，preset → gamemap → scenefile 链见 wardb.py）。
+# ★ 2026-08-27 剔除本地缺失场景的 preset（客户端 _packed\Environments\Scenes\
+#   Gamemaps\ 无对应 .fst，进图必失败）：
+#   4 (T04M01_RussianFactory) / 26 (T02M04_Airfield) /
+#   400513682 (T03M01_CityRiver) / 595333531 (T03M03_CityBoulevard) /
+#   775928046 (T03M02_CityTrainStation)
 GAMEMODES = {
     1:  _mode('training',         1,  1,  0,  [9, 10, 11]),            # 训练：单人立即开局
     3:  _mode('capture_hold_inf', 2, 18, 30,  [19, 20, 21, 1, 373394539,
                                                373394540, 373394541]),
     4:  _mode('capture_hold_all', 2, 18, 30,  [12, 22, 23, 24, 25]),
-    5:  _mode('assault_infantry', 2, 18, 30,  [8, 4, 1345335, 400513682,
-                                               595333531, 775928046]),
-    6:  _mode('assault_battle',   2, 18, 30,  [26, 27, 28, 29, 31]),
-    10: _mode('war',              2, 18, 30,  [26, 27, 28, 29, 31]),   # 同 assault 小图（war 局通常由联盟推图，此处兜底）
-    11: _mode('quickplay',        2, 18, 30,  [26, 27, 28, 29, 31]),   # quickplay 无选图 → 随机小图
+    5:  _mode('assault_infantry', 2, 18, 30,  [8, 1345335]),
+    6:  _mode('assault_battle',   2, 18, 30,  [27, 28, 29, 31]),
+    10: _mode('war',              2, 18, 0,   [27, 28, 29, 31]),   # 战争模式纯真人：不超时 AI 补位，凑够真人才开局（同 assault 小图兜底）
+    11: _mode('quickplay',        2, 18, 30,  [27, 28, 29, 31]),   # quickplay 无选图 → 随机小图
 }
 DEFAULT_GAMEMODE = _mode('default', 2, 18, 30)    # 未知模式兜底
 

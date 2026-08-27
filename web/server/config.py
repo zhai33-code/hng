@@ -33,7 +33,7 @@ _load_dotenv(os.path.join(_REPO_DIR, '.env'))          # 与游戏服共用同�
 
 # ---- 数据库 ----
 DATABASE_URL = os.environ.get(
-    'HNG_DATABASE_URL', 'postgresql://hng:hng_password@localhost:5432/hng')
+    'HNG_DATABASE_URL', 'postgresql://hng:hng_password@localhost:15432/hng')
 
 # ---- 监听（默认仅回环：公网不可达，远程走 SSH 隧道）----
 ADMIN_BIND = os.environ.get('HNG_ADMIN_BIND', '127.0.0.1').strip() or '127.0.0.1'

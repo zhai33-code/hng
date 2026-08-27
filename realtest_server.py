@@ -270,6 +270,16 @@ async def main():
                 log(f'[DB] closed {n} stale mission_records (server restart)')
         except Exception as e:
             log(f'[DB] close_stale_missions failed: {e}')
+        # 选中士兵注册表回放（player_selected_char → 内存，
+        # 组队入队规则"被邀者当前选中角色"跨重启保留）
+        try:
+            from state import PLAYER_SELECTED_CHAR
+            loaded = await STORE.load_all_selected_chars()
+            PLAYER_SELECTED_CHAR.update(loaded)
+            if loaded:
+                log(f'[DB] restored {len(loaded)} player_selected_char rows')
+        except Exception as e:
+            log(f'[DB] load_all_selected_chars failed: {e}')
     except Exception as e:
         log(f'[DB] PostgreSQL UNAVAILABLE ({e}) -- 持久化已禁用')
     # HTTP 线程模块注入主 loop（/register 经它投递 create_player 协程）

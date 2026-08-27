@@ -281,6 +281,49 @@ def main():
     e = fields(pb_field_payload(entry))
     check('坦克兵 f7=10（tankcrew actionid）', e[7][0] == 10)
 
+    print('== 8. 武器弹药过滤（slot_index>0 才下发，与官方回放一致）==')
+    # 用户改子弹场景：PPD-40(weapon 123) 持有 2 条弹药
+    #   - 旧弹药 317(slot=0，已卸下) + 新弹药 318(slot=1，已装备)
+    # 官方回放 weapon f3 ammos 子消息无 equippedAmmoSlotIndex 字段，
+    # 客户端按"列表中所有 ammo 均视为已装备"处理 → 必须只下发已装备的那一条
+    swap_loadout = {
+        'weapons': {3: [{'id': 123, 'name': 'PPD-40', 'template_id': 24,
+                         'character_id': 3, 'container_id': 3, 'container_slot': 1,
+                         'variant_template_id': 0, 'variant_id': 0,
+                         'condition': 1.0, 'clip_count': 1}]},
+        'w_ammo': {123: [
+            {'id': 317, 'ammo_template_id': 92, 'weapon_id': 123,
+             'slot_index': 0, 'condition': 1000.0},   # 旧弹药，已卸下
+            {'id': 318, 'ammo_template_id': 93, 'weapon_id': 123,
+             'slot_index': 1, 'condition': 1000.0}]},  # 新弹药，已装备
+        'w_mods': {}, 'vehicles': {}, 'v_ups': {}, 'v_ammo': {},
+        'uv_tmpl': {}, 'u_parts': {},
+    }
+    entry = _msg_character_entry(chars[2], loadout=swap_loadout)
+    e = fields(pb_field_payload(entry))
+    w = fields(e[3][0])
+    check('f3 ammos 只下发已装备的 1 条（slot_index>0 过滤）',
+          len(w[3]) == 1)
+    am = fields(w[3][0])
+    check('下发的是新弹药 id=318 template=93（用户改后已装备的那条）',
+          am[1][0] == 318 and am[2][0] == 93)
+    # 全部 slot=0 时整体省略（repeated 空字段整体省略）
+    noeq_loadout = {
+        'weapons': {3: [{'id': 123, 'name': 'PPD-40', 'template_id': 24,
+                         'character_id': 3, 'container_id': 3, 'container_slot': 1,
+                         'variant_template_id': 0, 'variant_id': 0,
+                         'condition': 1.0, 'clip_count': 1}]},
+        'w_ammo': {123: [{'id': 317, 'ammo_template_id': 92, 'weapon_id': 123,
+                         'slot_index': 0, 'condition': 1000.0}]},
+        'w_mods': {}, 'vehicles': {}, 'v_ups': {}, 'v_ammo': {},
+        'uv_tmpl': {}, 'u_parts': {},
+    }
+    entry = _msg_character_entry(chars[2], loadout=noeq_loadout)
+    e = fields(pb_field_payload(entry))
+    w = fields(e[3][0])
+    check('全部弹药 slot=0 → f3 ammos 整体省略（无已装备弹药）',
+          3 not in w)
+
     print()
     print('ALL PASS' if ok else 'SOME CHECKS FAILED')
     return 0 if ok else 1

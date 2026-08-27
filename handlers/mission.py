@@ -167,6 +167,16 @@ async def handle_get_mission_list(sess, writer, cmd_id, req_type, proto):
     pid = await sess.ensure_player()
     zulu = _zulu_now()
 
+    # 侧面记录当前选中士兵（GetMissionList 在玩家点进战斗界面时携带
+    # characterId，是"当前选中"最频繁的感知点；内存 + DB 双写）
+    if pid is not None and char_id:
+        try:
+            from state import PLAYER_SELECTED_CHAR
+            PLAYER_SELECTED_CHAR[int(pid)] = int(char_id)
+            await STORE.set_player_selected_char(int(pid), int(char_id))
+        except Exception as e:
+            log(f'      [DB] set_player_selected_char failed: {e}')
+
     # 收集任务：{mission_id: (MissionInfo proto, [MissionListFaction proto])}
     entries = {}
 

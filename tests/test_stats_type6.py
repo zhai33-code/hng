@@ -140,15 +140,43 @@ async def test_reverse_map():
 
 
 def test_build_totals():
+    # 单角色布局：charId → numStats → stats → numRibbons → ribbons
+    # （numRibbons 在 stats 之后，客户端 sub_18000ADF0 读取顺序）
     data = ss._build_totals(7, [(31, [(517, 12345, 0, 7)], [(13, 500.0, 3, 900.0)])])
     sid, n = struct.unpack_from('<qI', data, 0)
-    cid, ns, nr = struct.unpack_from('<qII', data, 12)
-    entry = struct.unpack_from('<Iqqq', data, 28)
+    cid, ns = struct.unpack_from('<qI', data, 12)
+    entry = struct.unpack_from('<Iqqq', data, 24)
+    nr, = struct.unpack_from('<I', data, 52)
     rib = struct.unpack_from('<qdId', data, 56)
-    check('build_totals 布局',
+    check('build_totals 布局（numRibbons 在 stats 后）',
           sid == 7 and n == 1 and cid == 31 and ns == 1 and nr == 1
           and entry == (517, 12345, 0, 7) and rib == (13, 500.0, 3, 900.0),
           f'len={len(data)}')
+    # 双角色回归（2026-08-27 双人进战局崩溃）：按客户端读取顺序流式
+    # 解析整包，第二个角色头部必须落在正确偏移上，读完恰好到包尾
+    two = ss._build_totals(1, [
+        (53, [(11, 0, 0, 111), (50, 0, 0, 278)], [(28, 1500.0, 2, 3000.0)]),
+        (54, [(93, 37, 0, 100809)], []),
+    ])
+    off = 0
+    sid2, n2 = struct.unpack_from('<qI', two, off); off += 12
+    ok = sid2 == 1 and n2 == 2
+    for cid2, nst, stats, ribs in (
+            (53, 2, [(11, 0, 0, 111), (50, 0, 0, 278)], [(28, 1500.0, 2, 3000.0)]),
+            (54, 1, [(93, 37, 0, 100809)], [])):
+        c, s = struct.unpack_from('<qI', two, off); off += 12
+        ok = ok and c == cid2 and s == nst
+        for i in range(nst):
+            e = struct.unpack_from('<Iqqq', two, off); off += 28
+            ok = ok and e == stats[i]
+        r, = struct.unpack_from('<I', two, off); off += 4
+        ok = ok and r == len(ribs)
+        for i in range(len(ribs)):
+            b = struct.unpack_from('<qdId', two, off); off += 28
+            ok = ok and b == ribs[i]
+    ok = ok and off == len(two)
+    check('build_totals 双角色流式解析（顺序读不错位不越界）', ok,
+          f'off={off} len={len(two)}')
 
 
 def test_group_dim():

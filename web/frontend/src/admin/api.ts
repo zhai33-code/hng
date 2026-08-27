@@ -29,6 +29,7 @@ export async function http<T = unknown>(
   path: string,
   body?: unknown,
   timeoutMs = 15000,
+  opts: { isLogin?: boolean } = {},
 ): Promise<T> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)
@@ -46,15 +47,17 @@ export async function http<T = unknown>(
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: ctrl.signal,
     })
-    if (res.status === 401) {
-      onUnauthorized?.()
-      throw new HttpError(401, '会话已过期，请重新登录')
-    }
     let data: any = null
     try {
       data = await res.json()
     } catch {
       /* 非 JSON 响应 */
+    }
+    if (res.status === 401) {
+      // 登录接口的 401 = 凭据错误（后端带 detail 文案）：
+      // 直接抛给登录页弹窗展示，不触发全局"会话过期"登出逻辑
+      if (!opts.isLogin) onUnauthorized?.()
+      throw new HttpError(401, data?.detail || '会话已过期，请重新登录')
     }
     if (!res.ok) {
       throw new HttpError(res.status, data?.detail || `请求失败 (${res.status})`)
@@ -73,5 +76,6 @@ export async function http<T = unknown>(
 
 export const get = <T = unknown>(path: string, timeoutMs?: number) =>
   http<T>('GET', path, undefined, timeoutMs)
-export const post = <T = unknown>(path: string, body?: unknown) =>
-  http<T>('POST', path, body)
+export const post = <T = unknown>(path: string, body?: unknown,
+                                  opts?: { isLogin?: boolean }) =>
+  http<T>('POST', path, body, undefined, opts)

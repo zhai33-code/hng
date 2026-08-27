@@ -562,11 +562,9 @@ def _ensure_store_campaign_file():
 _ensure_store_campaign_file()
 
 
-def _generate_wardb_unique():
-    """扫描 WarDatabase 目录，生成 wardb_unique manifest
-    格式: "tableName",sha256hex-size\n
-    """
-    lines = []
+def _scan_wardb_entries():
+    """扫描 WarDatabase 目录 → [(表名, sha256hex, 字节数)]，两种清单共用。"""
+    entries = []
     if os.path.isdir(WARDDB_DIR):
         for name in sorted(os.listdir(WARDDB_DIR)):
             fpath = os.path.join(WARDDB_DIR, name)
@@ -574,14 +572,47 @@ def _generate_wardb_unique():
                 continue
             with open(fpath, 'rb') as f:
                 data = f.read()
-            sha = hashlib.sha256(data).hexdigest()
-            size = len(data)
-            lines.append(f'"{name}",{sha}-{size}')
+            entries.append((name, hashlib.sha256(data).hexdigest(), len(data)))
+    return entries
+
+
+_WARDB_ENTRIES = _scan_wardb_entries()
+
+
+def _generate_wardb_unique():
+    """swf 用（HandleDownloadDataCommand）：2 列 "表名",sha256hex-size。"""
+    lines = [f'"{n}",{s}-{z}' for n, s, z in _WARDB_ENTRIES]
     return ('\n'.join(lines) + '\n').encode('utf-8')
 
 
-# WarDatabase 文件清单：列出所有静态表文件
+def _generate_wardb_sync():
+    """hngsync 用（登录同步 set:desktop_client）：官方 3 列 wire 清单格式
+    "相对路径",<sha256>-<size>_<flag>,<size>，目录累积式相对路径（首条全路径、
+    后续相对上一条目录 —— 与官方 desktop_client 清单 tmp/manifest_desktop.txt
+    同构，hngsync UniqueFileList_Parse 按 sCurrentDir+名字拼接解析）。
+    列 2 必须是完整 CAS 名 <sha256>-<size>_<flag>：hngsync 发现本地文件
+    哈希/大小不符时以 GET /<列2> 下载本体修复。"""
+    import posixpath as _pp
+    lines = []
+    cur_dir = ''
+    for n, s, z in _WARDB_ENTRIES:
+        rel = _pp.join('WarDatabase', n)
+        rel_path = rel if not cur_dir else _pp.relpath(rel, cur_dir)
+        lines.append(f'"{rel_path}",{s}-{z}_0,{z}')
+        cur_dir = 'WarDatabase'
+    return ('\n'.join(lines) + '\n').encode('utf-8')
+
+
+# WarDatabase 文件清单（swf 登录链 wardb_unique 用）
 WARDB_UNIQUE = _generate_wardb_unique()
+
+# hngsync desktop_client 同步清单（远程客户端改表推送通道）
+WARDB_SYNC_UNIQUE = _generate_wardb_sync()
+
+# CAS 名 → 表文件路径：hngsync GET /<sha256>-<size>_<flag> 时直接回源
+# WarDatabase 目录，改动过的表无需手工复制进 web_server 的 cas/ 目录
+WARDB_CAS_MAP = {f'{s}-{z}_0': os.path.join(WARDDB_DIR, n)
+                 for n, s, z in _WARDB_ENTRIES}
 
 # 商店表文件列表（ShopView 订阅时从 WarDatabase 回放推送）
 SHOP_TABLE_FILES = [

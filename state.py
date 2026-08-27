@@ -43,9 +43,10 @@ _load_dotenv(os.path.join(_PKG_DIR, '.env'))
 # 注意：不要指向 D:\Program Files\HnG 个人正式客户端）
 #
 # 路径解析顺序（打包部署友好）：
-#   1. 环境变量 HNG_GAME_DIR（显式指定，最高优先级）
-#   2. 包目录的父级/上两级探测（存在 WarDatabase + images 即视为客户端根目录，
-#      仓库克隆到客户端根目录下时自动命中，如 d:\HnG-test\hng-server）
+#   1. 环境变量 HNG_GAME_DIR（显式指定，最高优先级，部署在非标准位置时用）
+#   2. 从包目录向上逐级探测客户端根目录（WarDatabase + images 特征），
+#      两种布局均自动命中：根目录自身含之（如 work\hng-server-re → d:\HnG-test），
+#      或根目录下 combat-server 含之（warserver 与 combat-server 同层部署）
 #   3. 探测失败：启动时打印警告并要求显式设置 HNG_GAME_DIR（无硬编码兜底路径）
 
 
@@ -53,19 +54,51 @@ def _detect_game_dir():
     env = os.environ.get('HNG_GAME_DIR')
     if env:
         return os.path.abspath(env)
-    for cand in (os.path.dirname(_PKG_DIR),
-                 os.path.dirname(os.path.dirname(_PKG_DIR))):
-        if (os.path.isdir(os.path.join(cand, 'WarDatabase'))
-                and os.path.isdir(os.path.join(cand, 'images'))):
-            return cand
-    print('[warn] 未能自动探测客户端根目录（父级目录无 WarDatabase + images）。\n'
-          '       请把本仓库克隆到客户端根目录下，或设置环境变量 HNG_GAME_DIR 指向客户端根目录。',
+    # 从包目录向上逐级探测客户端根目录（WarDatabase + images 为特征），
+    # 任意嵌套深度都能命中，如 d:\HnG-test\work\hng-server-re\server → d:\HnG-test。
+    # 两种布局：
+    #   a) 根目录自身含 WarDatabase + images（游戏根与服务器代码同处一棵树）
+    #   b) 根目录下有 combat-server，且其含 WarDatabase + images（warserver 与
+    #      combat-server 同层部署——combat-server 本身就是完整客户端根）
+    cur = os.path.dirname(_PKG_DIR)
+    for _ in range(6):
+        if cur in ('', os.path.dirname(cur)):
+            break
+        if (os.path.isdir(os.path.join(cur, 'WarDatabase'))
+                and os.path.isdir(os.path.join(cur, 'images'))):
+            return cur
+        cs = os.path.join(cur, 'combat-server')
+        if (os.path.isdir(os.path.join(cs, 'WarDatabase'))
+                and os.path.isdir(os.path.join(cs, 'images'))):
+            return cs
+        cur = os.path.dirname(cur)
+    print('[warn] 未能自动探测客户端根目录（各级父目录均无 WarDatabase + images）。\n'
+          '       请设置环境变量 HNG_GAME_DIR 指向客户端根目录。',
           file=sys.stderr)
     return ''
 
 
 GAME_DIR = _detect_game_dir()
-WARDDB_DIR = os.path.join(GAME_DIR, 'WarDatabase')
+
+# WarDatabase 表目录：战斗服 hng.exe 实际加载的是 combat-server 下的副本，
+# HTTP 下发（wardb_unique / wardb_sync / CAS 回源）必须与之同源，否则
+# 改表后下发给客户端的哈希与战斗服实际用的表不一致。
+# 解析：GAME_DIR\combat-server\WarDatabase 存在即用（战斗服副本优先），
+# 否则回退 GAME_DIR\WarDatabase。
+if os.path.isdir(os.path.join(GAME_DIR, 'combat-server', 'WarDatabase')):
+    WARDDB_DIR = os.path.join(GAME_DIR, 'combat-server', 'WarDatabase')
+else:
+    WARDDB_DIR = os.path.join(GAME_DIR, 'WarDatabase')
+
+# texts 语言文件目录（hngsync desktop_client 清单/CAS 推送源）：
+# 与 WARDDB_DIR 同源逻辑——combat-server 副本优先（服务器权威版本）。
+# 注意区分：HTTP /HnG_Strategy_en.xml 路由仍读 GAME_DIR\texts（客户端侧
+# 副本，_localization_body）。更新流验证：清单哈希取 combat-server 版 →
+# 客户端本地旧文件哈希不匹配 → hngsync 下载新版写回客户端本地。
+if os.path.isdir(os.path.join(GAME_DIR, 'combat-server', 'texts')):
+    TEXTS_DIR = os.path.join(GAME_DIR, 'combat-server', 'texts')
+else:
+    TEXTS_DIR = os.path.join(GAME_DIR, 'texts')
 
 # 当前连接的数据库 player_id（contextvar）：messages._msg_* 构建士兵视图
 # 各表行（character/weapon/Vehicle/UniformPart…）的 playerId 字段从这里读。
@@ -105,6 +138,15 @@ class Session:
             except Exception as e:
                 log(f'[DB] get_player failed: {e}')
         return self.player_id
+
+
+# 大厅"当前选中士兵"注册表：player_id → character_id。
+# 客户端不发独立的选角消息，服务器只能从携带 characterId 的请求侧面感知：
+# JoinMatchMaking f1（单人排队带选中角色）、SquadInvitePlayer f1（ownerCharacterId
+# 即邀请者选中角色）、SquadRespondToInvite f3。小队入队规则（B 必须换到与 A
+# 同阵营同兵种的角色）需要知道 B 的当前选中士兵，均从此表取，无记录则按
+# "首个同阵营同兵种角色"兜底。
+PLAYER_SELECTED_CHAR = {}
 
 
 # 已登录 Flash(playerview) 连接注册表：username → Session。

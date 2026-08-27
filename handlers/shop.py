@@ -274,6 +274,8 @@ async def handle_addribbonlevelrequest(sess, writer, cmd_id, req_type, proto):
                     if int(ch['id']) != int(char_id):
                         continue
                     bits = await _char_unlock_bits_for(sess, ch['template'], ch['faction'], ch['id'])
+                    # 尾部字段传全：客户端 setObject 整体替换 schema，漏传
+                    # head_id/previous_template 等会被抹回默认值（外观回退）
                     await _push_kvcs(writer, sess.soldier_view_cmd, b'character',
                                      _msg_character(ch['name'], ch['faction'], ch['template'],
                                                     _rank_from_combat_xp(ch.get('combat_xp', 0)),
@@ -282,7 +284,12 @@ async def handle_addribbonlevelrequest(sess, writer, cmd_id, req_type, proto):
                                                     ch.get('combat_badge_1', 0),
                                                     new_ts,
                                                     ch.get('uniform_variant_id', 0),
-                                                    ch.get('headgear_id', 0)))
+                                                    ch.get('headgear_id', 0),
+                                                    1 if ch.get('is_deleted') else 0,
+                                                    ch.get('previous_template', 0),
+                                                    ch.get('head_id', 0),
+                                                    0,
+                                                    1 if ch.get('is_on_leave') else 0))
                     log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
                         f'{ch["name"]} re-pushed, unlockBits={sum(bits)} true, '
                         f'statTs={new_ts})')

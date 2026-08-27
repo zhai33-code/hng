@@ -33,7 +33,7 @@ from protocol import Chunk, build_response, pb_parse, pb_bool, pb_parse_multi
 from protocol import (
     pb_float, pb_int32, pb_int64, pb_message, pb_string, pb_uint32, pb_varint,
 )
-from state import FLASH_SESSIONS, PUBLIC_HOST, STORE
+from state import FLASH_SESSIONS, PLAYER_SELECTED_CHAR, PUBLIC_HOST, STORE
 from wardb import (
     _load_accesspoint_templates, _load_capturepoint_templates, _load_preset,
     _rank_from_combat_xp, battlefield_entity_for_gamemap, battlefield_pos,
@@ -54,7 +54,9 @@ import force_pool
 #   2. 包目录同级的 combat-server（zip 解压到客户端根目录时命中，
 #      如 d:\HnG-test\hng-server + d:\HnG-test\combat-server）
 #   3. 客户端根目录（state.GAME_DIR）下的 combat-server
-#   4. 兜底开发机默认路径
+#   4. GAME_DIR 自身即 combat-server（warserver 与 combat-server 同层部署：
+#      state.py 探测到的客户端根就是 combat-server，hng.exe 直接在其中）
+#   5. 兜底 GAME_DIR\combat-server
 def _detect_combat_dir():
     env = os.environ.get('HNG_COMBAT_SERVER_DIR')
     if env:
@@ -62,7 +64,8 @@ def _detect_combat_dir():
     from state import GAME_DIR
     pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     for cand in (os.path.join(pkg_parent, 'combat-server'),
-                 os.path.join(GAME_DIR, 'combat-server')):
+                 os.path.join(GAME_DIR, 'combat-server'),
+                 GAME_DIR):
         if os.path.isfile(os.path.join(cand, 'hng.exe')):
             return cand
     return os.path.join(GAME_DIR, 'combat-server')
@@ -167,6 +170,16 @@ async def _watch_proc_exit(inst, mission_id):
         _log(f'combat server #{inst["seq"]} exited without release '
              f'(mission={mission_id}, code={inst["proc"].returncode}) - '
              f'reclaiming slot')
+        # ★ 未走 earnings 即退出（玩家中途退出 code=10016 / 崩溃）：必须补
+        #   _finish_mission_sessions（squad 重置 + PMS DELETE KVCS），客户端
+        #   closing 流程等的就是这个会话结束信号；不推则只能每秒轮询
+        #   GetMissionDetails 拿 mission_not_found，直到超时自行 Abandon
+        #   （2026-08-27 卡 closing 56s 根因）。earnings 正常路径已先
+        #   release_match（实例出队），这里不会重复触发；且函数末尾统一
+        #   清 PMS 映射，天然幂等。延迟 import 防 combat→matchmaking 循环。
+        from handlers import combat as _combat_mod
+        _spawn(_combat_mod._finish_mission_sessions(int(mission_id), None),
+               f'finish_sessions#{inst["seq"]}')
         release_match(int(mission_id))
 
 
@@ -1120,6 +1133,32 @@ async def _squad_eligible_members(pid):
     return squad, eligible
 
 
+async def _revive_own_membership(squad_db_id, pid):
+    """status 卡 InBattle 复活（官服语义：重连即回小队 InLobby）。
+
+    返回 True 表示已把自己成员行置回 InLobby。仅当玩家无存活战局
+    （_find_player_active_mission 为空）时调用——战局收尾的
+    reset_real_squad_to_lobby 未覆盖到的掉线者（战斗中崩溃 + 局已结束）
+    status 残留 InBattle，_squad_eligible_members 永远过滤掉他，
+    join 静默 no-op（2026-08-27 日志：9 次连点无任何入池/推送）。"""
+    if STORE is None or not squad_db_id:
+        return False
+    try:
+        members = await STORE.list_squad_members(int(squad_db_id))
+    except Exception as e:
+        _log(f'      [DB] _revive_own_membership lookup failed: {e}')
+        return False
+    for m in members:
+        if int(m['player_id']) == int(pid) and int(m['status']) not in (2, 3):
+            try:
+                await STORE.update_squad_member(int(m['member_id']), status=2)
+                return True
+            except Exception as e:
+                _log(f'      [DB] _revive_own_membership update failed: {e}')
+                return False
+    return False
+
+
 async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
                          req_mission_id):
     """全队入池：每名在线成员建排队上下文 + PMM 行；DB 置 Ready +
@@ -1257,7 +1296,11 @@ async def _start_match(match):
     preset = int(match.preset_id)
     gamemode_id = int(match.players[0].gamemode_id) if match.players else 0
     attacker, defender, one_sided = _split_factions(match.players)
-    enable_bots = bool(match.ai_fill or one_sided)
+    # ★ AI 补位策略（2026-08-27 调整）：所有非战争模式一律 enable_bots=True
+    #   ——超时补位局、单侧局、凑够人的双侧真人局均带 AI；
+    #   战争模式（gamemode 10）纯真人：ai_fill_after=0 不超时补位，
+    #   双侧凑齐真人也不掺 AI。
+    enable_bots = (int(gamemode_id) != 10)
 
     # ★ 防御（非战争模式同局最多两阵营）：combat server 只按攻防两阵营
     #   配出生侧，撮合若带出第三阵营（US/GE/SU 同池），第三阵营玩家进图
@@ -1796,6 +1839,14 @@ async def _handle_join(sess, writer, cmd_id, proto):
         _log(f'S->C cmd={cmd_id:<4} JoinMatchMakingResponse (rejected: char {char_id} not found)')
         return
 
+    # 记录当前选中士兵（squad 入队规则需要：邀请时解析被邀者角色），
+    # 同步落库（player_selected_char，重启回放）
+    PLAYER_SELECTED_CHAR[int(pid)] = int(char_info['id'])
+    try:
+        await STORE.set_player_selected_char(int(pid), int(char_info['id']))
+    except Exception as e:
+        _log(f'[DB] set_player_selected_char failed: {e}')
+
     faction = int(char_info['faction'])
 
     resp = build_response(cmd_id, 'JoinMatchMakingResponse', pb_int32(1, 1))
@@ -1849,8 +1900,19 @@ async def _handle_join(sess, writer, cmd_id, proto):
                 await _join_existing_mission(pid, rejoin_mid, rejoin_entry,
                                              rejoin_ctx)
                 return
+            # ★ 无存活战局可回：status 卡 InBattle（错过战局收尾的
+            #   reset_real_squad_to_lobby，如战斗中崩溃掉线 + 局已结束）
+            #   → 官服语义"重连即回小队 InLobby"：置回 2 并重查 eligible。
+            #   否则 20:52-20:58 式静默卡死（9 次 join 无任何入池/推送）。
+            if await _revive_own_membership(squad['id'], pid):
+                _log(f'mm: squad player {pid} status stuck InBattle -> '
+                     f'InLobby revived (squad={squad["id"]})')
+                squad, sq_members = await _squad_eligible_members(pid)
         await _enqueue_squad(squad, sq_members, gamemode_id,
                              staged_presets, req_mission_id)
+        if not sq_members:
+            _log(f'[MM] squad {squad["id"]} enqueue skipped: no eligible '
+                 f'members (pid={pid})')
         return
 
     # 重复排队：删旧 PMM 行（行 id 即将更换，防客户端表残留）

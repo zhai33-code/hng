@@ -72,6 +72,8 @@ ALTER TABLE players ALTER COLUMN password DROP DEFAULT;
 ALTER TABLE players ADD COLUMN IF NOT EXISTS credits  BIGINT NOT NULL DEFAULT 100000;
 ALTER TABLE players ADD COLUMN IF NOT EXISTS warfunds BIGINT NOT NULL DEFAULT 100000;
 ALTER TABLE players ADD COLUMN IF NOT EXISTS gold     BIGINT NOT NULL DEFAULT 100000;
+-- 软删除标记（管理后台写入；登录侧 get_password 排除已删除账号 → 拒登）
+ALTER TABLE players ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS characters (
     id         BIGINT PRIMARY KEY DEFAULT nextval('character_id_seq'),
@@ -419,6 +421,11 @@ CREATE TABLE IF NOT EXISTS squad_members (
     status INT NOT NULL DEFAULT 0,
     PRIMARY KEY (squad_id, character_id)
 );
+CREATE TABLE IF NOT EXISTS player_selected_char (
+    player_id BIGINT PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
+    character_id BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS companies (
     id SERIAL PRIMARY KEY, name TEXT NOT NULL, leader_player_id BIGINT NOT NULL
 );
@@ -723,10 +730,11 @@ class PlayerStore:
                 username, password)
 
     async def get_password(self, username):
-        """返回账号密码；账号不存在返回 None。"""
+        """返回账号密码；账号不存在或已软删除（管理后台 deleted_at）返回 None。"""
         async with self.pool.acquire() as conn:
             return await conn.fetchval(
-                'SELECT password FROM players WHERE username = $1', username)
+                'SELECT password FROM players '
+                'WHERE username = $1 AND deleted_at IS NULL', username)
 
     async def get_extra_unlock_uids(self, player_id, character_id):
         """返回该角色勋带购买的额外解锁 uid 集合（character_extra_unlocks 行表）。"""
@@ -1581,12 +1589,15 @@ class PlayerStore:
         return rep, players
 
     async def list_recent_report_ids(self, player_id, limit=10):
-        """玩家最近参战的战报 id 列表（新→旧）。"""
+        """玩家最近参战的战报 id 列表（新→旧）。
+
+        排除 bot 行：bot playerId 可能与真实账号撞号（bot 3 ≠ 玩家 3），
+        不排除会让真人凭空多出没参加过的人机局战报。"""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 'SELECT r.id FROM battle_reports r '
                 'JOIN battle_report_players p ON p.report_id = r.id '
-                'WHERE p.player_id = $1 '
+                'WHERE p.player_id = $1 AND NOT p.is_bot '
                 'ORDER BY r.created_at DESC, r.id DESC LIMIT $2',
                 player_id, int(limit))
         return [int(r['id']) for r in rows]
@@ -2420,6 +2431,15 @@ class PlayerStore:
                 'VALUES ($1, $2, 2)', int(sid), int(char_id))  # 2=InLobby
         return int(sid)
 
+    async def update_squad_leader(self, squad_id, leader_char_id, faction):
+        """队长换兵种/换角色（官服语义：小队类型跟随队长）。
+        更新 squads.leader_character_id + faction。"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE squads SET leader_character_id = $2, faction = $3 '
+                'WHERE id = $1', int(squad_id), int(leader_char_id),
+                int(faction))
+
     async def get_squad(self, squad_id):
         """小队行或 None。"""
         async with self.pool.acquire() as conn:
@@ -2469,6 +2489,35 @@ class PlayerStore:
                  'combat_xp': int(r['combat_xp']),
                  'char_name': r['char_name'],
                  'faction': int(r['faction'])} for r in rows]
+
+    async def set_player_selected_char(self, player_id, character_id):
+        """持久化"当前选中士兵"（官服组队规则需要被邀者的选中角色）。
+
+        客户端无独立选角消息，服务器从携带 characterId 的请求侧面感知
+        （JoinMatchMaking / 邀请 / 接受邀请 / GetMissionList），写内存
+        注册表 state.PLAYER_SELECTED_CHAR 时同步落库，重启后回放。"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'INSERT INTO player_selected_char (player_id, character_id, '
+                'updated_at) VALUES ($1, $2, now()) '
+                'ON CONFLICT (player_id) DO UPDATE SET '
+                'character_id = $2, updated_at = now()',
+                int(player_id), int(character_id))
+
+    async def get_player_selected_char(self, player_id):
+        """玩家持久化的选中士兵 id；无记录返回 0。"""
+        async with self.pool.acquire() as conn:
+            cid = await conn.fetchval(
+                'SELECT character_id FROM player_selected_char '
+                'WHERE player_id = $1', int(player_id))
+        return int(cid) if cid else 0
+
+    async def load_all_selected_chars(self):
+        """全量回放 player_id → character_id（服务器启动时灌内存注册表）。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT player_id, character_id FROM player_selected_char')
+        return {int(r['player_id']): int(r['character_id']) for r in rows}
 
     async def add_squad_member(self, squad_id, char_id, status=1):
         """添加成员会话行（1=InvitationPending 2=InLobby 3=Ready 4=InCombat）。
@@ -2839,6 +2888,18 @@ class PlayerStore:
         5: 'weapon_modifiers', 6: 'weapon_ammo', 7: 'weapon_variants',
         8: 'vehicle_upgrades', 9: 'vehicle_ammo', 10: 'vehicle_variants',
     }
+    # 挂靠件（配件/皮肤/弹药/载具升级与弹药）指派角色时需同步清 0 的外键列。
+    # 官方容器归属不变式：客户端 ModifyWeaponMediator 只认
+    # characterId==角色 && (weaponId==本枪 || weaponId==0)，指派后仍挂在
+    # 仓库枪上的配件在角色改枪窗口里永远不可见（幽灵配件脏数据）。
+    _ITEM_DETACH_SETS = {
+        'weapon_modifiers': ', weapon_id = 0',
+        'weapon_variants': ', weapon_id = 0',
+        'weapon_ammo': ', weapon_id = 0',
+        'vehicle_upgrades': ', vehicle_id = 0, equipped_slot_id = 0',
+        'vehicle_variants': ', vehicle_id = 0',
+        'vehicle_ammo': ', vehicle_id = 0, equipped_storage_id = 0',
+    }
 
     async def set_inventory_item_character(self, player_id, item_type, item_id,
                                            character_id):
@@ -2890,10 +2951,20 @@ class PlayerStore:
                     'WHERE vehicle_id = $1 AND player_id = $2',
                     int(item_id), int(player_id), int(character_id))
             else:
+                # 挂靠件指派角色 → 同步脱离原容器（weapon_id/vehicle_id 清 0），
+                # 详见 _ITEM_DETACH_SETS 注释（官方容器归属不变式）
+                detach = self._ITEM_DETACH_SETS.get(tbl, '')
                 n = await conn.execute(
-                    f'UPDATE {tbl} SET character_id = $3 WHERE id = $1 '
-                    'AND player_id = $2',
+                    f'UPDATE {tbl} SET character_id = $3{detach} '
+                    'WHERE id = $1 AND player_id = $2',
                     int(item_id), int(player_id), int(character_id))
+                # 皮肤实例脱离武器后，引用它的武器行同步复位默认皮肤
+                #（对齐 send_upgrades_to_depot 载具分支 variant_id 复位语义）
+                if tbl == 'weapon_variants':
+                    await conn.execute(
+                        'UPDATE weapons SET variant_id = 0 WHERE variant_id = $1 '
+                        'AND player_id = $2',
+                        int(item_id), int(player_id))
         return _rowcount(n) > 0
 
     async def get_item_character(self, player_id, item_type, object_id):

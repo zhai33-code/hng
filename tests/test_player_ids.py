@@ -252,9 +252,11 @@ def test_settlement_bot_and_ghost_pids_filtered():
 
     assert fake.currency == [(1, 150, 425)], \
         f'货币只应发给真人 pid=1（+25%），实际 {fake.currency}'
-    # 战报入库只存真人行
-    assert [p['player_id'] for p in fake.saved[1]] == [1], \
-        f'入库玩家行应只有真人 pid=1，实际 {fake.saved[1]}'
+    # 战报入库含 bot 行（人机局战报需显示 bot）
+    assert [p['player_id'] for p in fake.saved[1]] == [1, 3], \
+        f'入库玩家行应含真人 pid=1 与 bot pid=3，实际 {fake.saved[1]}'
+    assert fake.saved[1][1]['is_bot'] is True, \
+        f'bot 行应带 is_bot=True，实际 {fake.saved[1][1]}'
     # bot 角色 10001 不得产生任何统计写入
     assert all(cid != 10001 for cid, _, _ in fake.stats), \
         f'bot 角色 10001 不应写统计，实际 {fake.stats}'

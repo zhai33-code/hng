@@ -1,4 +1,4 @@
-﻿# HnG real-machine test launcher
+# HnG real-machine test launcher
 # Requires: Administrator (for port 80) + hosts entries (managed manually)
 #   hosts需手动添加：
 #     127.0.0.1 game.hng-group.com
@@ -27,13 +27,20 @@ if (-not $hng_game_dir) {
     }
 }
 if (-not $hng_game_dir) {
+    # 从 server 目录向上逐级探测（与 state.py 同步：任意嵌套深度；
+    # 根目录自身含 WarDatabase+images，或其下 combat-server 含之）
     $hng_game_dir = ''
-    foreach ($hng_c in @((Split-Path $hng_root -Parent), (Split-Path (Split-Path $hng_root -Parent) -Parent))) {
+    $hng_c = Split-Path $hng_root -Parent
+    for ($hng_i = 0; $hng_i -lt 6; $hng_i++) {
+        if (-not $hng_c) { break }
+        $hng_cs = Join-Path $hng_c 'combat-server'
         if ((Test-Path (Join-Path $hng_c 'WarDatabase')) -and (Test-Path (Join-Path $hng_c 'images'))) { $hng_game_dir = $hng_c; break }
+        if ((Test-Path (Join-Path $hng_cs 'WarDatabase')) -and (Test-Path (Join-Path $hng_cs 'images'))) { $hng_game_dir = $hng_cs; break }
+        $hng_c = Split-Path $hng_c -Parent
     }
     if (-not $hng_game_dir) {
-        Write-Host '[!] 未能自动探测客户端根目录（父级目录无 WarDatabase + images）。' -ForegroundColor Red
-        Write-Host '    请把本仓库克隆到客户端根目录下，或设置环境变量 HNG_GAME_DIR。' -ForegroundColor Red
+        Write-Host '[!] 未能自动探测客户端根目录（各级父目录均无 WarDatabase + images）。' -ForegroundColor Red
+        Write-Host '    请设置环境变量 HNG_GAME_DIR 指向客户端根目录。' -ForegroundColor Red
         exit 1
     }
 }

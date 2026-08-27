@@ -25,7 +25,7 @@ export const useAuthStore = defineStore('auth', {
       const r = await post<{ ok: boolean; username: string }>('/auth/login', {
         username,
         password,
-      })
+      }, { isLogin: true })
       this.username = r.username
     },
     async logout() {

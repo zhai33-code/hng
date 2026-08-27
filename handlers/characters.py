@@ -796,6 +796,110 @@ async def _repush_depot_new_item(sess, writer, pid):
         f'{sum(len(v) for v in depot_new.values())} unviewed)')
 
 
+# itemType 字符串（SetInventoryItemToCharacterRequest f1，客户端
+# buildSendItemToSoldierRequest 的取值）→ ItemType 枚举 int
+_DEPOT_STR_TYPE = {
+    'weapon': 1, 'vehicle': 2, 'uniformpart': 3, 'uniformvariant': 4,
+    'weaponmodifier': 5, 'weaponammo': 6, 'weaponvariant': 7,
+    'vehicleupgrade': 8, 'vehicleammo': 9, 'vehiclevariant': 10,
+}
+
+
+async def _repush_item_row(sess, writer, pid, item_type, item_id):
+    """按 ItemType（int 枚举或小写字符串）重推单件物品 KVCS 行（仓库转运/
+    指派后客户端各表收敛用）。
+
+    官方客户端所有 depot/装备列表监听对应表（WeaponModifier/WeaponAmmo/
+    WeaponVariant/UniformPart/UniformVariant/VehicleUpgrade/VehicleAmmo/
+    VehicleVariant/...）的 changeSignal，只回 response 不推行 → 列表不动
+    → 玩家连点重发（2026-08-27 La-7 事故同根因；此前只覆盖 weapon/vehicle
+    两类，其余 itemType 一律不推）。weapon/vehicle 走带挂靠行的整组重推。
+    """
+    if sess.soldier_view_cmd is None or pid is None or not item_id:
+        return
+    tid = item_type if isinstance(item_type, int) else \
+        _DEPOT_STR_TYPE.get(str(item_type).strip().lower())
+    if tid is None:
+        return
+    cmd = sess.soldier_view_cmd
+    try:
+        if tid == 1:
+            await _repush_weapon_rows(sess, writer, pid, int(item_id))
+            return
+        if tid == 2:
+            await _repush_vehicle_row(sess, writer, pid, int(item_id))
+            return
+        proto = None
+        tname = b''
+        if tid == 3:
+            for up in await STORE.list_uniform_parts(pid):
+                if int(up['id']) == int(item_id):
+                    tname, proto = b'UniformPart', _msg_uniform_part(
+                        up['id'], up['character_id'],
+                        up['uniform_part_template_id'], up['uniform_part_type'])
+                    break
+        elif tid == 4:
+            for uv in await STORE.list_uniform_variants(pid):
+                if int(uv['id']) == int(item_id):
+                    tname, proto = b'UniformVariant', _msg_uniform_variant(
+                        uv['id'], uv['uniform_variant_template_id'],
+                        uv['character_id'])
+                    break
+        elif tid == 5:
+            for m in await STORE.list_weapon_modifiers(pid):
+                if int(m['id']) == int(item_id):
+                    tname, proto = b'WeaponModifier', _msg_weapon_modifier(
+                        m['id'], m['template_id'], m['character_id'],
+                        m['weapon_id'], m.get('auto_repair', 0),
+                        m.get('condition', 1.0))
+                    break
+        elif tid == 6:
+            for a in await STORE.list_weapon_ammo(pid):
+                if int(a['id']) == int(item_id):
+                    tname, proto = b'WeaponAmmo', _msg_weapon_ammo(
+                        a['id'], a['ammo_template_id'], a['character_id'],
+                        a['weapon_id'], a['slot_index'],
+                        a.get('condition', 100.0), a.get('auto_repair', 0))
+                    break
+        elif tid == 7:
+            for vv in await STORE.list_weapon_variants(pid):
+                if int(vv['id']) == int(item_id):
+                    tname, proto = b'WeaponVariant', _msg_weapon_variant(
+                        vv['id'], vv['character_id'], vv['weapon_id'],
+                        vv['weapon_variant_template_id'])
+                    break
+        elif tid == 8:
+            for u in await STORE.list_vehicle_upgrades(pid):
+                if int(u['id']) == int(item_id):
+                    tname, proto = b'VehicleUpgrade', _msg_vehicle_upgrade(
+                        u['id'], u['upgrade_template_id'], u['vehicle_id'],
+                        u['equipped_slot_id'], u['character_id'],
+                        u.get('condition', 100.0), u.get('auto_repair', 0))
+                    break
+        elif tid == 9:
+            for a in await STORE.list_vehicle_ammo(pid):
+                if int(a['id']) == int(item_id):
+                    tname, proto = b'VehicleAmmo', _msg_vehicle_ammo(
+                        a['id'], a['ammo_template_id'], a['vehicle_id'],
+                        a['equipped_storage_id'], a['slot_index'],
+                        a['character_id'], a.get('condition', 100.0),
+                        a.get('auto_repair', 0))
+                    break
+        elif tid == 10:
+            for vv in await STORE.list_vehicle_variants(pid):
+                if int(vv['id']) == int(item_id):
+                    tname, proto = b'VehicleVariant', _msg_vehicle_variant(
+                        vv['id'], vv['character_id'], vv['vehicle_id'],
+                        vv['vehicle_variant_template_id'])
+                    break
+        if proto is not None:
+            await _push_kvcs(writer, cmd, tname, proto)
+            log(f'S->C cmd={cmd:<4} KeyValueChangeSet ({tname.decode()} '
+                f'id={item_id} re-pushed after depot transfer)')
+    except Exception as e:
+        log(f'[DB] repush item row failed: {e}')
+
+
 async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_type, proto):
     # 装备/仓库物品指派到角色（仓库物品栏拖拽）
     # SetInventoryItemToCharacterRequest { string itemType=1; int64 itemId=2; int64 characterId=3; }
@@ -816,6 +920,16 @@ async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_ty
         si_char_id = 0
 
     pid = await sess.ensure_player()
+    # 指派前捕获原属角色（指派后归属已变无法反查；原角色 unlockBits 里
+    # 弹药/配件/武器的 uid 要摘掉，不重推则原角色本会话解锁状态错乱）
+    prev_char = None
+    _si_tid = _DEPOT_STR_TYPE.get(str(si_item_type).strip().lower())
+    if pid is not None and si_item_id and _si_tid:
+        try:
+            prev_char = await STORE.get_item_character(pid, _si_tid,
+                                                       int(si_item_id))
+        except Exception as e:
+            log(f'[DB] get_item_character failed: {e}')
     updated = False
     if pid is not None and si_item_id:
         try:
@@ -831,29 +945,19 @@ async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_ty
     log(f'S->C cmd={cmd_id:<4} SetInventoryItemToCharacterResponse '
         f'(msg={1 if updated else 0})')
 
-    # 重推 Vehicle 行（characterId 变化 → 客户端 onVehicleUpdates 把载具从
-    # 仓库挪回角色装备列表；不推 UI 不刷新，玩家会连点重发）
-    if updated and str(si_item_type).strip().lower() == 'vehicle':
-        await _repush_vehicle_row(sess, writer, pid, si_item_id)
-
-    # 重推 Weapon 行及挂靠行（characterId 变化 → 客户端把武器从仓库挪回
-    # 角色装备列表；不推同样 UI 不走）
-    if updated and str(si_item_type).strip().lower() == 'weapon':
-        await _repush_weapon_rows(sess, writer, pid, si_item_id)
-
-    # 重推 character KVCS（武器+随行弹药指派到角色 → unlockBits 增加对应
-    # uid；不推则本会话内弹药勾选框锁死 + "Ribbon required"，重登才恢复）
-    if updated and str(si_item_type).strip().lower() == 'weapon' and si_char_id:
-        try:
-            for ch in await STORE.list_characters(pid):
-                if int(ch['id']) != int(si_char_id):
-                    continue
-                await _repush_character_row(sess, writer, ch)
-                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
-                    f'{ch["name"]} re-pushed after weapon assign)')
-                break
-        except Exception as e:
-            log(f'[DB] reload character after weapon assign failed: {e}')
+    if updated:
+        # 重推物品自身行（weapon/vehicle 带挂靠行整组，其余 itemType 单行）：
+        # 客户端各表只认 KVCS UPDATE，不推则 depot/装备列表双不刷新（玩家
+        # 连点重发；此前只覆盖 weapon/vehicle 两类，制服/配件/皮肤/弹药/
+        # 载具件指派一律不推 → 官方对齐补全）
+        await _repush_item_row(sess, writer, pid, si_item_type, si_item_id)
+        # 重推 character KVCS：unlockBits 随指派增减（武器+随行弹药/配件
+        # 指派到角色 → 增加对应 uid；原角色 → 摘掉 uid。不推则本会话内
+        # 弹药勾选框锁死 + "Ribbon required"，重登才恢复）
+        if prev_char:
+            await _repush_character_by_id(sess, writer, pid, prev_char)
+        if si_char_id:
+            await _repush_character_by_id(sess, writer, pid, si_char_id)
 
 
 # 余额不足 response 码按支付货币映射（paymentCurrency 枚举：1=credits 2=warfunds
@@ -908,10 +1012,8 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
         log(f'S->C cmd={cmd_id:<4} SendItemToDepotResponse '
             f'(already in depot, no charge)')
         # 仍重推行数据让客户端列表收敛（连点的根因就是收不到这条推送）
-        if int(sd_item_type) == 2:
-            await _repush_vehicle_row(sess, writer, pid, sd_object_id)
-        elif int(sd_item_type) == 1:
-            await _repush_weapon_rows(sess, writer, pid, sd_object_id)
+        await _repush_item_row(sess, writer, pid, int(sd_item_type),
+                               sd_object_id)
         return
 
     # 扣款（非免费存放时收存放费 = 定价 50%，与客户端 ItemInfoOverlayMediator
@@ -952,15 +1054,16 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
         f'(response={1 if updated else 0})')
 
     # 重推行数据（characterId→0 → 客户端把物品从装备列表挪进仓库；不推 UI
-    # 不刷新 → 玩家连点重发）
+    # 不刷新 → 玩家连点重发。全 itemType 通用：weapon/vehicle 带挂靠行整组，
+    # 制服/配件/皮肤/弹药/载具件单行——此前只推 weapon/vehicle，其余类型
+    # UI 不收敛）
     if updated:
-        if int(sd_item_type) == 2:
-            await _repush_vehicle_row(sess, writer, pid, sd_object_id)
-        elif int(sd_item_type) == 1:
-            await _repush_weapon_rows(sess, writer, pid, sd_object_id)
-        # 重推原角色 KVCS：武器/弹药/配件退仓后 unlockBits 变化（uid 移除），
-        # 不推则本会话内弹药/配件勾选框状态错乱，重登才恢复
-        if int(sd_item_type) in (1, 5, 6) and cur_char:
+        await _repush_item_row(sess, writer, pid, int(sd_item_type),
+                               sd_object_id)
+        # 重推原角色 KVCS：unlockBits 随归属变化（武器/弹药/配件/载具 uid
+        # 移除；此前只覆盖 1/5/6，制服与载具件退仓后原角色本会话解锁状态
+        # 不刷新）
+        if cur_char:
             await _repush_character_by_id(sess, writer, pid, cur_char)
         if sd_tab:
             await _repush_depot_new_item(sess, writer, pid)

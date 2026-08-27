@@ -1,0 +1,142 @@
+"""战斗服异常退出兜底收尾回归测试（2026-08-27 卡 closing 事故）。
+
+事故：玩家中途退出战局，combat server 未走 earnings 直接退出
+（ReportServerShutdown + exit code=10016）。旧版 _watch_proc_exit
+只 reclaim 坑位（release_match），不推 PMS DELETE，客户端 closing
+流程收不到会话结束信号 → 每秒轮询 GetMissionDetails 拿
+mission_not_found，56 秒超时后才自行 Abandon 回大厅。
+
+验证：
+1) _finish_mission_sessions(mid, None)（无战报路径）：推
+   PlayerMissionSession DELETE KVCS、不推 Notification、清内部状态；
+2) 幂等：PMS 映射已清后重复调用不再推送；
+3) _watch_proc_exit 兜底：未 release 的实例进程退出 → 触发 1) 收尾；
+4) 正常路径（earnings 已先 release_match 出队）：兜底空转不重复触发。
+"""
+import asyncio
+import os
+import sys
+import types
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import matchmaking
+from handlers import combat as combat_handlers
+from state import FLASH_SESSIONS
+
+
+class _MockWriter:
+    """收集响应字节的 writer 替身（write/drain 均 async）。"""
+
+    def __init__(self):
+        self.sent = b''
+
+    def write(self, data):
+        self.sent += bytes(data)
+
+    async def drain(self):
+        return
+
+
+class _FakeProc:
+    """已退出的战斗服进程替身（returncode=10016，wait 立即返回）。"""
+
+    returncode = 10016
+
+    async def wait(self):
+        return 0
+
+
+def _setup(mid, pms, pid, tag):
+    """登记一名在局玩家：PMS 映射 + 在线 Flash 会话，返回收集 writer。"""
+    writer = _MockWriter()
+    flash = types.SimpleNamespace(writer=writer, playerview_cmd=8,
+                                  soldier_view_cmd=None)
+    FLASH_SESSIONS[tag] = flash
+    matchmaking.PMS_TO_MISSION[pms] = mid
+    matchmaking.PMS_TO_SESSION[pms] = {
+        'player_id': pid, 'gamertag': tag, 'squad_db_id': 0}
+    return writer
+
+
+def _cleanup(mid, pms, tag):
+    FLASH_SESSIONS.pop(tag, None)
+    matchmaking.PMS_TO_MISSION.pop(pms, None)
+    matchmaking.PMS_TO_SESSION.pop(pms, None)
+    matchmaking.COMBAT_INSTANCES.pop(mid, None)
+
+
+def test_finish_sessions_without_report():
+    mid, pms = 987001, 987101
+    writer = _setup(mid, pms, 1, 'ExitGuyA')
+    try:
+        asyncio.run(combat_handlers._finish_mission_sessions(mid, None))
+        assert b'PlayerMissionSession' in writer.sent \
+            and b'delete' in writer.sent, '未推 PMS DELETE KVCS'
+        assert b'Notification' not in writer.sent, \
+            '无战报不应推 NewBattleReport 通知'
+        assert pms not in matchmaking.PMS_TO_MISSION, 'PMS_TO_MISSION 未清'
+        assert pms not in matchmaking.PMS_TO_SESSION, 'PMS_TO_SESSION 未清'
+        # 幂等：PMS 映射已清，重复调用不再推送
+        before = writer.sent
+        asyncio.run(combat_handlers._finish_mission_sessions(mid, None))
+        assert writer.sent == before, '重复调用不应再推送'
+    finally:
+        _cleanup(mid, pms, 'ExitGuyA')
+
+
+def test_watch_proc_exit_finishes_sessions():
+    mid, pms = 987002, 987102
+    writer = _setup(mid, pms, 2, 'ExitGuyB')
+    released = []
+    real_release = matchmaking.release_match
+    matchmaking.release_match = lambda m: released.append(m)  # 隔离副作用
+    try:
+        inst = {'seq': 777, 'proc': _FakeProc(), 'port': 5678,
+                'mission_id': mid}
+        matchmaking.COMBAT_INSTANCES[mid] = inst
+
+        async def _run():
+            await matchmaking._watch_proc_exit(inst, mid)
+            await asyncio.sleep(0.05)   # 让 _spawn 的收尾任务跑完
+
+        asyncio.run(_run())
+        assert released == [mid], '未回收坑位'
+        assert b'PlayerMissionSession' in writer.sent \
+            and b'delete' in writer.sent, '兜底未推 PMS DELETE（卡 closing 根因）'
+        assert pms not in matchmaking.PMS_TO_MISSION, '兜底未清 PMS 映射'
+    finally:
+        matchmaking.release_match = real_release
+        _cleanup(mid, pms, 'ExitGuyB')
+
+
+def test_watch_proc_exit_normal_path_no_finish():
+    """正常路径：earnings 已先 release_match（实例出队），兜底空转。"""
+    mid, pms = 987003, 987103
+    writer = _setup(mid, pms, 3, 'ExitGuyC')
+    released = []
+    real_release = matchmaking.release_match
+    matchmaking.release_match = lambda m: released.append(m)
+    try:
+        inst = {'seq': 778, 'proc': _FakeProc(), 'port': 5679,
+                'mission_id': mid}
+        matchmaking.COMBAT_INSTANCES[mid] = inst
+        matchmaking.COMBAT_INSTANCES.pop(mid)   # 模拟 earnings 已 release
+
+        async def _run():
+            await matchmaking._watch_proc_exit(inst, mid)
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_run())
+        assert released == [], '已释放实例不应重复 release'
+        assert writer.sent == b'', '正常路径不应触发兜底收尾'
+    finally:
+        matchmaking.release_match = real_release
+        _cleanup(mid, pms, 'ExitGuyC')
+
+
+if __name__ == '__main__':
+    test_finish_sessions_without_report()
+    test_watch_proc_exit_finishes_sessions()
+    test_watch_proc_exit_normal_path_no_finish()
+    print('test_combat_exit_finish: 3 项全部通过')
