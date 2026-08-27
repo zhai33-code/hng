@@ -92,7 +92,7 @@ import RegisterForm from './RegisterForm.vue'
 // ---- 士兵立绘（背景装饰，退到表单后方） ----
 .soldier-visual {
   position: absolute;
-  right: -8vw;
+  right: 0;
   bottom: 0;
   height: 92vh;
   aspect-ratio: 900 / 1500;
@@ -102,7 +102,7 @@ import RegisterForm from './RegisterForm.vue'
   background-position: bottom right;
   filter: drop-shadow(0 0 40px rgba(0, 0, 0, 0.9)) saturate(0.7);
   opacity: 0.55;
-  mask-image: linear-gradient(to right, transparent 0%, rgba(0, 0, 0, 0.2) 20%, #000 50%);
+  mask-image: linear-gradient(to right, transparent 0%, rgba(0, 0, 0, 0.2) 25%, #000 55%);
   pointer-events: none;
 }
 
