@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""管理端配置：.env 加载 / GAME_DIR 探测 / 绑定参数。
+"""管理端配置：.env 加载 / 绑定参数。
 
-精简复刻 hng-re/state.py 的对应逻辑（不 import state——其含日志重定向、
-STORE 全局等游戏服副作用，管理端进程保持独立）。
+（模板数据已固化在 templates_data.py，不依赖客户端 GAME_DIR/WarDatabase。）
 """
 import os
 import secrets
@@ -31,20 +30,6 @@ def _load_dotenv(path):
 
 _load_dotenv(os.path.join(_REPO_DIR, '.env'))          # 与游戏服共用同一份 .env
 
-
-def _detect_game_dir():
-    env = os.environ.get('HNG_GAME_DIR')
-    if env:
-        return os.path.abspath(env)
-    for cand in (os.path.dirname(_REPO_DIR), _REPO_DIR, os.path.dirname(os.path.dirname(_REPO_DIR))):
-        if (os.path.isdir(os.path.join(cand, 'WarDatabase'))
-                and os.path.isdir(os.path.join(cand, 'images'))):
-            return cand
-    return ''
-
-
-GAME_DIR = _detect_game_dir()
-WARDDB_DIR = os.path.join(GAME_DIR, 'WarDatabase')
 
 # ---- 数据库 ----
 DATABASE_URL = os.environ.get(

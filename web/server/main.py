@@ -26,14 +26,13 @@ _WEB_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _WEB_DIR not in sys.path:
     sys.path.insert(0, _WEB_DIR)
 
-from server import auth, config, db, wardb_meta
+from server import auth, config, db
 from server.routers import auth_router, misc, players
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await db.init()          # 独立连接池 + admin 表迁移（含 players.banned 列）
-    wardb_meta.load()        # WarDatabase 模板映射（失败静默降级为 #id 显示）
     yield
     await db.close()
 
@@ -130,8 +129,7 @@ def main():
             print(e, file=sys.stderr)        # db.init 的友好报错（含 DSN 与排查提示）
             sys.exit(1)
     print(f'[admin] 监听 http://{config.ADMIN_BIND}:{config.ADMIN_PORT} '
-          f'（dist: {os.path.isdir(config.WEB_DIST)}，'
-          f'GAME_DIR: {config.GAME_DIR or "未探测到"}）')
+          f'（dist: {os.path.isdir(config.WEB_DIST)}）')
     # log_level=info：启动完成后 uvicorn 会打印 "Uvicorn running on ..."，
     # 避免服务已就绪但无任何输出、被误认为卡住
     uvicorn.run(app, host=config.ADMIN_BIND, port=config.ADMIN_PORT, log_level='info')

@@ -5,7 +5,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .. import auth, wardb_meta
+from .. import auth, templates_data
 from .. import db
 
 router = APIRouter(prefix='/api', tags=['misc'],
@@ -33,7 +33,7 @@ async def dashboard():
         'characters': characters,
         'battles': battles,
         'recent_players': [dict(r) for r in recent],
-        'wardb_loaded': len(wardb_meta.WEAPON_NAMES),
+        'wardb_loaded': len(templates_data.WEAPONS),   # 固化数据条目数（weapons）
     }
 
 
