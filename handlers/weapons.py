@@ -50,6 +50,29 @@ from player_service import (
     _weapon_template_id,
     )
 
+from handlers.characters import _repush_character_row
+
+
+async def _repush_character_unlocks(sess, writer, char_id):
+    """购买武器/配件/弹药后重推 character KVCS（unlockBits 刷新）。
+
+    客户端 EquippableItemRenderer 的 isUnlocked 走 hasCharacterUnlockedItem
+    → CharacterSchema.unlockBits（登录时的旧位图）。购买成功后若不重推，
+    本会话内已购物品的勾选框锁死并显示 "Ribbon required"，直到重新登录。"""
+    pid = await sess.ensure_player()
+    if pid is None or sess.soldier_view_cmd is None or not char_id:
+        return
+    try:
+        for ch in await STORE.list_characters(pid):
+            if int(ch['id']) != int(char_id):
+                continue
+            await _repush_character_row(sess, writer, ch)
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
+                f'{ch["name"]} re-pushed after purchase, unlockBits refreshed)')
+            break
+    except Exception as e:
+        log(f'[DB] reload character after purchase failed: {e}')
+
 
 async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, proto):
     # 武器商店购买武器请求（武器商店用这个，不是 BuyStoreBundleRequest）
@@ -300,6 +323,10 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
     if sess.playerview_cmd is not None:
         player_proto = await _msg_player_for(sess)
         await _push_kvcs(writer, sess.playerview_cmd, b'player', player_proto)
+
+    # 5. 重推 character KVCS：新武器的默认弹药 mapping uid 进入 unlockBits，
+    #    否则本会话内弹药勾选框锁死 + "Ribbon required"（重登才恢复）
+    await _repush_character_unlocks(sess, writer, char_id)
 
 
 
@@ -577,6 +604,9 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
         player_proto = await _msg_player_for(sess)
         await _push_kvcs(writer, sess.playerview_cmd, b'player', player_proto)
 
+    # 4. 重推 character KVCS（配件 mapping uid 进入 unlockBits）
+    await _repush_character_unlocks(sess, writer, mod_char_id)
+
 
 
 async def handle_createweaponammorequest(sess, writer, cmd_id, req_type, proto):
@@ -682,6 +712,9 @@ async def handle_createweaponammorequest(sess, writer, cmd_id, req_type, proto):
     if sess.playerview_cmd is not None:
         player_proto = await _msg_player_for(sess)
         await _push_kvcs(writer, sess.playerview_cmd, b'player', player_proto)
+
+    # 4. 重推 character KVCS（已购弹药 mapping uid 进入 unlockBits）
+    await _repush_character_unlocks(sess, writer, ammo_char_id)
 
 
 

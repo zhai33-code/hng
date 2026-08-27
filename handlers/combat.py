@@ -220,9 +220,17 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
             mid = cm
             det = matchmaking._MM_MISSION_DETAILS.get(cm)
     if det and 'preset' in det:
-        mm_preset = int(det['preset'])
-        mm_defender = int(det.get('defender_faction', 2) or 2)
-        mm_attacker = int(det.get('attacker_faction', 3) or 3)
+        # ★ 阵营字段无默认值：_faction_pair 校验（损坏 → None + ERROR 日志），
+        #   不静默用 2/GE、3/SU 默认（曾致错阵营布局）。校验不过走
+        #   builder 默认路径（与"det 缺失"同款降级）。
+        fp = matchmaking._faction_pair(det)
+        if fp is None:
+            mm_preset = None
+            mm_defender = None
+            mm_attacker = None
+        else:
+            mm_preset = int(det['preset'])
+            mm_attacker, mm_defender = fp
     else:
         mm_preset = None      # 走 builder 默认（兼容旧路径）
         mm_defender = None
@@ -824,6 +832,17 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
     # bot 行不入库（省空间）：战报只存真人；bot 也无 DB 账号，
     # 后续 xp/统计循环按 is_bot 跳过
     real_players = [p for p in br_players if not p.get('is_bot')]
+    # f5 PlayerBattleResult 里 bot 也带 playerId，且编号可能与真实账号
+    # id 撞号（实测 bot 3 ≠ 玩家 3，错发货币到真实账号）——收益/统计
+    # 循环统一按 BattleReport 的 is_bot 名单过滤；不在 BattleReport
+    # 名单里的 pid 一并跳过（bot 无 DB 账号，只会刷 FK/NoneType 错误）
+    bot_pids = {p['player_id'] for p in br_players
+                if p.get('is_bot') and p['player_id']}
+    known_pids = {p['player_id'] for p in br_players if p['player_id']}
+
+    def _is_settleable(pid):
+        return pid and pid not in bot_pids and \
+            (not known_pids or pid in known_pids)
     report_id = 0
     if STORE is not None:
         try:
@@ -836,7 +855,7 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
             log(f'      [DB] save_battle_report failed: {e}')
 
         for pid, credits, warfunds in currency_ops:
-            if not (credits or warfunds):
+            if not (credits or warfunds) or not _is_settleable(pid):
                 continue
             try:
                 # 老兵会员 +25%（PlayerSettings f26 恒 2=会员模板 → 人人加成）
@@ -886,7 +905,7 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
 
         ribbon_ends = _report_ribbon_end(br_players)
         for pid, ch in char_results:
-            if not pid or not ch['characterId']:
+            if not _is_settleable(pid) or not ch['characterId']:
                 continue
             try:
                 if ch['playerDamage']:
@@ -1024,7 +1043,7 @@ async def _finish_mission_sessions(mission_id, report_id):
                         solo['faction'], 0, solo.get('entered', 0)))
                 await matchmaking._push_kvcs(
                     flash.writer, flash.playerview_cmd, b'SquadMemberSession',
-                    matchmaking._msg_solo_squad_member_session(
+                    await matchmaking._msg_solo_squad_member_session(
                         solo['member_row'], solo['squad_row'], pid,
                         solo['gamertag'], solo['char_id'], solo['char_name'],
                         solo['rank'], 2,

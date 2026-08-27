@@ -1,0 +1,255 @@
+"""两人局 SquadResponse faction 回归测试（2026-08-27 线上 bug）。
+
+背景：ZServer 的 SquadRequest 里 missionSessionId 是它自己按局生成的 id
+（730433917*10^6+mission，兼作 stats session id），不是玩家的
+pms_id/battle_session_id → 两人局精确匹配落空、回退"最新会话"=
+后入队玩家 → 先入队玩家（如德军）的小队拿到后者的 faction（苏军）→
+战斗服两个小队全进同一 team → "#error3 squad setup invalid"、
+部署界面起不来、无小队名。
+
+用例：
+ 1. 两人局（A=德军 faction 2 先入队，B=苏军 faction 3 后入队），
+    ZServer 风格 missionSessionId（命不中任何玩家会话）分别请求
+    A/B 的小队 → 各自 SquadResponse 的 team/factionTemplate 必须是
+    2/3（修复前 A 会拿到 3）
+ 2. 单人局回退路径仍正确（唯一会话）
+ 3. 精确命中 pms_id 的旧路径不回归
+ 4. RequestReadCharacterStats 两人局聚合：按 char_id 反查所属 player
+    查勋带（修复前只取最后一条会话 → A 的角色查无勋带）
+"""
+import asyncio
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import game_server
+import matchmaking
+from protocol import Chunk, pb_message, pb_varint
+
+RESULTS = []
+
+
+def check(label, ok, detail=''):
+    RESULTS.append((label, ok))
+    print(f'[{"PASS" if ok else "FAIL"}] {label}{("  " + detail) if detail else ""}')
+
+
+class FakeWriter:
+    def __init__(self):
+        self.data = b''
+
+    def write(self, data):
+        self.data += data
+
+    async def drain(self):
+        pass
+
+
+def _parse_varints(data):
+    """protobuf 顶层 varint 字段 → {field_no: value}（message 字段收集到 _messages）。"""
+    out = {}
+    i = 0
+    while i < len(data):
+        key = v = 0
+        shift = 0
+        while True:
+            b = data[i]
+            i += 1
+            v |= (b & 0x7F) << shift
+            shift += 7
+            if not (b & 0x80):
+                break
+        key, wt = v >> 3, v & 7
+        if wt == 0:
+            val = 0
+            shift = 0
+            while True:
+                b = data[i]
+                i += 1
+                val |= (b & 0x7F) << shift
+                shift += 7
+                if not (b & 0x80):
+                    break
+            out[key] = val
+        elif wt == 2:
+            ln = 0
+            shift = 0
+            while True:
+                b = data[i]
+                i += 1
+                ln |= (b & 0x7F) << shift
+                shift += 7
+                if not (b & 0x80):
+                    break
+            out.setdefault('_messages', {})[key] = data[i:i + ln]
+            i += ln
+        else:
+            break
+    return out
+
+
+async def _squad_request(mission_session_id, squad_id):
+    """发一条 SquadRequest，返回解析后的 SquadResponse 字段。"""
+    proto = pb_varint(1, mission_session_id) + pb_varint(2, squad_id)
+    w = FakeWriter()
+    await game_server.handle_request(None, w, 6, 'SquadRequest', proto)
+    main, _ = Chunk.parse(w.data, 0)
+    title = main.subs[0]
+    resp = _parse_varints(title.subs[0].data)
+    squad_def = _parse_varints(resp['_messages'][2])
+    return {
+        'squad_id': resp.get(1),
+        'team': squad_def.get(1),
+        'squad_template': squad_def.get(2),
+        'faction_template': squad_def.get(3),
+        'name': squad_def.get('_messages', {}).get(4, b'').decode(),
+    }
+
+
+def _seed_two_player_match():
+    """两人局：A=德军(2) 先入队，B=苏军(3) 后入队；同 mission 两个 solo 小队。"""
+    matchmaking.PMS_TO_SESSION.clear()
+    matchmaking.PMS_TO_MISSION.clear()
+    matchmaking._MM_MISSION_SQUADS.clear()
+    mission = 488464
+    sess_a = {'pms_id': 903048748842679864, 'player_id': 2,
+              'char_id': 31, 'gamertag': 'zhai33', 'faction': 2,
+              'metrics_uid': 'u-a', 'metrics_session_id': 1,
+              'battle_session_id': 1189987113029180681,
+              'squad_id': 3721435839200754145, 'squad_db_id': 0,
+              'squad_slot': 0, 'mission_id': mission, 'quickplay': True}
+    sess_b = {'pms_id': 903048748842679865, 'player_id': 11,
+              'char_id': 49, 'gamertag': 'summercatOVO', 'faction': 3,
+              'metrics_uid': 'u-b', 'metrics_session_id': 2,
+              'battle_session_id': 1189987113029180682,
+              'squad_id': 3721435839200754146, 'squad_db_id': 0,
+              'squad_slot': 0, 'mission_id': mission, 'quickplay': True}
+    matchmaking.PMS_TO_SESSION[sess_a['pms_id']] = sess_a
+    matchmaking.PMS_TO_SESSION[sess_b['pms_id']] = sess_b
+    matchmaking.PMS_TO_MISSION[sess_a['pms_id']] = mission
+    matchmaking.PMS_TO_MISSION[sess_b['pms_id']] = mission
+    matchmaking._MM_MISSION_SQUADS[mission] = {
+        3721435839200754145: {
+            'name': 'Infantry Squad', 'leader_char_id': 31, 'faction': 2,
+            'squad_db_id': 0, 'template': 1,
+            'members': [{'player_id': 2, 'char_id': 31, 'gamertag': 'zhai33',
+                         'rank': 5, 'slot': 0}]},
+        3721435839200754146: {
+            'name': 'Infantry Squad', 'leader_char_id': 49, 'faction': 3,
+            'squad_db_id': 0, 'template': 1,
+            'members': [{'player_id': 11, 'char_id': 49,
+                         'gamertag': 'summercatOVO', 'rank': 5, 'slot': 0}]},
+    }
+    return mission, sess_a, sess_b
+
+
+async def _stats_request(char_ids):
+    """发一条 RequestReadCharacterStats，返回 {charId: ribbonId}。"""
+    proto = b''.join(pb_varint(1, c) for c in char_ids)
+    w = FakeWriter()
+    await game_server.handle_request(None, w, 7,
+                                     'RequestReadCharacterStats', proto)
+    main, _ = Chunk.parse(w.data, 0)
+    body = main.subs[0].subs[0].data
+    entries = []
+    i = 0
+    while i < len(body):
+        v = shift = 0
+        while True:
+            b = body[i]; i += 1
+            v |= (b & 0x7F) << shift; shift += 7
+            if not (b & 0x80):
+                break
+        fn, wt = v >> 3, v & 7
+        ln = 0; shift = 0
+        while True:
+            b = body[i]; i += 1
+            ln |= (b & 0x7F) << shift; shift += 7
+            if not (b & 0x80):
+                break
+        if fn == 1 and wt == 2:
+            ent = body[i:i + ln]
+            ev = _parse_varints(ent)
+            rid = ev.get('_messages', {}).get(3)
+            rid_no = _parse_varints(rid).get(1) if rid else None
+            entries.append((ev.get(1), rid_no))
+        i += ln
+    return dict(entries)
+
+
+class FakeStore:
+    """两人局假 DB：A(pid=2) 角色 31/32，B(pid=11) 角色 49。"""
+    CHARACTERS = {2: [{'id': 31, 'combat_xp': 0},
+                      {'id': 32, 'combat_xp': 0}],
+                  11: [{'id': 49, 'combat_xp': 0}]}
+    RIBBONS = {(2, 31): {13: 12000.0},   # A 的角色 31 勋带 13
+               (11, 49): {79: 3000.0}}    # B 的角色 49 勋带 79
+
+    async def list_characters(self, pid):
+        return self.CHARACTERS[pid]
+
+    async def get_ribbon_xp(self, pid, cid):
+        return self.RIBBONS.get((pid, cid), {})
+
+
+async def run():
+    # --- 用例 1：两人局 ZServer 风格 missionSessionId（730433917*10^6+mission）---
+    mission, sess_a, sess_b = _seed_two_player_match()
+    zserver_sid = 730433917 * 10**6 + mission     # 命不中任何玩家会话
+    resp_a = await _squad_request(zserver_sid, sess_a['squad_id'])
+    check('两人局先入队(德军) factionTemplate=2',
+          resp_a['faction_template'] == 2 and resp_a['team'] == 2,
+          f'got team={resp_a["team"]} factionTemplate='
+          f'{resp_a["faction_template"]} name={resp_a["name"]!r}')
+    check('两人局先入队(德军) squadId 回显',
+          resp_a['squad_id'] == sess_a['squad_id'])
+    resp_b = await _squad_request(zserver_sid, sess_b['squad_id'])
+    check('两人局后入队(苏军) factionTemplate=3',
+          resp_b['faction_template'] == 3 and resp_b['team'] == 3,
+          f'got team={resp_b["team"]} factionTemplate='
+          f'{resp_b["faction_template"]}')
+
+    # --- 用例 2：单人局回退（唯一会话）不回归 ---
+    matchmaking.PMS_TO_SESSION.clear()
+    matchmaking.PMS_TO_SESSION[sess_a['pms_id']] = sess_a
+    resp_solo = await _squad_request(zserver_sid, sess_a['squad_id'])
+    check('单人局回退 faction 正确',
+          resp_solo['faction_template'] == 2 and resp_solo['team'] == 2)
+
+    # --- 用例 3：精确命中 pms_id 旧路径不回归 ---
+    resp_exact = await _squad_request(sess_b['pms_id'], sess_b['squad_id'])
+    check('精确命中 pms_id 路径 faction 正确',
+          resp_exact['faction_template'] == 3 and resp_exact['team'] == 3)
+
+    # --- 用例 4：RequestReadCharacterStats 两人局聚合 ---
+    # 修复前只取最后一条会话的角色库：A(先入队)的角色查无此 id。
+    matchmaking.PMS_TO_SESSION.clear()
+    matchmaking.PMS_TO_SESSION[sess_a['pms_id']] = sess_a
+    matchmaking.PMS_TO_SESSION[sess_b['pms_id']] = sess_b
+    old_store = game_server.STORE
+    game_server.STORE = FakeStore()
+    try:
+        got = await _stats_request([31, 49])
+        check('两人局 stats：A(先入队)角色 31 勋带 13 正确归属',
+              got.get(31) == 13, f'entries={got}')
+        check('两人局 stats：B(后入队)角色 49 勋带 79 正确归属',
+              got.get(49) == 79, f'entries={got}')
+    finally:
+        game_server.STORE = old_store
+
+    # --- 清理 ---
+    matchmaking.PMS_TO_SESSION.clear()
+    matchmaking.PMS_TO_MISSION.clear()
+    matchmaking._MM_MISSION_SQUADS.clear()
+
+
+def main():
+    asyncio.run(run())
+    ok = all(r[1] for r in RESULTS)
+    print('\nRESULT:', 'PASS' if ok else 'FAIL')
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

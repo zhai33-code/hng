@@ -92,7 +92,7 @@ import RegisterForm from './RegisterForm.vue'
 // ---- 士兵立绘（背景装饰，退到表单后方） ----
 .soldier-visual {
   position: absolute;
-  right: 0;
+  right: 6vw;
   bottom: 0;
   height: 92vh;
   aspect-ratio: 900 / 1500;

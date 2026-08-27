@@ -180,6 +180,13 @@ async def character_detail(player_id: int, character_id: int):
         'ribbons': [{
             'ribbon_template_id': r['ribbon_template_id'],
             'name': wardb_meta.ribbon_name(int(r['ribbon_template_id'])),
+            # 后端直接拼好最终路径：专属图或类别底图（官方 Specialist 渲染方式），前端零试错
+            'icon': wardb_meta.ribbon_icon(int(r['ribbon_template_id'])),
+            # 官方 pip 叠加图（灰度武器/载具图，与底图同画布）+ 缺失回退全尺寸图标
+            'overlay_icon': wardb_meta.ribbon_overlay(int(r['ribbon_template_id'])),
+            'overlay_fallback': wardb_meta.ribbon_overlay_fallback(int(r['ribbon_template_id'])),
+            # 官方 PipTransform 摆放参数（scale/x/y），前端按此缩放定位叠加
+            'overlay_style': wardb_meta.ribbon_overlay_style(int(r['ribbon_template_id'])),
             'total_xp': float(r['total_xp']),
         } for r in ribbons],
     }

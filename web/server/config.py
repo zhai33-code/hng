@@ -39,6 +39,10 @@ DATABASE_URL = os.environ.get(
 ADMIN_BIND = os.environ.get('HNG_ADMIN_BIND', '127.0.0.1').strip() or '127.0.0.1'
 ADMIN_PORT = int(os.environ.get('HNG_ADMIN_PORT', '8080') or '8080')
 
+# ---- 游戏服 web_server（同机 80 端口，/online.json 内部在线统计）----
+GAME_HTTP_BASE = (os.environ.get('HNG_GAME_HTTP', 'http://127.0.0.1')
+                  .rstrip('/')) or 'http://127.0.0.1'
+
 # ---- JWT 签发密钥 ----
 # 优先环境变量 HNG_ADMIN_SECRET；未设置时自动生成随机密钥落 .admin_secret
 # （gitignore，不入库）。删除该文件 = 应急全体登出。

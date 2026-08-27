@@ -316,7 +316,7 @@ def msg_login2_challenge(salt_b64, temp_sid_b64, enc_key_b64):
 
 
 def msg_player(gamertag, credits=None, warfunds=None, gold=None,
-               tutorials_completed=0):
+               tutorials_completed=0, pid=1, faction=None):
     m = b''
     # 货币默认与数据库新账号默认值一致（新账号给默认货币）
     if credits is None:
@@ -325,7 +325,10 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
         warfunds = 100000
     if gold is None:
         gold = 100000
-    m += pb_int64(1, 1)                 # id
+    # id：必须用数据库真实 player_id——客户端 Global.currentPlayer.id 即
+    # 此值，战报界面 getCurrentPlayerInformation() 按它匹配本局玩家行；
+    # 恒发 1 会导致 DB id≥2 的玩家战报匹配不到自己 → 结算窗口不弹
+    m += pb_int64(1, int(pid or 1))     # id
     m += pb_string(2, gamertag)
     m += pb_uint32(3, 0)                # invertmouse
     m += pb_uint32(4, 0)                # invertmouseairplane
@@ -335,7 +338,9 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     m += pb_uint32(8, 1)                # showcrosshair
     m += pb_uint32(9, 1)                # showcrosshairVehicles
     m += pb_int64(10, 1)                # war
-    m += pb_int64(11, 1)                # factionid (1=US 2=GE 3=USSR)
+    # factionid：客户端阵营颜色/战场部署过滤/资源总览都读 currentPlayer.factionid，
+    # 恒发 1(US) 会让 GE/SU 玩家界面按美国阵营展示。None 时回退 1（老行为）
+    m += pb_int64(11, int(faction) if faction else 1)  # factionid (1=US 2=GE 3=USSR)
     m += pb_string(12, '')              # subscribedupto
     # 货币：Bought/Earned/Used 三段式，余额 = Bought + Earned - Used
     m += pb_int64(13, 0)                # goldBought
@@ -373,11 +378,11 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     return m
 
 
-def msg_login2_result(username, code):
+def msg_login2_result(username, code, pid=1, faction=None):
     m = b''
     m += pb_string(1, username)
     m += pb_string(2, time.strftime('%Y-%m-%d %H:%M:%S'))
     m += pb_int32(3, code)
     if code == RC['login_success']:
-        m += pb_message(6, msg_player(username))
+        m += pb_message(6, msg_player(username, pid=pid, faction=faction))
     return m

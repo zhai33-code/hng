@@ -67,6 +67,15 @@ def _detect_game_dir():
 GAME_DIR = _detect_game_dir()
 WARDDB_DIR = os.path.join(GAME_DIR, 'WarDatabase')
 
+# 当前连接的数据库 player_id（contextvar）：messages._msg_* 构建士兵视图
+# 各表行（character/weapon/Vehicle/UniformPart…）的 playerId 字段从这里读。
+# 客户端 CharacterTable 等按 playerId.Equals(Global.currentPlayer.id) 过滤
+# 自己的行——恒发 1 会让 DB id≥2 的玩家看不到自己的角色/装备。
+# dispatch 入口（handlers/__init__.py）按会话设置；asyncio task 各自持有
+# context 拷贝，跨连接/后台 _spawn 任务不会串号。
+import contextvars
+CURRENT_PID = contextvars.ContextVar('current_pid', default=1)
+
 # 服务器对外地址（下发给客户端的连接地址）：
 # - Settings.js 的 flash_dynhttp / unique_file_servers / account_url 等
 # - 匹配成局后 PMS 的 game_connect（客户端 hng.exe 连战斗服）

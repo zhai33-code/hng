@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { get } from '../api'
 
@@ -17,9 +17,41 @@ interface RegStat {
   items: { day: string; count: number }[]
 }
 
+interface OnlineSnapshot {
+  online: number
+  in_queue: number
+  in_battle: number
+  players: { username: string; player_id: number | null }[]
+  missions: {
+    mission_id: number
+    preset: string | null
+    gamemode: number | null
+    attacker_faction: number | null
+    defender_faction: number | null
+    players: { gamertag: string | null; faction: number | null }[]
+  }[]
+  server_time: number
+}
+
 const loading = ref(true)
 const data = ref<DashboardData | null>(null)
 const regStat = ref<RegStat | null>(null)
+const online = ref<OnlineSnapshot | null>(null)
+const onlineUnreachable = ref(false)
+
+const ONLINE_REFRESH_MS = 30_000
+let onlineTimer: ReturnType<typeof setInterval> | null = null
+
+async function loadOnline(initial = false) {
+  try {
+    online.value = await get<OnlineSnapshot>('/online')
+    onlineUnreachable.value = false
+  } catch (e: unknown) {
+    onlineUnreachable.value = true
+    // 首次加载才弹错误提示，定时轮询失败只静默标记（避免刷屏）
+    if (initial) ElMessage.error((e as Error).message || '在线统计不可用')
+  }
+}
 
 onMounted(async () => {
   try {
@@ -34,11 +66,21 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
+  await loadOnline(true)
+  onlineTimer = setInterval(() => loadOnline(), ONLINE_REFRESH_MS)
+})
+
+onBeforeUnmount(() => {
+  if (onlineTimer) clearInterval(onlineTimer)
 })
 
 function fmtTime(s: string | null): string {
   return s ? s.replace('T', ' ').slice(0, 19) : '-'
 }
+
+const FACTION_NAMES: Record<number, string> = { 1: '美', 2: '德', 3: '苏' }
+const factionName = (f: number | null | undefined) =>
+  (f != null && FACTION_NAMES[f]) || '-'
 
 // 简易柱状图（纯 CSS，避免引图表库）
 const maxCount = () =>
@@ -48,6 +90,18 @@ const maxCount = () =>
 <template>
   <div v-loading="loading">
     <div class="stat-cards">
+      <div class="stat online-stat">
+        <div class="label">当前在线</div>
+        <div class="value">{{ onlineUnreachable ? '不可用' : (online?.online ?? '-') }}</div>
+      </div>
+      <div class="stat">
+        <div class="label">战斗中</div>
+        <div class="value">{{ onlineUnreachable ? '-' : (online?.in_battle ?? '-') }}</div>
+      </div>
+      <div class="stat">
+        <div class="label">匹配排队</div>
+        <div class="value">{{ onlineUnreachable ? '-' : (online?.in_queue ?? '-') }}</div>
+      </div>
       <div class="stat">
         <div class="label">玩家总数</div>
         <div class="value">{{ data?.players ?? '-' }}</div>
@@ -68,6 +122,43 @@ const maxCount = () =>
         <div class="label">WarDatabase 模板</div>
         <div class="value">{{ data?.wardb_loaded ?? '-' }}</div>
       </div>
+    </div>
+
+    <div v-if="onlineUnreachable" class="panel" style="margin-bottom: 20px">
+      <div style="font-weight: 700; margin-bottom: 8px">实时在线</div>
+      <el-empty description="游戏服在线统计不可达（服务未启动或版本过旧）" :image-size="60" />
+    </div>
+    <div v-else class="panel" style="margin-bottom: 20px">
+      <div style="font-weight: 700; margin-bottom: 12px">
+        实时在线（{{ online?.online ?? 0 }} 人 · 战斗中 {{ online?.in_battle ?? 0 }} ·
+        排队 {{ online?.in_queue ?? 0 }}，每 30 秒自动刷新）
+      </div>
+      <el-table v-if="online?.players.length" :data="online.players" size="small">
+        <el-table-column prop="username" label="用户名" min-width="160" />
+        <el-table-column label="玩家 ID" width="110">
+          <template #default="{ row }">{{ row.player_id ?? '-' }}</template>
+        </el-table-column>
+      </el-table>
+      <el-empty v-else description="当前无玩家在线" :image-size="60" />
+      <template v-if="online?.missions.length">
+        <div style="font-weight: 700; margin: 16px 0 8px">活跃战局</div>
+        <el-table :data="online.missions" size="small">
+          <el-table-column prop="mission_id" label="战局 ID" width="100" />
+          <el-table-column prop="preset" label="预设" min-width="120" />
+          <el-table-column label="攻/守阵营" width="110">
+            <template #default="{ row }">
+              {{ factionName(row.attacker_faction) }} / {{ factionName(row.defender_faction) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="参战玩家" min-width="220">
+            <template #default="{ row }">
+              <span v-for="p in row.players" :key="p.gamertag" class="mission-player">
+                {{ p.gamertag }}（{{ factionName(p.faction) }}）
+              </span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
     </div>
 
     <div class="panel" style="margin-bottom: 20px">
@@ -96,6 +187,16 @@ const maxCount = () =>
 </template>
 
 <style lang="scss" scoped>
+.online-stat .value {
+  color: #a7c070;
+}
+
+.mission-player {
+  display: inline-block;
+  margin: 0 8px 2px 0;
+  white-space: nowrap;
+}
+
 .chart {
   display: flex;
   align-items: flex-end;

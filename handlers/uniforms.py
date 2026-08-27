@@ -155,6 +155,17 @@ async def handle_setuniformvariantrequest(sess, writer, cmd_id, req_type, proto)
         except Exception as e:
             log(f'[DB] set_uniform_variant failed: {e}')
 
+    # 在队内换迷彩 → 重推整队行（SquadMemberSession f8 变化，
+    # 其他成员的小队头像立即刷新，否则要重登才可见）
+    if pid is not None:
+        try:
+            squad = await STORE.get_squad_for_player(pid)
+            if squad is not None:
+                from handlers.squad import push_squad_rows_to_all_members
+                await push_squad_rows_to_all_members(int(squad['id']))
+        except Exception as e:
+            log(f'[DB] squad rows refresh after uniform set failed: {e}')
+
     resp_proto = pb_int32(2, 1)  # response = 1 (ok)；SetUniformVariantResponse 字段号是 2
     resp = build_response(cmd_id, 'SetUniformVariantResponse', resp_proto)
     writer.write(resp)
@@ -309,6 +320,17 @@ async def handle_setuniformpartrequest(sess, writer, cmd_id, req_type, proto):
             await STORE.set_character_headgear(pid, sp_char_id, sp_part_id)
         except Exception as e:
             log(f'[DB] set_character_headgear failed: {e}')
+
+    # 在队内换头盔 → 重推整队行（SquadMemberSession f19 变化，
+    # 其他成员的小队头像立即刷新）
+    if pid is not None:
+        try:
+            squad = await STORE.get_squad_for_player(pid)
+            if squad is not None:
+                from handlers.squad import push_squad_rows_to_all_members
+                await push_squad_rows_to_all_members(int(squad['id']))
+        except Exception as e:
+            log(f'[DB] squad rows refresh after headgear set failed: {e}')
 
     resp_proto = pb_int32(2, 1)  # response = 1 (ok)；SetUniformPartResponse 字段号是 2
     resp = build_response(cmd_id, 'SetUniformPartResponse', resp_proto)

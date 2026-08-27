@@ -139,6 +139,16 @@
       font-weight: 800;
       color: $hng-gold;
       margin-top: 6px;
+      overflow-wrap: anywhere;
+
+      // 大金额自适应：位数越多字号越小，防止撑破卡片
+      &.num {
+        font-variant-numeric: tabular-nums;
+
+        &.long {
+          font-size: 20px;
+        }
+      }
     }
   }
 }
@@ -149,6 +159,15 @@
   align-items: center;
   flex-wrap: wrap;
   margin-bottom: 16px;
+}
+
+// 面板内表格：贴圆角裁剪，修复表头背景溢出导致的错位观感
+.panel .el-table {
+  --el-table-header-bg-color: #23261b;
+}
+
+.panel .el-table .el-table__inner-wrapper::before {
+  display: none; // 底部冗余边线，与 panel 边框叠加显得错位
 }
 
 .pager {
@@ -196,13 +215,30 @@
   }
 }
 
+// 装备卡列表：多列网格自适应换行（武器 3 列起 / 载具 2 列起）
+.gear-list {
+  display: grid;
+  gap: 10px;
+
+  // 武器（竖卡：图上字下）
+  &.weapons {
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  }
+
+  // 载具（图 190px + 文字，卡片较宽）
+  &.vehicles {
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  }
+}
+
 .gear-card {
   @extend .panel;
   display: flex;
-  gap: 14px;
+  gap: 12px;
   align-items: flex-start;
-  margin-bottom: 10px;
+  margin-bottom: 0;
   padding: 12px 14px;
+  overflow: hidden;
 
   .gear-icon {
     width: 48px;
@@ -221,6 +257,7 @@
     .gear-name {
       font-weight: 700;
       color: $hng-text;
+      overflow-wrap: anywhere;
     }
 
     .gear-meta {
@@ -242,6 +279,10 @@
         border: 1px solid #33362a;
         border-radius: 3px;
         color: #b5af9a;
+        // 窄卡内长名（弹药等）允许折行，防截断
+        max-width: 100%;
+        overflow-wrap: anywhere;
+        white-space: normal;
       }
     }
   }

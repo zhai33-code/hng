@@ -73,6 +73,42 @@
   background: #2a2e1f;
 }
 
+// el-select 2.x 触发器（新版 DOM 结构不再走 --el-fill-color-blank，必须直打）
+.el-select__wrapper {
+  background-color: #191c12;
+  box-shadow: 0 0 0 1px #3a3e2e inset;
+
+  &:hover {
+    box-shadow: 0 0 0 1px rgba(200, 185, 138, 0.5) inset;
+  }
+
+  &.is-focused {
+    box-shadow: 0 0 0 1px #{$hng-olive} inset;
+  }
+}
+
+// el-table 数字列/通用单元格溢出保护
+.el-table {
+  .cell {
+    word-break: break-word;
+  }
+}
+
+// el-loading 遮罩（默认白底 rgba(255,255,255,.9)）
+.el-loading-mask {
+  background-color: rgba(20, 22, 15, 0.75);
+
+  .el-loading-spinner {
+    .path {
+      stroke: $hng-gold;
+    }
+
+    .el-loading-text {
+      color: $hng-text;
+    }
+  }
+}
+
 // stencil 军事标题
 .hng-stencil {
   font-weight: 900;

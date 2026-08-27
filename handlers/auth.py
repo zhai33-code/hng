@@ -153,7 +153,18 @@ async def handle_login2_response(sess, writer, cmd_id, req_type, proto):
     else:
         code = RC['wrong_password']
         note = 'wrong_password=98'
-    resp_proto = msg_login2_result(sess.username or 'DemoPlayer', code)
+    # currentplayer.id 用数据库真实 player_id（客户端战报界面按它
+    # 匹配本局玩家行，恒 1 会让 DB id≥2 的玩家结算窗口不弹）；
+    # factionid 同理取最新角色阵营（阵营颜色/部署过滤/资源总览都读它）
+    pid = await sess.ensure_player() if code == RC['login_success'] else None
+    faction = None
+    if pid:
+        try:
+            faction = await STORE.get_player_faction(pid)
+        except Exception as e:
+            log(f'[DB] get_player_faction failed: {e}')
+    resp_proto = msg_login2_result(sess.username or 'DemoPlayer', code,
+                                   pid=pid or 1, faction=faction)
     resp = build_response(cmd_id, 'login2_result', resp_proto)
     log(f'S->C cmd={cmd_id:<4} login2_result -- {note}')
     log(f'      resp bytes ({len(resp)}B): {resp.hex()}')

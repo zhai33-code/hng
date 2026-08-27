@@ -355,7 +355,8 @@ CREATE TABLE IF NOT EXISTS chat_channel_members (
 CREATE TABLE IF NOT EXISTS player_boosters (
     id SERIAL PRIMARY KEY, player_id BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
     booster_template_id BIGINT NOT NULL,
-    activated_at TIMESTAMPTZ, expires_at TIMESTAMPTZ
+    activated_at TIMESTAMPTZ, expires_at TIMESTAMPTZ,
+    is_ribbon BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE TABLE IF NOT EXISTS player_tickets (
     id SERIAL PRIMARY KEY, player_id BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
@@ -570,6 +571,15 @@ ALTER TABLE players ADD COLUMN IF NOT EXISTS tutorials_completed INT NOT NULL DE
 UPDATE players SET tutorials_completed = 1
  WHERE tutorials_completed = 0
    AND id IN (SELECT DISTINCT player_id FROM characters);
+
+-- 加成行归属（勋带/通用）：RibbonBoosterTemplate 与 BoosterTemplate 模板 id
+-- 有重叠（通用表 1-5 是勋带表的子集），不能按模板 id 区分，购买时按请求
+-- 类型记录。推送 KVCS 时决定进 RibbonBooster 还是 Booster 表，分类错误
+-- 会导致勋带加成无法激活（客户端按表查模板）。
+ALTER TABLE player_boosters ADD COLUMN IF NOT EXISTS is_ribbon BOOLEAN NOT NULL DEFAULT FALSE;
+-- 历史行回填：模板不在通用表（1-5）内的一定是勋带加成
+UPDATE player_boosters SET is_ribbon = TRUE
+ WHERE is_ribbon = FALSE AND booster_template_id NOT IN (1,2,3,4,5);
 """
 
 
@@ -1202,6 +1212,24 @@ class PlayerStore:
             await conn.execute(
                 'UPDATE characters SET headgear_id = $1 '
                 'WHERE id = $2 AND player_id = $3', headgear_id, character_id, player_id)
+
+    async def get_character_appearance(self, player_id, character_id):
+        """角色装备的迷彩/头盔模板 id（SquadMemberSession f8/f19 小队头像用）。
+
+        characters.uniform_variant_id / headgear_id 存的是实例 id，这里换算成
+        uniform_variants / uniform_parts 表的模板 id；未装备（0 或实例缺失）
+        返回 0，客户端按默认军服渲染。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT (SELECT uniform_variant_template_id FROM uniform_variants '
+                'WHERE id = c.uniform_variant_id) AS uvt, '
+                '(SELECT uniform_part_template_id FROM uniform_parts '
+                'WHERE id = c.headgear_id) AS upt '
+                'FROM characters c WHERE c.id = $1 AND c.player_id = $2',
+                int(character_id), int(player_id))
+        if row is None:
+            return (0, 0)
+        return (int(row['uvt'] or 0), int(row['upt'] or 0))
 
     # ---- weapon variants（武器皮肤变体）----
 
@@ -2237,21 +2265,25 @@ class PlayerStore:
         return dict(row) if row else None
 
     async def add_booster(self, player_id, template_id, duration_minutes=240,
-                          activate_now=False, conn=None):
+                          activate_now=False, conn=None, is_ribbon=False):
         """购买加成（AddBooster/AddVariousBoosterRequest）。返回 booster 行 id。
-        传入 conn 时并入外部事务（与扣款同生共死）。"""
+        传入 conn 时并入外部事务（与扣款同生共死）。
+        is_ribbon：勋带加成（AddBoosterRequest）为 True，通用加成
+        （AddVariousBoosterRequest）为 False —— 两张模板表 id 有重叠，
+        推送 KVCS 时靠该列决定进 RibbonBooster 还是 Booster 表。"""
         async with self._conn(conn) as c:
             if activate_now:
                 bid = await c.fetchval(
                     'INSERT INTO player_boosters (player_id, booster_template_id, '
-                    'activated_at, expires_at) VALUES ($1, $2, now(), '
-                    'now() + make_interval(mins => $3)) RETURNING id',
-                    int(player_id), int(template_id), int(duration_minutes))
+                    'activated_at, expires_at, is_ribbon) VALUES ($1, $2, now(), '
+                    'now() + make_interval(mins => $3), $4) RETURNING id',
+                    int(player_id), int(template_id), int(duration_minutes),
+                    bool(is_ribbon))
             else:
                 bid = await c.fetchval(
-                    'INSERT INTO player_boosters (player_id, booster_template_id) '
-                    'VALUES ($1, $2) RETURNING id',
-                    int(player_id), int(template_id))
+                    'INSERT INTO player_boosters (player_id, booster_template_id, '
+                    'is_ribbon) VALUES ($1, $2, $3) RETURNING id',
+                    int(player_id), int(template_id), bool(is_ribbon))
         return int(bid)
 
     async def activate_booster(self, player_id, booster_row_id, duration_minutes=240):
@@ -2312,13 +2344,15 @@ class PlayerStore:
         """玩家加成行（Booster/RibbonBooster KVCS 源）。"""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                'SELECT id, booster_template_id, activated_at, expires_at '
-                'FROM player_boosters WHERE player_id = $1 ORDER BY id',
+                'SELECT id, booster_template_id, activated_at, expires_at, '
+                'is_ribbon FROM player_boosters WHERE player_id = $1 '
+                'ORDER BY id',
                 int(player_id))
         return [{'id': int(r['id']),
                  'template_id': int(r['booster_template_id']),
                  'activated_at': r['activated_at'],
-                 'expires_at': r['expires_at']} for r in rows]
+                 'expires_at': r['expires_at'],
+                 'is_ribbon': bool(r['is_ribbon'])} for r in rows]
 
     async def list_tickets(self, player_id, timed_only=False):
         """玩家门票行（Ticket/TicketTimed KVCS 源）。"""
@@ -2811,6 +2845,11 @@ class PlayerStore:
                     f'UPDATE {tbl} SET character_id = $3 WHERE id = $1 '
                     'AND player_id = $2',
                     int(item_id), int(player_id), int(character_id))
+                # 弹药随武器指派（slot_index 保留：默认弹药 slot 1 自动恢复装备）
+                await conn.execute(
+                    'UPDATE weapon_ammo SET character_id = $3 WHERE weapon_id = $1 '
+                    'AND player_id = $2',
+                    int(item_id), int(player_id), int(character_id))
             else:
                 n = await conn.execute(
                     f'UPDATE {tbl} SET character_id = $3 WHERE id = $1 '
@@ -2818,9 +2857,22 @@ class PlayerStore:
                     int(item_id), int(player_id), int(character_id))
         return _rowcount(n) > 0
 
+    async def get_item_character(self, player_id, item_type, object_id):
+        """查询物品当前所属角色 id（SendItemToDepot 幂等预检用，
+        itemType 为 ItemType 枚举 int）。物品不存在返回 None，已在仓库返回 0。"""
+        tbl = self._ITEM_TYPE_ID_TABLES.get(int(item_type or 0))
+        if tbl is None:
+            return None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f'SELECT character_id FROM {tbl} WHERE id = $1 AND player_id = $2',
+                int(object_id), int(player_id))
+            return row['character_id'] if row else None
+
     async def send_item_to_depot(self, player_id, item_type, object_id):
         """物品送回仓库（SendItemToDepotRequest，itemType 为 ItemType 枚举 int）：
-        character_id 清 0；武器同时卸下装备槽。返回是否更新。"""
+        character_id 清 0；武器同时卸下容器槽，载具同时卸下装备槽
+        （否则装备中的载具入库会留下"仓库里却占着角色槽位"的脏数据）。返回是否更新。"""
         tbl = self._ITEM_TYPE_ID_TABLES.get(int(item_type or 0))
         if tbl is None:
             return False
@@ -2829,6 +2881,20 @@ class PlayerStore:
                 n = await conn.execute(
                     'UPDATE weapons SET character_id = 0, container_id = 0, '
                     'container_slot = 0 WHERE id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                # 弹药随武器退仓：不清理会留下"武器在仓库、弹药仍挂在角色名下
+                # 且装备中"的脏数据 → unlockBits 弹药回查查不到武器（不在角色
+                # 名下），默认弹药 uid 加不上 → 客户端显示锁定 + "Ribbon
+                # required"（2026-08-27 weapon 147/ammo 346 实锤）。slot_index
+                # 保留，重新指派角色时默认弹药自动恢复装备槽。
+                await conn.execute(
+                    'UPDATE weapon_ammo SET character_id = 0 WHERE weapon_id = $1 '
+                    'AND player_id = $2',
+                    int(object_id), int(player_id))
+            elif tbl == 'vehicles':
+                n = await conn.execute(
+                    'UPDATE vehicles SET character_id = 0, equipped_in_slot = 0 '
+                    'WHERE id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
             else:
                 n = await conn.execute(

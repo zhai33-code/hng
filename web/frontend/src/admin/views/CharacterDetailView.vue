@@ -43,7 +43,15 @@ interface CharacterDetail {
   }
   weapons: WeaponItem[]
   vehicles: VehicleItem[]
-  ribbons: { ribbon_template_id: number; name: string; total_xp: number }[]
+  ribbons: {
+    ribbon_template_id: number
+    name: string
+    icon: string
+    overlay_icon: string
+    overlay_fallback: string
+    overlay_style: { scale: number; x: number; y: number }
+    total_xp: number
+  }[]
 }
 
 const route = useRoute()
@@ -69,14 +77,15 @@ function fmtTime(s: string | null): string {
   return s ? s.replace('T', ' ').slice(0, 19) : '-'
 }
 
+/** 武器图标：客户端 images/Weapons/{weaponTemplate id}.png */
+function weaponIcon(w: WeaponItem): string {
+  return `/icons/Weapons/${w.template_id}.png`
+}
 /** 载具图标：客户端 images/Vehicles/{vehicleTemplate id}.png（variant 级无图，用父模板图） */
 function vehicleIcon(v: VehicleItem): string {
   return `/icons/Vehicles/${v.parent}.png`
 }
-/** 勋带图标：客户端 images/Ribbons/{ribbonTemplate id}.png */
-function ribbonIcon(r: { ribbon_template_id: number }): string {
-  return `/icons/Ribbons/${r.ribbon_template_id}.png`
-}
+/** 勋带图标：后端拼好最终路径（专属图或类别底图），前端零试错 */
 /** 军衔徽章 */
 function rankIcon(): string {
   const c = data.value?.character
@@ -84,6 +93,29 @@ function rankIcon(): string {
 }
 function onImgError(e: Event) {
   ;(e.target as HTMLElement).style.display = 'none'
+}
+
+/** 叠加图加载失败：先降级到武器/载具全尺寸图，再失败则隐藏 */
+function onOverlayError(e: Event, r: { overlay_fallback: string }) {
+  const img = e.target as HTMLImageElement
+  if (img.dataset.fb !== '1' && r.overlay_fallback) {
+    img.dataset.fb = '1'
+    img.src = r.overlay_fallback
+    img.classList.add('fallback')
+  } else {
+    img.style.display = 'none'
+  }
+}
+
+/** pip 摆放（官方 PipTransform）：高度 = scale×底图高，中心定位 (x, y)；
+ * 后端字段缺失时回退官方 smg 默认值，保证居中 */
+function pipStyle(r: { overlay_style?: { scale: number; x: number; y: number } }) {
+  const s = r.overlay_style ?? { scale: 0.65, x: 0.5, y: 0.5 }
+  return {
+    height: `${s.scale * 100}%`,
+    left: `${s.x * 100}%`,
+    top: `${s.y * 100}%`,
+  }
 }
 
 const equippedWeapons = computed(() => data.value?.weapons.filter((w) => w.equipped) ?? [])
@@ -114,19 +146,22 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
       <!-- 武器（已装备） -->
       <div class="gear-section">
         <span class="section-title">已装备武器（{{ equippedWeapons.length }}）</span>
-        <div v-if="equippedWeapons.length" class="gear-list">
-          <div v-for="w in equippedWeapons" :key="w.id" class="gear-card">
+        <div v-if="equippedWeapons.length" class="gear-list weapons">
+          <div v-for="w in equippedWeapons" :key="w.id" class="gear-card weapon-card">
+            <div class="weapon-visual">
+              <img :src="weaponIcon(w)" :alt="w.template_name" @error="onImgError" />
+            </div>
             <div class="gear-main">
               <div class="gear-name">{{ w.template_name }}</div>
               <div class="gear-meta">
-                自定义名 "{{ w.name }}" · 槽位 {{ w.container_slot }} · 变体 #{{ w.variant_template_id }}
+                "{{ w.name }}" · 槽位 {{ w.container_slot }}
               </div>
               <div v-if="w.modifiers.length || w.ammo.length" class="gear-parts">
                 <span v-for="m in w.modifiers" :key="'m' + m.id" class="part-tag">
-                  配件 · {{ m.name }}
+                  {{ m.name }}
                 </span>
                 <span v-for="a in w.ammo" :key="'a' + a.id" class="part-tag">
-                  弹药 · {{ a.name }}（{{ (a.condition * 100).toFixed(0) }}%）
+                  {{ a.name }}
                 </span>
               </div>
             </div>
@@ -138,17 +173,20 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
       <!-- 武器（仓库） -->
       <div v-if="storedWeapons.length" class="gear-section">
         <span class="section-title">仓库武器（{{ storedWeapons.length }}）</span>
-        <div class="gear-list">
-          <div v-for="w in storedWeapons" :key="w.id" class="gear-card">
+        <div class="gear-list weapons">
+          <div v-for="w in storedWeapons" :key="w.id" class="gear-card weapon-card">
+            <div class="weapon-visual">
+              <img :src="weaponIcon(w)" :alt="w.template_name" @error="onImgError" />
+            </div>
             <div class="gear-main">
               <div class="gear-name">{{ w.template_name }}</div>
-              <div class="gear-meta">自定义名 "{{ w.name }}" · 变体 #{{ w.variant_template_id }}</div>
+              <div class="gear-meta">"{{ w.name }}"</div>
               <div v-if="w.modifiers.length || w.ammo.length" class="gear-parts">
                 <span v-for="m in w.modifiers" :key="'m' + m.id" class="part-tag">
-                  配件 · {{ m.name }}
+                  {{ m.name }}
                 </span>
                 <span v-for="a in w.ammo" :key="'a' + a.id" class="part-tag">
-                  弹药 · {{ a.name }}（{{ (a.condition * 100).toFixed(0) }}%）
+                  {{ a.name }}
                 </span>
               </div>
             </div>
@@ -159,9 +197,9 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
       <!-- 载具 -->
       <div class="gear-section">
         <span class="section-title">载具（{{ data.vehicles.length }}）</span>
-        <div v-if="data.vehicles.length" class="gear-list">
-          <div v-for="v in data.vehicles" class="gear-card">
-            <img class="gear-icon" :src="vehicleIcon(v)" :alt="v.name" @error="onImgError" />
+        <div v-if="data.vehicles.length" class="gear-list vehicles">
+          <div v-for="v in data.vehicles" :key="v.id" class="gear-card">
+            <img class="gear-icon vehicle" :src="vehicleIcon(v)" :alt="v.name" @error="onImgError" />
             <div class="gear-main">
               <div class="gear-name">{{ v.name }}</div>
               <div class="gear-meta">
@@ -183,7 +221,13 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
         <span class="section-title">勋带（{{ data.ribbons.length }}）</span>
         <div v-if="data.ribbons.length" class="ribbon-grid">
           <div v-for="r in data.ribbons" :key="r.ribbon_template_id" class="ribbon-item">
-            <img class="gear-icon" :src="ribbonIcon(r)" :alt="r.name" @error="onImgError" />
+            <div class="ribbon-container">
+              <img class="gear-icon ribbon base" :src="r.icon" :alt="r.name" @error="onImgError" />
+              <img v-if="r.overlay_icon || r.overlay_fallback" class="ribbon overlay"
+                   :src="r.overlay_icon || r.overlay_fallback"
+                   :class="{ fallback: !r.overlay_icon }" :style="pipStyle(r)"
+                   :alt="r.name" @error="onOverlayError($event, r)" />
+            </div>
             <div class="ribbon-meta">
               <div>{{ r.name }}</div>
               <div class="ribbon-xp">{{ r.total_xp }} XP</div>
@@ -197,6 +241,71 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
 </template>
 
 <style lang="scss" scoped>
+// 武器卡：竖向布局（图上字下，像游戏背包格子）
+// 客户端素材：Weapons 640×360 / Vehicles 320×138 / Ribbons 256×128
+.gear-card.weapon-card {
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+
+  .weapon-visual {
+    // 16:9 顶部图区，深底 + 底边线，与文字区分隔
+    background: #14170e;
+    border-bottom: 1px solid #33362a;
+    border-radius: 5px 5px 0 0;
+    overflow: hidden;
+    aspect-ratio: 640 / 360;
+
+    img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+  }
+
+  .gear-main {
+    padding: 10px 12px 12px;
+  }
+}
+
+.gear-icon.vehicle {
+  width: 170px;
+  height: 73px;
+  flex-shrink: 0;
+}
+
+// 勋带图标容器：类别底图 + 官方 pip 叠加图
+// 官方 updatePipImage()：pip 等比缩放到底图高度 × PipTransform.scale，
+// 中心定位 (pos.x×W, pos.y×H)，配合内联样式 height/left/top + translate 复刻
+.ribbon-container {
+  position: relative;
+  width: 132px;
+  height: 66px;
+  flex-shrink: 0;
+
+  .gear-icon.ribbon {
+    width: 100%;
+    height: 100%;
+    display: block;
+    object-fit: contain;
+  }
+
+  .ribbon.overlay {
+    position: absolute;
+    width: auto; // 高度由内联 style 按官方 scale 给出，宽度按原图比例
+    transform: translate(-50%, -50%);
+    object-fit: contain;
+    // 官方 pip 为灰度图并用 ColorMatrixFilter 染铜色，这里轻微提亮染色近似
+    filter: brightness(1.8) sepia(0.35) saturate(2);
+  }
+
+  // 回退：武器(640x360)/载具(320x138)全尺寸图，同样缩放叠加（不染色）
+  .ribbon.overlay.fallback {
+    filter: none;
+  }
+}
+
 .char-head {
   display: flex;
   align-items: center;
@@ -223,7 +332,7 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
 
 .ribbon-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 10px;
 }
 
@@ -234,11 +343,13 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
   border-radius: 6px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
+  gap: 12px;
+  padding: 10px 14px;
 
   .ribbon-meta {
     font-size: 13px;
+    min-width: 0;
+    overflow-wrap: anywhere;
 
     .ribbon-xp {
       color: #7a7561;

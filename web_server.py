@@ -12,6 +12,7 @@
   /WarDatabase/<tbl>  单个静态表文件下发
   /flashres_unique    Flash_Resources 清单（images/Rank 军衔图标）
   /undefined, /HnG_Strategy_en.xml 等本地化文件（动态注入缺失 key）
+  /online.json        内部在线统计（仅限回环地址，管理后台跨进程拉取）
   /admin*             404（管理后台由独立进程 web/server/ 提供，不经 80 端口）
   其余                GAME_DIR 静态文件回退（目录列表与敏感扩展名 404）
 
@@ -23,6 +24,7 @@ import json
 import mimetypes
 import os
 import re
+import time
 
 from http.server import (
     SimpleHTTPRequestHandler,
@@ -30,6 +32,7 @@ from http.server import (
     )
 
 from state import (
+    FLASH_SESSIONS,
     GAME_DIR,
     PUBLIC_HOST,
     STORE,
@@ -45,6 +48,10 @@ from wardb import WARDB_UNIQUE
 # 常量对应的 key（如 server_error），购买/操作失败后 Texts.getText 查找失败会显示
 # '"ErrorMessages/StrategyGame/xxx" not found' 之类乱码。这里在服务器提供该文件时
 # 动态注入缺失 key（不改原始文件）。ok/fail 等已存在，无需注入。
+# 另：texts/ 新版（EAC 文案）删掉了全部 StrategyGUI/AntiCheat/battleye_* key，
+# 但客户端登录流程（FrontScreenMediator 检测/安装 BattlEye、AntiCheatInformationMediator
+# 弹窗）仍会引用，缺失时显示 '"StrategyGUI/AntiCheat/battleye_install_info" not found'，
+# 因此从旧版 BattlEyeTlm/HnG_Strategy_en.xml 补回。
 LOCALIZATION_EXTRA = """  <data name="ErrorMessages/StrategyGame/server_error">
     <value>An error occurred on the server</value>
   </data>
@@ -92,6 +99,72 @@ LOCALIZATION_EXTRA = """  <data name="ErrorMessages/StrategyGame/server_error">
   </data>
   <data name="ErrorMessages/StrategyGame/pricing_mismatch">
     <value>Pricing mismatch</value>
+  </data>
+  <data name="StrategyGUI/AntiCheat/battleye_install_check">
+    <value>Checking for battlEye anti-cheat</value>
+  </data>
+  <data name="StrategyGUI/AntiCheat/battleye_install_info">
+    <value>Installing BattlEye anti-cheat</value>
+  </data>
+  <data name="StrategyGUI/AntiCheat/battleye_install_failure">
+    <value>BattlEye anti-cheat was not installed</value>
+  </data>
+  <data name="StrategyGUI/AntiCheat/battleye_accept_header">
+    <value>HEROES &amp; GENERALS USES BATTLEYE</value>
+  </data>
+  <data name="StrategyGUI/AntiCheat/battleye_accept_calltoaction">
+    <value>I HAVE READ THE INFORMATION ABOVE ABOUT ANTI-CHEAT TECHNOLOGIES, \nAND I AGREE TO THE USE OF THESE.</value>
+  </data>
+  <data name="StrategyGUI/AntiCheat/battleye_information_header">
+    <value>1. HEROES &amp; GENERALS USES BATTLEYE
+2. BATTLEYE EULA</value>
+  </data>
+  <data name="StrategyGUI/AntiCheat/battleye_accept_body">
+    <value>1. HEROES &amp; GENERALS USES BATTLEYE.
+You asked, we listened: New Anti-Cheat system, BattlEye, is now implemented to make Heroes &amp; Generals fun and fair for everyone and provide an effective shield against cheats and hacks. Enjoy!
+Please click button below to get started.
+
+AS A FURTHER CONDITION FOR USING HEROES &amp; GENERALS®, YOU AGREE THAT WE MAY USE OUR OWN OR PARTNERS’ ANTI-CHEAT TECHNOLOGIES IN CONNECTION WITH ANY OF OUR GAME SERVICES AND IN PARTICULAR WITH HEROES &amp; GENERALS® ("THE GAME SERVICE").
+
+WHEN PLAYERS CONNECT TO GAME SERVERS, THESE TECHNOLOGIES WILL ACTIVATE AND MONITOR GAME PLAY, THE GAME FILES ASSOCIATED WITH THE GAME SERVICE AND RAM OF THE PLAYER'S COMPUTER. THESE TECHNOLOGIES DETECT CHEATING AND ANY UNAUTHORIZED THIRD-PARTY PROGRAMS RUNNING CONCURRENTLY WITH THE GAME SERVICE AND ANY MODIFICATIONS TO THE GAME SERVICE FILES ENABLING OR FACILITATING CHEATING. AN UNAUTHORIZED THIRD-PARTY PROGRAM IS ANY THIRD-PARTY PROGRAM OR FILE (SUCH AS AN “ADDON”, “MOD”, “HACK”, “TRAINER”, “AIMBOT”, “ESP” OR “CHEAT”) THAT WE BELIEVE ENABLES OR FACILITATES CHEATING OF ANY TYPE, ALLOWS USERS TO MODIFY OR HACK THE GAME SERVICE INTERFACE, ENVIRONMENT, OR EXPERIENCE IN ANY WAY NOT EXPRESSLY AUTHORIZED BY TLM Partners Inc., OR INTERCEPTS, “MINES”, OR OTHERWISE COLLECTS INFORMATION FROM OR THROUGH THE GAME SERVICE. WHEN PLAYERS DISCONNECT FROM THE GAME SERVICE, THESE ANTI-CHEAT TECHNOLOGIES WILL BE AUTOMATICALLY DEACTIVATED.
+
+IF OUR ANTI-CHEAT TECHNOLOGIES SUSPECT CHEATING, WE MAY COLLECT RELEVANT INFORMATION, INCLUDING BUT NOT LIMITED TO YOUR TLM AND/OR HEROES &amp; GENERALS® ACCOUNT NAME, DETAILS ABOUT ANY UNAUTHORIZED THIRD-PARTY PROGRAMS, THE GAME SERVICE FILES MODIFICATION DETECTED, AND THE TIME AND DATE THE CHEATING WAS SUSPECTED TO OCCUR. IF WE DETERMINE A PLAYER HAS BEEN CHEATING, WE MAY ALSO, AT OUR DISCRETION, DECIDE TO TERMINATE THE TARGETED ACCOUNT, EITHER TEMPORARILY OR PERMANENTLY, DEPENDING ON THE OFFENSE BASED ON SUCH FACTORS AS RECURRENCES, SEVERITY OF THE CHEAT, AND IMPACT TO OTHER PLAYERS. IN ADDITION TO TERMINATION OF A PLAYER'S ACCOUNTS, LEGAL ACTION MAY BE TAKEN AGAINST PERSONS OR ENTITIES INFRINGING ON OUR RIGHTS.</value>
+  </data>
+  <data name="StrategyGUI/AntiCheat/battleye_eula">
+    <value>2. BATTLEYE EULA
+
+
+****** End-User License Agreement ******
+
+
+This License Agreement ("Agreement") is made between you (the "Licensee") and BattlEye Innovations e.K. (the "Licensor" and the "Data Processor") on behalf of TLM Partners Inc. (the "Data Controller"). The terms of this Agreement apply to all current and future versions and updates of BattlEye anti-cheat software ("BattlEye").
+
+
+By installing, enabling or using BattlEye, Licensee agrees with all the terms of this Agreement. Licensor reserves all rights not specifically granted and transferred to Licensee.
+
+
+Licensee understands, acknowledges and agrees with the following:
+
+- Licensor grants Licensee a non-exclusive and non-transferable license to use BattlEye for non-commercial purposes only. Licensee therefore does not own BattlEye, Licensor remains the owner of BattlEye.
+
+- Licensor provides BattlEye on an "as is" basis without warranty of any kind. Licensor neither guarantees the correct, error-free functioning of BattlEye nor is Licensor responsible for any damage caused by the use of BattlEye.
+
+- Licensee may not decompile, disassemble, reverse-engineer, modify or redistribute BattlEye in any way.
+
+- BattlEye will automatically, without notice to Licensee, download and install updates from time to time.
+
+- BattlEye may scan Licensee's entire random access memory (RAM), and any game-related and system-related files and folders on Licensee's system using cheat-program-identifying algorithms, transmit results of such algorithms to other connected computers and/or to Licensor and process such information for the sole purpose of preventing and detecting the use of cheat programs. BattlEye only scans and/or processes data which is reasonably necessary to be scanned and/or processed to meet this purpose.
+
+- BattlEye may collect and process Licensee's Internet Protocol address, game account name and identifier, in-game nickname, and system-related and hardware-related information including, but not limited to, device identifiers and hardware serial numbers.
+
+- Licensor processes all information collected by BattlEye on servers located in the European Union. Licensor may share the information with its partners and/or affiliates.
+
+- Licensee acknowledges that the invasive nature of BattlEye is necessary to meet its purpose and goal of preventing and detecting cheat programs.
+
+- Licensor is allowed to terminate the license at any time for any reason and without notice to Licensee.
+
+
+This License Agreement constitutes the entire agreement between Licensor and Licensee and supersedes any prior statements.</value>
   </data>
 """
 
@@ -312,6 +385,59 @@ def _deny_static(path):
     return os.path.splitext(path)[1].lower() in _STATIC_DENY_EXTS
 
 
+def _online_snapshot():
+    """跨进程在线统计快照：FLASH_SESSIONS（大厅+战斗中的 Flash 连接）+
+    匹配队列 + 活跃战局名单。
+
+    供管理后台（独立进程 admin_main.py）经 127.0.0.1:80/online.json 拉取。
+    HTTP 线程与主 asyncio 线程并发读写这些 dict——list() 拷贝期间撞上
+    增删抛 RuntimeError 时按空表处理（下次轮询自会拿到一致快照）。
+    matchmaking 惰性 import：web_server 在 realtest_server 启动序里先于
+    matchmaking 就绪，也避免任何潜在循环依赖。"""
+    import matchmaking
+
+    try:
+        items = sorted(FLASH_SESSIONS.items())
+    except RuntimeError:
+        items = []
+    players = [{'username': name, 'player_id': sess.player_id}
+               for name, sess in items]
+
+    try:
+        det_items = list(matchmaking._MM_MISSION_DETAILS.items())
+    except RuntimeError:
+        det_items = []
+    missions = [{
+        'mission_id': mid,
+        'preset': det.get('preset'),
+        'gamemode': det.get('gamemode'),
+        'attacker_faction': det.get('attacker_faction'),
+        'defender_faction': det.get('defender_faction'),
+        'players': [{'gamertag': p.get('gamertag'),
+                     'faction': p.get('faction')}
+                    for p in det.get('players', [])],
+    } for mid, det in sorted(det_items)]
+
+    return {
+        'online': len(players),
+        'in_queue': len(matchmaking._MM_QUEUES),
+        'in_battle': len(matchmaking.PMS_TO_SESSION),
+        'players': players,
+        'missions': missions,
+        'server_time': int(time.time()),
+    }
+
+
+def _handle_online_api(handler):
+    """GET /online.json：内部在线统计（仅限回环地址，公网请求 403）。"""
+    ip = handler.client_address[0]
+    if ip not in ('127.0.0.1', '::1'):
+        _json_reply(handler, {'error': 'forbidden'}, 403)
+        log(f'[HTTP] BLOCKED /online.json from {ip} (非本机)')
+        return
+    _json_reply(handler, _online_snapshot())
+
+
 class HttpHandler(SimpleHTTPRequestHandler):
     """Serve /status, /settings.js, and static files from the game directory."""
 
@@ -378,6 +504,9 @@ class HttpHandler(SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'OK')
+            return
+        if path == '/online.json' or path == '//online.json':
+            _handle_online_api(self)
             return
         if path == '/settings.js' or path == '//settings.js':
             self.send_response(200)

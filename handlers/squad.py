@@ -124,15 +124,25 @@ def _str(v):
 
 # ------------------------------------------------------------- KVCS 推送
 
-def _msg_squad_session(squad, members, mission_id=0, entered=0):
-    """SquadSession proto（22 字段，f11 缺失；repeated 空省略）。"""
+def _msg_squad_session(squad, members, mission_id=0, entered=0,
+                       viewer_faction=None):
+    """SquadSession proto（22 字段，f11 缺失；repeated 空省略）。
+
+    viewer_faction：客户端把 SquadSession.f4 当作"本队阵营"渲染——
+    MatchmakingView 阵营图标、SquadPlayerSlotItemRenderer 段位徽章、
+    默认迷彩、StatusMediator 进战确认框全部绑 squadModel.
+    factionTemplateId（=SquadSession.f4，官方语义=全队同阵营）。私服
+    允许混阵营小队 → 按接收者自己的角色阵营逐连接下发 f4（每个客户端
+    只收到自己连接的 KVCS 流，行 id 相同、字段值可按观察者区分），
+    否则全队显示建队者阵营（德军玩家也显示苏军）。"""
     leader = next((m for m in members
                    if m['character_id'] == squad['leader_character_id']),
                   members[0] if members else None)
     m = pb_int64(1, squad['id'])                     # id（=squadSessionId）
     m += pb_int64(2, leader['player_id'] if leader else 0)  # ownerPlayerId
     m += pb_int64(3, leader['template'] if leader else 0)   # characterTemplateId
-    m += pb_int64(4, squad['faction'])               # factionTemplateId
+    m += pb_int64(4, int(viewer_faction) if viewer_faction
+                  else squad['faction'])             # factionTemplateId（按观察者）
     m += pb_int64(5, 0)                              # supportSlotTemplateId1
     m += pb_int64(6, 0)                              # supportSlotTemplateId2
     m += pb_int64(7, 0)                              # supportSlotTemplateId3
@@ -149,8 +159,22 @@ def _msg_squad_session(squad, members, mission_id=0, entered=0):
     return m
 
 
-def _msg_squad_member_session(member, squad_id):
-    """SquadMemberSession proto（20 字段，repeated 空省略）。"""
+async def _member_appearance(member):
+    """成员角色装备的迷彩/头盔模板 id（SquadMemberSession f8/f19）。
+
+    小队头像按这两个模板渲染士兵外观；0 = 未装备 → 默认军服。"""
+    try:
+        return await STORE.get_character_appearance(
+            int(member['player_id']), int(member['character_id']))
+    except Exception as e:
+        log(f'      [DB] member appearance lookup failed: {e}')
+        return (0, 0)
+
+
+def _msg_squad_member_session(member, squad_id, uvt=0, upt=0):
+    """SquadMemberSession proto（20 字段，repeated 空省略）。
+
+    uvt/upt：角色装备的迷彩/头盔模板 id（_member_appearance 解析）。"""
     m = pb_int64(1, member['id'])                    # id（成员行 id）
     m += pb_int64(2, squad_id)                       # squadSessionId
     m += pb_int64(3, 0)                              # squadPlayerSlotTemplateId
@@ -158,7 +182,7 @@ def _msg_squad_member_session(member, squad_id):
     m += pb_string(5, member['gamertag'])            # gamerTag
     m += pb_int64(6, member['faction'])              # playerFactionTemplateId
     m += pb_int64(7, member['character_id'])         # characterId
-    m += pb_int64(8, 0)                              # uniformVariantTemplateId
+    m += pb_int64(8, uvt)                            # uniformVariantTemplateId
     m += pb_int64(9, 0)                              # weaponVariantTemplateId
     m += pb_int32(10, _rank_from_combat_xp(member['combat_xp']))  # characterRank
     m += pb_int64(11, 0)                             # shopMembershipItemId
@@ -168,16 +192,19 @@ def _msg_squad_member_session(member, squad_id):
     m += pb_int32(16, 0)                             # playerTier
     m += pb_int32(17, 0)                             # squadCustomizationPoints
     m += pb_bool(18, member['status'] == ST_INVITE_PENDING)  # wasInvited
-    m += pb_int64(19, 0)                             # uniformPartTemplateId
+    m += pb_int64(19, upt)                           # uniformPartTemplateId
     m += pb_int64(20, member['faction'])             # characterFactionTemplateId
     return m
 
 
-async def push_squad_rows_to_writer(writer, view_cmd, squad_id, mission_id=0):
+async def push_squad_rows_to_writer(writer, view_cmd, squad_id, mission_id=0,
+                                     viewer_pid=None, viewer_name=None):
     """整队 KVCS 行推给指定连接（底层；状态读 DB 实时值）。
 
     matchmaking 进战局序列复用：真实小队成员各自的连接收到同一份
-    SquadSession(f17=missionId) + 全体 SquadMemberSession。"""
+    SquadSession(f17=missionId) + 全体 SquadMemberSession。
+    viewer_pid/viewer_name：接收者身份 → SquadSession.f4 按其角色阵营
+    下发（混阵营小队显示，见 _msg_squad_session）；都不传则用小队默认。"""
     if STORE is None or view_cmd is None or not squad_id:
         return
     try:
@@ -188,11 +215,22 @@ async def push_squad_rows_to_writer(writer, view_cmd, squad_id, mission_id=0):
     except Exception as e:
         log(f'      [DB] push_squad_rows_to_writer failed: {e}')
         return
+    viewer_faction = None
+    if viewer_pid is not None or viewer_name:
+        for m in members:
+            if (viewer_pid is not None
+                    and int(m['player_id']) == int(viewer_pid)) \
+                    or (viewer_name
+                        and (m['gamertag'] or '') == viewer_name):
+                viewer_faction = int(m['faction'])
+                break
     await _push_kvcs(writer, view_cmd, b'SquadSession',
-                     _msg_squad_session(squad, members, mission_id))
+                     _msg_squad_session(squad, members, mission_id,
+                                        viewer_faction=viewer_faction))
     for mem in members:
+        uvt, upt = await _member_appearance(mem)
         await _push_kvcs(writer, view_cmd, b'SquadMemberSession',
-                         _msg_squad_member_session(mem, squad_id))
+                         _msg_squad_member_session(mem, squad_id, uvt, upt))
     log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet '
         f'(SquadSession id={squad_id} + {len(members)} members, '
         f'mission={mission_id or 0})')
@@ -203,7 +241,11 @@ async def push_squad_rows(sess, writer, squad_id, mission_id=0):
     if sess.playerview_cmd is None:
         return
     await push_squad_rows_to_writer(writer, sess.playerview_cmd, squad_id,
-                                    mission_id)
+                                    mission_id,
+                                    viewer_pid=getattr(sess, 'player_id',
+                                                        None),
+                                    viewer_name=getattr(sess, 'username',
+                                                         None))
 
 
 async def push_squad_member_row(sess, writer, member_row_id):
@@ -222,8 +264,10 @@ async def push_squad_member_row(sess, writer, member_row_id):
     mem = next((x for x in members if x['id'] == member_row_id), None)
     if mem is None:
         return
+    uvt, upt = await _member_appearance(mem)
     await _push_kvcs(writer, sess.playerview_cmd, b'SquadMemberSession',
-                     _msg_squad_member_session(mem, mem_row['squad_id']))
+                     _msg_squad_member_session(mem, mem_row['squad_id'],
+                                               uvt, upt))
     log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
         f'(SquadMemberSession id={member_row_id})')
 
@@ -531,14 +575,48 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
     pid = await sess.ensure_player()
     code = RC_OK
     member_row = 0
+    created_squad_id = 0
+    squad = None
     if pid is None or STORE is None or not friend_player_id:
         code = RC_PLAYER_NOT_FOUND
     else:
         try:
             squad = await STORE.get_squad_for_player(int(pid))
             if squad is None:
-                code = RC_SQUAD_NOT_FOUND
-            else:
+                # ★ 客户端从不发 CreateSquadRequest（SquadService.inviteFriend
+                #   直接发本请求，桌面/网页两版 swf 均无建队调用）：官服由
+                #   服务端在首次邀请时隐式建队。私服若无此步，
+                #   get_squad_for_player 恒 None → 161 squad_not_found。
+                #   用请求 f1 ownerCharacterId（选中角色）建队，兜底最新角色。
+                char = None
+                if owner_char_id:
+                    char = await STORE.get_character(int(pid), owner_char_id)
+                if char is None:
+                    char = await STORE.get_latest_character(int(pid))
+                if char is None:
+                    code = RC_CHARACTER_NOT_OWNED
+                else:
+                    # 清残留 solo 隐式小队（上一局 squadId=0 行仍在客户端
+                    # SquadSession 表），否则新真队行入表后两行并存冲突
+                    solo = _SOLO_SQUADS.pop(int(pid), None)
+                    if solo is not None and sess.playerview_cmd is not None:
+                        await _push_kvcs_delete(
+                            writer, sess.playerview_cmd,
+                            b'SquadMemberSession', solo['member_row'])
+                        await _push_kvcs_delete(
+                            writer, sess.playerview_cmd,
+                            b'SquadSession', solo['squad_row'])
+                        log(f'S->C cmd={sess.playerview_cmd:<4} '
+                            f'KeyValueChangeSet (solo squad delete '
+                            f'id={solo["squad_row"]} ★before implicit create)')
+                    name = f"Squad of {sess.username or 'Player'}"
+                    created_squad_id = await STORE.create_squad(
+                        char['id'], char['faction'], name)
+                    squad = await STORE.get_squad(created_squad_id)
+                    log(f'      [DB] implicit create_squad id='
+                        f'{created_squad_id} leader_char={char["id"]} '
+                        f'faction={char["faction"]} (on invite)')
+            if code == RC_OK and squad is not None:
                 friend_char = await STORE.get_latest_character(friend_player_id)
                 if friend_char is None:
                     code = RC_PLAYER_NOT_FOUND
@@ -552,7 +630,12 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
             code = RC_PLAYER_NOT_FOUND
 
     if code == RC_OK and member_row:
-        await push_squad_member_row(sess, writer, member_row)
+        if created_squad_id:
+            # 隐式建队：队长此前无队 → 整队行（SquadSession + 队长 InLobby 行
+            # + 被邀请者 pending 行）一起推，客户端小队 UI 才会激活
+            await push_squad_rows(sess, writer, created_squad_id)
+        else:
+            await push_squad_member_row(sess, writer, member_row)
         # 被邀请方实时收邀请（整队行含其 pending 成员行 → 弹邀请提示）；
         # 不推则对方要重登才能看到邀请
         if STORE is not None:

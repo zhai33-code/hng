@@ -59,6 +59,10 @@ function fmtTime(s: string | null): string {
   return s ? s.replace('T', ' ').slice(0, 19) : '-'
 }
 
+function fmtNum(n: number): string {
+  return (n ?? 0).toLocaleString('en-US')
+}
+
 /** 军衔徽章：客户端 images/Rank/{faction}_{branch}_{rank}.png（找不到则隐藏） */
 function rankIcon(c: CharacterRow): string {
   return `/icons/Rank/${c.faction}_1_${c.rank}.png`
@@ -145,15 +149,15 @@ async function onToggleBan() {
         </div>
         <div class="stat">
           <div class="label">Credits</div>
-          <div class="value">{{ data.player.credits }}</div>
+          <div class="value num" :class="{ long: data.player.credits >= 10_000_000 }">{{ fmtNum(data.player.credits) }}</div>
         </div>
         <div class="stat">
           <div class="label">Warfunds</div>
-          <div class="value">{{ data.player.warfunds }}</div>
+          <div class="value num" :class="{ long: data.player.warfunds >= 10_000_000 }">{{ fmtNum(data.player.warfunds) }}</div>
         </div>
         <div class="stat">
           <div class="label">Gold</div>
-          <div class="value">{{ data.player.gold }}</div>
+          <div class="value num" :class="{ long: data.player.gold >= 10_000_000 }">{{ fmtNum(data.player.gold) }}</div>
         </div>
         <div class="stat">
           <div class="label">账号状态</div>
@@ -201,7 +205,9 @@ async function onToggleBan() {
           <el-table-column prop="class_name" label="兵种" min-width="150" />
           <el-table-column prop="faction_name" label="阵营" width="110" />
           <el-table-column prop="rank" label="军衔" width="70" />
-          <el-table-column prop="combat_xp" label="战斗经验" width="110" />
+          <el-table-column label="战斗经验" width="110" align="right">
+            <template #default="{ row }">{{ fmtNum(row.combat_xp) }}</template>
+          </el-table-column>
           <el-table-column label="战斗徽章" min-width="200">
             <template #default="{ row }">
               <span v-if="row.badge_0 || row.badge_1">

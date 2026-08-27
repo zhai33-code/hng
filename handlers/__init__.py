@@ -23,6 +23,7 @@ from . import (
     views,
     weapons,
     )
+from state import CURRENT_PID
 
 _EXACT = {}
 for _m in (acks, auth, battlereport, career, characters, combat, economy, misc,
@@ -36,6 +37,13 @@ _PREFIX_HANDLERS = {
 
 
 async def dispatch(sess, writer, cmd_id, req_type, proto):
+    # 绑定当前会话的数据库 player_id：messages._msg_* 构建士兵视图各表行
+    # 的 playerId 字段从 contextvar 读（客户端按 currentPlayer.id 过滤）。
+    # ensure_player 有缓存，非首条消息无 DB 开销；未登录连接保持默认 1。
+    try:
+        CURRENT_PID.set(int(await sess.ensure_player() or 1))
+    except Exception:
+        pass
     h = _EXACT.get(req_type)
     if h is not None:
         await h(sess, writer, cmd_id, req_type, proto)

@@ -344,7 +344,7 @@ async def handle_abandon_mission(sess, writer, cmd_id, req_type, proto):
                                          0, solo.get('entered', 0)))
                     await _push_kvcs(writer, sess.playerview_cmd,
                                      b'SquadMemberSession',
-                                     _msg_solo_squad_member_session(
+                                     await _msg_solo_squad_member_session(
                                          solo['member_row'], solo['squad_row'],
                                          int(pid), solo['gamertag'],
                                          solo['char_id'], solo['char_name'],

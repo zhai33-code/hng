@@ -11,7 +11,13 @@ from protocol import (
     Chunk,
     pb_string, pb_int32, pb_int64, pb_uint32, pb_float, pb_message, pb_packed_bool,
 )
+from state import CURRENT_PID
 from wardb import _prog_max, _AMMO_MAXCOND, _RIBBON_LEVEL_XP, _ribbon_level_from_xp
+
+
+def _cur_pid():
+    """当前会话的数据库 player_id（客户端按它过滤自己拥有的行）。"""
+    return int(CURRENT_PID.get() or 1)
 
 
 # ---- war_catalogue 构建（用于 query_war_catalogue_response）----
@@ -70,7 +76,7 @@ def _msg_character(name='Soldier', faction=1, template=1, rank=0, char_id=1,
     m = b''
     m += pb_int64(1, char_id)               # id（数据库 characters.id）
     m += pb_string(2, name)                # name
-    m += pb_int64(3, 1)                    # playerid
+    m += pb_int64(3, _cur_pid())           # playerid（客户端按 currentPlayer.id 过滤）
     m += pb_int64(4, template)             # charactertemplateid (从 pack 解析)
     m += pb_int64(5, faction)              # factiontemplateid (从 pack 解析)
     m += pb_int64(10, combat_badge_0)      # combatbadgeslot0
@@ -111,7 +117,7 @@ def _msg_weapon(wid, name, template_id, char_id, container_id=0, container_slot=
     m += pb_int64(1, wid)                  # id
     m += pb_string(2, name)                # name
     m += pb_int64(3, template_id)          # weapontemplateid
-    m += pb_int64(4, 1)                    # playerid
+    m += pb_int64(4, _cur_pid())           # playerid（客户端按 currentPlayer.id 过滤）
     m += pb_int64(5, char_id)              # characterId (0 = 仓库)
     m += pb_int32(6, 0)                    # posx
     m += pb_int32(7, 0)                    # posy
@@ -135,7 +141,7 @@ def _msg_weapon_modifier(mid, template_id, char_id, weapon_id, auto_repair=0,
     m = b''
     m += pb_int64(1, mid)              # id
     m += pb_int64(2, template_id)      # templateId
-    m += pb_int64(3, 1)                # playerId
+    m += pb_int64(3, _cur_pid())       # playerId
     m += pb_int64(4, char_id)          # characterId
     m += pb_int64(5, weapon_id)        # weaponId
     m += pb_float(6, condition)        # condition
@@ -151,7 +157,7 @@ def _msg_weapon_ammo(aid, ammo_template_id, char_id, weapon_id, slot_index=0,
     m = b''
     m += pb_int64(1, aid)                  # id
     m += pb_int64(2, ammo_template_id)     # ammoTemplateId
-    m += pb_int64(3, 1)                    # playerId
+    m += pb_int64(3, _cur_pid())           # playerId
     m += pb_int64(4, char_id)              # characterId
     m += pb_int64(5, weapon_id)            # weaponId
     m += pb_int32(6, slot_index)           # equippedAmmoSlotIndex (0=未装备)
@@ -205,7 +211,7 @@ def _msg_weapon_variant(variant_id, char_id, weapon_id, variant_template_id):
     """构建 HnG_States.WeaponVariant proto（武器皮肤实例）"""
     m = b''
     m += pb_int64(1, variant_id)              # id
-    m += pb_int64(2, 1)                       # playerId
+    m += pb_int64(2, _cur_pid())              # playerId
     m += pb_int64(3, char_id)                 # characterId
     m += pb_int64(4, weapon_id)               # weaponId
     m += pb_int64(5, variant_template_id)     # weaponVariantTemplateId
@@ -219,7 +225,7 @@ def _msg_vehicle(vid, vehicle_variant_template_id, char_id, equipped_in_slot=0, 
     m = b''
     m += pb_int64(1, vid)                        # id
     m += pb_int64(3, vehicle_variant_template_id)  # vehicleVariantTemplateId
-    m += pb_int64(4, 1)                          # playerId
+    m += pb_int64(4, _cur_pid())                  # playerId
     m += pb_int64(5, char_id)                    # characterId
     m += pb_int64(6, equipped_in_slot)           # equippedInSlot
     m += pb_float(7, condition)                  # condition
@@ -233,7 +239,7 @@ def _msg_vehicle_variant(vid, char_id, vehicle_id, variant_template_id):
     表名注册为 'VehicleVariant'（VehicleVariantTable.xmlTag）。"""
     m = b''
     m += pb_int64(1, vid)                       # id
-    m += pb_int64(2, 1)                         # playerId
+    m += pb_int64(2, _cur_pid())                # playerId
     m += pb_int64(3, char_id)                   # characterId
     m += pb_int64(4, vehicle_id)                # vehicleId
     m += pb_int64(5, variant_template_id)       # vehicleVariantTemplateId
@@ -248,8 +254,8 @@ def _msg_vehicle_upgrade(uid, upgrade_template_id, vehicle_id, slot_id, char_id,
     m += pb_int64(1, uid)                       # id
     m += pb_int64(2, upgrade_template_id)       # vehicleUpgradeTemplateId
     m += pb_int64(3, vehicle_id)                # vehicleId
-    m += pb_int64(4, slot_id)                   # equippedVehicleUpgradeSlotId (0=未装备)
-    m += pb_int64(5, 1)                         # playerId
+    m += pb_int64(4, slot_id)                # equippedVehicleUpgradeSlotId (0=未装备)
+    m += pb_int64(5, _cur_pid())             # playerId
     m += pb_int64(6, char_id)                   # characterId
     m += pb_float(7, condition)                 # condition
     m += pb_int32(8, auto_repair)               # autoRepair（SetVehicleUpgradeAutoRepairRequest）
@@ -265,8 +271,8 @@ def _msg_vehicle_ammo(aid, ammo_template_id, vehicle_id, storage_id, slot_index,
     m += pb_int64(2, ammo_template_id)          # ammoTemplateId
     m += pb_int64(3, vehicle_id)                # vehicleId
     m += pb_int64(4, storage_id)                # equippedVehicleAmmoStorageId (0=未装备)
-    m += pb_int32(5, slot_index)                # equippedAmmoSlotIndex (0=未装备)
-    m += pb_int64(6, 1)                         # playerId
+    m += pb_int32(5, slot_index)               # equippedAmmoSlotIndex (0=未装备)
+    m += pb_int64(6, _cur_pid())                # playerId
     m += pb_int64(7, char_id)                   # characterId
     m += pb_float(8, condition)                 # condition
     m += pb_int32(9, auto_repair)               # autoRepair（SetVehicleAmmoAutoRepairRequest）
@@ -278,7 +284,7 @@ def _msg_uniform_variant(vid, template_id, char_id):
     表名注册为 'UniformVariant'（UniformVariantTable.xmlTag）。"""
     m = b''
     m += pb_int64(1, vid)                       # id
-    m += pb_int64(2, 1)                         # playerId
+    m += pb_int64(2, _cur_pid())                # playerId
     m += pb_int64(3, char_id)                   # characterId
     m += pb_int64(4, template_id)               # uniformVariantTemplateId
     return m
@@ -289,7 +295,7 @@ def _msg_uniform_part(pid2, char_id, template_id, part_type):
     表名注册为 'UniformPart'（UniformPartTable.xmlTag）。"""
     m = b''
     m += pb_int64(1, pid2)                 # id
-    m += pb_int64(2, 1)                    # playerId
+    m += pb_int64(2, _cur_pid())           # playerId
     m += pb_int64(3, char_id)              # characterId
     m += pb_int64(4, template_id)          # uniformPartTemplateId
     m += pb_int32(5, part_type)            # uniformPartType (EUniformPartType: eHelmet=1)

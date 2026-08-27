@@ -45,6 +45,10 @@ function fmtTime(s: string | null): string {
   return s ? s.replace('T', ' ').slice(0, 19) : '-'
 }
 
+function fmtNum(n: number): string {
+  return (n ?? 0).toLocaleString('en-US')
+}
+
 onMounted(load)
 </script>
 
@@ -71,9 +75,15 @@ onMounted(load)
           </RouterLink>
         </template>
       </el-table-column>
-      <el-table-column prop="credits" label="Credits" width="110" />
-      <el-table-column prop="warfunds" label="Warfunds" width="110" />
-      <el-table-column prop="gold" label="Gold" width="90" />
+      <el-table-column label="Credits" width="130" align="right">
+        <template #default="{ row }">{{ fmtNum(row.credits) }}</template>
+      </el-table-column>
+      <el-table-column label="Warfunds" width="130" align="right">
+        <template #default="{ row }">{{ fmtNum(row.warfunds) }}</template>
+      </el-table-column>
+      <el-table-column label="Gold" width="100" align="right">
+        <template #default="{ row }">{{ fmtNum(row.gold) }}</template>
+      </el-table-column>
       <el-table-column label="状态" width="90">
         <template #default="{ row }">
           <el-tag v-if="row.banned" type="danger" size="small">已封禁</el-tag>

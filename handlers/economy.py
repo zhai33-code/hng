@@ -49,6 +49,7 @@
   余额不足码 56 not_enough_credits / 153 not_enough_warfunds / 57 not_enough_gold。
 """
 
+import calendar
 import time
 
 from protocol import (
@@ -101,19 +102,30 @@ def _zulu(dt):
 
 
 def _ms_str(dt):
-    """datetime → 毫秒数字符串（Booster.expirationTime 格式）。"""
+    """datetime → 毫秒数字符串（Booster.expirationTime 格式）。
+
+    客户端 getTimeLeft 用 Number(expirationTime) - serverTimeAsNumber
+    （均为 UTC epoch ms），须用 timegm 而非 mktime（后者按本地时区解析
+    UTC 分量，非 UTC 时区服务器上激活中的加成会被立即判过期）。"""
     if dt is None:
         return '0'
-    return str(int(time.mktime(dt.timetuple()) * 1000))
+    return str(calendar.timegm(dt.utctimetuple()) * 1000)
 
 
 # ------------------------------------------------------------- KVCS 推送
 
-async def push_booster_rows(sess, writer, pid, ribbon=False):
-    """推送加成 KVCS 行（Booster 或 RibbonBooster 表，xmlTag 区分）。
+async def push_booster_rows(sess, writer, pid):
+    """推送加成 KVCS 行，按 is_ribbon 列分表（全量刷新，幂等）：
 
-    ribbon=True 推 RibbonBooster（勋带加成，AddBoosterRequest 购买）；
-    否则推 Booster（通用加成，AddVariousBoosterRequest 购买）。"""
+    - 勋带加成（AddBoosterRequest 购买）→ RibbonBooster 表
+      （激活链路 RibbonBoosterTable→ProgressionModel→ActivateBoosterCommand）；
+    - 通用加成（AddVariousBoosterRequest 购买）→ Booster 表。
+
+    两张模板表 id 有重叠（BoosterTemplate 1-5 是 RibbonBoosterTemplate
+    子集），不能按模板 id 分类，须以购买请求类型记录的 is_ribbon 为准。
+    勋带行漏推 RibbonBooster 表时，重登后客户端表为空 → 已购勋带加成
+    无法激活（激活按钮回落购买态）；勋带行误推 Booster 表时，客户端
+    BoosterTemplateTable 查不到模板引发空引用。"""
     if STORE is None or sess.playerview_cmd is None:
         return
     try:
@@ -121,17 +133,19 @@ async def push_booster_rows(sess, writer, pid, ribbon=False):
     except Exception as e:
         log(f'      [DB] list_boosters failed: {e}')
         return
-    table = b'RibbonBooster' if ribbon else b'Booster'
+    counts = {}
     for r in rows:
+        table = b'RibbonBooster' if r.get('is_ribbon') else b'Booster'
+        counts[table] = counts.get(table, 0) + 1
         m = pb_int64(1, r['id'])                          # id
         m += pb_int64(2, pid)                             # playerId
         m += pb_int64(3, r['template_id'])                # boosterTemplateId
         m += pb_uint32(4, 1)                              # itemsAccumulated
         m += pb_string(5, _ms_str(r['expires_at']))       # expirationTime
         await _push_kvcs(writer, sess.playerview_cmd, table, m)
-    if rows:
+    for table, n in counts.items():
         log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
-            f'({table.decode()} x{len(rows)}, player={pid})')
+            f'({table.decode()} x{n}, player={pid})')
 
 
 async def push_ticket_rows(sess, writer, pid, timed=False):
@@ -470,7 +484,8 @@ async def handle_add_booster(sess, writer, cmd_id, req_type, proto):
             if pid is not None and booster_id:
                 await STORE.add_booster(int(pid), booster_id,
                                         duration_minutes=_BOOSTER_MINUTES,
-                                        activate_now=activate_now, conn=tx)
+                                        activate_now=activate_now, conn=tx,
+                                        is_ribbon=True)
                 log(f'      [DB] add_booster(ribbon) player={pid} '
                     f'template={booster_id} activate_now={activate_now}')
     except _PaymentFailed:
@@ -482,7 +497,7 @@ async def handle_add_booster(sess, writer, cmd_id, req_type, proto):
     if ok:
         await _push_player_refresh(sess, writer)
         if pid is not None:
-            await push_booster_rows(sess, writer, int(pid), ribbon=True)
+            await push_booster_rows(sess, writer, int(pid))
 
     resp = build_response(cmd_id, 'AddBoosterResponse', pb_int32(1, code))
     writer.write(resp)
@@ -511,7 +526,7 @@ async def handle_activate_booster(sess, writer, cmd_id, req_type, proto):
             log(f'      [DB] activate_booster failed: {e}')
             code = 208
     if code == RC_OK and pid is not None:
-        await push_booster_rows(sess, writer, int(pid), ribbon=True)
+        await push_booster_rows(sess, writer, int(pid))
 
     resp = build_response(cmd_id, 'ActivateBoosterResponse', pb_int32(1, code))
     writer.write(resp)

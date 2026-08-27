@@ -219,16 +219,24 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         # ★ 2026-08-20 DB 化：f35 CharacterXp ← characters.combat_xp（军衔进度条），
         #   f3 Ribbon 勋带进度 ← character_ribbon_xp（等级经 ribbonlevel 阈值推导）。
         #   其余计数字段（击杀/死亡/距离/载具武器统计等）无战斗结算写入源，保持 0。
+        # ★ 2026-08-27 两人局修复：请求里的 characterids 属于"发起请求的那个
+        #   玩家"，但该请求无玩家标识可回查（ZServer 按角色直发），原来只取
+        #   最后一条会话的角色库 → 两人局先入队玩家的角色查无此 id（xp=0、
+        #   无勋带）。改为聚合所有进局会话玩家的角色，按 char_id 反查所属
+        #   player 查勋带。
         chars_by_id = {}
+        pid_by_char = {}
         stats_pid = None
         stats_cid = 0
         for _s in matchmaking.PMS_TO_SESSION.values():
             stats_pid = _s['player_id']   # dict 保序 → 最后一条 = 最新进局会话
             stats_cid = int(_s.get('char_id', 0) or 0)
-        if stats_pid is not None and STORE is not None:
+            if STORE is None:
+                continue
             try:
-                for ch in await STORE.list_characters(int(stats_pid)):
+                for ch in await STORE.list_characters(int(_s['player_id'])):
                     chars_by_id[int(ch['id'])] = ch
+                    pid_by_char[int(ch['id'])] = int(_s['player_id'])
             except Exception as e:
                 log(f'[DB] stats list_characters failed: {e}')
         stat_fields = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
@@ -246,9 +254,12 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             cs += pb_string(56, '')                      # key（required）
             entry = pb_int64(1, cid)
             entry += pb_message(2, cs)
-            if ch and stats_pid is not None and STORE is not None:
+            if ch and STORE is not None:
                 try:
-                    xps = await STORE.get_ribbon_xp(int(stats_pid), int(cid))
+                    ribbon_pid = pid_by_char.get(int(cid), stats_pid)
+                    if ribbon_pid is None:
+                        raise LookupError('char not owned by any live session')
+                    xps = await STORE.get_ribbon_xp(int(ribbon_pid), int(cid))
                     for rid, total in sorted(xps.items()):
                         if total > 0:
                             entry += pb_message(3, _msg_ribbon_progress(rid, total))
@@ -393,13 +404,24 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         #   账号库角色（小 id），回放大 id(6360...) 不在列表里 → 客户端按角色查
         #   装备落空 → 部署界面空 + 部署崩溃。
         #   会话匹配：优先按请求 f1 missionSessionId 精确命中（可能是 pms_id 或
-        #   battle_session_id——ZServer 从 PlayerSettings f25 / PMS 取值回传），
-        #   匹配不到回退最新一条（单人服）。
+        #   battle_session_id——ZServer 从 PlayerSettings f25 / PMS 取值回传）。
+        #   ★ 2026-08-27 两人局修复：ZServer 实际回传的却是它自己按局生成的
+        #   id（730433917*10^6+mission，兼作 stats session id），两人局必然
+        #   命不中任何玩家会话 → 原来回退"最新会话"= 后入队玩家 → 先入队
+        #   玩家小队拿到后者的 faction → 战斗服两个小队全进同一 team →
+        #   "#error3 squad setup invalid"、部署界面起不来。故再加一层按
+        #   请求 f2 squadId（=PlayerSettings f16=成局登记 squad_id）反查；
+        #   faction 最终以 _MM_MISSION_SQUADS 登记表为准（见下方 sq_info）。
         mm_sess = None
         if mission_session_id_req:
             for _s in matchmaking.PMS_TO_SESSION.values():
                 if mission_session_id_req in (_s.get('pms_id'),
                                               _s.get('battle_session_id')):
+                    mm_sess = _s
+                    break
+        if mm_sess is None and requested_squad_id:
+            for _s in matchmaking.PMS_TO_SESSION.values():
+                if int(requested_squad_id) == int(_s.get('squad_id', 0) or 0):
                     mm_sess = _s
                     break
         if mm_sess is None:
@@ -433,6 +455,11 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             squad_leader_char_id = int(sq_info.get('leader_char_id', 0) or 0) \
                 or (int(members[0]['char_id']) if members else sess_char_id)
             owner_char_id = squad_leader_char_id
+            # ★ faction 以成局登记表为准（matchmaking 按 entry.faction 分组
+            #   写入）：会话回退值在两人局可能是另一名玩家的 faction。
+            if int(sq_info.get('faction', 0) or 0):
+                team_runtime_faction_id = int(sq_info['faction'])
+                faction_template_id = int(sq_info['faction'])
             # playerSlots：每名成员一个槽（slotTemplateId=1 突击步兵位，
             # 与 SquadPlayerSlotTemplate 对齐；index=成员在队内槽位）
             slots = b''.join(
@@ -507,9 +534,17 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                 missionid = claimed
                 det = matchmaking._MM_MISSION_DETAILS.get(missionid)
         if det and 'preset' in det:
+            # ★ 阵营字段无默认值：_faction_pair 校验（缺失/非法/同侧 →
+            #   None + ERROR 日志），不静默用 2/GE、3/SU 默认阵营配出生侧
+            #   （曾致错阵营判负+观战）。校验不过按"无详情"走 legacy 回退。
+            #   角色建号即写 faction、_start_match 恒写攻防字段，正常路径
+            #   恒合法；此处仅拦结构损坏。
+            fp = matchmaking._faction_pair(det)
+            if fp is None:
+                det = None
+        if det and 'preset' in det:
             preset_id = int(det['preset'])
-            defender_faction = int(det.get('defender_faction', 2) or 2)
-            attacker_faction = int(det.get('attacker_faction', 3) or 3)
+            attacker_faction, defender_faction = fp
             enable_bots = bool(det.get('enable_bots', True))
             # 本局天气/时段（成局时随机抽取，与简报 MissionInfo f12/f13 同源）
             weather_tod = int(det.get('weather_tod', 1))

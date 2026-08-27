@@ -167,18 +167,158 @@ def main():
               b'delete' in data and b'PlayerMatchMaking' in data)
         check('推送序列：BattleInfo 已推', b'BattleInfo' in data)
 
+        # ---- 7. 阵营字段缺失 → 不放行（加固：原 .get 默认 3=SU 漏放） ----
+        seed_mission(900006, gamemode=5, preset=10, players=1, age=5,
+                     attacker=1, defender=2)
+        det6 = matchmaking._MM_MISSION_DETAILS[900006]
+        det6['attacker_faction'] = 0
+        check('attacker_faction 为 0 → 不放行（不回退默认 3）',
+              matchmaking._find_joinable_mission(5, (10,), 3,
+                                                  only_mission=900006) is None)
+        det6['attacker_faction'] = 1
+        det6.pop('defender_faction', None)
+        check('defender_faction 字段缺失 → 不放行',
+              matchmaking._find_joinable_mission(5, (10,), 2,
+                                                  only_mission=900006) is None)
+        det6['defender_faction'] = 2
+        check('字段恢复：SU（第三方）仍不可加入（美德局挡苏军）',
+              matchmaking._find_joinable_mission(5, (10,), 3,
+                                                  only_mission=900006) is None)
+        check('字段恢复：GE（defender）可加入',
+              matchmaking._find_joinable_mission(5, (10,), 2,
+                                                  only_mission=900006) is not None)
+
+        # ---- 8. rejoin：_find_player_active_mission 只找存活原局 ----
+        rpid = 999
+        pms_a, pms_b = 600001, 600002
+        matchmaking.PMS_TO_SESSION[pms_a] = {
+            'pms_id': pms_a, 'player_id': rpid, 'char_id': 42, 'faction': 3}
+        matchmaking.PMS_TO_MISSION[pms_a] = 900003
+        check('rejoin：有存活原局 → 命中该局',
+              matchmaking._find_player_active_mission(rpid) == 900003)
+        matchmaking.PMS_TO_SESSION[pms_b] = {
+            'pms_id': pms_b, 'player_id': rpid, 'char_id': 42, 'faction': 3}
+        matchmaking.PMS_TO_MISSION[pms_b] = 900001
+        check('rejoin：多条会话 → 取最新成局（最大 mission_id）',
+              matchmaking._find_player_active_mission(rpid) == 900003)
+        matchmaking.PMS_TO_MISSION[pms_a] = 999999
+        matchmaking.PMS_TO_MISSION[pms_b] = 999999
+        check('rejoin：原局均已释放 → None（走正常匹配）',
+              matchmaking._find_player_active_mission(rpid) is None)
+        check('rejoin：无会话玩家 → None',
+              matchmaking._find_player_active_mission(123456) is None)
+
+        # ---- 9. _join_existing_mission 去重（rejoin 不残留旧痕迹） ----
+        matchmaking.PMS_TO_SESSION[pms_a] = {
+            'pms_id': pms_a, 'player_id': rpid, 'char_id': 42, 'faction': 3}
+        matchmaking.PMS_TO_MISSION[pms_a] = 900003
+        det3 = matchmaking._MM_MISSION_DETAILS[900003]
+        det3['players'].append({'player_id': rpid, 'gamertag': 'Rejoiner',
+                                'char_id': 42, 'faction': 3,
+                                'pms_id': pms_a})
+        matchmaking._MM_MISSION_SQUADS.setdefault(900003, {})[777001] = {
+            'name': 'Infantry Squad', 'leader_char_id': 42, 'faction': 3,
+            'squad_db_id': 0, 'template': 1,
+            'members': [{'player_id': rpid, 'char_id': 42,
+                         'gamertag': 'Rejoiner', 'rank': 1, 'slot': 0}]}
+        w9 = FakeWriter()
+        ctx9 = {'writer': w9, 'view_cmd': 100, 'gamertag': 'Rejoiner',
+                'char_name': 'Rejoiner', 'rank': 1, 'metrics_uid': 'uid-r',
+                'metrics_session_id': 434343}
+        entry9 = mm_pool.QueueEntry(player_id=rpid, char_id=42, faction=3,
+                                    gamemode_id=5, presets=(10,))
+        matchmaking._MM_QUEUES[rpid] = {'pmm_id': 555009, 'mission_id': 0,
+                                        'gamemode': 5, 'ctx': ctx9}
+        asyncio.run(matchmaking._join_existing_mission(rpid, 900003, entry9,
+                                                        ctx9))
+        pms_of_rpid = [p for p, r in matchmaking.PMS_TO_SESSION.items()
+                       if r.get('player_id') == rpid and
+                       matchmaking.PMS_TO_MISSION.get(p) == 900003]
+        check('去重：同玩家同局 PMS 会话仅 1 条（旧会话已清）',
+              len(pms_of_rpid) == 1 and pms_a not in pms_of_rpid)
+        check('去重：det.players 该玩家仅 1 条',
+              sum(1 for p in det3['players']
+                  if p['player_id'] == rpid) == 1)
+        squads3 = matchmaking._MM_MISSION_SQUADS.get(900003) or {}
+        check('去重：小队 members 该玩家仅 1 条',
+              sum(1 for s in squads3.values() for m in s['members']
+                  if m['player_id'] == rpid) == 1)
+        check('去重：原空小队 777001 已移除（重选/重建小队）',
+              777001 not in squads3)
+
+        # ---- 10. _prune_match_factions：非战争模式同局限两阵营 ----
+        m3 = mm_pool.Match(players=[
+            mm_pool.QueueEntry(player_id=1, char_id=11, faction=1,
+                               gamemode_id=5, presets=(10,)),
+            mm_pool.QueueEntry(player_id=2, char_id=22, faction=2,
+                               gamemode_id=5, presets=(10,)),
+            mm_pool.QueueEntry(player_id=3, char_id=33, faction=3,
+                               gamemode_id=5, presets=(10,))],
+            preset_id=10)
+        dropped = matchmaking._prune_match_factions(m3, 1, 2, 5)
+        check('撮合裁剪：三国同局 → 第三阵营被裁（美德局裁苏军）',
+              [e.player_id for e in dropped] == [3] and
+              [e.player_id for e in m3.players] == [1, 2])
+        m2 = mm_pool.Match(players=[
+            mm_pool.QueueEntry(player_id=1, char_id=11, faction=1,
+                               gamemode_id=5, presets=(10,)),
+            mm_pool.QueueEntry(player_id=2, char_id=22, faction=2,
+                               gamemode_id=5, presets=(10,))],
+            preset_id=10)
+        check('撮合裁剪：两阵营 → 不裁',
+              matchmaking._prune_match_factions(m2, 1, 2, 5) == [])
+        m3w = mm_pool.Match(players=[
+            mm_pool.QueueEntry(player_id=1, char_id=11, faction=1,
+                               gamemode_id=10, presets=(10,)),
+            mm_pool.QueueEntry(player_id=3, char_id=33, faction=3,
+                               gamemode_id=10, presets=(10,))],
+            preset_id=10)
+        check('撮合裁剪：战争模式（gamemode 10）不裁',
+              matchmaking._prune_match_factions(m3w, 1, 3, 10) == [])
+
+        # ---- 11. _faction_pair / _rival_faction（去默认值加固） ----
+        check('_faction_pair：合法攻防 → (atk, dfd)',
+              matchmaking._faction_pair({'attacker_faction': 1,
+                                         'defender_faction': 2}) == (1, 2))
+        check('_faction_pair：字段缺失 → None',
+              matchmaking._faction_pair({'attacker_faction': 1}) is None and
+              matchmaking._faction_pair({}) is None)
+        check('_faction_pair：非法值/同侧 → None',
+              matchmaking._faction_pair({'attacker_faction': 0,
+                                         'defender_faction': 2}) is None and
+              matchmaking._faction_pair({'attacker_faction': 2,
+                                         'defender_faction': 2}) is None)
+        check('_rival_faction：GE→SU、US/SU→GE（两处硬编码合一）',
+              matchmaking._rival_faction(2) == 3 and
+              matchmaking._rival_faction(1) == 2 and
+              matchmaking._rival_faction(3) == 2)
+        # AI 局简报 f8 = 实际 AI 阵营（原恒 2，GE 玩家错位）
+        info_ge = matchmaking._msg_mission_info(1, 2, '2026-01-01T00:00:00Z',
+                                                 matchmaking._rival_faction(2))
+        info_us = matchmaking._msg_mission_info(1, 2, '2026-01-01T00:00:00Z',
+                                                 matchmaking._rival_faction(1))
+        # f8 = field 8 varint（field1-7 均小于 8 字节，0x40 03 = f8:3 粗定位）
+        check('AI 局简报 f8：GE 玩家 → AI 方 SU(3)（原恒 GE 错位）',
+              b'\x40\x03' in info_ge)
+        check('AI 局简报 f8：US 玩家 → AI 方 GE(2)（原行为不变）',
+              b'\x40\x02' in info_us)
+
         # ---- 清理（模块级全局，防污染其它测试） ----
-        for mid in (900001, 900002, 900003, 900004, 900005):
+        for mid in (900001, 900002, 900003, 900004, 900005, 900006):
             matchmaking.COMBAT_INSTANCES.pop(mid, None)
             matchmaking._MM_MISSION_DETAILS.pop(mid, None)
+            matchmaking._MM_MISSION_SQUADS.pop(mid, None)
         for pms_id in list(matchmaking.PMS_TO_SESSION):
             if matchmaking.PMS_TO_MISSION.get(pms_id) in (
-                    900001, 900002, 900003, 900004, 900005):
+                    900001, 900002, 900003, 900004, 900005, 900006, 999999):
                 matchmaking.PMS_TO_MISSION.pop(pms_id, None)
                 matchmaking.PMS_TO_SESSION.pop(pms_id, None)
         matchmaking._MM_QUEUES.pop(pid, None)
+        matchmaking._MM_QUEUES.pop(rpid, None)
         matchmaking._MATCH_PMM_IDS.pop(pid, None)
+        matchmaking._MATCH_PMM_IDS.pop(rpid, None)
         matchmaking._SOLO_SQUADS.pop(pid, None)
+        matchmaking._SOLO_SQUADS.pop(rpid, None)
     finally:
         mm_config.JOIN_WINDOW = old_window
         mm_config.GAMEMODES[5] = old_gm5

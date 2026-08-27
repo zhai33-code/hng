@@ -645,6 +645,32 @@ async def handle_setcharacteractivestatusrequest(sess, writer, cmd_id, req_type,
             log(f'[DB] reload character after active status failed: {e}')
 
 
+async def _repush_vehicle_row(sess, writer, pid, vehicle_id):
+    """重推单条 Vehicle KVCS（仓库转运/指派后客户端 VehicleTable 收敛用）。
+
+    SendItemToDepot / SetInventoryItemToCharacter 只回 response 不推数据时，
+    客户端列表等不到 characterId/equippedInSlot 变化 → UI"不走"→ 玩家连点重发
+    （2026-08-27 La-7 重复扣费事故根因之一）。
+    """
+    if sess.soldier_view_cmd is None or pid is None or not vehicle_id:
+        return
+    try:
+        v = await STORE.get_vehicle(pid, int(vehicle_id))
+    except Exception as e:
+        log(f'[DB] get_vehicle failed: {e}')
+        return
+    if v is None:
+        return
+    vproto = _msg_vehicle(v['id'], v['vehicle_variant_template_id'],
+                          v['character_id'], v['equipped_in_slot'],
+                          v.get('variant_id', 0), v.get('auto_repair', 0),
+                          v.get('condition', 100.0))
+    await _push_kvcs(writer, sess.soldier_view_cmd, b'Vehicle', vproto)
+    log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+        f'(Vehicle id={v["id"]}, charId={v["character_id"]}, '
+        f'slot={v["equipped_in_slot"]})')
+
+
 async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_type, proto):
     # 装备/仓库物品指派到角色（仓库物品栏拖拽）
     # SetInventoryItemToCharacterRequest { string itemType=1; int64 itemId=2; int64 characterId=3; }
@@ -680,6 +706,25 @@ async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_ty
     log(f'S->C cmd={cmd_id:<4} SetInventoryItemToCharacterResponse '
         f'(msg={1 if updated else 0})')
 
+    # 重推 Vehicle 行（characterId 变化 → 客户端 onVehicleUpdates 把载具从
+    # 仓库挪回角色装备列表；不推 UI 不刷新，玩家会连点重发）
+    if updated and str(si_item_type).strip().lower() == 'vehicle':
+        await _repush_vehicle_row(sess, writer, pid, si_item_id)
+
+    # 重推 character KVCS（武器+随行弹药指派到角色 → unlockBits 增加对应
+    # uid；不推则本会话内弹药勾选框锁死 + "Ribbon required"，重登才恢复）
+    if updated and str(si_item_type).strip().lower() == 'weapon' and si_char_id:
+        try:
+            for ch in await STORE.list_characters(pid):
+                if int(ch['id']) != int(si_char_id):
+                    continue
+                await _repush_character_row(sess, writer, ch)
+                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
+                    f'{ch["name"]} re-pushed after weapon assign)')
+                break
+        except Exception as e:
+            log(f'[DB] reload character after weapon assign failed: {e}')
+
 
 async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
     # 物品送回仓库（物品栏 → 仓库；character_id 清 0）
@@ -707,9 +752,36 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
         sd_tab = ''
         sd_is_free = True
 
-    # 扣款（非免费存放时收存放费）
-    if not sd_is_free and sd_pricing_id:
-        cost, ok = await _charge_player(sess, sd_pricing_id, sd_currency)
+    pid = await sess.ensure_player()
+
+    # 幂等预检（2026-08-27 La-7 事故：客户端收不到 Vehicle 重推导致连点 4 次，
+    # 每次都被重复扣全价转运费）：物品已在仓库（character_id=0）时直接成功返回，
+    # 不扣款不重写；物品不存在（None）时同样跳过扣款（避免钱货两空）
+    cur_char = None
+    if pid is not None and sd_object_id:
+        try:
+            cur_char = await STORE.get_item_character(pid, int(sd_item_type),
+                                                      int(sd_object_id))
+        except Exception as e:
+            log(f'[DB] get_item_character failed: {e}')
+    if cur_char == 0:
+        resp_proto = pb_int32(1, 1)
+        resp = build_response(cmd_id, 'SendItemToDepotResponse', resp_proto)
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} SendItemToDepotResponse '
+            f'(already in depot, no charge)')
+        # 仍重推 Vehicle 行让客户端列表收敛（连点的根因就是收不到这条推送）
+        if int(sd_item_type) == 2:
+            await _repush_vehicle_row(sess, writer, pid, sd_object_id)
+        return
+
+    # 扣款（非免费存放时收存放费 = 定价 50%，与客户端 ItemInfoOverlayMediator
+    # setTransferPrice 的 finalGoldFractionPrice(0.5)/finalCreditFractionPrice(0.5)
+    # 一致；此前扣全价，确认框显示半价、实际扣款翻倍）
+    if not sd_is_free and sd_pricing_id and cur_char is not None:
+        cost, ok = await _charge_player(sess, sd_pricing_id, sd_currency,
+                                        fraction=0.5)
         if not ok:
             resp_proto = pb_int32(1, 56)  # not_enough_credits
             resp = build_response(cmd_id, 'SendItemToDepotResponse', resp_proto)
@@ -719,7 +791,6 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
                 f'(response=56 not_enough) cost={cost}')
             return
 
-    pid = await sess.ensure_player()
     updated = False
     if pid is not None and sd_object_id:
         try:
@@ -736,6 +807,11 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} SendItemToDepotResponse '
         f'(response={1 if updated else 0})')
+
+    # 重推 Vehicle 行（characterId→0、equippedInSlot→0 → 客户端 onVehicleUpdates
+    # 把载具从装备列表挪进仓库；不推 UI 不刷新）
+    if int(sd_item_type) == 2:
+        await _repush_vehicle_row(sess, writer, pid, sd_object_id)
     await _push_player_refresh(sess, writer)
 
 

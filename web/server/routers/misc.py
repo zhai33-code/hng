@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
-"""管理 API：仪表盘 / 战报 / 服务器状态 / 注册统计 / 审计日志。"""
+"""管理 API：仪表盘 / 战报 / 服务器状态 / 在线统计 / 注册统计 / 审计日志。"""
+import asyncio
+import json
 import socket
 import time
+import urllib.request
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .. import auth, templates_data
 from .. import db
+from ..config import GAME_HTTP_BASE
 
 router = APIRouter(prefix='/api', tags=['misc'],
                    dependencies=[Depends(auth.current_admin)])
@@ -104,6 +108,28 @@ async def status():
         'game_tcp_15110': probe('127.0.0.1', 15110),
         'stats_tcp_15115': probe('127.0.0.1', 15115),
     }
+
+
+def _fetch_online_snapshot(timeout: float = 3.0):
+    """同步拉取游戏服 /online.json（urllib 走 to_thread 线程池）。"""
+    url = f'{GAME_HTTP_BASE}/online.json'
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode('utf-8'))
+    except Exception:
+        return None
+
+
+@router.get('/online')
+async def online():
+    """实时在线统计：转发游戏服 web_server 的 /online.json。
+
+    数据源是游戏服进程内存（FLASH_SESSIONS + 匹配/战局注册表），
+    零延迟无落库；游戏服不可达 / 未更新到含 /online.json 的版本 → 502。"""
+    data = await asyncio.to_thread(_fetch_online_snapshot)
+    if data is None:
+        raise HTTPException(502, '游戏服在线统计不可达（服务未启动或版本过旧）')
+    return data
 
 
 @router.get('/audit-log')

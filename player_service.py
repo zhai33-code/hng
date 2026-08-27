@@ -57,11 +57,13 @@ from messages import (
     )
 
 
-async def _charge_player(sess, pricing_id, currency, conn=None):
+async def _charge_player(sess, pricing_id, currency, conn=None, fraction=1.0):
     """按 pricing_id + 支付货币扣款，返回 (cost, ok)。定价缺失或货币类型无效时不扣款（返回 0, True）。
 
     原子扣款（事务内 FOR UPDATE + 增量扣减），杜绝并发丢更新/超额消费；
     传入 conn（STORE.transaction() 上下文）时并入外部事务，与发货同生共死。
+    fraction 为价格比例（如仓库转运费 0.5），取整口径与客户端
+    PriceObject.calculateFractionPrice 的 Math.max(1, int(base*fraction)) 一致。
     """
     if pricing_id is None or pricing_id <= 0:
         return 0, True
@@ -74,6 +76,8 @@ async def _charge_player(sess, pricing_id, currency, conn=None):
     cost = int(price[key] or 0)
     if cost <= 0:
         return 0, True
+    if fraction != 1.0:
+        cost = max(1, int(cost * fraction))
     pid = await sess.ensure_player()
     if pid is None:
         return cost, False
@@ -342,6 +346,7 @@ async def _msg_player_for(sess, gamertag=None):
     """从数据库读取货币/教程完成态并构建 player proto；DB 不可用时回退默认值。"""
     cur = {'credits': 100000, 'warfunds': 100000, 'gold': 100000}
     tutorials_completed = 0
+    faction = None
     pid = await sess.ensure_player()
     if pid is not None:
         try:
@@ -352,8 +357,13 @@ async def _msg_player_for(sess, gamertag=None):
             tutorials_completed = await STORE.get_tutorials_completed(pid)
         except Exception as e:
             log(f'[DB] get_tutorials_completed failed: {e}')
+        try:
+            faction = await STORE.get_player_faction(pid)
+        except Exception as e:
+            log(f'[DB] get_player_faction failed: {e}')
     return msg_player(gamertag or sess.username or 'DemoPlayer',
-                      tutorials_completed=tutorials_completed, **cur)
+                      tutorials_completed=tutorials_completed,
+                      pid=pid or 1, faction=faction, **cur)
 
 
 
