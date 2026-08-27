@@ -42,6 +42,10 @@ from state import (
 
 from wardb import WARDB_UNIQUE
 
+# fs 同步 CAS 文件目录：改动过的客户端文件以 <sha256>-<size>_<flag> 为名放入，
+# 供 hngsync GET /<sha256>-<size>_<flag> 下载（见 do_GET 内 CAS 路由）
+CAS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cas')
+
 
 # ---- 本地化文件补全 ----
 # 客户端 HnG_Strategy_en.xml 的 ErrorMessages/StrategyGame 段缺少部分 ResponseCodes
@@ -500,10 +504,15 @@ class HttpHandler(SimpleHTTPRequestHandler):
             self.wfile.write(b'OK')
             return
         if path == '/status' or path == '//status':
-            self.send_response(200)
+            # swf 维护检查 onStatusReceived 的开服判定与域名/IP 版本相反：
+            # 域名访问（streamURL 含 "game" → isGame=true）需 <400 才判开服；
+            # IP 直连版 swf（isGame=false）需 >400 才判开服，回 200 反而弹维护屏
+            host = (self.headers.get('Host') or '').lower()
+            ok = 'hng-group.com' in host
+            self.send_response(200 if ok else 404)
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
-            self.wfile.write(b'OK')
+            self.wfile.write(b'OK' if ok else b'Not Found')
             return
         if path == '/online.json' or path == '//online.json':
             _handle_online_api(self)
@@ -582,6 +591,32 @@ class HttpHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(body)
                 log(f'[HTTP] served patched HnG_Strategy_en.xml ({len(body)}B)')
                 return
+        # fs 同步 CAS 下发：hngsync 以 GET /<sha256>-<size>_<flag> 拉文件本体。
+        # 把改动过的客户端文件（如 IP 版 HeroesAndGeneralsDesktop.swf）以 CAS 名
+        # 放入 hng-re/cas/ 即可被下载——与 currentfiles.txt 登记的哈希保持一致，
+        # 客户端 hngsync 校验/自愈时下到的就是改后版本。
+        # 注意：hngsync 解析响应依赖 Content-Length（Http_FileDownload 0x1400410F0），
+        # 此处必须显式下发该头。
+        m = re.fullmatch(r'/([0-9a-f]{64}-\d+_\d+)', path)
+        if m:
+            cas_name = m.group(1)
+            cas_path = os.path.realpath(os.path.join(CAS_DIR, cas_name))
+            if (cas_path.startswith(os.path.realpath(CAS_DIR) + os.sep)
+                    and os.path.isfile(cas_path)):
+                with open(cas_path, 'rb') as f:
+                    body = f.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/octet-stream')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                log(f'[HTTP] served CAS /{cas_name} ({len(body)}B)')
+            else:
+                self.send_response(404)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                log(f'[HTTP] 404 CAS /{cas_name} (not in cas dir)')
+            return
         # 安全校验：目录列表与敏感扩展名一律 404（统一在静态回退前拦截）
         if _deny_static(path):
             self.send_error(404, 'Not Found')
