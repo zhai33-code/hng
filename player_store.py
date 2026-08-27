@@ -399,6 +399,14 @@ CREATE TABLE IF NOT EXISTS depot_items (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 迁移：depot_items 去重 + 唯一约束（历史无约束导致 SetDepotItemViewed 每次
+-- INSERT 一行、ON CONFLICT DO NOTHING 永不触发 → 表无限膨胀且 UPDATE 跨 tab 误标）
+DELETE FROM depot_items a USING depot_items b
+WHERE a.player_id = b.player_id AND a.item_type = b.item_type
+  AND a.item_id = b.item_id AND a.id > b.id;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_depot_items
+    ON depot_items(player_id, item_type, item_id);
+
 -- 小队 / 军团
 CREATE TABLE IF NOT EXISTS squads (
     id SERIAL PRIMARY KEY, name TEXT NOT NULL, faction BIGINT NOT NULL DEFAULT 0,
@@ -2835,7 +2843,11 @@ class PlayerStore:
     async def set_inventory_item_character(self, player_id, item_type, item_id,
                                            character_id):
         """装备/仓库物品指派到角色（SetInventoryItemToCharacterRequest，
-        itemType 为小写字符串 'weapon'/'vehicle'/...）。返回是否更新。"""
+        itemType 为小写字符串 'weapon'/'vehicle'/...）。返回是否更新。
+
+        武器指派时配件/皮肤随行（character_id 跟随武器，否则 _char_unlock_bits_for
+        的配件 mapping uid 挂在旧角色名下 → 新角色配件显示锁定 + "Ribbon required"，
+        与 2026-08-27 弹药跟随同根因）；载具指派时升级/弹药/皮肤同理随行。"""
         tbl = self._ITEM_TABLES.get(str(item_type or '').strip().lower())
         if tbl is None:
             return False
@@ -2849,6 +2861,33 @@ class PlayerStore:
                 await conn.execute(
                     'UPDATE weapon_ammo SET character_id = $3 WHERE weapon_id = $1 '
                     'AND player_id = $2',
+                    int(item_id), int(player_id), int(character_id))
+                # 配件/皮肤随武器指派（weapon_id 挂靠关系保留）
+                await conn.execute(
+                    'UPDATE weapon_modifiers SET character_id = $3 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(item_id), int(player_id), int(character_id))
+                await conn.execute(
+                    'UPDATE weapon_variants SET character_id = $3 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(item_id), int(player_id), int(character_id))
+            elif tbl == 'vehicles':
+                n = await conn.execute(
+                    f'UPDATE {tbl} SET character_id = $3 WHERE id = $1 '
+                    'AND player_id = $2',
+                    int(item_id), int(player_id), int(character_id))
+                # 升级/弹药/皮肤随载具指派（vehicle_id 挂靠关系与槽位保留）
+                await conn.execute(
+                    'UPDATE vehicle_upgrades SET character_id = $3 '
+                    'WHERE vehicle_id = $1 AND player_id = $2',
+                    int(item_id), int(player_id), int(character_id))
+                await conn.execute(
+                    'UPDATE vehicle_ammo SET character_id = $3 '
+                    'WHERE vehicle_id = $1 AND player_id = $2',
+                    int(item_id), int(player_id), int(character_id))
+                await conn.execute(
+                    'UPDATE vehicle_variants SET character_id = $3 '
+                    'WHERE vehicle_id = $1 AND player_id = $2',
                     int(item_id), int(player_id), int(character_id))
             else:
                 n = await conn.execute(
@@ -2891,10 +2930,35 @@ class PlayerStore:
                     'UPDATE weapon_ammo SET character_id = 0 WHERE weapon_id = $1 '
                     'AND player_id = $2',
                     int(object_id), int(player_id))
+                # 配件/皮肤随武器退仓（weapon_id 挂靠关系保留：客户端 isModded
+                # 靠 WeaponModifierTable 按 weapon_id 索引，清 0 会显示"无配件"，
+                # 且卸配件的 SendUpgradesToDepot 按钮也不再出现）
+                await conn.execute(
+                    'UPDATE weapon_modifiers SET character_id = 0 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                await conn.execute(
+                    'UPDATE weapon_variants SET character_id = 0 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
             elif tbl == 'vehicles':
                 n = await conn.execute(
                     'UPDATE vehicles SET character_id = 0, equipped_in_slot = 0 '
                     'WHERE id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                # 升级/弹药/皮肤随载具退仓（vehicle_id 挂靠关系与槽位保留，
+                # 语义同武器配件：客户端按 vehicle_id 判定 hasUpgradeEquipped）
+                await conn.execute(
+                    'UPDATE vehicle_upgrades SET character_id = 0 '
+                    'WHERE vehicle_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                await conn.execute(
+                    'UPDATE vehicle_ammo SET character_id = 0 '
+                    'WHERE vehicle_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                await conn.execute(
+                    'UPDATE vehicle_variants SET character_id = 0 '
+                    'WHERE vehicle_id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
             else:
                 n = await conn.execute(
@@ -2904,30 +2968,82 @@ class PlayerStore:
         return _rowcount(n) > 0
 
     async def send_upgrades_to_depot(self, player_id, item_type, object_id):
-        """升级件（配件/补给）送回仓库（SendUpgradesToDepotRequest，
-        itemType 为 ItemType 枚举 int）。返回是否更新。"""
-        tbl = self._ITEM_TYPE_ID_TABLES.get(int(item_type or 0))
-        if tbl is None:
-            return False
-        async with self.pool.acquire() as conn:
-            n = await conn.execute(
-                f'UPDATE {tbl} SET character_id = 0 WHERE id = $1 AND player_id = $2',
-                int(object_id), int(player_id))
-        return _rowcount(n) > 0
+        """卸下容器上挂的升级件（SendUpgradesToDepotRequest）。
+
+        客户端 ItemInfoOverlayMediator.showSendUpgradesToDepotButtonIfNeeded：
+        物品已在仓库时，武器 isModded / 载具 hasUpgradeEquipped 或非默认皮肤
+        → 显示"卸下升级件"按钮，请求的 itemType 是【容器类型】（1=weapon
+        2=vehicle）、objectId 是【容器实例 id】：
+        - 武器：weapon_modifiers.weapon_id 清 0（配件回仓库，character_id 同步清 0）；
+        - 载具：vehicle_upgrades 卸下（vehicle_id/equipped_slot_id 清 0）、
+          vehicles.variant_id 复位默认皮肤、vehicle_variants.character_id 清 0。
+        返回受影响行数（0 = 容器上没有可卸下的升级件/皮肤）。"""
+        if int(item_type or 0) == 1:
+            async with self.pool.acquire() as conn:
+                n = await conn.execute(
+                    'UPDATE weapon_modifiers SET weapon_id = 0, character_id = 0 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+            return _rowcount(n)
+        if int(item_type or 0) == 2:
+            async with self.pool.acquire() as conn:
+                n = await conn.execute(
+                    'UPDATE vehicle_upgrades SET vehicle_id = 0, '
+                    'equipped_slot_id = 0, character_id = 0 '
+                    'WHERE vehicle_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                m = await conn.execute(
+                    'UPDATE vehicles SET variant_id = 0 '
+                    'WHERE id = $1 AND player_id = $2 AND variant_id != 0',
+                    int(object_id), int(player_id))
+                await conn.execute(
+                    'UPDATE vehicle_variants SET character_id = 0 '
+                    'WHERE vehicle_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+            return _rowcount(n) + _rowcount(m)
+        return 0
 
     async def mark_depot_item_viewed(self, player_id, tab_name, item_id):
-        """仓库物品已读（SetDepotItemViewedRequest）。"""
+        """仓库物品已读（SetDepotItemViewedRequest）。
+        UPDATE 带 item_type 条件（唯一索引 uq_depot_items 按
+        (player_id, item_type, item_id)，不带会跨 tab 误标）。"""
         async with self.pool.acquire() as conn:
             await conn.execute(
                 'INSERT INTO depot_items (player_id, item_type, item_id, viewed) '
                 'VALUES ($1, $2, $3, TRUE) '
-                'ON CONFLICT DO NOTHING',
+                'ON CONFLICT (player_id, item_type, item_id) DO NOTHING',
                 int(player_id), str(tab_name or ''), int(item_id))
             await conn.execute(
                 'UPDATE depot_items SET viewed = TRUE WHERE player_id = $1 '
-                'AND item_id = $2',
-                int(player_id), int(item_id))
+                'AND item_type = $2 AND item_id = $3',
+                int(player_id), str(tab_name or ''), int(item_id))
         return True
+
+    async def mark_depot_item_new(self, player_id, tab_name, item_id):
+        """物品入仓标记"新"（SendItemToDepot 后调用；客户端 ItemInfoOverlay
+        setInfo 对 isNewItem 的物品发 SetDepotItemViewed 消点）。"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'INSERT INTO depot_items (player_id, item_type, item_id, viewed) '
+                'VALUES ($1, $2, $3, FALSE) '
+                'ON CONFLICT (player_id, item_type, item_id) '
+                'DO UPDATE SET viewed = FALSE',
+                int(player_id), str(tab_name or ''), int(item_id))
+        return True
+
+    async def list_depot_new_items(self, player_id):
+        """未读仓库物品 → {tab_name: [item_id,...]}（登录回放 DepotNewItem 行用）。
+        物品行已被物理删除（如武器实例清理）时对应条目自动失效，客户端
+        checkIsItemNew 查不到物品即无红点，无需服务端清理。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT item_type, item_id FROM depot_items '
+                'WHERE player_id = $1 AND viewed = FALSE ORDER BY id',
+                int(player_id))
+        out = {}
+        for r in rows:
+            out.setdefault(str(r['item_type']), []).append(int(r['item_id']))
+        return out
 
     async def mark_tutorial_triggered(self, player_id, tutorial_template_id):
         """教程已触发（MarkTutorialTriggeredRequest，幂等）。"""

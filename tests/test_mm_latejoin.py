@@ -303,22 +303,152 @@ def main():
         check('AI 局简报 f8：US 玩家 → AI 方 GE(2)（原行为不变）',
               b'\x40\x02' in info_us)
 
+        # ---- 9b. 真实小队 rejoin 归队（InBattle 掉线重连回原小队） ----
+        # A(pid=888) 与 R(pid=777) 同在 DB 小队 555（局内登记行 888001，
+        # R 掉线重连：去重移出 members 后必须放回原小队，而不是自建散人队
+        seed_mission(900007, gamemode=5, preset=10, players=2)
+        det7 = matchmaking._MM_MISSION_DETAILS[900007]
+        rpid2 = 777
+        pms_r = 600777
+        matchmaking.PMS_TO_SESSION[pms_r] = {
+            'pms_id': pms_r, 'player_id': rpid2, 'char_id': 42,
+            'gamertag': 'Rejoiner2', 'faction': 3, 'squad_db_id': 555,
+            'squad_id': 888001, 'squad_slot': 1, 'mission_id': 900007}
+        matchmaking.PMS_TO_MISSION[pms_r] = 900007
+        det7['players'].append({'player_id': rpid2, 'gamertag': 'Rejoiner2',
+                                'char_id': 42, 'faction': 3, 'pms_id': pms_r})
+        matchmaking._MM_MISSION_SQUADS.setdefault(900007, {})[888001] = {
+            'name': 'RealSquad', 'leader_char_id': 488, 'faction': 3,
+            'squad_db_id': 555, 'template': 1,
+            'members': [{'player_id': 888, 'char_id': 488,
+                         'gamertag': 'StayMate', 'rank': 3, 'slot': 0}]}
+        w9b = FakeWriter()
+        ctx9b = {'writer': w9b, 'view_cmd': 101, 'gamertag': 'Rejoiner2',
+                 'char_name': 'Rejoiner2', 'rank': 2, 'faction': 3,
+                 'char_template': 1, 'metrics_uid': 'uid-r2',
+                 'metrics_session_id': 434344}
+        entry9b = mm_pool.QueueEntry(player_id=rpid2, char_id=42, faction=3,
+                                     gamemode_id=5, presets=(10,))
+        asyncio.run(matchmaking._join_existing_mission(rpid2, 900007, entry9b,
+                                                       ctx9b))
+        new_sess9b = [r for r in matchmaking.PMS_TO_SESSION.values()
+                      if r.get('player_id') == rpid2 and
+                      matchmaking.PMS_TO_MISSION.get(r.get('pms_id')) == 900007]
+        sq9b = matchmaking._MM_MISSION_SQUADS[900007][888001]
+        check('小队 rejoin 归队：放回原小队行（squad_id 888001）',
+              len(new_sess9b) == 1 and
+              new_sess9b[0].get('squad_id') == 888001 and
+              new_sess9b[0].get('squad_db_id') == 555,
+              f'sess={new_sess9b[0] if new_sess9b else None}')
+        check('小队 rejoin 归队：槽位接续队友（slot=1）',
+              new_sess9b and new_sess9b[0].get('squad_slot') == 1)
+        check('小队 rejoin 归队：members 含队友+归队者各一次',
+              [m['player_id'] for m in sq9b['members']] == [888, 777])
+        check('小队 rejoin 归队：未自建散人队',
+              len(matchmaking._MM_MISSION_SQUADS[900007]) == 1)
+        # 原小队行不在本局（被裁/解散）→ 降级散人凑队，squad_db_id 清零
+        matchmaking._MM_MISSION_SQUADS[900007].pop(888001, None)
+        asyncio.run(matchmaking._join_existing_mission(rpid2, 900007, entry9b,
+                                                       ctx9b))
+        sess9c = [r for r in matchmaking.PMS_TO_SESSION.values()
+                  if r.get('player_id') == rpid2 and
+                  matchmaking.PMS_TO_MISSION.get(r.get('pms_id')) == 900007]
+        check('小队行缺失 → 降级散人队且 squad_db_id=0',
+              len(sess9c) == 1 and sess9c[0].get('squad_db_id') == 0)
+
+        # ---- 12. _handle_join 小队分支路由：InBattle 掉线重连回原局 ----
+        # 修复前：_squad_eligible_members 过滤 InBattle → (squad, []) →
+        # _enqueue_squad 静默 return（不掉 rejoin、不入池、无状态推送）。
+        from protocol import pb_varint
+
+        calls = {'rejoin': [], 'enqueue': []}
+
+        async def fake_eligible(p):
+            return ({'id': 555, 'name': 'RealSquad'}, [])
+
+        def fake_active(p):
+            return 900007
+
+        async def fake_rejoin(p, mid, e, c):
+            calls['rejoin'].append((p, mid, c))
+
+        async def fake_enqueue(squad, members, gm, presets, req_mid):
+            calls['enqueue'].append((squad, members))
+
+        old_eligible = matchmaking._squad_eligible_members
+        old_active = matchmaking._find_player_active_mission
+        old_rejoin = matchmaking._join_existing_mission
+        old_enqueue = matchmaking._enqueue_squad
+        old_store = matchmaking.STORE
+
+        class Store12:
+            async def list_characters(self, p):
+                return [{'id': 42, 'faction': 3, 'name': 'Rejoiner2',
+                         'combat_xp': 0, 'template': 1}]
+
+        class Sess12:
+            player_id = rpid2
+            username = 'Rejoiner2'
+            playerview_cmd = None          # 跳过 KVCS 推送
+
+            async def ensure_player(self):
+                return rpid2
+
+        matchmaking._squad_eligible_members = fake_eligible
+        matchmaking._find_player_active_mission = fake_active
+        matchmaking._join_existing_mission = fake_rejoin
+        matchmaking._enqueue_squad = fake_enqueue
+        matchmaking.STORE = Store12()
+        try:
+            proto12 = pb_varint(1, 42)      # f1 charId（f7 gamemode 缺省=0）
+            w12 = FakeWriter()
+            asyncio.run(matchmaking._handle_join(
+                Sess12(), w12, 30, proto12))
+            check('小队 InBattle 重连：路由到 rejoin 回原局（900007）',
+                  calls['rejoin'] and calls['rejoin'][0][:2] == (rpid2, 900007)
+                  and not calls['enqueue'],
+                  f'rejoin={calls["rejoin"][:1]} enqueue={calls["enqueue"]}')
+            check('小队 InBattle 重连：rejoin ctx 携带本队 squad_db_id',
+                  calls['rejoin'] and
+                  calls['rejoin'][0][2].get('squad_db_id') == 555)
+            # 无存活原局（局已结束/会话清理）→ 维持旧行为：仅整队入池路径
+            calls['rejoin'].clear()
+            matchmaking._find_player_active_mission = lambda p: None
+            w12b = FakeWriter()
+            asyncio.run(matchmaking._handle_join(
+                Sess12(), w12b, 30, proto12))
+            check('无存活原局 → 不 rejoin，空成员入池（原行为）',
+                  not calls['rejoin'] and
+                  calls['enqueue'] and calls['enqueue'][0][1] == [])
+        finally:
+            matchmaking._squad_eligible_members = old_eligible
+            matchmaking._find_player_active_mission = old_active
+            matchmaking._join_existing_mission = old_rejoin
+            matchmaking._enqueue_squad = old_enqueue
+            matchmaking.STORE = old_store
+
         # ---- 清理（模块级全局，防污染其它测试） ----
-        for mid in (900001, 900002, 900003, 900004, 900005, 900006):
+        for mid in (900001, 900002, 900003, 900004, 900005, 900006, 900007):
             matchmaking.COMBAT_INSTANCES.pop(mid, None)
             matchmaking._MM_MISSION_DETAILS.pop(mid, None)
             matchmaking._MM_MISSION_SQUADS.pop(mid, None)
         for pms_id in list(matchmaking.PMS_TO_SESSION):
             if matchmaking.PMS_TO_MISSION.get(pms_id) in (
-                    900001, 900002, 900003, 900004, 900005, 900006, 999999):
+                    900001, 900002, 900003, 900004, 900005, 900006, 900007,
+                    999999):
                 matchmaking.PMS_TO_MISSION.pop(pms_id, None)
                 matchmaking.PMS_TO_SESSION.pop(pms_id, None)
+        matchmaking.PMS_TO_SESSION.pop(600777, None)
+        matchmaking.PMS_TO_MISSION.pop(600777, None)
         matchmaking._MM_QUEUES.pop(pid, None)
         matchmaking._MM_QUEUES.pop(rpid, None)
+        matchmaking._MM_QUEUES.pop(rpid2, None)
         matchmaking._MATCH_PMM_IDS.pop(pid, None)
         matchmaking._MATCH_PMM_IDS.pop(rpid, None)
+        matchmaking._MATCH_PMM_IDS.pop(rpid2, None)
         matchmaking._SOLO_SQUADS.pop(pid, None)
         matchmaking._SOLO_SQUADS.pop(rpid, None)
+        matchmaking._SOLO_SQUADS.pop(rpid2, None)
     finally:
         mm_config.JOIN_WINDOW = old_window
         mm_config.GAMEMODES[5] = old_gm5

@@ -39,13 +39,17 @@ from wardb import (
 from messages import (
     _msg_character,
     _msg_character_stats_entry,
+    _msg_depot_new_item,
     _msg_uniform_part,
     _msg_uniform_variant,
     _msg_vehicle,
     _msg_vehicle_ammo,
+    _msg_vehicle_upgrade,
+    _msg_vehicle_variant,
     _msg_weapon,
     _msg_weapon_ammo,
     _msg_weapon_modifier,
+    _msg_weapon_variant,
     _push_kvcs,
     )
 
@@ -646,11 +650,12 @@ async def handle_setcharacteractivestatusrequest(sess, writer, cmd_id, req_type,
 
 
 async def _repush_vehicle_row(sess, writer, pid, vehicle_id):
-    """重推单条 Vehicle KVCS（仓库转运/指派后客户端 VehicleTable 收敛用）。
+    """重推单条 Vehicle KVCS 及其挂靠行（皮肤/升级/弹药），仓库转运/指派/
+    卸下升级件后客户端各表收敛用。
 
-    SendItemToDepot / SetInventoryItemToCharacter 只回 response 不推数据时，
-    客户端列表等不到 characterId/equippedInSlot 变化 → UI"不走"→ 玩家连点重发
-    （2026-08-27 La-7 重复扣费事故根因之一）。
+    SendItemToDepot / SetInventoryItemToCharacter / SendUpgradesToDepot 只回
+    response 不推数据时，客户端列表等不到 characterId/vehicleId 变化 →
+    UI"不走"→ 玩家连点重发（2026-08-27 La-7 重复扣费事故根因之一）。
     """
     if sess.soldier_view_cmd is None or pid is None or not vehicle_id:
         return
@@ -661,14 +666,134 @@ async def _repush_vehicle_row(sess, writer, pid, vehicle_id):
         return
     if v is None:
         return
+    cmd = sess.soldier_view_cmd
+    # 挂靠行（皮肤/升级/弹药）先推：Vehicle 行的 variant_id 引用 VehicleVariant
+    # 实例，与登录回放推送顺序一致（先 VehicleVariant 后 Vehicle）
+    try:
+        for vv in await STORE.list_vehicle_variants(pid):
+            if int(vv['vehicle_id']) != int(vehicle_id):
+                continue
+            await _push_kvcs(writer, cmd, b'VehicleVariant',
+                             _msg_vehicle_variant(vv['id'], vv['character_id'],
+                                                  vv['vehicle_id'],
+                                                  vv['vehicle_variant_template_id']))
+        for u in await STORE.list_vehicle_upgrades(pid):
+            if int(u['vehicle_id']) != int(vehicle_id):
+                continue
+            await _push_kvcs(writer, cmd, b'VehicleUpgrade',
+                             _msg_vehicle_upgrade(u['id'], u['upgrade_template_id'],
+                                                  u['vehicle_id'], u['equipped_slot_id'],
+                                                  u['character_id'],
+                                                  u.get('condition', 100.0),
+                                                  u.get('auto_repair', 0)))
+        for a in await STORE.list_vehicle_ammo(pid):
+            if int(a['vehicle_id']) != int(vehicle_id):
+                continue
+            await _push_kvcs(writer, cmd, b'VehicleAmmo',
+                             _msg_vehicle_ammo(a['id'], a['ammo_template_id'],
+                                               a['vehicle_id'],
+                                               a['equipped_storage_id'],
+                                               a['slot_index'], a['character_id'],
+                                               a.get('condition', 100.0),
+                                               a.get('auto_repair', 0)))
+    except Exception as e:
+        log(f'[DB] repush vehicle attached rows failed: {e}')
     vproto = _msg_vehicle(v['id'], v['vehicle_variant_template_id'],
                           v['character_id'], v['equipped_in_slot'],
                           v.get('variant_id', 0), v.get('auto_repair', 0),
                           v.get('condition', 100.0))
-    await _push_kvcs(writer, sess.soldier_view_cmd, b'Vehicle', vproto)
-    log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+    await _push_kvcs(writer, cmd, b'Vehicle', vproto)
+    log(f'S->C cmd={cmd:<4} KeyValueChangeSet '
         f'(Vehicle id={v["id"]}, charId={v["character_id"]}, '
-        f'slot={v["equipped_in_slot"]})')
+        f'slot={v["equipped_in_slot"]} + attached rows)')
+
+
+async def _repush_weapon_rows(sess, writer, pid, weapon_id):
+    """重推单件武器的 Weapon KVCS 及其挂靠行（配件/皮肤/弹药），仓库转运/
+    指派后客户端各表收敛用（对齐载具 _repush_vehicle_row；不推则武器列表
+    UI 不走 → 连点重发，且本会话 unlockBits 不刷新）。"""
+    if sess.soldier_view_cmd is None or pid is None or not weapon_id:
+        return
+    cmd = sess.soldier_view_cmd
+    try:
+        w = None
+        for row in await STORE.list_weapons(pid):
+            if int(row['id']) == int(weapon_id):
+                w = row
+                break
+        if w is None:
+            return
+        # 皮肤实例先推（与登录回放顺序一致），再推 Weapon 行
+        for vv in await STORE.list_weapon_variants(pid):
+            if int(vv['weapon_id']) != int(weapon_id):
+                continue
+            await _push_kvcs(writer, cmd, b'WeaponVariant',
+                             _msg_weapon_variant(vv['id'], vv['character_id'],
+                                                 vv['weapon_id'],
+                                                 vv['weapon_variant_template_id']))
+        for m in await STORE.list_weapon_modifiers(pid):
+            if int(m['weapon_id']) != int(weapon_id):
+                continue
+            await _push_kvcs(writer, cmd, b'WeaponModifier',
+                             _msg_weapon_modifier(m['id'], m['template_id'],
+                                                  m['character_id'], m['weapon_id'],
+                                                  m.get('auto_repair', 0),
+                                                  m.get('condition', 1.0)))
+        for a in await STORE.list_weapon_ammo(pid):
+            if int(a['weapon_id']) != int(weapon_id):
+                continue
+            await _push_kvcs(writer, cmd, b'WeaponAmmo',
+                             _msg_weapon_ammo(a['id'], a['ammo_template_id'],
+                                              a['character_id'], a['weapon_id'],
+                                              a['slot_index'],
+                                              a.get('condition', 100.0),
+                                              a.get('auto_repair', 0)))
+        wproto = _msg_weapon(w['id'], w['name'], w['template_id'],
+                             w['character_id'], w['container_id'],
+                             w['container_slot'], w.get('variant_id', 0),
+                             w.get('clip_count', 0), w.get('auto_repair', 0),
+                             w.get('condition', 100.0))
+        await _push_kvcs(writer, cmd, b'weapon', wproto)
+        log(f'S->C cmd={cmd:<4} KeyValueChangeSet (weapon id={w["id"]}, '
+            f'charId={w["character_id"]}, slot={w["container_slot"]} '
+            f'+ attached rows)')
+    except Exception as e:
+        log(f'[DB] repush weapon rows failed: {e}')
+
+
+async def _repush_character_by_id(sess, writer, pid, char_id):
+    """按 id 重推 character KVCS（unlockBits 刷新用：武器/弹药/配件归属变化后，
+    不推则本会话内勾选框锁死 + "Ribbon required"，重登才恢复）。"""
+    if sess.soldier_view_cmd is None or pid is None or not char_id:
+        return
+    try:
+        for ch in await STORE.list_characters(pid):
+            if int(ch['id']) == int(char_id):
+                await _repush_character_row(sess, writer, ch)
+                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                    f'(character {ch["name"]} re-pushed after depot transfer)')
+                break
+    except Exception as e:
+        log(f'[DB] repush character after depot transfer failed: {e}')
+
+
+async def _repush_depot_new_item(sess, writer, pid):
+    """重推 DepotNewItem 行（仓库红点即时点亮/消点用）。"""
+    if sess.soldier_view_cmd is None or pid is None:
+        return
+    try:
+        depot_new = await STORE.list_depot_new_items(pid)
+    except Exception as e:
+        log(f'[DB] list_depot_new_items failed: {e}')
+        return
+    new_item_str = '|'.join(
+        f'{tab}_{",".join(str(i) for i in ids)}'
+        for tab, ids in sorted(depot_new.items()))
+    await _push_kvcs(writer, sess.soldier_view_cmd, b'DepotNewItem',
+                     _msg_depot_new_item(int(pid), int(pid), new_item_str))
+    log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+        f'(DepotNewItem: {len(depot_new)} tabs, '
+        f'{sum(len(v) for v in depot_new.values())} unviewed)')
 
 
 async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_type, proto):
@@ -711,6 +836,11 @@ async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_ty
     if updated and str(si_item_type).strip().lower() == 'vehicle':
         await _repush_vehicle_row(sess, writer, pid, si_item_id)
 
+    # 重推 Weapon 行及挂靠行（characterId 变化 → 客户端把武器从仓库挪回
+    # 角色装备列表；不推同样 UI 不走）
+    if updated and str(si_item_type).strip().lower() == 'weapon':
+        await _repush_weapon_rows(sess, writer, pid, si_item_id)
+
     # 重推 character KVCS（武器+随行弹药指派到角色 → unlockBits 增加对应
     # uid；不推则本会话内弹药勾选框锁死 + "Ribbon required"，重登才恢复）
     if updated and str(si_item_type).strip().lower() == 'weapon' and si_char_id:
@@ -724,6 +854,12 @@ async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_ty
                 break
         except Exception as e:
             log(f'[DB] reload character after weapon assign failed: {e}')
+
+
+# 余额不足 response 码按支付货币映射（paymentCurrency 枚举：1=credits 2=warfunds
+# 3=gold；客户端 ResponseCodes not_enough_credits=56 / not_enough_gold=57 /
+# not_enough_warfunds=153，handleSendItemToDepotRequest 按码弹对应货币提示）
+_NOT_ENOUGH_RESP = {1: 56, 2: 153, 3: 57}
 
 
 async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
@@ -771,9 +907,11 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
         await writer.drain()
         log(f'S->C cmd={cmd_id:<4} SendItemToDepotResponse '
             f'(already in depot, no charge)')
-        # 仍重推 Vehicle 行让客户端列表收敛（连点的根因就是收不到这条推送）
+        # 仍重推行数据让客户端列表收敛（连点的根因就是收不到这条推送）
         if int(sd_item_type) == 2:
             await _repush_vehicle_row(sess, writer, pid, sd_object_id)
+        elif int(sd_item_type) == 1:
+            await _repush_weapon_rows(sess, writer, pid, sd_object_id)
         return
 
     # 扣款（非免费存放时收存放费 = 定价 50%，与客户端 ItemInfoOverlayMediator
@@ -783,12 +921,15 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
         cost, ok = await _charge_player(sess, sd_pricing_id, sd_currency,
                                         fraction=0.5)
         if not ok:
-            resp_proto = pb_int32(1, 56)  # not_enough_credits
+            # 余额不足 response 码按支付货币映射（客户端 handleSendItemToDepotRequest
+            # 区分 56/57/153 弹对应货币的不足提示，此前一律 56 金币不足时提示错误）
+            resp_proto = pb_int32(1, _NOT_ENOUGH_RESP.get(int(sd_currency), 56))
             resp = build_response(cmd_id, 'SendItemToDepotResponse', resp_proto)
             writer.write(resp)
             await writer.drain()
             log(f'S->C cmd={cmd_id:<4} SendItemToDepotResponse '
-                f'(response=56 not_enough) cost={cost}')
+                f'(response={_NOT_ENOUGH_RESP.get(int(sd_currency), 56)} '
+                f'not_enough) cost={cost}')
             return
 
     updated = False
@@ -796,8 +937,10 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
         try:
             updated = await STORE.send_item_to_depot(pid, int(sd_item_type),
                                                      int(sd_object_id))
+            # 入仓标记"新"（客户端 DepotNewItemTable 红点；此前误标 viewed=TRUE
+            # 导致红点永不出现）
             if updated and sd_tab:
-                await STORE.mark_depot_item_viewed(pid, sd_tab, int(sd_object_id))
+                await STORE.mark_depot_item_new(pid, sd_tab, int(sd_object_id))
         except Exception as e:
             log(f'[DB] send_item_to_depot failed: {e}')
 
@@ -808,16 +951,28 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
     log(f'S->C cmd={cmd_id:<4} SendItemToDepotResponse '
         f'(response={1 if updated else 0})')
 
-    # 重推 Vehicle 行（characterId→0、equippedInSlot→0 → 客户端 onVehicleUpdates
-    # 把载具从装备列表挪进仓库；不推 UI 不刷新）
-    if int(sd_item_type) == 2:
-        await _repush_vehicle_row(sess, writer, pid, sd_object_id)
+    # 重推行数据（characterId→0 → 客户端把物品从装备列表挪进仓库；不推 UI
+    # 不刷新 → 玩家连点重发）
+    if updated:
+        if int(sd_item_type) == 2:
+            await _repush_vehicle_row(sess, writer, pid, sd_object_id)
+        elif int(sd_item_type) == 1:
+            await _repush_weapon_rows(sess, writer, pid, sd_object_id)
+        # 重推原角色 KVCS：武器/弹药/配件退仓后 unlockBits 变化（uid 移除），
+        # 不推则本会话内弹药/配件勾选框状态错乱，重登才恢复
+        if int(sd_item_type) in (1, 5, 6) and cur_char:
+            await _repush_character_by_id(sess, writer, pid, cur_char)
+        if sd_tab:
+            await _repush_depot_new_item(sess, writer, pid)
     await _push_player_refresh(sess, writer)
 
 
 async def handle_sendupgradestodepotrequest(sess, writer, cmd_id, req_type, proto):
-    # 升级件（配件/补给）送回仓库
+    # 卸下容器上挂的升级件（客户端 ItemInfoOverlayMediator
+    # showSendUpgradesToDepotButtonIfNeeded：物品已在仓库时，武器 isModded /
+    # 载具 hasUpgradeEquipped 或非默认皮肤 → 显示"卸下升级件"按钮）
     # SendUpgradesToDepotRequest { int32 itemType=1; int64 objectId=2; int64 characterId=3; }
+    #   itemType 是【容器类型】（1=weapon 2=vehicle），objectId 是【容器实例 id】
     # SendUpgradesToDepotResponse { int32 response = 1; }
     try:
         f = pb_parse(proto)
@@ -833,20 +988,44 @@ async def handle_sendupgradestodepotrequest(sess, writer, cmd_id, req_type, prot
         su_char_id = 0
 
     pid = await sess.ensure_player()
-    updated = False
+    affected = 0
+    # 卸下前捕获挂靠在该武器上的配件行（卸下后 weapon_id 已清 0，无法反查）
+    loaded_mods = []
+    if pid is not None and su_object_id and int(su_item_type) == 1:
+        try:
+            loaded_mods = [m for m in await STORE.list_weapon_modifiers(pid)
+                           if int(m['weapon_id']) == int(su_object_id)]
+        except Exception as e:
+            log(f'[DB] list_weapon_modifiers failed: {e}')
     if pid is not None and su_object_id:
         try:
-            updated = await STORE.send_upgrades_to_depot(pid, int(su_item_type),
-                                                         int(su_object_id))
+            affected = await STORE.send_upgrades_to_depot(pid, int(su_item_type),
+                                                          int(su_object_id))
         except Exception as e:
             log(f'[DB] send_upgrades_to_depot failed: {e}')
 
-    resp_proto = pb_int32(1, 1 if updated else 0)
+    resp_proto = pb_int32(1, 1 if affected else 0)
     resp = build_response(cmd_id, 'SendUpgradesToDepotResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} SendUpgradesToDepotResponse '
-        f'(response={1 if updated else 0})')
+        f'(response={1 if affected else 0}, affected={affected})')
+
+    # 重推受影响行：武器 → 配件行（weaponId→0）+ 原角色 unlockBits（配件
+    # mapping uid 移除）；载具 → 升级/皮肤/Vehicle 行。只回 response 不推
+    # 数据时客户端 isModded/hasUpgradeEquipped 不变 → 按钮状态不收敛
+    if affected and sess.soldier_view_cmd is not None:
+        if int(su_item_type) == 1:
+            for m in loaded_mods:
+                await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponModifier',
+                                 _msg_weapon_modifier(m['id'], m['template_id'],
+                                                      0, 0,
+                                                      m.get('auto_repair', 0),
+                                                      m.get('condition', 1.0)))
+            if su_char_id:
+                await _repush_character_by_id(sess, writer, pid, su_char_id)
+        elif int(su_item_type) == 2:
+            await _repush_vehicle_row(sess, writer, pid, su_object_id)
 
 
 async def handle_setdepotitemviewedrequest(sess, writer, cmd_id, req_type, proto):
@@ -877,6 +1056,10 @@ async def handle_setdepotitemviewedrequest(sess, writer, cmd_id, req_type, proto
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} SetDepotItemViewedResponse (response=1 ok)')
+
+    # 重推 DepotNewItem 行消点（不推则本会话红点不消失，重登才恢复）
+    if pid is not None and dv_item_id:
+        await _repush_depot_new_item(sess, writer, pid)
 
 
 # 教程已触发默认集：与 PlayerSettings f28 triggeredTutorialTemplateIds 同源

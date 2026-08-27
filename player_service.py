@@ -43,6 +43,7 @@ from starting_gear import STARTING_GEAR
 
 from messages import (
     _msg_character,
+    _msg_depot_new_item,
     _msg_uniform_part,
     _msg_uniform_variant,
     _msg_vehicle,
@@ -384,9 +385,21 @@ async def _push_stored_soldier_data(sess, writer):
         weapon_variants = await STORE.list_weapon_variants(pid)
         uniform_parts = await STORE.list_uniform_parts(pid)
         vehicle_variants = await STORE.list_vehicle_variants(pid)
+        depot_new = await STORE.list_depot_new_items(pid)
     except Exception as e:
         log(f'[DB] load soldier data failed: {e}')
         return
+    # 仓库"新物品"通知行（DepotNewItemTable）：客户端按 newItem 字符串点亮
+    # 仓库 tab 红点；不推则 wasNewItem 恒 false，红点永不出现
+    if depot_new:
+        new_item_str = '|'.join(
+            f'{tab}_{",".join(str(i) for i in ids)}'
+            for tab, ids in sorted(depot_new.items()))
+        await _push_kvcs(writer, sess.soldier_view_cmd, b'DepotNewItem',
+                         _msg_depot_new_item(int(pid), int(pid), new_item_str))
+        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+            f'(DepotNewItem: {len(depot_new)} tabs, '
+            f'{sum(len(v) for v in depot_new.values())} unviewed)')
     # 清理历史 bug 产生的假武器（template_id=0，客户端 WeaponTemplateTable 查不到模板
     # → updateWeaponObject 空指针 Error #1009 崩溃）。删除后不参与回放，关联弹药/配件/皮肤一并过滤。
     fake_weapons = [w for w in weapons if not w['template_id']]

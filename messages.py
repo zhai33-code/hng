@@ -302,6 +302,20 @@ def _msg_uniform_part(pid2, char_id, template_id, part_type):
     return m
 
 
+def _msg_depot_new_item(row_id, player_id, new_item_str):
+    """构建 HnG_States.DepotNewItem proto（仓库"新物品"通知行）。
+
+    newItem f3 字符串格式（客户端 DepotNewItemTable.updateDictionary 解析）：
+    "tab_id1,id2|tab2_id3"——竖线分 tab，下划线分隔 tab 名与逗号串联的物品 id。
+    客户端 checkIsItemNew(tab, id) 据此点亮仓库红点；SetDepotItemViewed 后
+    服务端重推该行即消点。"""
+    m = b''
+    m += pb_int64(1, row_id)                 # id
+    m += pb_int64(2, player_id)              # playerId
+    m += pb_string(3, new_item_str)          # newItem
+    return m
+
+
 def _msg_ribbon(ribbon_template_id, total_xp):
     """构建 statrequests.Ribbon proto（武器勋带进度）。
     currentValue=累计XP, currentLevel=XP 推导等级, nextValue=下一级阈值。

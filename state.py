@@ -216,5 +216,7 @@ sys.stdout = _Tee(_LOG_FH, LOG_FILE)
 
 
 def log(msg):
-    sys.stdout.maybe_rotate()
+    rotate = getattr(sys.stdout, 'maybe_rotate', None)
+    if callable(rotate):
+        rotate()
     print(f'[{time.strftime("%H:%M:%S")}] {msg}')

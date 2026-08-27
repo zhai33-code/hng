@@ -1607,9 +1607,13 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
     old_pms = [p for p, m in list(PMS_TO_MISSION.items())
                if int(m) == int(mission_id) and
                int((PMS_TO_SESSION.get(p) or {}).get('player_id', 0) or 0) == pid]
+    old_squad_db = 0
     for p in old_pms:
         PMS_TO_MISSION.pop(p, None)
-        PMS_TO_SESSION.pop(p, None)
+        old_s = PMS_TO_SESSION.pop(p, None)
+        if old_s:
+            # 旧会话的小队归属（真实小队 rejoin 归队用；散人为 0）
+            old_squad_db = int(old_s.get('squad_db_id', 0) or 0) or old_squad_db
     det['players'] = [p for p in (det.get('players') or [])
                       if int(p.get('player_id', 0) or 0) != pid]
     for sq_id, info in list((_MM_MISSION_SQUADS.get(mission_id) or {}).items()):
@@ -1629,34 +1633,49 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
                 'metrics_session_id': metrics_session_id,
                 'battle_session_id': _next_match_id(_MM_BATTLE_SESSION_ID),
                 'squad_id': 0, 'squad_slot': 0,
+                'squad_db_id': int(ctx.get('squad_db_id', 0) or 0),
                 'mission_id': mission_id,
                 'quickplay': bool(ctx.get('quickplay', False))}
-    # ★ 局内小队归组：单人中途加入优先补进同阵营、同兵种、未满员的单人
-    #   凑成队（不动真实小队）；没有可补的队则自建一队（本人任队长），
-    #   队名=本人兵种官方小队模板名（与大厅 UI 默认名一致）。
+    # ★ 局内小队归组：
+    #   - 真实小队 rejoin 归队（优先）：掉线重连的 DB 小队成员放回原
+    #     小队在本局的登记行（去重已移出 members），恢复 squad_id/slot
+    #     与队友一致（PlayerSettings f16 / SquadResponse f1 同源）；
+    #     原小队行不在本局（被裁/解散）才降级散人路径
+    #   - 散人中途加入补进同阵营、同兵种、未满员的单人凑成队（不动
+    #     真实小队）；没有可补的队则自建一队（本人任队长），队名=本人
+    #     兵种官方小队模板名（与大厅 UI 默认名一致）。
     join_rank = int(ctx.get('rank', 0) or 0)
     join_tmpl = squad_template_for_character(ctx.get('char_template'))
     new_member = {'player_id': pid, 'char_id': int(e.char_id),
                   'gamertag': sess_rec['gamertag'], 'rank': join_rank,
                   'slot': 0}
     picked = None
-    for sq_id, info in (_MM_MISSION_SQUADS.get(mission_id) or {}).items():
-        if info.get('squad_db_id'):
-            continue                      # 真实小队不吸收散人
-        if int(info.get('faction', 0) or 0) != int(e.faction):
-            continue
-        if int(info.get('template', 1) or 1) != int(join_tmpl):
-            continue                      # 兵种不同则大厅默认名对不上
-        if len(info.get('members') or []) >= _MM_SOLO_SQUAD_MAX:
-            continue
-        picked = (sq_id, info)
-        break
+    squad_db_id = old_squad_db or int(ctx.get('squad_db_id', 0) or 0)
+    if squad_db_id:
+        for sq_id, info in (_MM_MISSION_SQUADS.get(mission_id) or {}).items():
+            if int(info.get('squad_db_id', 0) or 0) != int(squad_db_id):
+                continue
+            picked = (sq_id, info)      # 原小队在本局的登记行
+            break
+    if picked is None:
+        for sq_id, info in (_MM_MISSION_SQUADS.get(mission_id) or {}).items():
+            if info.get('squad_db_id'):
+                continue                  # 真实小队不吸收散人
+            if int(info.get('faction', 0) or 0) != int(e.faction):
+                continue
+            if int(info.get('template', 1) or 1) != int(join_tmpl):
+                continue                  # 兵种不同则大厅默认名对不上
+            if len(info.get('members') or []) >= _MM_SOLO_SQUAD_MAX:
+                continue
+            picked = (sq_id, info)
+            break
     if picked is not None:
         sq_id, info = picked
         new_member['slot'] = len(info['members'])
         info['members'].append(new_member)
         sess_rec['squad_id'] = sq_id
         sess_rec['squad_slot'] = new_member['slot']
+        sess_rec['squad_db_id'] = int(info.get('squad_db_id', 0) or 0)
     else:
         sq_id = _next_match_id(_MM_SQUAD_ID)
         _MM_MISSION_SQUADS.setdefault(mission_id, {})[sq_id] = {
@@ -1665,6 +1684,7 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
             'squad_db_id': 0, 'template': int(join_tmpl),
             'members': [new_member]}
         sess_rec['squad_id'] = sq_id
+        sess_rec['squad_db_id'] = 0   # 自建散人队：清掉 ctx 带入的小队归属
     PMS_TO_MISSION[pms_id] = mission_id
     PMS_TO_SESSION[pms_id] = sess_rec
     det.setdefault('players', []).append(
@@ -1799,6 +1819,36 @@ async def _handle_join(sess, writer, cmd_id, proto):
     #   这里任何成员点匹配都带全队（角色取各自小队成员行）。
     squad, sq_members = await _squad_eligible_members(pid)
     if squad is not None:
+        # ★ 小队成员战斗中掉线重连：自己 InBattle 被 eligible 过滤 →
+        #   sq_members 为空，原路径 _enqueue_squad 直接 return（静默
+        #   卡死到局结束：JoinMM ok 后既不入池、不推 PMM、也不回局）。
+        #   改查存活原局直接回局（与 solo 1c-0 rejoin 同路径，含去重
+        #   清痕与真实小队归队）。仅未显式指定战局时生效（指定时尊重指定）。
+        if not sq_members and not req_mission_id:
+            rejoin_mid = _find_player_active_mission(pid)
+            if rejoin_mid:
+                _log(f'rejoin: squad player {pid} -> original '
+                     f'mission={rejoin_mid} (InBattle session recovered)')
+                rejoin_ctx = {
+                    'writer': writer, 'view_cmd': view_cmd,
+                    'gamertag': sess.username or 'Player',
+                    'char_name': char_info['name'],
+                    'rank': _rank_from_combat_xp(
+                        int(char_info.get('combat_xp', 0) or 0)),
+                    'faction': faction, 'char_id': int(char_id),
+                    'quickplay': quickplay,
+                    'req_mission_id': req_mission_id,
+                    'char_template': int(char_info.get('template', 0) or 0),
+                    'metrics_uid': str(uuid.uuid4()),
+                    'metrics_session_id':
+                        _next_match_id(_MM_METRICS_SESSION_ID),
+                    'squad_db_id': int(squad['id'])}
+                rejoin_entry = mm_pool.QueueEntry(
+                    player_id=pid, char_id=int(char_id), faction=faction,
+                    gamemode_id=gamemode_id, presets=staged_presets)
+                await _join_existing_mission(pid, rejoin_mid, rejoin_entry,
+                                             rejoin_ctx)
+                return
         await _enqueue_squad(squad, sq_members, gamemode_id,
                              staged_presets, req_mission_id)
         return
