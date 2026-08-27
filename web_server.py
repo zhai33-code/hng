@@ -4,19 +4,23 @@
 （注册 / 静态资源下发 / WarDatabase 表服务），独立成模块便于审计。
 
 职责：
-  /register           账号注册页（表单 + POST 建号，经主 loop 投递 STORE.create_player）
+  /register /account  注册页（Vite/Vue SPA，web/dist，HnG 官方风格）
+  /api/register       账号注册 JSON API（经主 loop 投递 STORE.create_player）
   /settings.js        客户端入口配置（warserver 地址 / 静态资源地址 / statserver 等）
   /hng_unique_v173293 静态数据文件清单 XML
   /wardb_unique       WarDatabase 表清单（表名,sha256-size）
   /WarDatabase/<tbl>  单个静态表文件下发
   /flashres_unique    Flash_Resources 清单（images/Rank 军衔图标）
   /undefined, /HnG_Strategy_en.xml 等本地化文件（动态注入缺失 key）
+  /admin*             404（管理后台由独立进程 web/server/ 提供，不经 80 端口）
   其余                GAME_DIR 静态文件回退（目录列表与敏感扩展名 404）
 
 启动：main() 里 web_server.init(main_loop) 后 threading.Thread(start_http)。
 """
 import asyncio
 import hashlib
+import json
+import mimetypes
 import os
 import re
 
@@ -99,7 +103,9 @@ def _localization_body():
     global _LOCALIZATION_CACHE
     if _LOCALIZATION_CACHE is not None:
         return _LOCALIZATION_CACHE
-    lang_file = os.path.join(GAME_DIR, 'BattlEyeTlm', 'HnG_Strategy_en.xml')
+    # texts/ 为 hng-group.com 生态新版（EAC 反作弊文案 + 私服品牌信息），
+    # 旧源 BattlEyeTlm/ 是 TLM Partners 时代官方原始版
+    lang_file = os.path.join(GAME_DIR, 'texts', 'HnG_Strategy_en.xml')
     try:
         with open(lang_file, 'rb') as f:
             body = f.read()
@@ -126,7 +132,10 @@ def _localization_body():
 # account_url=账号页、ircserver=聊天（irc 服务未实现，仅占位）。
 SETTINGS_JS = (f"flash_dynhttp=\"{PUBLIC_HOST}:15110\";\n"
                f"unique_file_servers=\"{PUBLIC_HOST}\";\n"
-               "localizerFile=\"BattlEyeTlm/HnG_Strategy_en.xml\";\n"
+               # 官方格式：语言文件用 locale_<lang> 族（裸文件名，请求 file server 根路径）。
+               # localizerFile 不是下发项——客户端 setLanguage() 会用它覆盖任意已下发的
+               # localizerFile，缺失时被覆盖为 undefined → /undefined 请求。
+               "locale_en=\"HnG_Strategy_en.xml\";\n"
                "version=\"173293\";\n"
                "distribution=\"live\";\n"
                "language=\"en\";\n"
@@ -181,135 +190,79 @@ log(f'[init] flashres_unique generated: {_flashres_n} files, '
     f'{len(FLASHRES_UNIQUE)}B (scanned {os.path.join(GAME_DIR, "images", "Rank")})')
 
 
-# ================================================================ 注册页面（本地建号）
-# GET  /register  -> 表单页；POST /register -> 调 STORE.create_player 写库。
+# ================================================================ 注册页（Vue SPA）
+# 前端源码在仓库内 web/（Vite + Vue3 + TS，MPA 双入口），构建产物 web/dist 由本模块下发：
+#   /register /account      -> dist/register.html
+#   /assets/*               -> dist/assets/*（vite 构建的 js/css）
+#   /icons/* /soldier.png   -> dist 根下复制的客户端素材（web/public 随 build 并入）
+# POST /api/register        -> JSON 建号，经主 loop 投递 STORE.create_player。
 # HTTP 跑在独立线程，STORE 是主线程 asyncio loop 里的 asyncpg 池，
 # 因此经 run_coroutine_threadsafe 把建号协程投递回主 loop 执行。
+
+_WEB_DIST = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'web', 'dist')
 
 _MAIN_LOOP = None  # init() 由 main() 记录（asyncio.get_running_loop()）
 
 
 def init(main_loop):
-    """注入主线程 asyncio loop（/register 投递 create_player 用）。"""
+    """注入主线程 asyncio loop（/api/register 投递 create_player 用）。"""
     global _MAIN_LOOP
     _MAIN_LOOP = main_loop
 
 
-_REGISTER_TMPL = """<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<title>HnG 私服 - 账号注册</title>
-<style>
- body{font-family:"Segoe UI","Microsoft YaHei",sans-serif;background:#f0f2f5;
-      display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}
- .card{background:#fff;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.08);
-       padding:32px 36px;width:320px}
- h1{font-size:20px;margin:0 0 4px}
- p.sub{color:#888;font-size:13px;margin:0 0 24px}
- label{display:block;font-size:13px;color:#555;margin:12px 0 4px}
- input{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #ccc;
-       border-radius:4px;font-size:14px}
- input:focus{outline:none;border-color:#4a90d9}
- button{width:100%;margin-top:20px;padding:10px;background:#4a90d9;color:#fff;
-        border:none;border-radius:4px;font-size:15px;cursor:pointer}
- button:hover{background:#3a7bc0}
- .msg{padding:10px 12px;border-radius:4px;font-size:14px;margin-bottom:16px}
- .ok{background:#e8f5e9;color:#2e7d32}
- .err{background:#fdecea;color:#c62828}
-</style>
-</head>
-<body>
-<div class="card">
- <h1>HnG 私服账号注册</h1>
- <p class="sub">注册后即可用该账号密码登录游戏客户端</p>
-@@MSG@@
- <form method="post" action="/register">
-  <label>用户名（2-24位字母/数字/_-.）</label>
-  <input name="username" maxlength="24" required autofocus>
-  <label>密码（4-64位）</label>
-  <input name="password" type="password" maxlength="64" required>
-  <label>确认密码</label>
-  <input name="password2" type="password" maxlength="64" required>
-  <button type="submit">注 册</button>
- </form>
-</div>
-</body>
-</html>
-"""
-
-_REGISTER_RESULT_TMPL = """<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<title>HnG 私服 - 注册结果</title>
-<style>
- body{font-family:"Segoe UI","Microsoft YaHei",sans-serif;background:#f0f2f5;
-      display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}
- .card{background:#fff;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.08);
-       padding:32px 36px;width:320px;text-align:center}
- h1{font-size:20px;margin:0 0 20px}
- .msg{padding:12px;border-radius:4px;font-size:14px;margin-bottom:20px}
- .ok{background:#e8f5e9;color:#2e7d32}
- .err{background:#fdecea;color:#c62828}
- a{color:#4a90d9;text-decoration:none;font-size:14px}
-</style>
-</head>
-<body>
-<div class="card">
- <h1>HnG 私服账号注册</h1>
- <div class="@@CLS@@">@@TEXT@@</div>
- <a href="/register">&larr; 返回注册页</a>
-</div>
-</body>
-</html>
-"""
+def _serve_file(handler, path, cache=False):
+    """下发 dist 内文件（realpath 前缀校验防穿越）。文件不存在返回 False。"""
+    full = os.path.realpath(os.path.join(_WEB_DIST, path))
+    dist_root = os.path.realpath(_WEB_DIST) + os.sep
+    if not full.startswith(dist_root) or not os.path.isfile(full):
+        return False
+    ctype = mimetypes.guess_type(full)[0] or 'application/octet-stream'
+    with open(full, 'rb') as f:
+        body = f.read()
+    handler.send_response(200)
+    handler.send_header('Content-Type', ctype)
+    handler.send_header('Content-Length', str(len(body)))
+    # vite 产物带内容哈希文件名，可安全长缓存；html 不缓存
+    if cache:
+        handler.send_header('Cache-Control', 'public, max-age=86400')
+    else:
+        handler.send_header('Cache-Control', 'no-cache')
+    handler.end_headers()
+    handler.wfile.write(body)
+    return True
 
 
-def _register_form_html(msg_html=''):
-    return _REGISTER_TMPL.replace('@@MSG@@', msg_html).encode('utf-8')
-
-
-def _register_result_html(ok, text):
-    import html as _html
-    cls = 'ok' if ok else 'err'
-    body = _REGISTER_RESULT_TMPL.replace('@@CLS@@', cls) \
-        .replace('@@TEXT@@', _html.escape(text))
-    return body.encode('utf-8')
-
-
-def _register_reply(handler, body, status=200):
+def _json_reply(handler, obj, status=200):
+    body = json.dumps(obj).encode('utf-8')
     handler.send_response(status)
-    handler.send_header('Content-Type', 'text/html; charset=utf-8')
+    handler.send_header('Content-Type', 'application/json; charset=utf-8')
     handler.send_header('Content-Length', str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
 
 
-def _handle_register_post(handler):
-    """处理 POST /register：解析表单 -> 校验 -> 投递 create_player 到主 loop。"""
-    from urllib.parse import parse_qs
+def _handle_register_api(handler):
+    """POST /api/register：JSON -> 校验 -> 投递 create_player 到主 loop。"""
     try:
         length = int(handler.headers.get('Content-Length') or 0)
         if length > 65536:            # 上限防内存 DoS
-            _register_reply(handler, _register_result_html(False, '请求过大'), 413)
+            _json_reply(handler, {'error': '请求过大'}, 413)
             return
         raw = handler.rfile.read(length) if length > 0 else b''
-        form = parse_qs(raw.decode('utf-8', 'replace'))
-        username = (form.get('username', [''])[0] or '').strip()
-        password = form.get('password', [''])[0] or ''
-        password2 = form.get('password2', [''])[0] or ''
+        data = json.loads(raw or b'{}')
+        username = (data.get('username') or '').strip()
+        password = data.get('password') or ''
     except Exception as e:
-        _register_reply(handler, _register_result_html(False, '表单解析失败'))
-        log(f'[register] form parse failed: {e}')
+        _json_reply(handler, {'error': '请求格式错误'}, 400)
+        log(f'[register] json parse failed: {e}')
         return
 
     if not username or not password:
-        _register_reply(handler, _register_result_html(False, '用户名和密码不能为空'))
+        _json_reply(handler, {'error': '用户名和密码不能为空'}, 400)
         return
     if not re.fullmatch(r'[A-Za-z0-9_\-.]{2,24}', username):
-        _register_reply(handler, _register_result_html(
-            False, '用户名需为 2-24 位字母/数字/_ - . 组合'))
+        _json_reply(handler, {'error': '用户名需为 2-24 位字母/数字/_-. 组合'}, 400)
         return
     # cheat 门控封禁：客户端 ApplicationPlayer::PreInit 对昵称做
     # "reto.*" / "[admin]*" 通配匹配，命中即解锁控制台 + cheat 选项。
@@ -317,18 +270,13 @@ def _handle_register_post(handler):
     low = username.lower()
     if low.startswith(('reto.', '[admin]')):
         log(f'[register] BLOCKED reserved-prefix username {username!r}')
-        _register_reply(handler, _register_result_html(
-            False, '无法注册，请稍后重试'))
+        _json_reply(handler, {'error': '无法注册，请稍后重试'}, 400)
         return
     if not (4 <= len(password) <= 64):
-        _register_reply(handler, _register_result_html(False, '密码长度需为 4-64 位'))
-        return
-    if password != password2:
-        _register_reply(handler, _register_result_html(False, '两次输入的密码不一致'))
+        _json_reply(handler, {'error': '密码长度需为 4-64 位'}, 400)
         return
     if _MAIN_LOOP is None or STORE.pool is None:
-        _register_reply(handler, _register_result_html(
-            False, '数据库未连接（PostgreSQL 不可用），无法注册'))
+        _json_reply(handler, {'error': '数据库未连接，暂时无法注册'}, 503)
         return
 
     fut = asyncio.run_coroutine_threadsafe(
@@ -337,17 +285,14 @@ def _handle_register_post(handler):
         pid = fut.result(timeout=10)
     except Exception as e:
         log(f'[register] create_player({username!r}) failed: {e}')
-        _register_reply(handler, _register_result_html(
-            False, '注册失败，请稍后重试'))
+        _json_reply(handler, {'error': '注册失败，请稍后重试'}, 500)
         return
     if pid is None:
         log(f'[register] user {username!r} already exists (web)')
-        _register_reply(handler, _register_result_html(
-            False, f'用户名 {username} 已存在，请换一个'))
+        _json_reply(handler, {'error': f'用户名 {username} 已存在，请换一个'}, 409)
     else:
         log(f'[register] user {username!r} created via web (id={pid})')
-        _register_reply(handler, _register_result_html(
-            True, f'账号 {username} 注册成功（id={pid}），现在可以用它登录游戏了'))
+        _json_reply(handler, {'ok': True, 'player_id': pid}, 201)
 
 
 # 禁止经 HTTP 暴露的扩展名：IDA 分析库、运行日志、脚本/文档等非游戏运行文件。
@@ -382,9 +327,38 @@ class HttpHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split('?')[0]
         self._log_client_request('GET')
-        if path == '/register' or path == '//register':
-            # 本地建号页面（表单）
-            _register_reply(self, _register_form_html())
+        # ---- 注册页 SPA（web/dist）----
+        if path in ('/register', '//register', '/account', '//account',
+                    '/register.html'):
+            if _serve_file(self, 'register.html'):
+                return
+            self.send_error(404, 'Not Found')
+            log('[HTTP] 404 /register (web/dist 未构建？)')
+            return
+        if path.startswith('/assets/') or path.startswith('//assets/'):
+            # vite 构建产物（带内容哈希文件名，可缓存）
+            rel = path.lstrip('/').removeprefix('assets/')
+            if not rel or '..' in rel:
+                self.send_error(404, 'Not Found')
+                return
+            if _serve_file(self, os.path.join('assets', rel), cache=True):
+                return
+            self.send_error(404, 'Not Found')
+            return
+        if path.startswith('/icons/') or path.startswith('//icons/') \
+                or path == '/soldier.png' or path == '//soldier.png':
+            # web/public 复制的客户端素材（武器/载具/军衔/勋带图标 + 注册页士兵立绘）
+            rel = path.lstrip('/')
+            if '..' in rel:
+                self.send_error(404, 'Not Found')
+                return
+            if _serve_file(self, rel, cache=True):
+                return
+            self.send_error(404, 'Not Found')
+            return
+        if path == '/admin' or path.startswith('/admin'):
+            # 管理后台由独立进程（web/server/main.py）提供，公网 80 端口不可达
+            self.send_error(404, 'Not Found')
             return
         if path == '/' or path == '/index.html':
             # hngsync daemon 的 HostingCenter ping 探测（GET /）：
@@ -466,12 +440,10 @@ class HttpHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(body)
                 log(f'[HTTP] served /undefined -> patched HnG_Strategy_en.xml ({len(body)}B)')
                 return
-        # 本地化文件：返回补全版（注入缺失的 ErrorMessages/StrategyGame key）
-        # 注意根路径 /HnG_Strategy_en.xml：远程客户端 loading 阶段会按裸文件名
-        # 请求语言文件（带 ?resetCache=1），GAME_DIR 根目录下没有该文件 → 404 →
-        # 客户端重试失败后闪退，必须与 BattlEyeTlm/ 路径同样返回补全版
-        if path in ('/BattlEyeTlm/HnG_Strategy_en.xml', '//BattlEyeTlm/HnG_Strategy_en.xml',
-                    '/HnG_Strategy_en.xml', '//HnG_Strategy_en.xml'):
+        # 本地化文件：官方 locale_xx 下发的是裸文件名，客户端请求 file server
+        # 根路径 /HnG_Strategy_en.xml（可能带 ?resetCache=N），GAME_DIR 根目录下
+        # 没有该文件 → 404 → 客户端重试失败后闪退，必须返回补全版
+        if path in ('/HnG_Strategy_en.xml', '//HnG_Strategy_en.xml'):
             body = _localization_body()
             if body:
                 self.send_response(200)
@@ -498,8 +470,12 @@ class HttpHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split('?')[0]
         self._log_client_request('POST')
-        if path == '/register' or path == '//register':
-            _handle_register_post(self)
+        if path == '/api/register' or path == '//api/register':
+            # CSRF 双保险之一：自定义头（跨站表单无法携带；SameSite 由 Cookie 侧管）
+            if self.headers.get('X-Requested-With') != 'XMLHttpRequest':
+                _json_reply(self, {'error': '非法请求'}, 403)
+                return
+            _handle_register_api(self)
             return
         self.send_error(404, 'Not Found')
 

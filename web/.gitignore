@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.local
+*.tsbuildinfo
+__pycache__/
+*.pyc
+.admin_secret
+admin_stderr.log

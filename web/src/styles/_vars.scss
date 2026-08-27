@@ -1,0 +1,28 @@
+// HnG 色板与混入（仅变量/混入，无 CSS 输出；组件内 @use '@/styles/vars' as *;）
+$hng-bg-deep: #14160f;        // 近黑棕橄榄
+$hng-bg-panel: #1e2117;       // 面板底
+$hng-khaki: #c8b98a;          // 卡其/帆布
+$hng-gold: #e8d48b;           // HnG 金
+$hng-olive: #8a7a2e;          // 橄榄按钮
+$hng-olive-hover: #a69542;
+$hng-text: #d8d2bd;           // 主文字
+$hng-text-dim: #8b8877;       // 次文字
+$hng-red: #b0473a;            // 阵营红（SU / 危险）
+$hng-blue: #47618b;           // 阵营蓝（US）
+$hng-grey: #6a6d66;           // 阵营灰（GE）
+$hng-green: #5e7d46;          // 成功
+
+@mixin battlefield-bg {
+  background-color: $hng-bg-deep;
+  background-image:
+    repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.014) 0 2px, transparent 2px 6px),
+    radial-gradient(ellipse at 30% 20%, rgba(200, 185, 138, 0.05), transparent 60%),
+    radial-gradient(ellipse at 70% 90%, rgba(0, 0, 0, 0.55), transparent 70%);
+}
+
+@mixin military-card {
+  background: rgba(30, 33, 23, 0.92);
+  border: 1px solid rgba(200, 185, 138, 0.35);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+  clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 14px 100%, 0 calc(100% - 14px));
+}

@@ -1,0 +1,62 @@
+// 全局主题（入口 main.ts 导入一次）：Element Plus 变量覆盖 + 公共类
+@use './vars' as *;
+
+:root {
+  // Element Plus 主题变量覆盖
+  --el-color-primary: #{$hng-olive};
+  --el-color-primary-light-3: #6d6224;
+  --el-color-primary-light-5: #6d6224;
+  --el-color-primary-light-7: #4a4318;
+  --el-color-primary-light-8: #383312;
+  --el-color-primary-light-9: #26220d;
+  --el-color-primary-dark-2: #{$hng-olive-hover};
+  --el-color-success: #{$hng-green};
+  --el-color-danger: #{$hng-red};
+  --el-bg-base: #{$hng-bg-panel};
+  --el-bg-overlay: #23261b;
+  --el-border-color: #3a3e2e;
+  --el-border-color-light: #33362a;
+  --el-text-color-primary: #{$hng-text};
+  --el-text-color-regular: #b5af9a;
+  --el-text-color-secondary: #{$hng-text-dim};
+  --el-fill-color-blank: #191c12;
+  --el-fill-color-light: #22251a;
+  --el-font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+// stencil 军事标题
+.hng-stencil {
+  font-weight: 900;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: $hng-gold;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.8), 0 0 22px rgba(232, 212, 139, 0.25);
+}
+
+// 斜切角按钮质感（叠加在 el-button 上）
+.hng-btn {
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  clip-path: polygon(0 0, calc(100% - 8px) 0, 100% 8px, 100% 100%, 8px 100%, 0 calc(100% - 8px));
+}
+
+// 全局滚动条
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #3a3e2e;
+  border-radius: 5px;
+}
+::-webkit-scrollbar-track {
+  background: #191c12;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  color: $hng-text;
+}
