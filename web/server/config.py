@@ -82,5 +82,6 @@ def _load_admin_secret():
 
 ADMIN_SECRET = _load_admin_secret()
 
-# 前端构建产物（admin.html / assets / icons）
-WEB_DIST = os.path.join(_WEB_DIR, 'dist')
+# 前端构建产物（admin.html / assets / icons）：前端工程在 web/frontend/，
+# 构建命令 pnpm build（frontend 目录），产物 frontend/dist
+WEB_DIST = os.path.join(_WEB_DIR, 'frontend', 'dist')

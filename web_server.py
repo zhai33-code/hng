@@ -191,16 +191,17 @@ log(f'[init] flashres_unique generated: {_flashres_n} files, '
 
 
 # ================================================================ 注册页（Vue SPA）
-# 前端源码在仓库内 web/（Vite + Vue3 + TS，MPA 双入口），构建产物 web/dist 由本模块下发：
+# 前端源码在仓库内 web/frontend（Vite + Vue3 + TS，MPA 双入口），
+# 构建产物 web/frontend/dist 由本模块下发：
 #   /register /account      -> dist/register.html
 #   /assets/*               -> dist/assets/*（vite 构建的 js/css）
-#   /icons/* /soldier.png   -> dist 根下复制的客户端素材（web/public 随 build 并入）
+#   /icons/* /soldier.png   -> dist 根下复制的客户端素材（frontend/public 随 build 并入）
 # POST /api/register        -> JSON 建号，经主 loop 投递 STORE.create_player。
 # HTTP 跑在独立线程，STORE 是主线程 asyncio loop 里的 asyncpg 池，
 # 因此经 run_coroutine_threadsafe 把建号协程投递回主 loop 执行。
 
 _WEB_DIST = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'web', 'dist')
+    os.path.dirname(os.path.abspath(__file__)), 'web', 'frontend', 'dist')
 
 _MAIN_LOOP = None  # init() 由 main() 记录（asyncio.get_running_loop()）
 

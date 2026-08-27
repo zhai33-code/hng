@@ -6,20 +6,21 @@ Vite + Vue 3 + TypeScript + Pinia + Element Plus + SCSS（pnpm 管理，依赖�
 
 ```
 web/
-  register.html / admin.html    # MPA 双入口
-  src/register/                 # 注册页（部署到游戏服 80 端口，hng-re/web_server.py 托管 dist）
-  src/admin/                    # 管理后台 SPA（hash 路由；FastAPI 同域托管，API_BASE=/api）
-  src/styles/                   # HnG 主题（SCSS 变量 + Element Plus 变量覆盖）
-  public/icons/                 # 客户端素材（Rank 军衔 / Vehicles 载具 / Ribbons 勋带 / CombatBadges 徽章）
+  frontend/                     # 前端工程（Vite + Vue3 + TS + Pinia + Element Plus + SCSS）
+    register.html / admin.html    # MPA 双入口
+    src/register/                 # 注册页（部署到游戏服 80 端口，hng-re/web_server.py 托管 dist）
+    src/admin/                    # 管理后台 SPA（hash 路由；FastAPI 同域托管，API_BASE=/api）
+    src/styles/                   # HnG 主题（SCSS 变量 + Element Plus 变量覆盖）
+    public/icons/                 # 客户端素材（Rank 军衔 / Vehicles 载具 / Ribbons 勋带 / CombatBadges 徽章）
+    dist/                         # 构建产物（不入库；部署时手动上传到服务器对应目录）
   server/                       # 管理后端（FastAPI + asyncpg，独立进程，仅共享 PostgreSQL）
   start_admin.ps1               # Windows 启动脚本
-  dist/                         # 构建产物（不入库；部署时手动上传到服务器对应目录）
 ```
 
 ## 开发
 
 ```powershell
-cd web
+cd web/frontend
 pnpm install
 pnpm dev          # /register.html、/admin.html；/api -> 127.0.0.1:80，/admin/api -> 127.0.0.1:8080
 pnpm build        # vue-tsc 类型检查 + vite build -> dist/
