@@ -22,6 +22,32 @@
   --el-fill-color-blank: #191c12;
   --el-fill-color-light: #22251a;
   --el-font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+  // el-table 专用变量（默认白底，必须显式覆盖）
+  --el-table-bg-color: #191c12;
+  --el-table-tr-bg-color: #191c12;
+  --el-table-header-bg-color: #23261b;
+  --el-table-header-text-color: #{$hng-gold};
+  --el-table-text-color: #{$hng-text};
+  --el-table-border-color: #33362a;
+  --el-table-border: 1px solid #33362a;
+  --el-table-row-hover-bg-color: #2a2e1f;
+  --el-table-expanded-cell-bg-color: #22251a;
+
+  // 弹层/分页/表单等常用组件兜底
+  --el-bg-color: #191c12;
+  --el-fill-color: #22251a;
+  --el-disabled-bg-color: #22251a;
+  --el-disabled-text-color: #6b6a5a;
+
+  // 其他常用组件
+  --el-card-bg-color: #{$hng-bg-panel};
+  --el-pagination-bg-color: transparent;
+  --el-pagination-button-bg-color: #22251a;
+  --el-pagination-hover-color: #{$hng-gold};
+  --el-tag-bg-color: #2a2e1f;
+  --el-tag-text-color: #{$hng-text};
+  --el-descriptions-item-bordered-label-background: #23261b;
 }
 
 // stencil 军事标题
