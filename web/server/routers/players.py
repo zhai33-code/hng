@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from .. import audit, auth, wardb_meta
-from ..db import pool
+from .. import db
 
 router = APIRouter(prefix='/api/players', tags=['players'],
                    dependencies=[Depends(auth.current_admin)])
@@ -16,7 +16,7 @@ async def list_players(page: int = Query(1, ge=1),
                        q: str = Query('', max_length=64),
                        order: str = Query('created_desc')):
     """玩家分页列表（q 按用户名包含匹配）。"""
-    assert pool is not None
+    assert db.pool is not None
     where = ''
     args: list = []
     if q:
@@ -28,7 +28,7 @@ async def list_players(page: int = Query(1, ge=1),
         'name_asc': 'username ASC',
         'name_desc': 'username DESC',
     }.get(order, 'created_at DESC')
-    async with pool.acquire() as conn:
+    async with db.pool.acquire() as conn:
         total = await conn.fetchval(
             f'SELECT count(*) FROM players {where}', *args)
         rows = await conn.fetch(
@@ -45,8 +45,8 @@ async def list_players(page: int = Query(1, ge=1),
 @router.get('/{player_id}')
 async def player_detail(player_id: int):
     """玩家账号级详情：账号信息 + 三货币 + 角色概览 + 最近战报。"""
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         p = await conn.fetchrow(
             'SELECT id, username, credits, warfunds, gold, banned, created_at '
             'FROM players WHERE id = $1', player_id)
@@ -82,8 +82,8 @@ async def player_detail(player_id: int):
 @router.get('/{player_id}/characters/{character_id}')
 async def character_detail(player_id: int, character_id: int):
     """角色装备明细：武器（含配件/弹药）、载具（含升级件）、勋带、徽章。"""
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         c = await conn.fetchrow(
             'SELECT id, player_id, name, faction, template, combat_xp, '
             'combat_badge_0, combat_badge_1, created_at '
@@ -199,8 +199,8 @@ async def reset_password(player_id: int, body: ResetPasswordBody,
     pw = body.new_password
     if not (4 <= len(pw) <= 64):
         raise HTTPException(400, '密码长度需为 4-64 位')
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
             'UPDATE players SET password = $1 WHERE id = $2 '
             'RETURNING username', pw, player_id)
@@ -223,8 +223,8 @@ async def adjust_currency(player_id: int, body: CurrencyBody,
         raise HTTPException(400, '非法货币类型')
     if body.delta == 0 or abs(body.delta) > 10 ** 9:
         raise HTTPException(400, '变动值非法')
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
                 f'UPDATE players SET {body.currency} = {body.currency} + $1 '
@@ -248,8 +248,8 @@ class BanBody(BaseModel):
 async def set_ban(player_id: int, body: BanBody,
                   request: Request,
                   admin: auth.AdminUser = Depends(auth.current_admin)):
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
             'UPDATE players SET banned = $1 WHERE id = $2 RETURNING username',
             body.banned, player_id)

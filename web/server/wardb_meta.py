@@ -18,7 +18,9 @@ Chunk/pb 解码原语精简自 hng-re/protocol.py（保持管理端不 import �
   combatbadgetemplate     f1=id  f3=name
   ExperienceLevels        f2=逗号分隔军衔经验阈值
 """
+import os
 import struct
+import sys
 
 from . import config
 
@@ -132,6 +134,12 @@ def load():
     """启动时加载全部映射；逐表独立容错。"""
     global RANK_THRESHOLDS
     if not config.GAME_DIR:
+        return
+    if not os.path.isdir(config.WARDDB_DIR):
+        # .env 常是从服务器拷来的（HNG_GAME_DIR 为 Windows 路径），本机无效属预期
+        print(f'[warn] GAME_DIR 无效（{config.GAME_DIR}）：装备名称将降级为 #id 显示。'
+              '本机开发可忽略；服务器部署需确认 HNG_GAME_DIR。',
+              file=sys.stderr)
         return
     for e in _entries('weapontemplate'):
         WEAPON_NAMES[int(e.get(1, 0))] = _s(e[2]) if 2 in e else ''

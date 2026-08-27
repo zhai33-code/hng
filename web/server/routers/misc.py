@@ -6,7 +6,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .. import auth, wardb_meta
-from ..db import pool
+from .. import db
 
 router = APIRouter(prefix='/api', tags=['misc'],
                    dependencies=[Depends(auth.current_admin)])
@@ -16,8 +16,8 @@ _STARTED_AT = time.time()
 
 @router.get('/dashboard')
 async def dashboard():
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         players = await conn.fetchval('SELECT count(*) FROM players')
         today = await conn.fetchval(
             "SELECT count(*) FROM players "
@@ -40,8 +40,8 @@ async def dashboard():
 @router.get('/battles')
 async def battles(page: int = Query(1, ge=1),
                   page_size: int = Query(20, ge=1, le=100)):
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         total = await conn.fetchval('SELECT count(*) FROM battle_reports')
         rows = await conn.fetch(
             'SELECT id, mission_session_id, mission_id, mission_preset_id, '
@@ -54,8 +54,8 @@ async def battles(page: int = Query(1, ge=1),
 
 @router.get('/battles/{battle_id}')
 async def battle_detail(battle_id: int):
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
             'SELECT id, mission_session_id, mission_id, mission_preset_id, '
             'winner_faction_id, defender_faction_id, mission_time_seconds, '
@@ -68,8 +68,8 @@ async def battle_detail(battle_id: int):
 
 @router.get('/stats/registrations')
 async def registration_stats(days: int = Query(30, ge=1, le=90)):
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day, "
             "count(*) AS n FROM players "
@@ -91,9 +91,9 @@ async def status():
             return False
 
     db_ok = False
-    if pool is not None:
+    if db.pool is not None:
         try:
-            async with pool.acquire() as conn:
+            async with db.pool.acquire() as conn:
                 db_ok = await conn.fetchval('SELECT 1') == 1
         except Exception:
             db_ok = False
@@ -109,8 +109,8 @@ async def status():
 @router.get('/audit-log')
 async def audit_log(page: int = Query(1, ge=1),
                     page_size: int = Query(50, ge=1, le=200)):
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         total = await conn.fetchval('SELECT count(*) FROM admin_audit_log')
         rows = await conn.fetch(
             'SELECT id, admin_name, action, target, detail, ip, created_at '

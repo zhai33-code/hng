@@ -3,14 +3,14 @@
 import json
 
 from .auth import AdminUser
-from .db import pool
+from . import db       # 模块引用：db.init() 是 global 重绑定，from .db import pool 会固化 None
 
 
 async def record(admin: AdminUser, request, action: str,
                  target: str = '', detail: dict | None = None):
     ip = request.client.host if request.client else ''
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         await conn.execute(
             'INSERT INTO admin_audit_log (admin_id, admin_name, action, target, '
             'detail, ip) VALUES ($1, $2, $3, $4, $5::jsonb, $6)',

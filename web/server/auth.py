@@ -17,7 +17,8 @@ import jwt
 from fastapi import HTTPException, Request
 
 from . import config
-from .db import pool
+from . import db          # 注意：导入模块而非 pool 对象——db.init() 是 global 重绑定，
+                          # from .db import pool 会在导入期固化 None，导致所有请求 500
 
 # ---- scrypt ----
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 14, 8, 1
@@ -107,8 +108,8 @@ async def current_admin(request: Request) -> AdminUser:
     except jwt.PyJWTError:
         raise HTTPException(401, '会话无效或已过期')
     admin_id = int(payload['sub'])
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
             'SELECT username, credentials_updated_at FROM admin_users WHERE id = $1',
             admin_id)
@@ -138,8 +139,8 @@ async def login(request: Request, username: str, password: str):
     ip = _client_ip(request)
     if _is_rate_limited(ip):
         raise HTTPException(429, '尝试次数过多，请 15 分钟后再试')
-    assert pool is not None
-    async with pool.acquire() as conn:
+    assert db.pool is not None
+    async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
             'SELECT id, username, password_hash FROM admin_users WHERE username = $1',
             username)
@@ -147,7 +148,7 @@ async def login(request: Request, username: str, password: str):
         _record_failure(ip)
         raise HTTPException(401, '用户名或密码错误')
     _clear_failures(ip)
-    async with pool.acquire() as conn:
+    async with db.pool.acquire() as conn:
         await conn.execute(
             'UPDATE admin_users SET last_login_at = now() WHERE id = $1', row['id'])
     admin = AdminUser(int(row['id']), row['username'])

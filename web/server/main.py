@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """HnG 私服管理端入口（独立进程，与游戏服解耦，仅共享 PostgreSQL）。
 
-启动（web 目录下）：
-  python -m server.main                    启动管理端 HTTP 服务（默认 127.0.0.1:8080）
+启动（两种方式等价）：
+  python -m server.main                    （web 目录下）
+  python web/server/main.py                （任意目录，自动补包路径）
 
 管理员账号管理（本机 CLI，不经网络）：
   python -m server.main create-admin <用户名>          创建首个管理员（生成随机密码并打印，仅当无管理员时）
@@ -20,8 +21,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import auth, config, db, wardb_meta
-from .routers import auth_router, misc, players
+# 兼容 python server/main.py 直接运行：无包上下文时把 web/ 注入 sys.path
+_WEB_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _WEB_DIR not in sys.path:
+    sys.path.insert(0, _WEB_DIR)
+
+from server import auth, config, db, wardb_meta
+from server.routers import auth_router, misc, players
 
 
 @asynccontextmanager
@@ -118,11 +124,17 @@ async def _cli(argv: list[str]) -> int:
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ('create-admin', 'add-admin', 'set-password'):
-        sys.exit(asyncio.run(_cli(sys.argv[1:])))
+        try:
+            sys.exit(asyncio.run(_cli(sys.argv[1:])))
+        except RuntimeError as e:
+            print(e, file=sys.stderr)        # db.init 的友好报错（含 DSN 与排查提示）
+            sys.exit(1)
     print(f'[admin] 监听 http://{config.ADMIN_BIND}:{config.ADMIN_PORT} '
           f'（dist: {os.path.isdir(config.WEB_DIST)}，'
           f'GAME_DIR: {config.GAME_DIR or "未探测到"}）')
-    uvicorn.run(app, host=config.ADMIN_BIND, port=config.ADMIN_PORT, log_level='warning')
+    # log_level=info：启动完成后 uvicorn 会打印 "Uvicorn running on ..."，
+    # 避免服务已就绪但无任何输出、被误认为卡住
+    uvicorn.run(app, host=config.ADMIN_BIND, port=config.ADMIN_PORT, log_level='info')
 
 
 if __name__ == '__main__':
