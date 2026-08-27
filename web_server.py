@@ -176,15 +176,21 @@ This License Agreement constitutes the entire agreement between Licensor and Lic
 
 _LOCALIZATION_CACHE = None
 
+# 客户端支持的全部语言（HnGGUIGameVariables.supportedLanguages，与
+# combat-server\texts\HnG_Strategy_<lang>.xml 一一对应）
+SUPPORTED_LOCALES = ('cs', 'de', 'en', 'es', 'fr', 'ja',
+                     'ko', 'pl', 'pt', 'ru', 'tr', 'zh')
+
 
 def _localization_body():
     """读取原始本地化文件并在 StrategyGame 段后追加缺失 key（结果缓存）。"""
     global _LOCALIZATION_CACHE
     if _LOCALIZATION_CACHE is not None:
         return _LOCALIZATION_CACHE
-    # texts/ 为 hng-group.com 生态新版（EAC 反作弊文案 + 私服品牌信息），
+    # 源 = state.TEXTS_DIR（combat-server\texts，服务器权威副本，含私服
+    # 补充 key 如 BackgroundSelector）；hngsync wardb_sync 清单同源。
     # 旧源 BattlEyeTlm/ 是 TLM Partners 时代官方原始版
-    lang_file = os.path.join(GAME_DIR, 'texts', 'HnG_Strategy_en.xml')
+    lang_file = os.path.join(TEXTS_DIR, 'HnG_Strategy_en.xml')
     try:
         with open(lang_file, 'rb') as f:
             body = f.read()
@@ -214,8 +220,13 @@ SETTINGS_JS = (f"flash_dynhttp=\"{PUBLIC_HOST}:15110\";\n"
                # 官方格式：语言文件用 locale_<lang> 族（裸文件名，请求 file server 根路径）。
                # localizerFile 不是下发项——客户端 setLanguage() 会用它覆盖任意已下发的
                # localizerFile，缺失时被覆盖为 undefined → /undefined 请求。
-               "locale_en=\"HnG_Strategy_en.xml\";\n"
-               "version=\"173293\";\n"
+               # 客户端 setLanguage() 查 parameters["locale_"+cookie语言]，查不到会
+               # 强制回退英语并重置 cookie（GameContext.setLanguage）——locale 族
+               # 必须覆盖 HnGGUIGameVariables.supportedLanguages 全部 12 语言，
+               # 否则语言切换永远弹回英文。
+               + ''.join(f'locale_{lang}="HnG_Strategy_{lang}.xml";\n'
+                         for lang in SUPPORTED_LOCALES)
+               + "version=\"173293\";\n"
                "distribution=\"live\";\n"
                "language=\"en\";\n"
                "releasename=\"QQ\";\n"
@@ -653,16 +664,29 @@ class HttpHandler(SimpleHTTPRequestHandler):
                 log(f'[HTTP] served /undefined -> patched HnG_Strategy_en.xml ({len(body)}B)')
                 return
         # 本地化文件：官方 locale_xx 下发的是裸文件名，客户端请求 file server
-        # 根路径 /HnG_Strategy_en.xml（可能带 ?resetCache=N），GAME_DIR 根目录下
-        # 没有该文件 → 404 → 客户端重试失败后闪退，必须返回补全版
-        if path in ('/HnG_Strategy_en.xml', '//HnG_Strategy_en.xml'):
-            body = _localization_body()
+        # 根路径 /HnG_Strategy_<lang>.xml（可能带 ?resetCache=N），GAME_DIR 根目录
+        # 下没有该文件 → 404 → 客户端重试失败后闪退，必须返回服务器版。
+        # en 走 _localization_body（TEXTS_DIR 版 + LOCALIZATION_EXTRA 注入）；
+        # 其余语言直接下发 TEXTS_DIR 原文件（含私服补充 key）。
+        m = re.fullmatch(r'/+HnG_Strategy_([a-z]{2})\.xml', path)
+        if m and m.group(1) in SUPPORTED_LOCALES:
+            lang = m.group(1)
+            if lang == 'en':
+                body = _localization_body()
+            else:
+                try:
+                    with open(os.path.join(TEXTS_DIR,
+                                           f'HnG_Strategy_{lang}.xml'), 'rb') as f:
+                        body = f.read()
+                except OSError:
+                    body = None
             if body:
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/xml')
+                self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-                log(f'[HTTP] served patched HnG_Strategy_en.xml ({len(body)}B)')
+                log(f'[HTTP] served HnG_Strategy_{lang}.xml ({len(body)}B)')
                 return
         # fs 同步 CAS 下发：hngsync 以 GET /<sha256>-<size>_<flag> 拉文件本体。
         # 三个来源：
@@ -671,8 +695,8 @@ class HttpHandler(SimpleHTTPRequestHandler):
         #   2. WARDB_CAS_MAP 回源：hngsync 按 wardb_sync 清单修复远程客户端的
         #      WarDatabase 表时，CAS 名即当前表文件的 sha256-size_0，直接回源
         #      WarDatabase 目录（改表后无需手工生成 cas 文件，重启服务器即可）；
-        #   3. TEXTS_CAS_MAP 回源：texts 语言文件（en 为补丁版字节，与
-        #      /HnG_Strategy_en.xml 路由同源），直接回内存字节。
+        #   3. TEXTS_CAS_MAP 回源：texts 语言文件（TEXTS_DIR 原始字节，与
+        #      wardb_sync 清单同源），直接回内存字节。
         # 注意：hngsync 解析响应依赖 Content-Length（Http_FileDownload 0x1400410F0），
         # 此处必须显式下发该头。
         m = re.fullmatch(r'/([0-9a-f]{64}-\d+_\d+)', path)
