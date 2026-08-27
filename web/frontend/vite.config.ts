@@ -17,11 +17,13 @@ export default defineConfig({
     vue(),
     AutoImport({
       imports: ['vue', 'vue-router', 'pinia'],
-      resolvers: [ElementPlusResolver()],
+      // 样式改为 main.ts 全量引入（必须在 hng-theme.scss 之前），
+      // 否则按需注入的组件样式会把 :root 主题变量覆盖回白色
+      resolvers: [ElementPlusResolver({ importStyle: false })],
       dts: 'auto-imports.d.ts',
     }),
     Components({
-      resolvers: [ElementPlusResolver()],
+      resolvers: [ElementPlusResolver({ importStyle: false })],
       dts: 'components.d.ts',
     }),
   ],

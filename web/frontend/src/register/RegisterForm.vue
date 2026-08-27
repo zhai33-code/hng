@@ -7,40 +7,32 @@
     size="large"
     @submit.prevent
   >
-    <el-form-item prop="username">
+    <el-form-item prop="username" label="用户名">
       <el-input
         v-model="form.username"
-        placeholder="用户名（登录账号）"
-        maxlength="32"
+        placeholder="2-24 位字母 / 数字 / _ - . 组合"
+        maxlength="24"
         autocomplete="username"
         :disabled="loading"
       />
     </el-form-item>
-    <el-form-item prop="password">
+    <el-form-item prop="password" label="密码">
       <el-input
         v-model="form.password"
         type="password"
-        placeholder="密码"
+        placeholder="至少 4 位"
         show-password
         autocomplete="new-password"
         :disabled="loading"
       />
     </el-form-item>
-    <el-form-item prop="password2">
+    <el-form-item prop="password2" label="确认密码">
       <el-input
         v-model="form.password2"
         type="password"
-        placeholder="确认密码"
+        placeholder="再次输入密码"
         show-password
         autocomplete="new-password"
-        :disabled="loading"
-      />
-    </el-form-item>
-    <el-form-item prop="email">
-      <el-input
-        v-model="form.email"
-        placeholder="邮箱（可选，用于找回密码）"
-        maxlength="64"
         :disabled="loading"
       />
     </el-form-item>
@@ -77,7 +69,7 @@ const formRef = ref<FormInstance>()
 const loading = ref(false)
 const result = ref<{ type: 'success' | 'error'; message: string } | null>(null)
 
-const form = reactive({ username: '', password: '', password2: '', email: '' })
+const form = reactive({ username: '', password: '', password2: '' })
 
 const rules: FormRules = {
   username: [
@@ -95,7 +87,6 @@ const rules: FormRules = {
       trigger: 'blur',
     },
   ],
-  email: [{ type: 'email', message: '邮箱格式不正确', trigger: 'blur' }],
 }
 
 async function submit() {
@@ -108,13 +99,12 @@ async function submit() {
     await apiPost('/api/register', {
       username: form.username,
       password: form.password,
-      ...(form.email ? { email: form.email } : {}),
     })
     result.value = {
       type: 'success',
       message: '注册成功！现在可以启动游戏客户端，使用该账号登录了。',
     }
-    form.username = form.password = form.password2 = form.email = ''
+    form.username = form.password = form.password2 = ''
   } catch (e) {
     const err = e as ApiError
     result.value = { type: 'error', message: err.message || '注册失败，请稍后重试' }
@@ -127,9 +117,21 @@ async function submit() {
 <style scoped lang="scss">
 @use '@/styles/vars' as *;
 
+:deep(.el-form-item__label) {
+  color: $hng-khaki;
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 700;
+  padding-bottom: 4px;
+}
+
 .submit-btn {
   width: 100%;
-  margin-top: 6px;
+  margin-top: 8px;
+  height: 46px;
+  font-size: 16px;
+  letter-spacing: 0.2em;
 }
 
 .result-alert {
