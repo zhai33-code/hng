@@ -48,6 +48,29 @@
   --el-tag-bg-color: #2a2e1f;
   --el-tag-text-color: #{$hng-text};
   --el-descriptions-item-bordered-label-background: #23261b;
+
+  // 下拉选择（el-select 触发器 + el-select-dropdown 弹层 + el-option 悬停）
+  --el-select-border-color-hover: #{$hng-olive};
+  --el-select-item-hover-bg-color: #2a2e1f;
+  --el-select-item-selected-bg-color: #31351f;
+  --el-select-item-selected-text-color: #{$hng-gold};
+  --el-fill-color-light: #22251a;
+  --el-border-color-light: #33362a;
+  --el-text-color-placeholder: #6b6a5a;
+}
+
+// 弹层兜底：teleport 到 body 的下拉/弹窗（el-select-dropdown / el-picker-panel 等）
+.el-popper.is-light,
+.el-select__popper.el-popper {
+  background: #23261b !important;
+  border-color: #3a3e2e !important;
+}
+.el-popper.is-light > .el-popper__arrow::before {
+  background: #23261b !important;
+  border-color: #3a3e2e !important;
+}
+.el-select-dropdown__item.is-hovering {
+  background: #2a2e1f;
 }
 
 // stencil 军事标题
