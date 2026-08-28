@@ -329,6 +329,21 @@ def _build_ribbon_upgrades():
 _RIBBON_UPGRADES = _build_ribbon_upgrades()
 
 
+# RibbonBoosterTemplate { id=1, ribbonTemplateId=2, durationInMinutes=3,
+#   multiplier=4(fixed32 float), forSale=5 }（HnG_States/RibbonBoosterTemplate.as）：
+# 勋带加成模板 → (目标勋带模板 id, 经验乘数)。charactersetting f5 ribbonBoosters
+# {f1 ribbonTemplateId, f2 boosterMultiplier(fixed32)} 的下发源；
+# 结算端 f13 ribbons endXp 由客户端按乘数放大后回报（服务端 set_ribbon_xp_floor 落库）
+_RIBBON_BOOSTERS = {}
+for _f in _parse_wardb_table('RibbonBoosterTemplate'):
+    _rb_rid = int(_f.get(2, 0) or 0)
+    _rb_raw = _f.get(4, b'')
+    _rb_mul = struct.unpack('<f', _rb_raw)[0] \
+        if isinstance(_rb_raw, bytes) and len(_rb_raw) == 4 else 0.0
+    if _rb_rid and _rb_mul > 1.0:
+        _RIBBON_BOOSTERS[int(_f.get(1, 0))] = (_rb_rid, _rb_mul)
+
+
 # progressionUnlock { uid=1, unlockMetaName=5, unlockMetaLevel=6, ... }：
 # 勋带等级购买后解锁该勋带（unlockMetaName==str(ribbonTemplateId)）下
 # unlockMetaLevel <= 购买等级 的全部弹药/配件映射解锁需求

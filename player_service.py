@@ -29,6 +29,7 @@ from wardb import (
     _MOD_MAPPING_IDS,
     _PRICING_MAP,
     _RANK_META_LEVEL,
+    _RIBBON_BOOSTERS,
     _RIBBON_META_LEVEL,
     _UNLOCK_BY_ITEM,
     _UNLOCK_UID_META,
@@ -625,18 +626,24 @@ async def _load_db_loadout(player_id):
     """
     try:
         weapons = await STORE.list_weapons(player_id)
+        w_vars = await STORE.list_weapon_variants(player_id)
         w_ammo = await STORE.list_weapon_ammo(player_id)
         w_mods = await STORE.list_weapon_modifiers(player_id)
         vehicles = await STORE.list_vehicles(player_id)
+        v_vars = await STORE.list_vehicle_variants(player_id)
         v_ups = await STORE.list_vehicle_upgrades(player_id)
         v_ammo = await STORE.list_vehicle_ammo(player_id)
         u_vars = await STORE.list_uniform_variants(player_id)
         u_parts = await STORE.list_uniform_parts(player_id)
+        boosters = await STORE.list_active_boosters(player_id, ribbon_only=True)
     except Exception as e:
         log(f'[DB] load loadout failed: {e}')
         return None
     loadout = {'weapons': {}, 'w_ammo': {}, 'w_mods': {}, 'vehicles': {},
-               'v_ups': {}, 'v_ammo': {}, 'uv_tmpl': {}, 'u_parts': {}}
+               'v_ups': {}, 'v_ammo': {}, 'vv_tmpl': {},
+               'wv_tmpl': {}, 'wv_owned': {},
+               'uv_tmpl': {}, 'u_parts': {}, 'up_tmpl': {},
+               'rboosters': {}}
     for w in weapons:
         loadout['weapons'].setdefault(int(w['character_id'] or 0), []).append(w)
     for a in w_ammo:
@@ -645,6 +652,9 @@ async def _load_db_loadout(player_id):
         loadout['w_mods'].setdefault(int(md['weapon_id'] or 0), []).append(md)
     for v in vehicles:
         loadout['vehicles'].setdefault(int(v['character_id'] or 0), []).append(v)
+    # vv_tmpl：载具迷彩皮肤实例 id → 涂装变体模板 id（VehicleSetting f2 用）
+    for vv in v_vars:
+        loadout['vv_tmpl'][int(vv['id'])] = int(vv['vehicle_variant_template_id'])
     for u in v_ups:
         loadout['v_ups'].setdefault(int(u['vehicle_id'] or 0), []).append(u)
     for a in v_ammo:
@@ -654,5 +664,24 @@ async def _load_db_loadout(player_id):
     for up in u_parts:
         loadout['u_parts'].setdefault(int(up['character_id'] or 0), []).append(
             int(up['uniform_part_template_id']))
+        # up_tmpl：军装部件实例 id → 模板（charactersetting f10 按 headgear_id 取已装备）
+        loadout['up_tmpl'][int(up['id'])] = int(up['uniform_part_template_id'])
+    # wv_tmpl：武器皮肤实例 id → 涂装模板（WeaponSetting f10 用）；
+    # wv_owned：weapon_id → 已拥有皮肤模板集（旧库 variant_template_id 兜底判定用：
+    # 有实例行且 variant_id=0 = 已卸下 → 发默认涂装）
+    for wv in w_vars:
+        tmpl = int(wv['weapon_variant_template_id'])
+        loadout['wv_tmpl'][int(wv['id'])] = tmpl
+        loadout['wv_owned'].setdefault(int(wv['weapon_id'] or 0), []).append(tmpl)
+    # rboosters：激活中的勋带加成 → {勋带模板 id: 乘数}（账号级，所有角色条目
+    # 同发；同一勋带多个加成取最大乘数，不叠乘）。模板不在
+    # RibbonBoosterTemplate 表 / 乘数<=1 的行跳过
+    for b in boosters:
+        rb = _RIBBON_BOOSTERS.get(int(b['template_id']))
+        if not rb:
+            continue
+        rid, mul = rb
+        if mul > loadout['rboosters'].get(rid, 0):
+            loadout['rboosters'][rid] = mul
     return loadout
 

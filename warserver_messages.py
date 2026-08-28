@@ -27,6 +27,7 @@ from state import log
 import force_pool
 from wardb import (
     _RIBBON_LEVEL_XP,
+    _VEHICLE_VARIANT_PARENT,
     _load_accesspoint_templates,
     _load_preset,
     _rank_from_combat_xp,
@@ -214,10 +215,11 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
 def _msg_character_entry(ch, loadout=None):
     """PlayerSettings f12 角色条目（charactersetting，§7.2）—— 100% 账号库构建。
 
-      f1 id / f2 name / f3 武器(含弹药/配件/耐久/出生弹夹) / f4 载具(含升级/弹药)
+      f1 id / f2 name / f3 武器(含弹药/配件/耐久/出生弹夹) / f4 载具(含迷彩/升级/弹药)
+      f5 勋带加成{f1 勋带模板, f2 乘数}(fixed32)
       f6 战斗徽章 / f7 兵种 actionid(charactertemplate.f4，游戏端部署方式判定) /
       f8 军衔(combat_xp 推导)
-      f9 军服迷彩模板 / f10 军装部件 / f11 squadPoints / f12 receiveDailyBonus
+      f9 军服迷彩模板 / f10 已装备军装部件(头盔) / f11 squadPoints / f12 receiveDailyBonus
     ★ f3 只下发已装备武器（weapons.container_slot>0，槽位用真实值）；
       f4 只下发已装备载具（vehicles.equipped_in_slot>0）——
       未装备武器/载具只在军械库/车库（KVCS）显示，不进战斗配装。
@@ -226,7 +228,10 @@ def _msg_character_entry(ch, loadout=None):
     """
     if loadout is None:
         loadout = {'weapons': {}, 'w_ammo': {}, 'w_mods': {}, 'vehicles': {},
-                   'v_ups': {}, 'v_ammo': {}, 'uv_tmpl': {}, 'u_parts': {}}
+                   'v_ups': {}, 'v_ammo': {}, 'vv_tmpl': {},
+                   'wv_tmpl': {}, 'wv_owned': {},
+                   'uv_tmpl': {}, 'u_parts': {}, 'up_tmpl': {},
+                   'rboosters': {}}
     xp = int(ch.get('combat_xp', 0) or 0)
     rank = _rank_from_combat_xp(xp)
 
@@ -245,7 +250,8 @@ def _msg_character_entry(ch, loadout=None):
             continue
         out += _msg_weapon_setting(
             w, loadout['w_ammo'].get(int(w['id']), []),
-            loadout['w_mods'].get(int(w['id']), []), slot)
+            loadout['w_mods'].get(int(w['id']), []), slot,
+            loadout.get('wv_tmpl'), loadout.get('wv_owned'))
 
     # f4 载具：仅下发已装备载具（equipped_in_slot>0，与 f3 武器同原则）。
     # 未装备载具只在车库（Vehicle KVCS）显示，不进战斗配装
@@ -254,7 +260,17 @@ def _msg_character_entry(ch, loadout=None):
             continue
         out += _msg_vehicle_setting(
             v, loadout['v_ups'].get(int(v['id']), []),
-            loadout['v_ammo'].get(int(v['id']), []))
+            loadout['v_ammo'].get(int(v['id']), []),
+            loadout.get('vv_tmpl'))
+
+    # f5 勋带加成（账号级激活中的 RibbonBooster，每个角色条目同发）：
+    # {f1 ribbonTemplateId, f2 boosterMultiplier(fixed32)}——战斗客户端按乘数
+    # 放大局内勋带经验并在结算 BattleReport f13 回报放大后的 endXp，
+    # 服务端 set_ribbon_xp_floor 落库（此前缺发 → 激活的加成对战斗无效果）
+    for rb_rid, rb_mul in sorted(loadout.get('rboosters', {}).items()):
+        bm = pb_int64(1, int(rb_rid))
+        bm += pb_float(2, float(rb_mul))
+        out += pb_message(5, bm)
 
     # f6 战斗徽章（DB characters.combat_badge_0/1，0 = 空槽省略）
     for b in (ch.get('combat_badge_0', 0), ch.get('combat_badge_1', 0)):
@@ -276,20 +292,39 @@ def _msg_character_entry(ch, loadout=None):
         uvt = default_uniform_variant(ch.get('template', 1), ch.get('faction', 0))
     if uvt:
         out += pb_int64(9, int(uvt))
-    # f10 军装部件模板（uniform_parts 表，按角色）
-    for pt in loadout['u_parts'].get(cid, []):
-        out += pb_int64(10, int(pt))
+    # f10 军装部件模板：只发已装备的（characters.headgear_id → uniform_parts
+    # 实例 → 模板）。此前发角色名下全部 uniform_parts（含未装备的），
+    # 买了第二顶头盔未装备时战斗外观会被顶掉（2026-08-28 修复，
+    # 与 f3/f4/f6 只发已装备同原则）；未装备（headgear_id=0）= 默认外观，省略
+    hid = int(ch.get('headgear_id', 0) or 0)
+    if hid:
+        hpt = int(loadout.get('up_tmpl', {}).get(hid, 0) or 0)
+        if hpt:
+            out += pb_int64(10, hpt)
     # f11 squadPoints / f12 receiveDailyBonus（官方服恒发，含 0）
     out += pb_int32(11, int(ch.get('squad_points', 0) or 0))
     out += pb_bool(12, bool(ch.get('receive_daily_bonus', True)))
     return pb_message(12, out)
 
 
-def _msg_weapon_setting(w, ammos, mods, slot):
+def _msg_weapon_setting(w, ammos, mods, slot, wv_tmpl=None, wv_owned=None):
     """charactersetting.f3 WeaponSetting（§7.2，wire 格式按回放实测）：
     f1 id / f2 template / f3 弹药(含耐久 fixed32) / f4 配件 / f5 tracer(恒0) /
     f6 decals(官方服恒发空消息，按回放字节镜像) / f7 spawnClips /
-    f8 equipmentSlot / f9 condition(fixed32) / f10 皮肤模板 / f11 name。"""
+    f8 equipmentSlot / f9 condition(fixed32) / f10 皮肤模板 / f11 name。
+
+    f10 皮肤：以装备位 weapons.variant_id（→ weapon_variants 实例 →
+    weapon_variant_template_id，wv_tmpl 映射）为准 —— 此前恒发建武器时的
+    反规范化列 variant_template_id，导致"武器+皮肤合买"以外的路径（单买
+    皮肤后装备）战斗内皮肤不生效。variant_id=0（已卸下）时仅当该武器没有
+    任何皮肤实例行（旧库从未持久化 variant_id）才回退反规范化列；
+    有实例行而未装备 = 卸下 → 默认涂装（与 f3 弹药只发已装备同原则）。
+    """
+    vid = int(w.get('variant_id', 0) or 0)
+    vtmpl = int((wv_tmpl or {}).get(vid, 0) or 0) if vid else 0
+    if not vtmpl and not vid \
+            and not (wv_owned or {}).get(int(w['id'])):
+        vtmpl = int(w.get('variant_template_id', 0) or 0)
     m = b''
     m += pb_int64(1, int(w['id']))
     m += pb_int64(2, int(w['template_id']))
@@ -318,22 +353,42 @@ def _msg_weapon_setting(w, ammos, mods, slot):
         int(w.get('clip_count', 0) or 0), int(w['template_id'])))
     m += pb_int32(8, int(slot))
     m += pb_float(9, float(w.get('condition', 1.0) or 1.0))
-    if int(w.get('variant_template_id', 0) or 0):
-        m += pb_int64(10, int(w['variant_template_id']))
+    if vtmpl:
+        m += pb_int64(10, vtmpl)
     m += pb_string(11, w.get('name') or '')
     return pb_message(3, m)
 
 
-def _msg_vehicle_setting(v, ups, vammos):
+def _msg_vehicle_setting(v, ups, vammos, vv_tmpl=None):
     """charactersetting.f4 VehicleSetting（§7.2）：
-    f1 id / f2 载具模板 / f3 condition(fixed32) / f4 equippedInSlot /
-    f5 升级 / f6 弹药{f2 仓id f3 槽位 f4 模板 f5 耐久 f6 出生弹夹}(fixed32)。"""
+    f1 id / f2 载具变体模板 / f3 condition(fixed32) / f4 equippedInSlot /
+    f5 升级 / f6 弹药{f2 仓id f3 槽位 f4 模板 f5 耐久 f6 出生弹夹}(fixed32)。
+
+    f2 迷彩：VehicleSetting 描述符只有 f1-f6（player.dll 逆向，无独立皮肤
+    字段），载具涂装经 f2 本身传递 —— 迷彩涂装与原厂变体同属
+    VehicleVariantTemplate（共享 parentVehicleTemplateId，同载具不同漆），
+    装备迷彩时 f2 发皮肤实例的涂装模板（vv_tmpl：实例 id → 模板 id，
+    vehicles.variant_id 装备位），未装备/皮肤与基础模板不同 parent（脏数据，
+    会换成另一辆载具）时回退基础模板。与武器 f10 皮肤、军服 f9 迷彩同模式。
+    """
+    base_tmpl = int(v['vehicle_variant_template_id'])
+    tmpl = base_tmpl
+    camo = int((vv_tmpl or {}).get(int(v.get('variant_id', 0) or 0), 0) or 0)
+    if (camo and _VEHICLE_VARIANT_PARENT.get(camo) is not None
+            and _VEHICLE_VARIANT_PARENT.get(camo)
+            == _VEHICLE_VARIANT_PARENT.get(base_tmpl)):
+        tmpl = camo
     m = b''
     m += pb_int64(1, int(v['id']))
-    m += pb_int64(2, int(v['vehicle_variant_template_id']))
+    m += pb_int64(2, tmpl)
     m += pb_float(3, float(v.get('condition', 100.0) or 100.0))
     m += pb_int32(4, int(v['equipped_in_slot'] or 0))
     for u in ups:
+        # f5 只下发已安装升级（equipped_slot_id>0）—— 购买的升级件初始
+        # slot=0（车库升级列表待安装），未安装不应在战斗生效（2026-08-28
+        # 修复，与 f3/f4/f6 只发已装备同原则）
+        if int(u.get('equipped_slot_id', 0) or 0) <= 0:
+            continue
         um = pb_int64(1, int(u['id']))
         um += pb_int64(2, int(u['upgrade_template_id']))
         um += pb_float(3, float(u['condition'] or 1.0))
@@ -409,7 +464,10 @@ def _accesspoint_layout(preset_id=MISSION_PRESET_ID,
 
     通道点模板按 gamemap 分组动态取自 WarDatabase/accesspointtemplate
     （f2 == gamemap id；Mill=13 → 模板 8/15 = A/B 点，坐标在图内），
-    owner 交替 defender/attacker。combat.py 的
+    owner 交替 attacker/defender（首点=进攻方出生侧）。★必须与大厅简报
+    GetMissionDetailsResponse f6 同规则（他服抓包实测 Mill：模板 8=进攻、
+    15=防守）——此前起始=defender 与大厅相反，导致"大厅概览图攻防图标
+    位置与进战局后实际出生侧互换"。combat.py 的
     ActiveMissionRequestEventListResponse f3 归属状态与此同源
     （ReportMissionStatusRequest f4 捕获上报可覆盖 combat._CAPTURE_OWNERS）。
     preset_id 由匹配池成局时下发（不同地图 → 不同模板组）。
@@ -419,7 +477,7 @@ def _accesspoint_layout(preset_id=MISSION_PRESET_ID,
     ap_templates = _load_accesspoint_templates(gamemap_id)
     layout = []
     for i, tmpl in enumerate(ap_templates[:4]):   # 最多 4 点（A-D）
-        owner = defender_faction if (i % 2 == 0) else attacker_faction
+        owner = attacker_faction if (i % 2 == 0) else defender_faction
         layout.append((tmpl, owner))
     return layout
 
@@ -519,7 +577,8 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
         timeofday = _TOD_HOURS.get(weather_time_of_day, 12.0)
     timeofday = float(timeofday)
 
-    # f12 accesspoints：每个模板一个点，owner 交替 defender/attacker。
+    # f12 accesspoints：每个模板一个点，owner 交替 attacker/defender
+    # （首点=进攻方，与大厅简报 f6 同规则——详见 _accesspoint_layout）。
     # accesspointid 为运行时 id（真实局由 warserver 生成，私服固定自增段），
     # 低 32 位必须非零（sub_1803A7350 以低 32 位做非零校验后查 type25 树）。
     ap_msgs = []

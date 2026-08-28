@@ -109,23 +109,26 @@ def main():
                      'character_id': 3, 'equipped_in_slot': 0, 'variant_id': 0,
                      'condition': 100.0}]},
         'v_ups': {409: [{'id': 501, 'upgrade_template_id': 11, 'vehicle_id': 409,
-                         'condition': 1.0}]},
+                         'equipped_slot_id': 1, 'condition': 1.0},
+                        {'id': 502, 'upgrade_template_id': 12, 'vehicle_id': 409,
+                         'equipped_slot_id': 0, 'condition': 1.0}]},
         'v_ammo': {409: [{'id': 603, 'ammo_template_id': 93, 'vehicle_id': 409,
                           'equipped_storage_id': 71, 'slot_index': 1,
                           'condition': 2000.0, 'spawn_clip_count': 3}]},
         'uv_tmpl': {701: 1},
         'u_parts': {3: [90, 94]},
+        'up_tmpl': {902: 90, 903: 94},
     }
     chars = [
         {'id': 1, 'name': 'Alexei', 'faction': 3, 'template': 1, 'combat_xp': 0,
          'combat_badge_0': 0, 'combat_badge_1': 0, 'uniform_variant_id': 0,
-         'squad_points': 0, 'receive_daily_bonus': True},
+         'headgear_id': 0, 'squad_points': 0, 'receive_daily_bonus': True},
         {'id': 2, 'name': 'Hans', 'faction': 2, 'template': 1, 'combat_xp': 250000,
          'combat_badge_0': 0, 'combat_badge_1': 0, 'uniform_variant_id': 0,
-         'squad_points': 0, 'receive_daily_bonus': True},
+         'headgear_id': 0, 'squad_points': 0, 'receive_daily_bonus': True},
         {'id': 3, 'name': 'Dmitri', 'faction': 3, 'template': 1, 'combat_xp': 50000,
          'combat_badge_0': 110, 'combat_badge_1': 0, 'uniform_variant_id': 701,
-         'squad_points': 8, 'receive_daily_bonus': False},
+         'headgear_id': 902, 'squad_points': 8, 'receive_daily_bonus': False},
     ]
 
     print('== 1. Dmitri（全装备 DB 构建）==')
@@ -156,7 +159,8 @@ def main():
     check('载具 f3 耐久 wiretype=5 值=100.0',
           f3wt == 5 and abs(v[3][0] - 100.0) < 1e-3)
     vu = fields(v[5][0])
-    check('载具升级 f1=501 f2=11', vu[1][0] == 501 and vu[2][0] == 11)
+    check('载具升级 f5 只含已安装的 501/11（slot=0 的 502 不下发）',
+          len(v[5]) == 1 and vu[1][0] == 501 and vu[2][0] == 11)
     va = fields(v[6][0])
     check('载具弹药 f2仓=71 f3槽=1 f4模板=93 f6出生弹夹=3(VehicleAmmoStorage.f2)',
           va[2][0] == 71 and va[3][0] == 1 and va[4][0] == 93
@@ -167,7 +171,8 @@ def main():
           e[7][0] == 2 and e[8][0] == rank)
     check('f9 军服迷彩模板=1（uniform_variant_id 701 → uv_tmpl）',
           e[9][0] == 1)
-    check('f10 军装部件=[90, 94]', e[10] == [90, 94])
+    check('f10 军装部件=[90]（只发 headgear_id=902 已装备头盔，'
+          '未装备的 94 不下发）', e[10] == [90])
     check('f11 squadPoints=8 / f12 receiveDailyBonus=0',
           e[11][0] == 8 and e[12][0] == 0)
 
@@ -323,6 +328,120 @@ def main():
     w = fields(e[3][0])
     check('全部弹药 slot=0 → f3 ammos 整体省略（无已装备弹药）',
           3 not in w)
+
+    print('== 9. 载具迷彩下发（VehicleSetting f2 涂装变体模板）==')
+    # 车库装备迷彩 → vehicles.variant_id → vehicle_variants 实例（涂装模板）。
+    # f2 装备迷彩时发涂装模板（与基础模板同 parent = 同载具不同漆），
+    # 皮肤实例缺失/不同载具（脏数据）时回退基础模板（此前恒发基础模板，
+    # 导致"大厅装备的载具迷彩入场后不生效"）。测试用假模板 id 注入
+    # wardb._VEHICLE_VARIANT_PARENT（warserver_messages 按引用共享同一 dict）。
+    from wardb import _VEHICLE_VARIANT_PARENT
+    _VEHICLE_VARIANT_PARENT.update({90001: 700, 90002: 700, 90003: 701})
+    camo_loadout = {
+        'weapons': {}, 'w_ammo': {}, 'w_mods': {},
+        'vehicles': {3: [
+            {'id': 409, 'vehicle_variant_template_id': 90001,
+             'character_id': 3, 'equipped_in_slot': 1, 'variant_id': 777,
+             'condition': 100.0},
+            {'id': 410, 'vehicle_variant_template_id': 90001,
+             'character_id': 3, 'equipped_in_slot': 2, 'variant_id': 778,
+             'condition': 100.0},
+            {'id': 411, 'vehicle_variant_template_id': 90001,
+             'character_id': 3, 'equipped_in_slot': 3, 'variant_id': 0,
+             'condition': 100.0}]},
+        'v_ups': {}, 'v_ammo': {},
+        'vv_tmpl': {777: 90002, 778: 90003},   # 777=同载具迷彩 / 778=异载具脏数据
+        'uv_tmpl': {}, 'u_parts': {},
+    }
+    entry = _msg_character_entry(chars[2], loadout=camo_loadout)
+    e = fields(pb_field_payload(entry))
+    check('f4 载具条目数=3', len(e[4]) == 3)
+    v_ok = fields(e[4][0])      # 409：装备迷彩 90002（同 parent 700）
+    check('装备迷彩 → f2=涂装模板 90002（同 parent 替换）', v_ok[2][0] == 90002)
+    v_bad = fields(e[4][1])     # 410：迷彩 90003 parent=701 ≠ 基础 700 → 回退
+    check('迷彩与基础不同 parent（脏数据）→ f2 回退基础模板 90001',
+          v_bad[2][0] == 90001)
+    v_none = fields(e[4][2])    # 411：未装备迷彩（variant_id=0）
+    check('未装备迷彩 → f2=基础模板 90001', v_none[2][0] == 90001)
+    # 旧版 loadout（无 vv_tmpl 键，兼容）不报错且发基础模板
+    legacy_loadout = {k: v for k, v in camo_loadout.items() if k != 'vv_tmpl'}
+    entry = _msg_character_entry(chars[2], loadout=legacy_loadout)
+    e = fields(pb_field_payload(entry))
+    check('loadout 无 vv_tmpl 键（旧调用方）→ f2 仍为基础模板',
+          fields(e[4][0])[2][0] == 90001)
+
+    print('== 10. 武器皮肤下发（WeaponSetting f10 涂装模板）==')
+    # f10 以装备位 weapons.variant_id（→ weapon_variants 实例 → 模板）为准：
+    #   单买皮肤后装备（variant_id→实例）生效；有实例行而 variant_id=0 = 已卸下
+    #   → 默认涂装；无实例行的旧库数据回退建武器时的反规范化列
+    #   variant_template_id（此前恒发该列 → 单买装备的皮肤战斗内不生效）。
+    skin_loadout = {
+        'weapons': {3: [
+            # 单买皮肤已装备：variant_id=801 → 模板 44
+            {'id': 130, 'name': 'MP40', 'template_id': 9,
+             'character_id': 3, 'container_id': 3, 'container_slot': 1,
+             'variant_template_id': 0, 'variant_id': 801,
+             'condition': 1.0, 'clip_count': 0},
+            # 合买后已卸下：variant_id=0 但存在实例行(模板55) → 默认涂装
+            {'id': 131, 'name': 'StG44', 'template_id': 10,
+             'character_id': 3, 'container_id': 3, 'container_slot': 2,
+             'variant_template_id': 55, 'variant_id': 0,
+             'condition': 1.0, 'clip_count': 0},
+            # 旧库数据：variant_id 从未持久化且无实例行 → 反规范化列兜底
+            {'id': 132, 'name': 'Kar98k', 'template_id': 11,
+             'character_id': 3, 'container_id': 3, 'container_slot': 3,
+             'variant_template_id': 66, 'variant_id': 0,
+             'condition': 1.0, 'clip_count': 0},
+            # 脏数据：variant_id 指向不存在的实例 → 默认涂装
+            {'id': 133, 'name': 'MG42', 'template_id': 12,
+             'character_id': 3, 'container_id': 3, 'container_slot': 4,
+             'variant_template_id': 0, 'variant_id': 999,
+             'condition': 1.0, 'clip_count': 0}]},
+        'w_ammo': {}, 'w_mods': {}, 'vehicles': {}, 'v_ups': {}, 'v_ammo': {},
+        'wv_tmpl': {801: 44}, 'wv_owned': {131: [55]},
+        'uv_tmpl': {}, 'u_parts': {}, 'up_tmpl': {},
+    }
+    entry = _msg_character_entry(chars[2], loadout=skin_loadout)
+    e = fields(pb_field_payload(entry))
+    check('f3 武器条目数=4', len(e[3]) == 4)
+    w0, w1, w2, w3 = (fields(x) for x in e[3])
+    check('单买皮肤已装备(130) → f10=44（variant_id 801 → wv_tmpl）',
+          w0.get(10, [0])[0] == 44)
+    check('合买后已卸下(131) → f10 省略（有实例行且 variant_id=0）',
+          10 not in w1)
+    check('旧库无实例行(132) → f10=66（反规范化列兜底）',
+          w2.get(10, [0])[0] == 66)
+    check('实例行缺失脏数据(133) → f10 省略（默认涂装）', 10 not in w3)
+
+    print('== 11. 勋带加成下发（charactersetting f5 ribbonBoosters）==')
+    # 大厅购买/激活（economy 域 player_boosters：activated_at 非空且未过期）
+    # → charactersetting f5 {f1 ribbonTemplateId, f2 multiplier(fixed32)}。
+    # 战斗客户端按乘数放大局内勋带经验，结算 f13 endXp 回报放大值，
+    # 服务端 set_ribbon_xp_floor 落库（此前 f5 恒缺省 → 加成买了没用）。
+    from wardb import _RIBBON_BOOSTERS
+    check('wardb RibbonBoosterTemplate 解析出条目（模板表可读）',
+          len(_RIBBON_BOOSTERS) > 0)
+    rb_loadout = {
+        'weapons': {}, 'w_ammo': {}, 'w_mods': {}, 'vehicles': {},
+        'v_ups': {}, 'v_ammo': {}, 'uv_tmpl': {}, 'u_parts': {}, 'up_tmpl': {},
+        'rboosters': {5: 2.0, 9: 3.0},
+    }
+    entry = _msg_character_entry(chars[2], loadout=rb_loadout)
+    e = fields(pb_field_payload(entry))
+    check('f5 勋带加成条目数=2', len(e.get(5, [])) == 2)
+    rb0 = fields(e[5][0])
+    check('f5[0] {f1 勋带=5, f2 乘数=2.0 (fixed32)}',
+          rb0[1][0] == 5 and abs(rb0[2][0] - 2.0) < 1e-6)
+    rb_raw = parse(e[5][0])
+    f2wt = [wt for fn, wt, _ in rb_raw if fn == 2][0]
+    check('f5[0] f2 乘数 wiretype=5(fixed32)', f2wt == 5)
+    rb1 = fields(e[5][1])
+    check('f5[1] {f1 勋带=9, f2 乘数=3.0}', rb1[1][0] == 9
+          and abs(rb1[2][0] - 3.0) < 1e-6)
+    # 无加成 → f5 整体省略（repeated 空字段省略）；其余字段不受影响
+    entry = _msg_character_entry(chars[2], loadout=skin_loadout)
+    e = fields(pb_field_payload(entry))
+    check('无激活加成 → f5 整体省略', 5 not in e)
 
     print()
     print('ALL PASS' if ok else 'SOME CHECKS FAILED')

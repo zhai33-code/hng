@@ -20,7 +20,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from protocol import pb_parse_loose
+from protocol import pb_field_payload, pb_parse_loose, pb_split_top
 import matchmaking
 import warserver_messages
 from wardb import battlefield_entity_for_gamemap, battlefield_pos
@@ -105,6 +105,45 @@ try:
           bx == 0.0 and by == 0.0, f'got=({bx},{by})')
 finally:
     warserver_messages.battlefield_pos = orig
+
+print('== 5) 出兵点攻防归属：大厅简报 f6 ↔ 战斗 layout / f12 同源（不互换）')
+# 2026-08-28 事故：_accesspoint_layout 交替起始=defender，大厅 f6 起始=attacker
+# → 大厅概览图攻防图标位置与进战局后实际出生侧互换。修复后三方必须同规则。
+from warserver_messages import _accesspoint_layout
+
+_det = {'preset': 10, 'attacker_faction': 3, 'defender_faction': 2,
+        'players': [{'player_id': 1, 'gamertag': 'atk1', 'faction': 3}],
+        'map_entity_id': 112741325}
+_mm = matchmaking._msg_mission_details_response_multi(990001, _det, 'zulu')
+def _repeated_map(raw, fn, kf, vf):
+    """顶层拆 repeated 子消息 → {kf 字段值: vf 字段值}（pb_parse_loose 单值
+    覆盖语义收集不了 repeated，须 pb_split_top 保序拆块）。"""
+    out = {}
+    for _fn, block in pb_split_top(raw):
+        if _fn != fn:
+            continue
+        _ef = pb_parse_loose(pb_field_payload(block))
+        out[int(_ef.get(kf))] = int(_ef.get(vf))
+    return out
+
+
+_f6 = _repeated_map(_mm, 6, 1, 2)                   # {模板: factionTemplateId}
+_layout = _accesspoint_layout(10, 2, 3)
+check('layout 首点=进攻方、次点=防守方（交替起始=attacker）',
+      _layout and _layout[0][1] == 3 and
+      (len(_layout) < 2 or _layout[1][1] == 2),
+      f'layout={_layout}')
+check('大厅 f6 与战斗 layout 逐点同 owner',
+      _f6 and len(_f6) == len(_layout) and
+      all(_f6.get(int(t)) == int(o) for t, o in _layout),
+      f'f6={_f6} layout={_layout}')
+_bf = warserver_messages._msg_response_battlefield_settings(
+    10, 2, 3, True, 1, 0, None, counts_by_faction=None)
+_f12 = _repeated_map(_bf, 12, 3, 1)                 # f3=模板 f1=owner
+check('BattleFieldSettings f12 accesspoints owner 与 layout 同值',
+      _f12 and len(_f12) == len(_layout) and
+      all(_f12.get(int(t)) == int(o) for t, o in _layout),
+      f'f12={_f12} layout={_layout}')
 
 print(f'\nresult: ok={ok} fail={fail}')
 sys.exit(1 if fail else 0)

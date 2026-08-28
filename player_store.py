@@ -2381,6 +2381,22 @@ class PlayerStore:
                  'expires_at': r['expires_at'],
                  'is_ribbon': bool(r['is_ribbon'])} for r in rows]
 
+    async def list_active_boosters(self, player_id, ribbon_only=False):
+        """激活中的加成行（activated_at 非空且未过期；未激活/已过期不发）。
+
+        战斗 PlayerSettings charactersetting f5 ribbonBoosters 的数据源；
+        ribbon_only=True 只取勋带加成（is_ribbon）。"""
+        sql = ('SELECT id, booster_template_id, is_ribbon FROM player_boosters '
+               'WHERE player_id = $1 AND activated_at IS NOT NULL '
+               'AND expires_at > now()')
+        if ribbon_only:
+            sql += ' AND is_ribbon'
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql + ' ORDER BY id', int(player_id))
+        return [{'id': int(r['id']),
+                 'template_id': int(r['booster_template_id']),
+                 'is_ribbon': bool(r['is_ribbon'])} for r in rows]
+
     async def list_tickets(self, player_id, timed_only=False):
         """玩家门票行（Ticket/TicketTimed KVCS 源）。"""
         if timed_only:
