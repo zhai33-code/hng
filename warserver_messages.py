@@ -31,6 +31,8 @@ from wardb import (
     _load_preset,
     _rank_from_combat_xp,
     _ribbon_level_from_xp,
+    battlefield_entity_for_gamemap,
+    battlefield_pos,
     charactertemplate_actionid,
     default_uniform_variant,
     spawn_clips_for,
@@ -563,7 +565,14 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     m += pb_string(23, name)                       # 23 metricsMissionName
     m += pb_int64(24, 0)                           # 24 supplyLineId
     m += pb_float(25, 0.0)                         # 25 supplyLineOffsetFromAP1
-    m += pb_float(29, 0.0)                         # 29 stagedPosX
-    m += pb_float(30, 0.0)                         # 30 stagedPosY
+    # f29/f30 stagedPos：战斗内 SpawnMenu 的 IngameEuropeMapOverlay 缩放定位
+    # （player.dll SpawnMenu/IngameEuropeMapOverlayBlend + WarMap/deployTarget）。
+    # 取本局 gamemap 对应 battlefield 行坐标（与简报 GMD f8/f9、大厅地图同源
+    # 同值）；遭遇战图无行时 battlefield_entity_for_gamemap 回退 Benoit Village
+    # 锚点。恒为 0.0 会让 overlay 缩放到欧洲地图左上角（与大厅位置不一致）。
+    gamemap_id = int(preset.get(3, 0) or 0) or 13
+    pos = battlefield_pos(battlefield_entity_for_gamemap(gamemap_id)) or (0.0, 0.0)
+    m += pb_float(29, pos[0])                      # 29 stagedPosX
+    m += pb_float(30, pos[1])                      # 30 stagedPosY
     m += pb_bool(31, False)                        # 31 enableSaBots
     return m
