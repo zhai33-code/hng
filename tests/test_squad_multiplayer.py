@@ -26,7 +26,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import game_server
 import matchmaking
 from protocol import Chunk, pb_message, pb_varint
-
 RESULTS = []
 
 
@@ -47,53 +46,46 @@ class FakeWriter:
 
 
 def _parse_varints(data):
-    """protobuf 顶层 varint 字段 → {field_no: value}（message 字段收集到 _messages）。"""
+    """protobuf 顶层字段 → {field_no: value}（0 varint / 2 message 收集 /
+    5 fixed32 跳过——PlayerSettings f6 是 float，不能像旧版那样 break）。"""
     out = {}
     i = 0
-    while i < len(data):
-        key = v = 0
-        shift = 0
+    n = len(data)
+
+    def _read_varint(pos):
+        v = shift = 0
         while True:
-            b = data[i]
-            i += 1
+            b = data[pos]
+            pos += 1
             v |= (b & 0x7F) << shift
             shift += 7
             if not (b & 0x80):
-                break
-        key, wt = v >> 3, v & 7
+                return v, pos
+
+    while i < n:
+        key, i = _read_varint(i)
+        fn, wt = key >> 3, key & 7
         if wt == 0:
-            val = 0
-            shift = 0
-            while True:
-                b = data[i]
-                i += 1
-                val |= (b & 0x7F) << shift
-                shift += 7
-                if not (b & 0x80):
-                    break
-            out[key] = val
+            out[fn], i = _read_varint(i)
+        elif wt == 1:
+            i += 8
         elif wt == 2:
-            ln = 0
-            shift = 0
-            while True:
-                b = data[i]
-                i += 1
-                ln |= (b & 0x7F) << shift
-                shift += 7
-                if not (b & 0x80):
-                    break
-            out.setdefault('_messages', {})[key] = data[i:i + ln]
+            ln, i = _read_varint(i)
+            out.setdefault('_messages', {})[fn] = data[i:i + ln]
             i += ln
+        elif wt == 5:
+            i += 4
         else:
             break
     return out
 
 
-async def _squad_request(mission_session_id, squad_id):
-    """发一条 SquadRequest，返回解析后的 SquadResponse 字段。"""
+async def _squad_request(mission_session_id, squad_id, sess=None):
+    """发一条 SquadRequest，返回解析后的 SquadResponse 字段。
+    sess 可带 combat_mission（战斗服连接场景）。"""
     proto = pb_varint(1, mission_session_id) + pb_varint(2, squad_id)
     w = FakeWriter()
-    await game_server.handle_request(None, w, 6, 'SquadRequest', proto)
+    await game_server.handle_request(sess, w, 6, 'SquadRequest', proto)
     main, _ = Chunk.parse(w.data, 0)
     title = main.subs[0]
     resp = _parse_varints(title.subs[0].data)
@@ -237,6 +229,109 @@ async def run():
               got.get(49) == 79, f'entries={got}')
     finally:
         game_server.STORE = old_store
+
+    # --- 用例 5：跨局并行 SquadRequest 兜底圈定本局 ---
+    # 战斗服 M1 的连接（combat_mission=488464），f1=ZServer 自产 id（未命中）、
+    # f2=0（未命中）→ 修复前全局"最新会话"= M2 后进玩家 → faction 错；
+    # 修复后圈定 M1 → faction 用 M1 玩家的登记小队。
+    # （M1 只留一个会话：f2 未命中时局内无法区分具体玩家，验证点在跨局。）
+    from types import SimpleNamespace as NS
+    mission, sess_a, sess_b = _seed_two_player_match()
+    m2 = 488465
+    sess_c = dict(sess_b, pms_id=903048748842679900,
+                  battle_session_id=1189987113029180799,
+                  squad_id=3721435839200754200,
+                  mission_id=m2, player_id=33, char_id=77)
+    matchmaking.PMS_TO_SESSION.pop(sess_b['pms_id'])
+    matchmaking.PMS_TO_MISSION.pop(sess_b['pms_id'], None)
+    matchmaking.PMS_TO_SESSION[sess_c['pms_id']] = sess_c
+    matchmaking.PMS_TO_MISSION[sess_c['pms_id']] = m2
+    resp_scope = await _squad_request(
+        730433917 * 10**6 + m2, 0, sess=NS(combat_mission=mission))
+    check('跨局 SquadRequest 兜底圈定本局（faction=M1 德军 2）',
+          resp_scope['faction_template'] == 2 and resp_scope['team'] == 2,
+          f'got team={resp_scope["team"]} factionTemplate='
+          f'{resp_scope["faction_template"]}')
+    # M1 会话全清（结算后残留请求）：宁缺毋错 → 单槽默认而非串到 M2
+    matchmaking.PMS_TO_SESSION.pop(sess_a['pms_id'])
+    resp_empty = await _squad_request(
+        730433917 * 10**6 + m2, 0, sess=NS(combat_mission=mission))
+    check('M1 会话清空后不串到 M2（faction=默认 3 且 squad 非成员队）',
+          resp_empty['faction_template'] == 3
+          and resp_empty['squad_id'] not in (sess_b['squad_id'],
+                                             sess_c['squad_id']),
+          f'got faction={resp_empty["faction_template"]} '
+          f'squad={resp_empty["squad_id"]}')
+
+    # --- 用例 6：GetPlayerSettings 跨局兜底圈定本局 ---
+    # stale pms（rejoin/结算清理后 ZServer 仍持有）+ 战斗服 M1 连接 →
+    # 修复前全局最新会话 = M2 玩家 → 身份/角色错配（"进游戏人变成 bot"路径）
+    matchmaking.PMS_TO_SESSION.clear()
+    matchmaking.PMS_TO_SESSION[sess_a['pms_id']] = sess_a
+    matchmaking.PMS_TO_SESSION[sess_c['pms_id']] = sess_c
+    matchmaking.PMS_TO_MISSION.clear()
+    matchmaking.PMS_TO_MISSION[sess_a['pms_id']] = mission
+    matchmaking.PMS_TO_MISSION[sess_c['pms_id']] = m2
+    old_store = game_server.STORE
+    game_server.STORE = None
+    try:
+        w = FakeWriter()
+        stale_pms = 987654321
+        await game_server.handle_request(
+            NS(combat_mission=mission), w, 8, 'GetPlayerSettings',
+            pb_varint(1, stale_pms))
+        main, _ = Chunk.parse(w.data, 0)
+        ps = _parse_varints(main.subs[0].subs[0].data)
+        check('GetPlayerSettings stale pms 圈定本局（M1 玩家 2/角色 31）',
+              ps.get(1) == 2 and ps.get(15) == 31,
+              f'got player={ps.get(1)} char={ps.get(15)} '
+              f'faction={ps.get(7)}')
+        check('GetPlayerSettings 圈定本局阵营（M1 德军 2）',
+              ps.get(7) == 2, f'got faction={ps.get(7)}')
+        # 无 combat_mission（旧路径）→ 保持全局最新会话行为
+        w2 = FakeWriter()
+        await game_server.handle_request(None, w2, 9, 'GetPlayerSettings',
+                                         pb_varint(1, stale_pms))
+        main2, _ = Chunk.parse(w2.data, 0)
+        ps2 = _parse_varints(main2.subs[0].subs[0].data)
+        check('无 combat_mission 时保持旧回退（最新会话 M2 玩家 33）',
+              ps2.get(1) == 33, f'got player={ps2.get(1)}')
+    finally:
+        game_server.STORE = old_store
+
+    # --- 用例 7：击杀归属 bot 撞号过滤（ReportMissionStatus f3） ---
+    # M1 roster 只有 pid=2；killer pid=3 是 bot（M2 里恰好有同号真实玩家）→
+    # 修复前全局反查把 bot 击杀记到 M2 玩家角色上。
+    from handlers import combat as combat_handlers
+    matchmaking.PMS_TO_SESSION.clear()
+    matchmaking.PMS_TO_SESSION[sess_a['pms_id']] = sess_a   # M1: pid=2, char=31
+    matchmaking.PMS_TO_SESSION[sess_c['pms_id']] = sess_c   # M2: pid=33...
+    # 构造 pid=3 的他局会话（撞号源）
+    sess_d = dict(sess_b, pms_id=903048748842679910,
+                  battle_session_id=1189987113029180798,
+                  squad_id=3721435839200754201,
+                  mission_id=488466, player_id=3, char_id=99)
+    matchmaking.PMS_TO_SESSION[sess_d['pms_id']] = sess_d
+    recorded = []
+
+    class StatStore:
+        async def add_stat(self, cid, key, val):
+            recorded.append((cid, key, val))
+
+    old_cstore = combat_handlers.STORE
+    combat_handlers.STORE = StatStore()
+    try:
+        kill_rec_bot = pb_varint(1, 3) + pb_message(5, pb_varint(3, 2))
+        kill_rec_real = pb_varint(1, 2) + pb_message(5, pb_varint(3, 1))
+        proto = pb_message(3, kill_rec_bot) + pb_message(3, kill_rec_real)
+        await combat_handlers.handle_report_mission_status(
+            NS(combat_mission=mission), FakeWriter(), 10,
+            'ReportMissionStatusRequest', proto)
+        check('bot(pid=3 撞他局玩家号)击杀不入账，本局(pid=2)正常入账',
+              recorded == [(31, 'kills', 1)],
+              f'got recorded={recorded}')
+    finally:
+        combat_handlers.STORE = old_cstore
 
     # --- 清理 ---
     matchmaking.PMS_TO_SESSION.clear()

@@ -170,9 +170,23 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         #   （客户端校验 f1 == sub）。
         mm_sess = matchmaking.PMS_TO_SESSION.get(pms_id)
         if mm_sess is None:
-            # pms 未精确命中（理论不可达）→ 取最新进局会话，player/char 仍来自库
+            # ★ pms 未精确命中（stale pms：rejoin/结算清理后 ZServer 仍持有）
+            #   时兜底必须圈定本局：请求来自战斗服连接（握手已记
+            #   combat_mission），全局"最新会话"在多局并行时会拿错玩家 →
+            #   身份/阵营/角色错配（"进游戏人变成 bot"根因之一：ZServer
+            #   建玩家失败 → AI 补位顶替）。
+            cm = int(getattr(sess, 'combat_mission', 0) or 0)
             for _s in matchmaking.PMS_TO_SESSION.values():
-                mm_sess = _s
+                if cm and int(_s.get('mission_id', 0) or 0) != cm:
+                    continue
+                mm_sess = _s          # dict 保序 → 本局最新进局会话
+            if mm_sess is None and not cm:
+                for _s in matchmaking.PMS_TO_SESSION.values():
+                    mm_sess = _s      # 无本局信息（理论不可达）→ 全局最新
+                if mm_sess is not None:
+                    log(f'      [WARN] GetPlayerSettings: pms={pms_id} miss, '
+                        f'fell back to latest session (player='
+                        f'{mm_sess.get("player_id")})')
         faction = None
         quickplay = None
         first_action_game = None
@@ -229,8 +243,11 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             log(f'      [WARN] GetPlayerSettings: no PMS session '
                 f'(pms_id={pms_id}), ids generated, player fields zeroed')
         # missionId 必须与客户端启动参数 /M 一致（否则客户端校验失败挂起→20s 超时断开）
-        mission_id = matchmaking.PMS_TO_MISSION.get(
-            pms_id, matchmaking._MM_MISSION_ID[0])
+        # pms 命中时从映射取；未命中（兜底会话）用该会话的 mission；
+        # 都没有才回退全局计数（旧行为）
+        mission_id = matchmaking.PMS_TO_MISSION.get(pms_id, 0) or \
+            (int(mm_sess.get('mission_id', 0) or 0) if mm_sess else 0) or \
+            matchmaking._MM_MISSION_ID[0]
         # ★ 记在连接上：玩家游戏进程的 ActiveMissionRequestEventList 轮询
         #   实测不带 mission_id（f1=0，与战斗服同款），combat.py 用它定位
         #   本局资源池/布局（否则回退 Mill 模板 → 资源数字错局）。
@@ -564,8 +581,19 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                     mm_sess = _s
                     break
         if mm_sess is None:
+            # ★ 兜底圈定本局：f1（ZServer 自产 id）/f2（stale f16，如 rejoin
+            #   换队后 ZServer 缓存旧值）都未命中时，全局"最新会话"在多局
+            #   并行时会拿到别的局的玩家 → mission_id 错 → 登记表查不到 →
+            #   单槽默认 + 错误 faction（历史小队阵营错误同款路径）。
+            #   请求来自战斗服自己的连接，用握手记录的 combat_mission 圈定。
+            cm = int(getattr(sess, 'combat_mission', 0) or 0)
             for _s in matchmaking.PMS_TO_SESSION.values():
-                mm_sess = _s              # dict 保序 → 最后一条 = 最新进局会话
+                if cm and int(_s.get('mission_id', 0) or 0) != cm:
+                    continue
+                mm_sess = _s          # dict 保序 → 本局最新进局会话
+            if mm_sess is None and not cm:
+                for _s in matchmaking.PMS_TO_SESSION.values():
+                    mm_sess = _s      # 无本局信息（理论不可达）→ 全局最新
         if mm_sess is None:
             log('      [WARN] SquadRequest: no PMS session, char ids zeroed')
         sess_char_id = int(mm_sess['char_id']) if mm_sess else 0

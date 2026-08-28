@@ -148,12 +148,19 @@ def _report_ribbon_end(br_players):
     return out
 
 
-def _session_by_player(player_id):
-    """playerId → 最新匹配会话（PMS_TO_SESSION 值序 = 进局序）。"""
+def _session_by_player(player_id, mission_id=None):
+    """playerId → 最新匹配会话（PMS_TO_SESSION 值序 = 进局序）。
+
+    mission_id 给定时只在该局会话里反查：bot 的 playerId 是小整数、
+    可能与真实账号 id 撞号（实测 bot 3 ≠ 玩家 3），全局反查会把
+    bot 的击杀记到真实账号名下；圈定本局后不在名单 = bot → None。"""
     found = None
     for s in matchmaking.PMS_TO_SESSION.values():
-        if int(s.get('player_id', 0) or 0) == int(player_id):
-            found = s
+        if int(s.get('player_id', 0) or 0) != int(player_id):
+            continue
+        if mission_id and int(s.get('mission_id', 0) or 0) != int(mission_id):
+            continue
+        found = s
     return found
 
 
@@ -441,12 +448,17 @@ async def handle_report_mission_status(sess, writer, cmd_id, req_type, proto):
             n_kills += int(_get(tup, 3, 0) or 0)
         kill_total += n_kills
         if n_kills and STORE is not None:
-            mm_sess = _session_by_player(killer_pid)
+            # ★ bot 撞号过滤：killer 不在本局（mid）会话名单 → bot →
+            #   不给真实账号记击杀（f3 无 is_bot 字段，只能按 roster 判定）
+            mm_sess = _session_by_player(killer_pid, mission_id=mid)
             if mm_sess:
                 try:
                     await STORE.add_stat(int(mm_sess['char_id']), 'kills', n_kills)
                 except Exception as e:
                     log(f'      [DB] add_stat(kills) failed: {e}')
+            else:
+                log(f'      [combat] kills x{n_kills} by pid={killer_pid} '
+                    f'skipped (not in mission {mid} roster, likely bot)')
 
     n_res = len(_all(items, 2)) + len(_all(items, 5))
     if msid or kill_total or n_res:
@@ -928,7 +940,8 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 if p['kills'] or p['deaths'] or p['score'] or p['captures']:
                     target = p['characters'][0]['characterId'] if p['characters'] else 0
                     if not target:
-                        mm_sess = _session_by_player(pid)
+                        mm_sess = _session_by_player(
+                            pid, mission_id=report['mission_id'] or None)
                         target = int(mm_sess['char_id']) if mm_sess else 0
                     if target:
                         if p['kills']:
