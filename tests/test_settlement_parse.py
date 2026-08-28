@@ -239,10 +239,117 @@ def test_battlereport_ribbon_and_vet_encoding():
     assert pb_varint(3, 1) in mp
 
 
+def _pb_fixed32(field, value):
+    """wire type 5（fixed32 float）编码，供 f12 xpValue 测试。"""
+    import struct
+    return bytes([field << 3 | 5]) + struct.pack('<f', value)
+
+
+def test_capturepoints_and_xpstats_parse_and_persist():
+    """f7 据点归属 + 角色 f12 xpStatValues 解析入库（结算界面缺项补全）。"""
+    # BattleReportCharacter f12：ClientBattleStatRequirement
+    # {f1 statRequirementId, f2 statValue, f3 xpValue(fixed32)}
+    stat = (pb_varint(1, 5001) + pb_varint(2, 7)
+            + _pb_fixed32(3, 12.5))
+    earn = pb_varint(1, 5678)
+    char = (pb_varint(1, 4) + pb_varint(2, 1000) + pb_varint(3, 2500)
+            + pb_msg(11, earn) + pb_msg(12, stat))
+    player = (pb_varint(1, 1) + pb_varint(4, 500) + pb_msg(9, b'TestGuy')
+              + pb_varint(10, 0) + pb_msg(11, char))
+    faction = pb_varint(1, 2) + pb_msg(2, player)
+    # BattleReport f7：repeated CapturepointStatus{f1 tmpl, f2 owner}
+    report = (pb_varint(1, 730433917100003) + pb_varint(2, 2)
+              + pb_varint(3, 3) + pb_varint(4, 900) + pb_varint(5, 1787750000)
+              + pb_msg(6, faction)
+              + pb_msg(7, pb_varint(1, 101) + pb_varint(2, 3))
+              + pb_msg(7, pb_varint(1, 102) + pb_varint(2, 0)))
+    proto = (pb_varint(1, 100003) + pb_varint(2, 730433917100003)
+             + pb_varint(3, 10) + pb_msg(4, report))
+
+    fake = _FakeStore()
+    old = combat_handlers.STORE
+    combat_handlers.STORE = fake
+    try:
+        asyncio.run(combat_handlers.handle_announce_battlefield_earnings(
+            _MockSess(), _MockWriter(), 200,
+            'AnnounceBattleFieldEarningsRequest', proto))
+    finally:
+        combat_handlers.STORE = old
+    assert fake.saved, '战报未入库'
+    rep, players = fake.saved
+    # f7 据点归属透传入库
+    assert rep['capturepoints'] == [{'id': 101, 'owner': 3},
+                                    {'id': 102, 'owner': 0}], rep['capturepoints']
+    # 角色 f12 统计项：id/value/xp（float）
+    ch = players[0]['characters'][0]
+    assert ch['stats'] == [{'id': 5001, 'value': 7, 'xp': 12.5}], ch['stats']
+
+
+def test_capturepoints_fallback_from_status_overlay():
+    """BattleReport 无 f7 → ReportMissionStatus 持续上报的 _CAPTURE_OWNERS 兜底。"""
+    earn = pb_varint(1, 5678)
+    char = pb_varint(1, 4) + pb_varint(2, 1000) + pb_varint(3, 2500) \
+        + pb_msg(11, earn)
+    player = (pb_varint(1, 1) + pb_varint(4, 500) + pb_msg(9, b'G')
+              + pb_varint(10, 0) + pb_msg(11, char))
+    faction = pb_varint(1, 2) + pb_msg(2, player)
+    report = (pb_varint(1, 730433917100003) + pb_varint(2, 2)
+              + pb_varint(3, 3) + pb_varint(4, 900) + pb_varint(5, 1787750000)
+              + pb_msg(6, faction))            # 无 f7
+    proto = (pb_varint(1, 100003) + pb_varint(2, 730433917100003)
+             + pb_varint(3, 10) + pb_msg(4, report))
+
+    combat_handlers._CAPTURE_OWNERS.clear()
+    combat_handlers._CAPTURE_OWNERS.update({201: 1, 202: 2})
+    fake = _FakeStore()
+    old = combat_handlers.STORE
+    combat_handlers.STORE = fake
+    try:
+        asyncio.run(combat_handlers.handle_announce_battlefield_earnings(
+            _MockSess(), _MockWriter(), 200,
+            'AnnounceBattleFieldEarningsRequest', proto))
+    finally:
+        combat_handlers.STORE = old
+    rep, _ = fake.saved
+    assert rep['capturepoints'] == [{'id': 201, 'owner': 1},
+                                    {'id': 202, 'owner': 2}], rep['capturepoints']
+    # 结算后清空（下局从布局重新开始）
+    assert not combat_handlers._CAPTURE_OWNERS
+
+
+def test_battlereport_response_encodes_capturepoints_and_stats():
+    """GetBattleReportResponse：f12 capturepoints + 角色 f12 xpStatValues。"""
+    from handlers import battlereport as br
+    rep = {'id': 123, 'mission_preset_id': 10, 'defender_faction_id': 2,
+           'winner_faction_id': 3, 'mission_time_seconds': 900,
+           'battle_start_time': 1787750000,
+           'capturepoints_json': '[{"id": 101, "owner": 3}, '
+                                 '{"id": 102, "owner": 0}]'}
+    players = [{'player_id': 1, 'gamertag': 'T', 'score': 500, 'captures': 0,
+                'kills': 3, 'deaths': 1, 'squad_name': '',
+                'characters_json': '[{"characterId": 4, "factionId": 2, '
+                '"stats": [{"id": 5001, "value": 7, "xp": 12.5}]}]'}]
+    m = br._msg_client_battle_report(rep, players)
+    # f12 capturepoints：{f1 tmpl, f2 owner}
+    assert pb_msg(12, pb_varint(1, 101) + pb_varint(2, 3)) in m
+    assert pb_msg(12, pb_varint(1, 102) + pb_varint(2, 0)) in m
+    # 角色 f12 xpStatValues：{f1 id, f2 value, f3 fixed32 xp}
+    assert pb_msg(12, pb_varint(1, 5001) + pb_varint(2, 7)
+                  + _pb_fixed32(3, 12.5)) in m
+    # 旧战报（无 capturepoints_json / stats）不崩、不误发
+    rep_old = dict(rep)
+    rep_old['capturepoints_json'] = None
+    m_old = br._msg_client_battle_report(rep_old, players)
+    assert pb_msg(12, pb_varint(1, 101)) not in m_old
+
+
 if __name__ == '__main__':
     test_earnings_value_crash_bytes()
     test_handle_earnings_no_crash_and_response_first()
     test_ribbon_start_end_and_vet_bonus_persisted()
     test_msid_synthesized_when_missing()
     test_battlereport_ribbon_and_vet_encoding()
-    print('test_settlement_parse: 5 项全部通过')
+    test_capturepoints_and_xpstats_parse_and_persist()
+    test_capturepoints_fallback_from_status_overlay()
+    test_battlereport_response_encodes_capturepoints_and_stats()
+    print('test_settlement_parse: 8 项全部通过')

@@ -23,6 +23,7 @@ DB 落点（player_store，2026-08-21 U1 建表）：
 - CareerOrderActionGame → career_orders.progress
 """
 
+import struct
 import time
 import zlib
 
@@ -709,6 +710,7 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
         'mission_preset_id': mission_preset_id,
         'winner_faction_id': 0, 'defender_faction_id': 0,
         'mission_time_seconds': 0, 'battle_start_time': 0,
+        'capturepoints': [],
     }
     try:
         br_raw = _get(items, 4, b'')
@@ -719,6 +721,14 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
             report['winner_faction_id'] = int(_get(br, 3, 0) or 0)
             report['mission_time_seconds'] = int(_get(br, 4, 0) or 0)
             report['battle_start_time'] = int(_get(br, 5, 0) or 0)
+            # f7 capturepoints：结算界面战场态势图（BattlefieldStatusView
+            # setBattleReportCapturePointStatuses）逐点着色数据源
+            for cp_raw in _all(br, 7):
+                cp = _split_fields(cp_raw)
+                tmpl = int(_get(cp, 1, 0) or 0)
+                if tmpl:
+                    report['capturepoints'].append(
+                        {'id': tmpl, 'owner': int(_get(cp, 2, 0) or 0)})
             for fac_raw in _all(br, 6):                  # BattleReportFaction
                 fac = _split_fields(fac_raw)
                 faction_id = int(_get(fac, 1, 0) or 0)
@@ -740,6 +750,26 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                             })
                         credit = _earnings_value(_get(c, 10, b''))
                         warfund = _earnings_value(_get(c, 11, b''))
+                        # f12 xpStatValues：士兵详情"战斗经验明细"列表
+                        # （MissionBattleReportDetailedPlayerInformation
+                        # setDetailedInfoListItems 按统计分类展示）
+                        # ClientBattleStatRequirement{f1 statRequirementId,
+                        # f2 statValue, f3 xpValue(fixed32 float)}
+                        stats = []
+                        for st_raw in _all(c, 12):
+                            st = _split_fields(st_raw)
+                            st_id = int(_get(st, 1, 0) or 0)
+                            if not st_id:
+                                continue
+                            xp_raw = _get(st, 3, b'')
+                            xp_val = struct.unpack('<f', xp_raw)[0] \
+                                if isinstance(xp_raw, (bytes, bytearray)) \
+                                and len(xp_raw) == 4 else 0.0
+                            stats.append({
+                                'id': st_id,
+                                'value': int(_get(st, 2, 0) or 0),
+                                'xp': round(float(xp_val), 2),
+                            })
                         chars.append({
                             'characterId': int(_get(c, 1, 0) or 0),
                             'startXp': int(_get(c, 2, 0) or 0),
@@ -748,6 +778,7 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                             'creditVetBonus': credit * 25 // 100,
                             'warfundEarned': warfund,
                             'warfundVetBonus': warfund * 25 // 100,
+                            'stats': stats,
                             'ribbons': ribbons,
                             'factionId': faction_id,
                         })
@@ -764,6 +795,14 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                     })
     except Exception as e:
         log(f'      [combat] BattleReport parse error: {e}')
+
+    # 战报无 f7 时（本地战斗服缺省字段）：用 ReportMissionStatusRequest f4
+    # 持续上报的 _CAPTURE_OWNERS 终态兜底（须在 clear() 前快照）
+    if not report['capturepoints'] and _CAPTURE_OWNERS:
+        report['capturepoints'] = [
+            {'id': int(t), 'owner': int(o)} for t, o in _CAPTURE_OWNERS.items()]
+        log(f'      [combat] capturepoints from status overlay: '
+            f'{len(report["capturepoints"])} points')
 
     # msid=0（本地战斗服不发 BattleReport f1）时合成唯一幂等键：
     # 同局重复结算键值稳定（幂等保留），不同局互不覆盖——否则所有

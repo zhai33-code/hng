@@ -21,8 +21,10 @@ ClientBattleReport 嵌套（required 字段全给，空 repeated 完全省略）
   playerScore, playerCaptures, playerKills, playerDeaths, squadName,
   characters{characterId, startXp, endXp, ...bonuses=0,
   creditEarnings{valueEarned, veteranBonus}, warfundEarnings 同,
+  xpStatValues{statRequirementId, statValue, xpValue},
   ribbons{ribbonTemplateId, startValue, endValue}}} /
-  f12 capturepoints（空省略）
+  f12 capturepoints{capturepointTemplateId, ownerFactionId}
+  （BattleReport f7 / ReportMissionStatus f4 终态兜底，combat.py 结算入库）
 """
 
 import json
@@ -31,6 +33,7 @@ import matchmaking
 from protocol import (
     build_response,
     pb_bool,
+    pb_float,
     pb_int32,
     pb_int64,
     pb_message,
@@ -67,6 +70,12 @@ def _msg_report_character(ch):
                                       ch.get('creditVetBonus', 0)))
     m += pb_message(11, _msg_earnings(ch.get('warfundEarned', 0),
                                       ch.get('warfundVetBonus', 0)))
+    for st in ch.get('stats') or []:               # f12 xpStatValues
+        if isinstance(st, dict) and st.get('id'):
+            stm = pb_int64(1, int(st['id']))       # statRequirementId
+            stm += pb_int32(2, int(st.get('value', 0) or 0))
+            stm += pb_float(3, float(st.get('xp', 0) or 0))
+            m += pb_message(12, stm)
     for rb in ch.get('ribbons') or []:        # f13 ribbons
         if isinstance(rb, dict):              # 新格式：f13 start/end 直通
             rid, sv, ev = (int(rb.get('id', 0) or 0),
@@ -126,7 +135,20 @@ def _msg_client_battle_report(rep, players):
         for pm in by_faction[faction]:
             fm += pb_message(2, pm)
         m += pb_message(11, fm)
-    # f12 capturepoints：空省略（hurlant repeated 空字段坑）
+    # f12 capturepoints：BattlefieldStatusView 战场态势图逐点着色
+    # （capturepoints_json：[{id, owner}]，BattleReport f7 / 状态覆盖兜底）
+    raw_cps = rep.get('capturepoints_json') or '[]'
+    if isinstance(raw_cps, str):
+        try:
+            cps = json.loads(raw_cps)
+        except Exception:
+            cps = []
+    else:
+        cps = raw_cps or []
+    for cp in cps:
+        if isinstance(cp, dict) and cp.get('id'):
+            m += pb_message(12, pb_int64(1, int(cp['id']))
+                            + pb_int64(2, int(cp.get('owner', 0) or 0)))
     return m
 
 

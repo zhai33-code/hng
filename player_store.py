@@ -279,8 +279,11 @@ CREATE TABLE IF NOT EXISTS battle_reports (
     defender_faction_id BIGINT NOT NULL,
     mission_time_seconds INT NOT NULL DEFAULT 0,
     battle_start_time   INT NOT NULL DEFAULT 0,
+    capturepoints_json  JSONB NOT NULL DEFAULT '[]',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE battle_reports ADD COLUMN IF NOT EXISTS
+    capturepoints_json JSONB NOT NULL DEFAULT '[]';
 CREATE TABLE IF NOT EXISTS battle_report_players (
     id          SERIAL PRIMARY KEY,
     report_id   INT NOT NULL REFERENCES battle_reports(id) ON DELETE CASCADE,
@@ -1517,7 +1520,8 @@ class PlayerStore:
 
         report: {mission_session_id, mission_id, mission_preset_id,
                  winner_faction_id, defender_faction_id,
-                 mission_time_seconds, battle_start_time}
+                 mission_time_seconds, battle_start_time,
+                 capturepoints: [{id, owner}]（结算时据点终态，可缺省）}
         players: [{player_id, gamertag, squad_name, score, captures, kills,
                    deaths, is_bot, characters: [dict 任意结构存 JSONB]}]
         按 mission_session_id 幂等：同一局重复结算先删旧 players 再重建。
@@ -1533,13 +1537,14 @@ class PlayerStore:
                             'defender_faction_id = EXCLUDED.defender_faction_id, '
                             'mission_time_seconds = EXCLUDED.mission_time_seconds, '
                             'battle_start_time = EXCLUDED.battle_start_time, '
+                            'capturepoints_json = EXCLUDED.capturepoints_json, '
                             'created_at = now() ') if players else \
                            'ON CONFLICT (mission_session_id) DO NOTHING '
                 rid = await conn.fetchval(
                     'INSERT INTO battle_reports (mission_session_id, mission_id, '
                     'mission_preset_id, winner_faction_id, defender_faction_id, '
-                    'mission_time_seconds, battle_start_time) '
-                    'VALUES ($1, $2, $3, $4, $5, $6, $7) '
+                    'mission_time_seconds, battle_start_time, capturepoints_json) '
+                    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) '
                     + conflict +
                     'RETURNING id',
                     int(report['mission_session_id']), int(report.get('mission_id', 0)),
@@ -1547,7 +1552,9 @@ class PlayerStore:
                     int(report.get('winner_faction_id', 0)),
                     int(report.get('defender_faction_id', 0)),
                     int(report.get('mission_time_seconds', 0)),
-                    int(report.get('battle_start_time', 0)))
+                    int(report.get('battle_start_time', 0)),
+                    json.dumps(report.get('capturepoints') or [],
+                               ensure_ascii=False))
                 if rid is None:
                     # DO NOTHING 命中冲突：回查已存战报 id（供通知引用）
                     rid = await conn.fetchval(
@@ -1578,7 +1585,8 @@ class PlayerStore:
             rep = await conn.fetchrow(
                 'SELECT id, mission_session_id, mission_id, mission_preset_id, '
                 'winner_faction_id, defender_faction_id, mission_time_seconds, '
-                'battle_start_time, created_at FROM battle_reports WHERE id = $1',
+                'battle_start_time, capturepoints_json, created_at '
+                'FROM battle_reports WHERE id = $1',
                 report_id)
             if rep is None:
                 return None
