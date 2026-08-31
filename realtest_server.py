@@ -236,10 +236,25 @@ async def start_ping_responder():
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(_UdpProbe,
                                                        local_addr=('0.0.0.0', 20201))
-    server = await asyncio.start_server(_handle_ping_probe, '0.0.0.0', 20201)
-    log('Ping responder listening on 0.0.0.0:20201 (TCP+UDP, HostingCenter ping)')
-    async with server:
-        await server.serve_forever()
+    # TCP 20201 可能落在 Windows 保留端口段（Hyper-V/WSL WinNAT excludedportrange，
+    # 报 WSAEACCES 13）——实测 daemon 走 UDP 探测、TCP 从未收到连接，故 TCP 绑定
+    # 失败只降级告警，不杀 UDP 应答器（此前异常上抛还会泄漏 UDP transport，
+    # 导致 supervise 重启时自己占着自己端口报 10048）。
+    server = None
+    try:
+        server = await asyncio.start_server(_handle_ping_probe, '0.0.0.0', 20201)
+        log('Ping responder listening on 0.0.0.0:20201 (TCP+UDP, HostingCenter ping)')
+    except OSError as e:
+        log(f'[PING] TCP 20201 bind failed ({e}) -- UDP-only 降级运行 '
+            f'(Windows excludedportrange)')
+    try:
+        if server is not None:
+            async with server:
+                await server.serve_forever()
+        else:
+            await asyncio.Event().wait()   # 无 TCP 监听：挂住保持 UDP 应答
+    finally:
+        transport.close()
 
 
 # ================================================================ main

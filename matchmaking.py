@@ -445,13 +445,17 @@ FACTION_SUPREME_COMMANDS = {tmpl: random.getrandbits(63) for tmpl in (1, 2, 3)}
 
 
 def _rival_faction(faction):
-    """单阵营局的 AI 对手阵营（GE 玩家 → SU，其余 → GE）。
+    """单阵营局的 AI 对手阵营：另外两阵营等概率随机抽一。
 
     原先该规则在 _split_factions(L921) 与 AI 局简报(L850) 各写一份
     `2 if x != 2 else 3`——改一漏一即错位，收敛到这一处。
+    ★ 随机值只在成局时由 _split_factions 掷一次并写入
+    _MM_MISSION_DETAILS（attacker_faction/defender_faction），简报 f8/
+    战斗服 BattleFieldSettings/资源池/late-join 全读存储值，不再重掷
+    （避免简报与实际战局阵营错位）。
     """
     f = int(faction)
-    return 3 if f == 2 else 2
+    return random.choice([x for x in (1, 2, 3) if x != f])
 
 
 def _faction_pair(det):

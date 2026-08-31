@@ -288,20 +288,20 @@ def main():
                                          'defender_faction': 2}) is None and
               matchmaking._faction_pair({'attacker_faction': 2,
                                          'defender_faction': 2}) is None)
-        check('_rival_faction：GE→SU、US/SU→GE（两处硬编码合一）',
-              matchmaking._rival_faction(2) == 3 and
-              matchmaking._rival_faction(1) == 2 and
-              matchmaking._rival_faction(3) == 2)
-        # AI 局简报 f8 = 实际 AI 阵营（原恒 2，GE 玩家错位）
+        rivals = {f: matchmaking._rival_faction(f) for f in (1, 2, 3)}
+        check('_rival_faction：AI 方 ∈ 另外两阵营（等概率随机）',
+              rivals[2] in (1, 3) and rivals[1] in (2, 3) and
+              rivals[3] in (1, 2))
+        # AI 局简报 f8 = 实际 AI 阵营（成局掷一次，简报透传该值）
         info_ge = matchmaking._msg_mission_info(1, 2, '2026-01-01T00:00:00Z',
-                                                 matchmaking._rival_faction(2))
+                                                 rivals[2])
         info_us = matchmaking._msg_mission_info(1, 2, '2026-01-01T00:00:00Z',
-                                                 matchmaking._rival_faction(1))
-        # f8 = field 8 varint（field1-7 均小于 8 字节，0x40 03 = f8:3 粗定位）
-        check('AI 局简报 f8：GE 玩家 → AI 方 SU(3)（原恒 GE 错位）',
-              b'\x40\x03' in info_ge)
-        check('AI 局简报 f8：US 玩家 → AI 方 GE(2)（原行为不变）',
-              b'\x40\x02' in info_us)
+                                                 rivals[1])
+        # f8 = field 8 varint（field1-7 均小于 8 字节，0x40+值 粗定位）
+        check('AI 局简报 f8：GE 玩家 → AI 方=掷出阵营',
+              bytes((0x40, rivals[2])) in info_ge)
+        check('AI 局简报 f8：US 玩家 → AI 方=掷出阵营',
+              bytes((0x40, rivals[1])) in info_us)
 
         # ---- 9b. 真实小队 rejoin 归队（InBattle 掉线重连回原小队） ----
         # A(pid=888) 与 R(pid=777) 同在 DB 小队 555（局内登记行 888001，

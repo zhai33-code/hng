@@ -271,7 +271,7 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
                              w['character_id'], w['container_id'],
                              w['container_slot'], w.get('variant_id', 0),
                              w.get('clip_count', 0), w.get('auto_repair', 0),
-                             w.get('condition', 100.0))
+                             w.get('condition', 1.0))
         await _push_kvcs(writer, sess.soldier_view_cmd, b'weapon', wproto)
         log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (weapon '
             f'id={w["id"]}, template={w["template_id"]}, slot={w["container_slot"]}, '
@@ -752,7 +752,7 @@ async def _repush_weapon_rows(sess, writer, pid, weapon_id):
                              w['character_id'], w['container_id'],
                              w['container_slot'], w.get('variant_id', 0),
                              w.get('clip_count', 0), w.get('auto_repair', 0),
-                             w.get('condition', 100.0))
+                             w.get('condition', 1.0))
         await _push_kvcs(writer, cmd, b'weapon', wproto)
         log(f'S->C cmd={cmd:<4} KeyValueChangeSet (weapon id={w["id"]}, '
             f'charId={w["character_id"]}, slot={w["container_slot"]} '

@@ -390,7 +390,15 @@ def _msg_vehicle_setting(v, ups, vammos, vv_tmpl=None):
         if int(u.get('equipped_slot_id', 0) or 0) <= 0:
             continue
         um = pb_int64(1, int(u['id']))
-        um += pb_int64(2, int(u['upgrade_template_id']))
+        # f2 是 VehicleUpgradeSlot 表 id（equipped_slot_id，车库 schema 的
+        # equippedVehicleUpgradeSlotId）而非升级模板 id：客户端 spawn 侧
+        # （player.dll vehicles.cpp "vehicle mod slot" 循环，db kind=0xa）拿
+        # f2 查 eTableVehicleUpgradeSlot，再由行内 vehicleUpgradeTemplateId
+        # 得到真正模板。误发 upgrade_template_id 会撞表内同 id 行（id 空间
+        # 重叠：slot14=(vehicle61,tpl1)、slot3=(vehicle71,tpl1)），解析出
+        # 错误模板 1 且挂载失败，被 #error3 insufeciant slots 丢弃（2026-08-31
+        # hng_boot.log 实证：mod slot 14/3 → template 1 → 丢弃）
+        um += pb_int64(2, int(u['equipped_slot_id']))
         um += pb_float(3, float(u['condition'] or 1.0))
         m += pb_message(5, um)
     # f6 只下发已装备弹药（equipped_storage_id>0）——官方回放（pvt_player_settings.bin

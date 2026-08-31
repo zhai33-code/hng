@@ -39,7 +39,16 @@ from protocol import (
 from messages import _msg_character, _push_kvcs
 from player_service import _char_unlock_bits_for
 from state import FLASH_SESSIONS, PUBLIC_HOST, STORE, log
-from wardb import _RIBBON_LEVEL_XP, _rank_from_combat_xp, commandnode_template
+from wardb import (
+    _RIBBON_LEVEL_XP,
+    _rank_from_combat_xp,
+    ammo_wear_params,
+    commandnode_template,
+    vehicle_upgrade_wear_params,
+    vehicle_wear_params_for_variant,
+    weapon_modifier_wear_params,
+    weapon_wear_params,
+)
 from warserver_messages import _accesspoint_layout, _msg_army_resource_list
 
 # career 只依赖 protocol/state/messages/player_service/wardb，无回指 combat
@@ -654,6 +663,77 @@ async def handle_report_server_shutdown(sess, writer, cmd_id, req_type, proto):
     await _ack_error(writer, cmd_id, 'ReportServerShutdown acknowledged')
 
 
+async def handle_set_player_settings(sess, writer, cmd_id, req_type, proto):
+    """SetPlayerSettings（游戏进程对局内上报，远端实测 19B）→ HandlerErrorResponse。
+
+    实包锚点（2026-08-31 远端日志 ×38）：f1 playerMissionSessionId、
+    f5 fixed32 float（观测恒 0.4）、f7/f8 varint 0/1。
+    请求描述符未逆向（字段号与 PlayerSettings 响应 40 字段表对不上，
+    f5 在响应里是 bool invertmouseturret 而此处是 float），语义确认前
+    只结构化日志不落库——此前走 realtest 兜底被整条丢弃。"""
+    try:
+        items = _split_fields(proto)
+        msid = _get(items, 1)
+        raw5 = _get(items, 5)
+        f5 = struct.unpack('<f', raw5)[0] if isinstance(raw5, (bytes, bytearray)) \
+            else None
+        f7 = _get(items, 7)
+        f8 = _get(items, 8)
+    except Exception as e:
+        log(f'      [combat] SetPlayerSettings parse error: {e}')
+        msid = f5 = f7 = f8 = None
+    mm_sess = _session_by_msid(msid) if msid else None
+    log(f'      [combat] SetPlayerSettings msid={msid} f5={f5!r} f7={f7} f8={f8}'
+        f' -> {mm_sess["gamertag"] if mm_sess else "unknown session"}')
+    await _ack_error(writer, cmd_id, 'SetPlayerSettings acknowledged')
+
+
+async def handle_tutorial_request(sess, writer, cmd_id, req_type, proto):
+    """TutorialRequest（战斗内教程步骤上报，远端实测 12B）→ character_tutorials。
+
+    实包锚点（2026-08-31 远端日志 ×33）：f1 playerMissionSessionId、
+    f2 tutorialTemplateId（观测恒 26）。按 msid→会话角色记
+    character_tutorials(triggered+completed，幂等)——此前被兜底丢弃，
+    教程进度每局重置。"""
+    try:
+        items = _split_fields(proto)
+        msid = _get(items, 1)
+        tutorial_id = int(_get(items, 2, 0) or 0)
+    except Exception as e:
+        log(f'      [combat] TutorialRequest parse error: {e}')
+        msid = tutorial_id = 0
+    mm_sess = _session_by_msid(msid) if msid else None
+    log(f'      [combat] TutorialRequest msid={msid} tutorial={tutorial_id} -> '
+        f'{mm_sess["gamertag"] if mm_sess else "unknown session"}')
+    if mm_sess and tutorial_id and STORE is not None:
+        try:
+            await STORE.mark_character_tutorial(int(mm_sess['char_id']), tutorial_id)
+        except Exception as e:
+            log(f'      [DB] mark_character_tutorial failed: {e}')
+    await _ack_error(writer, cmd_id, 'TutorialRequest acknowledged')
+
+
+async def handle_report_accesspoint_faction_change(sess, writer, cmd_id,
+                                                   req_type, proto):
+    """ReportAccesspointFactionChange（据点易主即时上报，远端实测 5B）。
+
+    实包锚点（2026-08-31 远端日志 ×4）：f2 capturepointTemplateId（观测
+    202）、f3 ownerFactionId（观测 3）。与 ReportMissionStatusRequest f4
+    捕获上报同源写 _CAPTURE_OWNERS（f4 是 10s 周期全量，本消息是事件级
+    即时——覆盖后者两次轮询间隔内的快速易主）。"""
+    try:
+        items = _split_fields(proto)
+        tmpl = int(_get(items, 2, 0) or 0)
+        owner = int(_get(items, 3, 0) or 0)
+    except Exception as e:
+        log(f'      [combat] ReportAccesspointFactionChange parse error: {e}')
+        tmpl = owner = 0
+    if tmpl:
+        _CAPTURE_OWNERS[tmpl] = owner
+    log(f'      [combat] accesspoint faction change {tmpl} -> faction {owner}')
+    await _ack_error(writer, cmd_id, 'ReportAccesspointFactionChange acknowledged')
+
+
 async def handle_announce_battlefield_winner(sess, writer, cmd_id, req_type, proto):
     """AnnounceBattleFieldWinner（实测 2B：f2 varint 3 = 胜方）→ HandlerErrorResponse。"""
     try:
@@ -667,6 +747,137 @@ async def handle_announce_battlefield_winner(sess, writer, cmd_id, req_type, pro
 
 
 # ---------------------------------------------------------------- 战局结算
+
+def _est_shots(time_active):
+    """按活跃秒数估算本局射击发数（0.75 发/秒，钳 100~2000）。"""
+    return max(100, min(2000, int(time_active * 0.75)))
+
+
+def _est_spawns(time_active):
+    """按活跃秒数估算本局载具出生次数（每 300 秒一次，钳 1~6）。"""
+    return max(1, min(6, int(round(time_active / 300.0))))
+
+
+async def _apply_equipment_wear(char_times):
+    """战后维护损耗：按 CharacterBattleResult f7 timeActive 估算，扣减参战
+    角色已装备物品的 condition。
+
+    官方磨损模型（客户端 WeaponUtilities/VehicleUtilities + WarDatabase 模板）：
+      武器/配件 maxCondition=1.0，每发 wearPerShot；
+      载具/载具升级 maxCondition 为点数（25~220），每次 spawn wearPerSpawn；
+      弹药 condition 即剩余发数，wearPerShot 即每发消耗。
+    战斗服统计只到模板粒度（statrequests.WeaponStats 无实例磨损），只能
+    lobby 侧估算。模板磨损全 0（不可维护物品）与已扣到 0 的行跳过；
+    仅对参战角色已装备（container_slot / equipped_in_slot / 挂靠已装备
+    武器/载具）的物品生效。char_times: {(pid, charId): timeActive}。"""
+    for (pid, char_id), t_active in sorted(char_times.items()):
+        if not pid or not char_id or t_active <= 0:
+            continue
+        est_shots = _est_shots(t_active)
+        est_spawns = _est_spawns(t_active)
+        worn = 0
+        try:
+            # ---- 武器（装备中：container_id==角色 && container_slot>0）----
+            # 主武器槽（slot 1）全额定损，副武器按 30% 估算
+            weapons = await STORE.list_weapons(pid, char_id)
+            equipped_w = {int(w['id']): (int(w.get('container_slot') or 0), w)
+                          for w in weapons
+                          if int(w.get('container_id') or 0) == int(char_id)
+                          and int(w.get('container_slot') or 0) > 0}
+            for wid, (slot, w) in equipped_w.items():
+                params = weapon_wear_params(w['template_id'])
+                cond = float(w.get('condition') or 0)
+                if params and cond > 0 and (params[1] or params[2]):
+                    shots = est_shots if slot == 1 else int(est_shots * 0.3)
+                    new_cond = max(0.0, cond - params[1] * shots - params[2])
+                    if new_cond < cond:
+                        await STORE.update_weapon_condition(pid, wid, new_cond)
+                        worn += 1
+
+            # ---- 配件/弹药（挂在已装备武器上；弹药须已装备到弹药槽）----
+            if equipped_w:
+                for m in await STORE.list_weapon_modifiers(pid, char_id):
+                    if int(m.get('weapon_id') or 0) not in equipped_w:
+                        continue
+                    params = weapon_modifier_wear_params(m['template_id'])
+                    cond = float(m.get('condition') or 0)
+                    if params and cond > 0 and (params[1] or params[2]):
+                        slot = equipped_w[int(m['weapon_id'])][0]
+                        shots = est_shots if slot == 1 else int(est_shots * 0.3)
+                        new_cond = max(0.0, cond - params[1] * shots - params[2])
+                        if new_cond < cond:
+                            await STORE.update_weapon_modifier_condition(
+                                pid, m['id'], new_cond)
+                            worn += 1
+                for a in await STORE.list_weapon_ammo(pid, char_id):
+                    if int(a.get('weapon_id') or 0) not in equipped_w:
+                        continue
+                    if not int(a.get('slot_index') or 0):
+                        continue
+                    params = ammo_wear_params(a['ammo_template_id'])
+                    cond = float(a.get('condition') or 0)
+                    if params and cond > 0 and params[1]:
+                        slot = equipped_w[int(a['weapon_id'])][0]
+                        shots = est_shots if slot == 1 else int(est_shots * 0.3)
+                        new_cond = max(0.0, cond - params[1] * shots)
+                        if new_cond < cond:
+                            await STORE.update_weapon_ammo_condition(
+                                pid, a['id'], new_cond)
+                            worn += 1
+
+            # ---- 载具（装备中：character_id==角色 && equipped_in_slot>0）----
+            vehicles = await STORE.list_vehicles(pid, char_id)
+            equipped_v = {int(v['id']): v for v in vehicles
+                          if int(v.get('character_id') or 0) == int(char_id)
+                          and int(v.get('equipped_in_slot') or 0) > 0}
+            for vid, v in equipped_v.items():
+                params = vehicle_wear_params_for_variant(
+                    v['vehicle_variant_template_id'])
+                cond = float(v.get('condition') or 0)
+                if params and cond > 0 and (params[1] or params[2]):
+                    new_cond = max(0.0, cond - params[1] * est_spawns - params[2])
+                    if new_cond < cond:
+                        await STORE.update_vehicle_condition(pid, vid, new_cond)
+                        worn += 1
+
+            # ---- 载具升级/载具弹药（装在已装备载具上）----
+            if equipped_v:
+                for u in await STORE.list_vehicle_upgrades(pid):
+                    if int(u.get('vehicle_id') or 0) not in equipped_v:
+                        continue
+                    if not int(u.get('equipped_slot_id') or 0):
+                        continue
+                    params = vehicle_upgrade_wear_params(
+                        u['upgrade_template_id'])
+                    cond = float(u.get('condition') or 0)
+                    if params and cond > 0 and (params[1] or params[2]):
+                        new_cond = max(0.0,
+                                       cond - params[1] * est_spawns - params[2])
+                        if new_cond < cond:
+                            await STORE.update_vehicle_upgrade_condition(
+                                pid, u['id'], new_cond)
+                            worn += 1
+                for a in await STORE.list_vehicle_ammo(pid):
+                    if int(a.get('vehicle_id') or 0) not in equipped_v:
+                        continue
+                    if not int(a.get('equipped_storage_id') or 0):
+                        continue
+                    params = ammo_wear_params(a['ammo_template_id'])
+                    cond = float(a.get('condition') or 0)
+                    if params and cond > 0 and params[1]:
+                        new_cond = max(0.0, cond - params[1] * est_shots)
+                        if new_cond < cond:
+                            await STORE.update_vehicle_ammo_condition(
+                                pid, a['id'], new_cond)
+                            worn += 1
+
+            if worn:
+                log(f'      [wear] player={pid} char={char_id} '
+                    f'active={t_active}s shots~{est_shots} spawns~{est_spawns} '
+                    f'-> {worn} item(s) worn')
+        except Exception as e:
+            log(f'      [wear] player={pid} char={char_id} failed: {e}')
+
 
 async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, proto):
     """AnnounceBattleFieldEarningsRequest（结算）→ AnnounceBattleFieldEarningsResponse。
@@ -992,6 +1203,17 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
             except Exception as e:
                 log(f'      [DB] char result stats (pid={pid}) failed: {e}')
 
+        # ---- 战后维护损耗：参战角色已装备的武器/配件/弹药/载具/升级
+        #      按 timeActive 估算扣减 condition（同局重复结算取最大活跃值，
+        #      不叠加；bot 与未参战（timeActive=0）角色跳过）
+        char_times = {}
+        for pid, ch in char_results:
+            if not _is_settleable(pid) or not ch['characterId']:
+                continue
+            key = (pid, ch['characterId'])
+            char_times[key] = max(char_times.get(key, 0), ch['timeActive'])
+        await _apply_equipment_wear(char_times)
+
     # 战局结束：清空据点归属覆盖（下局从布局重新开始）+ 会话收尾
     # （PMS DELETE 清 rejoin + 战报通知触发结算界面）+ 释放本场
     # combat server 实例（杀进程/释放端口，触发排队战局拉起）
@@ -1186,4 +1408,7 @@ HANDLERS = {
     'ReportEacKick': handle_report_eac_kick,
     'ReportServerShutdown': handle_report_server_shutdown,
     'AnnounceBattleFieldWinner': handle_announce_battlefield_winner,
+    'SetPlayerSettings': handle_set_player_settings,
+    'TutorialRequest': handle_tutorial_request,
+    'ReportAccesspointFactionChange': handle_report_accesspoint_faction_change,
 }

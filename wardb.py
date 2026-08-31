@@ -196,6 +196,21 @@ def _build_mapping_req_levels():
 _MOD_REQ_LEVEL, _AMMO_REQ_LEVEL = _build_mapping_req_levels()
 
 
+# WeaponModifierTemplate { id=1, ..., weaponModCategoryId=28, ... } +
+# WeaponModCategory { id=1, name=2, weaponClassId=3, slotIndex=4 }：
+# 每个配件模板的槽位分类。基础分类 1=Ammunition 2=Barrel 3=Internal 4=Sight
+# 5=Trigger；11-75 为各枪械子类的同名分类（weaponClassId=11..17），f4 即槽位类型。
+# 同武器同槽位只允许装备一个配件（客户端 ModifyWeaponMediator 按槽位互斥渲染，
+# 与弹药 weaponAmmoMapping 一枪一发同理）——服务器装备配件时按此互斥卸下旧的。
+_MOD_CATEGORY_BY_TEMPLATE = {}
+for _f in _parse_wardb_table('WeaponModifierTemplate'):
+    _MOD_CATEGORY_BY_TEMPLATE[int(_f.get(1, 0))] = int(_f.get(28, 0))
+
+_MOD_CATEGORY_SLOT = {}
+for _f in _parse_wardb_table('WeaponModCategory'):
+    _MOD_CATEGORY_SLOT[int(_f.get(1, 0))] = int(_f.get(4, 0))
+
+
 # ammotemplate { id=1, ..., maxCondition=34 }：弹药满耐久值（新弹药/修复后 condition）
 def _build_ammo_maxcond():
     m = {}
@@ -237,6 +252,78 @@ for _f in _parse_wardb_table('VehicleUpgradeSlot'):
 _VEHICLE_VARIANT_PARENT = {}
 for _f in _parse_wardb_table('VehicleVariantTemplate'):
     _VEHICLE_VARIANT_PARENT[int(_f.get(1, 0))] = int(_f.get(3, 0))
+
+
+# ===== 装备耐久/磨损静态表（客户端 WeaponUtilities/VehicleUtilities 逆向确认）=====
+# 量纲：武器与配件 maxCondition=1.0（0~1 比例，按每发磨损 wearPerShot）；
+# 载具/载具升级 maxCondition 为点数（25~220），按每次 spawn 磨损 wearPerSpawn；
+# 弹药 maxCondition 即满弹发数，wearPerShot 即每发消耗（1.0/0.5/0）。
+# 字段号（HnG_States/*.as）：
+#   weapontemplate          f61 maxCondition / f62 wearPerShot / f63 wearPerBattle
+#   weaponmodifiertemplate  f23 maxCondition / f24 wearPerShot / f25 wearPerBattle
+#   ammotemplate            f34 maxCondition / f35 wearPerShot / f36 wearPerBattle
+#   vehicletemplate         f35 maxCondition / f36 wearPerSpawn / f37 wearPerBattle
+#   vehicleupgradetemplate  f6  maxCondition / f7  wearPerSpawn / f8  wearPerBattle
+def _build_wear_map(table, f_max, f_shot, f_battle):
+    m = {}
+    for f in _parse_wardb_table(table):
+        tid = int(f.get(1, 0) or 0)
+        if not tid:
+            continue
+
+        def fv(n):
+            raw = f.get(n, b'')
+            return struct.unpack('<f', raw)[0] \
+                if isinstance(raw, bytes) and len(raw) == 4 else 0.0
+        m[tid] = (fv(f_max), fv(f_shot), fv(f_battle))
+    return m
+
+
+_WEAPON_WEAR = _build_wear_map('weapontemplate', 61, 62, 63)
+_WEAPON_MOD_WEAR = _build_wear_map('WeaponModifierTemplate', 23, 24, 25)
+_AMMO_WEAR = _build_wear_map('ammotemplate', 34, 35, 36)
+_VEHICLE_WEAR = _build_wear_map('vehicletemplate', 35, 36, 37)
+_VEHICLE_UPGRADE_WEAR = _build_wear_map('vehicleupgradetemplate', 6, 7, 8)
+
+
+def weapon_wear_params(template_id):
+    """weapontemplate → (maxCondition, wearPerShot, wearPerBattle)；未知返回 None。"""
+    return _WEAPON_WEAR.get(int(template_id or 0))
+
+
+def weapon_modifier_wear_params(template_id):
+    """WeaponModifierTemplate → (maxCondition, wearPerShot, wearPerBattle)；未知返回 None。"""
+    return _WEAPON_MOD_WEAR.get(int(template_id or 0))
+
+
+def ammo_wear_params(template_id):
+    """ammotemplate → (maxCondition, wearPerShot, wearPerBattle)；未知返回 None。"""
+    return _AMMO_WEAR.get(int(template_id or 0))
+
+
+def vehicle_wear_params(template_id):
+    """vehicletemplate → (maxCondition, wearPerSpawn, wearPerBattle)；未知返回 None。"""
+    return _VEHICLE_WEAR.get(int(template_id or 0))
+
+
+def vehicle_upgrade_wear_params(template_id):
+    """vehicleupgradetemplate → (maxCondition, wearPerSpawn, wearPerBattle)；未知返回 None。"""
+    return _VEHICLE_UPGRADE_WEAR.get(int(template_id or 0))
+
+
+def vehicle_wear_params_for_variant(variant_template_id):
+    """载具变体模板 → 基础载具模板磨损参数（vehicletemplate f35-f37）；
+    变体 id 自身出现在 vehicletemplate 时兜底直查，均查不到返回 None。"""
+    parent = _VEHICLE_VARIANT_PARENT.get(int(variant_template_id or 0), 0)
+    return _VEHICLE_WEAR.get(parent) or \
+        _VEHICLE_WEAR.get(int(variant_template_id or 0))
+
+
+def vehicle_full_condition(variant_template_id):
+    """载具变体模板 → 基础载具模板的满耐久（vehicletemplate f35）。
+    新购/起始载具 condition 的单源；变体无父或父表缺失回退 100.0。"""
+    params = vehicle_wear_params_for_variant(variant_template_id)
+    return params[0] if params and params[0] > 0 else 100.0
 
 
 # VehicleWeaponSlot { id=1, vehicleTemplateId=2, weaponTemplateId=3, firingSequence=4,

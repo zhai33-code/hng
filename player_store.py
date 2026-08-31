@@ -54,9 +54,12 @@ CREATE SEQUENCE IF NOT EXISTS uniform_variant_id_seq START 700;
 CREATE SEQUENCE IF NOT EXISTS weapon_variant_id_seq START 800;
 CREATE SEQUENCE IF NOT EXISTS uniform_part_id_seq START 900;
 CREATE SEQUENCE IF NOT EXISTS vehicle_variant_id_seq START 1000;
+-- 玩家 id 从 1e6 起步：避开战斗服 bot 缺省 playerId（= u16 clientId ≤65535）
+-- 的命名空间，防止击杀归属/实体顶替撞号（playerid-bot-collision-2026-08-31.md）
+CREATE SEQUENCE IF NOT EXISTS players_id_seq START 1000000;
 
 CREATE TABLE IF NOT EXISTS players (
-    id         BIGSERIAL PRIMARY KEY,
+    id         BIGINT PRIMARY KEY DEFAULT nextval('players_id_seq'),
     username   TEXT UNIQUE NOT NULL,
     password   TEXT NOT NULL,
     credits    BIGINT NOT NULL DEFAULT 100000,
@@ -74,6 +77,20 @@ ALTER TABLE players ADD COLUMN IF NOT EXISTS warfunds BIGINT NOT NULL DEFAULT 10
 ALTER TABLE players ADD COLUMN IF NOT EXISTS gold     BIGINT NOT NULL DEFAULT 100000;
 -- 软删除标记（管理后台写入；登录侧 get_password 排除已删除账号 → 拒登）
 ALTER TABLE players ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+-- 存量库兜底：players_id_seq 仍处撞号区（<1e6，如 BIGSERIAL 时代建的库）时
+-- 抬到 1e6（不低于已用 max id+1）；已迁移过的库不受影响
+DO $$
+DECLARE cur bigint;
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_sequences
+             WHERE schemaname='public' AND sequencename='players_id_seq') THEN
+    SELECT COALESCE(last_value, 0) INTO cur FROM players_id_seq;
+    IF cur < 1000000 THEN
+      PERFORM setval('players_id_seq', GREATEST(
+          1000000, (SELECT COALESCE(MAX(id), 0) + 1 FROM players)), false);
+    END IF;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS characters (
     id         BIGINT PRIMARY KEY DEFAULT nextval('character_id_seq'),
@@ -386,6 +403,16 @@ CREATE TABLE IF NOT EXISTS character_stats (
     PRIMARY KEY (character_id, stat_key)
 );
 
+-- 迁移：wire stat 59 补映射（statistics_server.WIRE_STAT_NAMES 原缺 59，存量
+-- 以 x59/<ctx1>/<ctx2> 死键落库、回读端永远跳过）。聚并可能的多 ctx 变体后
+-- 改写为标准键 'Unknown59'（幂等：迁移后无 x59 行，INSERT..SELECT 空集 no-op）。
+INSERT INTO character_stats (character_id, stat_key, value)
+    SELECT character_id, 'Unknown59', SUM(value) FROM character_stats
+    WHERE stat_key LIKE 'x59/%' GROUP BY character_id
+ON CONFLICT (character_id, stat_key)
+    DO UPDATE SET value = character_stats.value + EXCLUDED.value;
+DELETE FROM character_stats WHERE stat_key LIKE 'x59/%';
+
 -- 教程触发（MarkTutorialTriggeredRequest / SetTutorialCompletedRequest 持久化）
 CREATE TABLE IF NOT EXISTS character_tutorials (
     character_id BIGINT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
@@ -627,6 +654,52 @@ class PlayerStore:
         async with self.pool.acquire() as conn:
             await conn.execute(_SCHEMA)
             await self._resync_small_sequences(conn)
+            await self._normalize_conditions(conn)
+
+    async def _normalize_conditions(self, conn):
+        """存量装备 condition 归一化（幂等迁移，修复"刚买就有损耗"的脏数据）。
+
+        历史创建路径从不写 condition，全部吃 DB 列默认值：vehicles 默认 100.0，
+        而各模板 maxCondition 为 25~220 点 —— 地面载具（max 25~75）超满
+        （维修费算出负数→客户端钳成 1 块钱）、飞机（max 200/220）一买即半损。
+        磨损系统上线前的载具从未被扣减过，condition==100.0 的行必为该默认值
+        残留，直接重置为模板满耐久；其余表只把超过模板上限的值钳到上限。"""
+        import wardb
+        fixed = 0
+        rows = await conn.fetch(
+            'SELECT id, vehicle_variant_template_id, condition FROM vehicles')
+        for r in rows:
+            full = wardb.vehicle_full_condition(r['vehicle_variant_template_id'])
+            cond = float(r['condition'] or 0)
+            if (cond == 100.0 and full != 100.0) or cond > full:
+                await conn.execute(
+                    'UPDATE vehicles SET condition = $1 WHERE id = $2',
+                    full, r['id'])
+                fixed += 1
+        # weapons/weapon_modifiers 上限 1.0（默认值即满），弹药/载具升级
+        # 创建路径一直显式写满耐久，这里只兜底钳制异常超上限的行
+        for tbl, tcol, params_fn in (
+            ('weapons', 'template_id', wardb.weapon_wear_params),
+            ('weapon_modifiers', 'template_id', wardb.weapon_modifier_wear_params),
+            ('weapon_ammo', 'ammo_template_id', wardb.ammo_wear_params),
+            ('vehicle_upgrades', 'upgrade_template_id',
+             wardb.vehicle_upgrade_wear_params),
+            ('vehicle_ammo', 'ammo_template_id', wardb.ammo_wear_params),
+        ):
+            rows = await conn.fetch(
+                f'SELECT id, {tcol} AS tid, condition FROM {tbl}')
+            for r in rows:
+                params = params_fn(r['tid'])
+                if not params or params[0] <= 0:
+                    continue
+                if float(r['condition'] or 0) > params[0]:
+                    await conn.execute(
+                        f'UPDATE {tbl} SET condition = $1 WHERE id = $2',
+                        params[0], r['id'])
+                    fixed += 1
+        if fixed:
+            from state import log
+            log(f'[store] normalized out-of-range condition on {fixed} item row(s)')
 
     # (表名, 序列名, 玩家 ID 过滤列 -- 只对大 pid 行保留; None=全表小 id)
     _SMALL_ID_SEQ_PAIRS = [
@@ -967,15 +1040,22 @@ class PlayerStore:
                 'FROM vehicles WHERE id = $1 AND player_id = $2', vehicle_id, player_id)
             return dict(row) if row else None
 
-    async def create_vehicle(self, player_id, vehicle_variant_template_id, character_id):
-        """创建载具实例，返回含新 id 的 dict。"""
+    async def create_vehicle(self, player_id, vehicle_variant_template_id,
+                             character_id, condition=None):
+        """创建载具实例，返回含新 id 的 dict。
+        condition 缺省时按模板满耐久初始化（vehicletemplate f35 maxCondition，
+        经变体 → 基础模板解析）——旧实现不写 condition 吃 DB 默认 100.0，
+        地面载具（max 25~75）超满、飞机（max 200/220）半损，购买即异常。"""
+        if condition is None:
+            import wardb
+            condition = wardb.vehicle_full_condition(vehicle_variant_template_id)
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                'INSERT INTO vehicles (player_id, vehicle_variant_template_id, character_id) '
-                'VALUES ($1, $2, $3) '
+                'INSERT INTO vehicles (player_id, vehicle_variant_template_id, '
+                'character_id, condition) VALUES ($1, $2, $3, $4) '
                 'RETURNING id, vehicle_variant_template_id, character_id, equipped_in_slot, '
                 'variant_id, condition',
-                player_id, vehicle_variant_template_id, character_id)
+                player_id, vehicle_variant_template_id, character_id, float(condition))
             return dict(row)
 
     async def set_vehicle_equipment(self, player_id, vehicle_id,
@@ -1427,6 +1507,23 @@ class PlayerStore:
                 'RETURNING id, template_id, character_id, weapon_id, condition',
                 player_id, template_id, character_id, weapon_id)
             return dict(row)
+
+    async def clear_weapon_modifier_category(self, player_id, weapon_id,
+                                             template_ids, exclude_modifier_id):
+        """卸下指定武器上与 exclude 同槽位（分类）的其他配件（互斥装备）。
+
+        分类不在表内：调用方按 WarDatabase WeaponModifierTemplate.f28
+        （weaponModCategoryId）算出同槽位的模板 id 列表传入。返回受影响行数。"""
+        if not template_ids:
+            return 0
+        async with self.pool.acquire() as conn:
+            n = await conn.execute(
+                'UPDATE weapon_modifiers SET weapon_id = 0 '
+                'WHERE player_id = $1 AND weapon_id = $2 AND id != $3 '
+                'AND template_id = ANY($4::bigint[])',
+                int(player_id), int(weapon_id), int(exclude_modifier_id),
+                [int(t) for t in template_ids])
+            return _rowcount(n)
 
     # ---- weapon ammo ----
 
@@ -3157,6 +3254,21 @@ class PlayerStore:
                 'SELECT tutorial_template_id FROM player_tutorials_triggered '
                 'WHERE player_id = $1', int(player_id))
         return sorted(int(r['tutorial_template_id']) for r in rows)
+
+    async def mark_character_tutorial(self, character_id, tutorial_id,
+                                      completed=True):
+        """战斗内教程上报（combat TutorialRequest）→ character_tutorials。
+
+        幂等：重复上报只补 completed（triggered 首报即置位）。"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'INSERT INTO character_tutorials '
+                '(character_id, tutorial_id, triggered, completed) '
+                'VALUES ($1, $2, TRUE, $3) '
+                'ON CONFLICT (character_id, tutorial_id) '
+                'DO UPDATE SET completed = character_tutorials.completed OR $3',
+                int(character_id), int(tutorial_id), bool(completed))
+        return True
 
     async def set_player_language(self, player_id, language_code):
         """玩家语言（SetPlayerLanguageRequest）。"""

@@ -24,6 +24,8 @@ from wardb import (
     _AMMO_REQ_LEVEL,
     _CUR_NAME,
     _E_WEAPON,
+    _MOD_CATEGORY_BY_TEMPLATE,
+    _MOD_CATEGORY_SLOT,
     _MOD_MAPPING_IDS,
     _MOD_REQ_LEVEL,
     _REQ_UNLOCK_BY_ITEM,
@@ -206,7 +208,7 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
                                      w2['container_slot'], w2['variant_id'],
                                      w2.get('clip_count', 0),
                                      w2.get('auto_repair', 0),
-                                     w2.get('condition', 100.0))
+                                     w2.get('condition', 1.0))
                 await _push_kvcs(writer, sess.soldier_view_cmd, b'weapon', wproto)
                 log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
                     f'(weapon id={weapon_id} re-pushed after skin purchase, '
@@ -220,12 +222,14 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
 
     # 分配武器实例 ID 并写入数据库（失败时用内存计数器兜底，仅本次会话可见）
     pid = await sess.ensure_player()
+    w_cond = None
     if pid is not None:
         try:
             w = await STORE.create_weapon(
                 pid, weapon_name, weapon_template_id,
                 char_id, variant_template_id)
             wid = w['id']
+            w_cond = w.get('condition')
         except Exception as e:
             log(f'[DB] create_weapon failed: {e}')
             wid = None
@@ -234,12 +238,16 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
     if wid is None:
         wid = getattr(sess, '_fallback_weapon_id', 99) + 1
         sess._fallback_weapon_id = wid
+    if w_cond is None:
+        # 兜底路径：武器 condition 量纲 0~1（weapontemplate f61 maxCondition=1.0），
+        # 推默认 100.0 会算出负损坏比例 → 客户端钳成 1 块钱维修费
+        w_cond = 1.0
     sess.weapons = getattr(sess, 'weapons', {})
     sess.weapons[wid] = {
         'name': weapon_name, 'template_id': weapon_template_id,
         'character_id': char_id, 'container_id': 0, 'container_slot': 0,
         'variant_template_id': variant_template_id, 'variant_id': 0,
-        'clip_count': 0,
+        'clip_count': 0, 'condition': w_cond,
     }
 
     # 1. 返回 CreateWeaponVariantResponse (response=1 ok)，客户端显示购买成功弹窗并关闭商店
@@ -286,7 +294,7 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
                              w['container_id'], w['container_slot'], w['variant_id'],
                              w.get('clip_count', 0),
                              w.get('auto_repair', 0),
-                             w.get('condition', 100.0))
+                             w.get('condition', 1.0))
         await _push_kvcs(writer, sess.soldier_view_cmd, b'weapon', wproto)
         log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (weapon id={wid}, '
             f'{len(wproto)}B, name={w["name"]!r})')
@@ -1069,8 +1077,37 @@ async def handle_setweaponmodifierrequest(sess, writer, cmd_id, req_type, proto)
         sm_char_id = 0
 
     pid = await sess.ensure_player()
+    replaced_ids = []  # 被同槽位互斥卸下的配件（重推 weaponId=0）
     if pid is not None and sm_modifier_id:
         try:
+            # 同槽位（分类）互斥：装备前卸下同武器同槽位的其他配件。
+            # 槽位取 WeaponModifierTemplate.f28（weaponModCategoryId）→
+            # WeaponModCategory.f4（slotIndex：2=Barrel 3=Internal 4=Sight
+            # 5=Trigger），客户端 ModifyWeaponMediator 每槽位只装一个，
+            # 与弹药 clear_weapon_ammo_slots 互斥同理。
+            if sm_do_equip and sm_weapon_id:
+                all_mods = await STORE.list_weapon_modifiers(pid)
+                target = next((m for m in all_mods
+                               if int(m['id']) == int(sm_modifier_id)), None)
+                if target is not None:
+                    cat = _MOD_CATEGORY_BY_TEMPLATE.get(
+                        int(target['template_id']), 0)
+                    slot = _MOD_CATEGORY_SLOT.get(cat, cat)
+                    if slot:
+                        same_slot = [t for t, c
+                                     in _MOD_CATEGORY_BY_TEMPLATE.items()
+                                     if _MOD_CATEGORY_SLOT.get(c, c) == slot]
+                        replaced_ids = [
+                            int(m['id']) for m in all_mods
+                            if int(m['weapon_id']) == int(sm_weapon_id)
+                            and int(m['id']) != int(sm_modifier_id)
+                            and int(m['template_id']) in same_slot]
+                        if replaced_ids:
+                            await STORE.clear_weapon_modifier_category(
+                                pid, int(sm_weapon_id), same_slot,
+                                int(sm_modifier_id))
+                            log(f'      SetWeaponModifier: slot {slot} exclusive, '
+                                f'unequipped {replaced_ids}')
             # 装备 → 挂到武器；卸下 → weapon_id 清 0
             await STORE.set_weapon_modifier_weapon(
                 pid, int(sm_modifier_id),
@@ -1086,11 +1123,13 @@ async def handle_setweaponmodifierrequest(sess, writer, cmd_id, req_type, proto)
     log(f'S->C cmd={cmd_id:<4} SetWeaponModifierResponse '
         f'(response=1 ok, doEquip={sm_do_equip})')
 
-    # 重推 WeaponModifier（weaponId 变化 → 客户端配件槽刷新）
+    # 重推 WeaponModifier（weaponId 变化 → 客户端配件槽刷新；
+    # 被互斥卸下的也重推 weaponId=0，客户端才能及时取消 isEquipped）
     if pid is not None and sess.soldier_view_cmd is not None:
         try:
+            push_ids = {int(sm_modifier_id)} | set(replaced_ids)
             for m in await STORE.list_weapon_modifiers(pid):
-                if int(m['id']) == int(sm_modifier_id):
+                if int(m['id']) in push_ids:
                     await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponModifier',
                                      _msg_weapon_modifier(m['id'], m['template_id'],
                                                           m['character_id'],
@@ -1098,9 +1137,8 @@ async def handle_setweaponmodifierrequest(sess, writer, cmd_id, req_type, proto)
                                                           m.get('auto_repair', 0),
                                                           m.get('condition', 1.0)))
                     log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
-                        f'(WeaponModifier id={sm_modifier_id} re-pushed, '
+                        f'(WeaponModifier id={m["id"]} re-pushed, '
                         f'weaponId={m["weapon_id"]})')
-                    break
         except Exception as e:
             log(f'[DB] reload modifier after equip failed: {e}')
 

@@ -29,6 +29,7 @@ from wardb import (
     _VEHICLE_VARIANT_PARENT,
     _default_vehicle_ammo_for,
     _vehicle_supports_ammo,
+    vehicle_full_condition,
     )
 
 from messages import (
@@ -180,10 +181,12 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
 
     # 分配载具实例 ID 并写入数据库（失败时用内存计数器兜底，仅本次会话可见）
     pid = await sess.ensure_player()
+    v_cond = None
     if pid is not None:
         try:
             v = await STORE.create_vehicle(pid, vv_template_id, vv_char_id)
             vid = v['id']
+            v_cond = v.get('condition')
         except Exception as e:
             log(f'[DB] create_vehicle failed: {e}')
             vid = None
@@ -192,6 +195,9 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
     if vid is None:
         vid = getattr(sess, '_fallback_vehicle_id', 399) + 1
         sess._fallback_vehicle_id = vid
+    if v_cond is None:
+        # DB 不可用/兜底路径：按模板满耐久下发，避免 100.0 默认值显示异常
+        v_cond = vehicle_full_condition(vv_template_id)
 
     # 1. 返回 CreateVehicleVariantResponse (response=1 ok)，客户端显示购买成功弹窗并关闭商店
     resp_proto = pb_int32(1, 1)
@@ -202,7 +208,7 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
 
     # 2. 通过 SOLDIER_VIEW 推送 Vehicle 数据（载具才会出现在士兵装备列表）
     if sess.soldier_view_cmd is not None:
-        vproto = _msg_vehicle(vid, vv_template_id, vv_char_id, 0)
+        vproto = _msg_vehicle(vid, vv_template_id, vv_char_id, 0, condition=v_cond)
         await _push_kvcs(writer, sess.soldier_view_cmd, b'Vehicle', vproto)
         log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (Vehicle id={vid}, '
             f'variantTemplate={vv_template_id}, {len(vproto)}B)')
@@ -365,7 +371,9 @@ async def handle_setvehicleequipmentrequest(sess, writer, cmd_id, req_type, prot
         for v in affected:
             vproto = _msg_vehicle(v['id'], v['vehicle_variant_template_id'],
                                   v['character_id'], v['equipped_in_slot'],
-                                  v.get('variant_id', 0))
+                                  v.get('variant_id', 0),
+                                  condition=v.get('condition') or
+                                  vehicle_full_condition(v['vehicle_variant_template_id']))
             await _push_kvcs(writer, sess.soldier_view_cmd, b'Vehicle', vproto)
             log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (Vehicle id={v["id"]}, '
                 f'charId={v["character_id"]}, slot={v["equipped_in_slot"]})')

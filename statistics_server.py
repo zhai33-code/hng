@@ -104,6 +104,10 @@ WIRE_STAT_NAMES = {
     46: 'PlayerNrOfBattleWithKillSameEnemy4Times',
     56: 'SquadLeaderTimePlayed', 57: 'SquadMemberTimePlayed', 58: 'SquadXp',
     62: 'SquadVetXp', 61: 'ArmorProximityXp', 63: 'SupportSpawns',
+    # 59：player.dll 全天高频上报（远端 2026-08-31 日志 79 次，值 1-5）但
+    # sub_18038E540 名表未还原出名字 —— 先给可回读的占位名（原走 x59/ 死键
+    # 永不回发），逆向确认后连 WIRE_STAT_NAMES 与 DB 键一起改名。
+    59: 'Unknown59',
     64: 'DestroyFriendlyExplosive', 65: 'DestroyEnemyExplosive',
     259: 'PlayerSpecKills', 260: 'PlayerSpecDamageDealt',
     257: 'PlayerSpecRevengeKill', 258: 'PlayerSpecKillsInARow',
@@ -340,6 +344,11 @@ async def _stats_entries_for_char(char_id: int):
       w<id>  → ctx1=id；v<id> → ctx1=id
       gm<id> → ctx2=id<<16（写入端语义：模式 id 在 ctx2 高 16 位）
       wv<w>_<v> → ctx1=w, ctx2=v
+    维度 id 非正（0/负，键碰撞或编码错位产物）整条丢弃 —— 战斗服
+    statistics.cpp 收到后按白名单校验拒掉即 "#error1 Character N had
+    X invalid stats"（2026-08-31 远端日志：6 角色 2-5 条/人）。回读端
+    无法得知客户端白名单，先滤掉确定非法的 0 id，其余正常下发并在
+    dims 日志里列出全部维度 id，供下次对局与 invalid 数逐条对账。
     """
     if STORE is None:
         return []
@@ -349,6 +358,7 @@ async def _stats_entries_for_char(char_id: int):
         log(f'[stats] get_stats failed (char={char_id}): {e}')
         return []
     out = []
+    dropped = []
     for key, val in stats.items():
         if not val:
             continue
@@ -363,15 +373,39 @@ async def _stats_entries_for_char(char_id: int):
         if wid is None:
             continue
         if prefix.startswith('gm') and prefix[2:].isdigit():
-            out.append((wid, 0, int(prefix[2:]) << 16, int(val)))
+            gm = int(prefix[2:])
+            if gm <= 0:
+                dropped.append(key)
+                continue
+            out.append((wid, 0, gm << 16, int(val)))
         elif prefix.startswith('wv') and '_' in prefix:
             w, _, v = prefix[2:].partition('_')
-            if w.isdigit() and v.isdigit():
-                out.append((wid, int(w), int(v), int(val)))
+            if not (w.isdigit() and v.isdigit()):
+                continue
+            if int(w) <= 0 or int(v) <= 0:
+                dropped.append(key)
+                continue
+            out.append((wid, int(w), int(v), int(val)))
         elif prefix.startswith('w') and prefix[1:].isdigit():
+            if int(prefix[1:]) <= 0:
+                dropped.append(key)
+                continue
             out.append((wid, int(prefix[1:]), 0, int(val)))
         elif prefix.startswith('v') and prefix[1:].isdigit():
+            if int(prefix[1:]) <= 0:
+                dropped.append(key)
+                continue
             out.append((wid, int(prefix[1:]), 0, int(val)))
+    if dropped:
+        log(f'[stats] GetTotals char={char_id}: dropped {len(dropped)} '
+            f'invalid dim entries ({", ".join(dropped[:8])})')
+    if out:
+        w_ids = sorted({c1 for wid, c1, _c2, _v in out if wid in _WEAPON_RANGE})
+        v_ids = sorted({c1 for wid, c1, _c2, _v in out if wid in _VEHICLE_RANGE})
+        gm_ids = sorted({c2 >> 16 for wid, _c1, c2, _v in out
+                         if wid in _GAMEMODE_RANGE})
+        log(f'[stats] GetTotals dims char={char_id}: w={w_ids} v={v_ids} '
+            f'gm={gm_ids}')
     return out
 
 
