@@ -838,6 +838,71 @@ def _load_capturepoint_templates(gamemap_id):
     return ids
 
 
+_OBJ_CP_TMPL_CACHE = {}
+
+
+def _load_objective_capturepoints(gamemap_id):
+    """本图 O 点（objective）据点模板 id 列表（CapturepointTemplate f2 ==
+    gamemap 分组中 f4 objectiveId 非零的行，升序）。
+
+    Assault 图中心 O 点（Airfield=204 → O3=63/O2=64/O1=65，f4=1）即此组；
+    连线中段 X1/X2 与 Encounter（Mill）单点 f4=0 不入。大厅简报 f7 据点
+    初始归属用：Assault 局 O 点=防守方、其余=0 中立
+    （assault-map-spawn-investigation.md §6.2）。"""
+    key = int(gamemap_id)
+    if key in _OBJ_CP_TMPL_CACHE:
+        return _OBJ_CP_TMPL_CACHE[key]
+    ids = []
+    try:
+        for r in _parse_wardb_table('CapturepointTemplate'):
+            f2 = r.get(2, 0)
+            if isinstance(f2, (bytes, bytearray)):
+                continue                  # 非分组键行（如 f2=名字）
+            f4 = r.get(4, 0)
+            if isinstance(f4, (bytes, bytearray)):
+                continue
+            if int(f2 or 0) == key and int(r.get(1, 0) or 0) \
+                    and int(f4 or 0):
+                ids.append(int(r.get(1, 0)))
+    except Exception as e:
+        log(f'[!] CapturepointTemplate objective parse failed: {e}')
+    ids.sort()
+    _OBJ_CP_TMPL_CACHE[key] = ids
+    return ids
+
+
+_MISSIONTYPE_CACHE = {}
+
+
+def _missiontype_for_gamemap(gamemap_id):
+    """gamemap → missiontype（missionpreset 表 f3==gamemap 行的 f4；
+    1=Assault、5=Encounter，同图多 preset 同型取首行）。
+
+    出兵点归属按模式分支的唯一判据：Assault 四角出兵点全归进攻方、
+    防守方 0 出兵点；Encounter 维持交替分配
+    （assault-map-spawn-investigation.md §6.1）。查不到回 0（按 Encounter
+    交替处理，保持旧行为）。"""
+    key = int(gamemap_id)
+    if key in _MISSIONTYPE_CACHE:
+        return _MISSIONTYPE_CACHE[key]
+    mt = 0
+    try:
+        for r in _parse_wardb_table('missionpreset'):
+            f3 = r.get(3, 0)
+            if isinstance(f3, (bytes, bytearray)):
+                continue
+            if int(f3 or 0) != key or not int(r.get(1, 0) or 0):
+                continue
+            f4 = r.get(4, 0)
+            if not isinstance(f4, (bytes, bytearray)) and int(f4 or 0):
+                mt = int(f4)
+            break
+    except Exception as e:
+        log(f'[!] missionpreset missiontype parse failed: {e}')
+    _MISSIONTYPE_CACHE[key] = mt
+    return mt
+
+
 _COMMANDNODE_NAME_CACHE = {}     # factionTemplateId -> {兵种名: 行 id}
 
 

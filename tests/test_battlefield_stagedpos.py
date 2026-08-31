@@ -145,5 +145,45 @@ check('BattleFieldSettings f12 accesspoints owner 与 layout 同值',
       all(_f12.get(int(t)) == int(o) for t, o in _layout),
       f'f12={_f12} layout={_layout}')
 
+print('== 5b) Assault 图（Airfield preset 26）：末点=防守方 其余=进攻方 + f7 O点=防守方')
+# assault-map-spawn-investigation.md §6.1/§6.2：Encounter 交替；Assault 出兵点
+# 归进攻方、★末点留防守方（引擎判负条件：0 出兵点 → "has lost their
+# accesspoints" 秒判负 + AI 小队无处部署，0831 实测）；f7 O 点=防守方。
+from wardb import (_load_objective_capturepoints, _load_preset as _lp,
+                   _missiontype_for_gamemap)
+if _missiontype_for_gamemap(int(_lp(26).get(3, 0) or 0)) != 1:
+    print('  SKIP 本机 WarDatabase 无 Airfield 行（preset 26 回退 Encounter），Assault 分支跳过')
+else:
+    _lay26 = _accesspoint_layout(26, 2, 3)
+    check('Airfield layout 末点=防守方(2) 其余=进攻方(3)',
+          _lay26 and len(_lay26) >= 3 and
+          all(o == (2 if i == len(_lay26) - 1 else 3)
+              for i, (_, o) in enumerate(_lay26)),
+          f'layout={_lay26}')
+    _det26 = {'preset': 26, 'attacker_faction': 3, 'defender_faction': 2,
+              'players': [{'player_id': 1, 'gamertag': 'atk1', 'faction': 3}],
+              'map_entity_id': 112741325}
+    _mm26 = matchmaking._msg_mission_details_response_multi(990002, _det26, 'zulu')
+    _f6a = _repeated_map(_mm26, 6, 1, 2)
+    check('大厅 f6 Assault 末点=防守方 其余=进攻方 且与 layout 同源',
+          _f6a and len(_f6a) == len(_lay26) and
+          all(_f6a.get(int(t)) == int(o) for t, o in _lay26),
+          f'f6={_f6a} layout={_lay26}')
+    _bf26 = warserver_messages._msg_response_battlefield_settings(
+        26, 2, 3, True, 1, 0, None, counts_by_faction=None)
+    _f12a = _repeated_map(_bf26, 12, 3, 1)
+    check('BattleFieldSettings f12 Assault 与 layout 同源（末点=防守方）',
+          _f12a and len(_f12a) == len(_lay26) and
+          all(_f12a.get(int(t)) == int(o) for t, o in _lay26),
+          f'f12={_f12a} layout={_lay26}')
+    _objs = set(_load_objective_capturepoints(int(_lp(26).get(3, 0) or 0)))
+    check('Airfield O 点识别非空（CapturepointTemplate f4 objectiveId）',
+          bool(_objs), f'objs={_objs}')
+    _f7a = _repeated_map(_mm26, 7, 3, 4)             # f3=模板 f4=owner
+    check('大厅 f7 O点=防守方(2)、其余=0 中立',
+          _f7a and all(v == (2 if int(k) in _objs else 0)
+                       for k, v in _f7a.items()),
+          f'f7={_f7a} objs={_objs}')
+
 print(f'\nresult: ok={ok} fail={fail}')
 sys.exit(1 if fail else 0)

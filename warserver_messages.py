@@ -470,23 +470,43 @@ def _accesspoint_layout(preset_id=MISSION_PRESET_ID,
                         attacker_faction=3):
     """本局通道点布局：[(accesspointtemplate, owner factionId), ...]（最多 4 点 A-D）。
 
-    通道点模板按 gamemap 分组动态取自 WarDatabase/accesspointtemplate
-    （f2 == gamemap id；Mill=13 → 模板 8/15 = A/B 点，坐标在图内），
-    owner 交替 attacker/defender（首点=进攻方出生侧）。★必须与大厅简报
-    GetMissionDetailsResponse f6 同规则（他服抓包实测 Mill：模板 8=进攻、
-    15=防守）——此前起始=defender 与大厅相反，导致"大厅概览图攻防图标
-    位置与进战局后实际出生侧互换"。combat.py 的
-    ActiveMissionRequestEventListResponse f3 归属状态与此同源
+    ★归属按 missiontype 分支（preset f4；1=Assault / 5=Encounter，
+    assault-map-spawn-investigation.md §6.1）：
+    - Assault（Airfield 式四角围攻中心）：出兵点全在边缘四角且**全归进攻方**，
+      防守方 0 出兵点（靠中心 O 点出生，载具出生实体只在 O3 机场）。
+      此前对所有地图统一交替分配，防守方分到边缘角落 → 引擎
+      `Squad Relocated to Accesspoint` + f14 资源挂点 → 防守方坦克出生在
+      战斗线最边缘（2026-08-28 排查）。
+    - Encounter（Mill 式两点对峙）：交替分配，首点=进攻方出生侧（他服抓包
+      实测 Mill：模板 8=进攻、15=防守）。★必须与大厅简报
+      GetMissionDetailsResponse f6 同规则——起始方向互换会导致"大厅概览图
+      攻防图标位置与进战局后实际出生侧互换"。
+    combat.py 的 ActiveMissionRequestEventListResponse f3 归属状态与此同源
     （ReportMissionStatusRequest f4 捕获上报可覆盖 combat._CAPTURE_OWNERS）。
     preset_id 由匹配池成局时下发（不同地图 → 不同模板组）。
     """
     preset = _load_preset(preset_id)
     gamemap_id = int(preset.get(3, 0) or 0)      # preset f3 → gamemap 表行
+    missiontype = int(preset.get(4, 0) or 0)     # preset f4 → missiontype
     ap_templates = _load_accesspoint_templates(gamemap_id)
+    aps4 = ap_templates[:4]                      # 最多 4 点（A-D）
     layout = []
-    for i, tmpl in enumerate(ap_templates[:4]):   # 最多 4 点（A-D）
-        owner = attacker_faction if (i % 2 == 0) else defender_faction
-        layout.append((tmpl, owner))
+    if missiontype == 1:
+        # Assault：外围出兵点归进攻方，★末点留防守方——引擎侧防守方 0
+        # 出兵点时 AI 小队无处部署（0831 实测 15:15 局防守方 0 兵力）且
+        # player.dll team.cpp 判负条件 v23=2 触发 "has lost their
+        # accesspoints" 秒判负（15:07 局开局 2 分 48 秒即 Gameover）。
+        # O 点归属走 BattleFieldSettings f3 defender（H3 已实测证实，
+        # 与出兵点归属无关）→ 末点给防守方不影响 O3 机场归防守方，
+        # 代价仅该线 X1 开局归防守方（§6.2 可接受）。
+        for i, tmpl in enumerate(aps4):
+            owner = (defender_faction if i == len(aps4) - 1
+                     else attacker_faction)
+            layout.append((tmpl, owner))
+    else:                                        # Encounter：交替（首点=进攻方）
+        for i, tmpl in enumerate(aps4):
+            owner = attacker_faction if (i % 2 == 0) else defender_faction
+            layout.append((tmpl, owner))
     return layout
 
 
@@ -501,7 +521,9 @@ def _msg_army_resource_list(preset_id=MISSION_PRESET_ID,
     counts_by_faction：每局资源池 {factionTemplateId: {cat: count}}（
     force_pool.init_mission 抽 AT 生成），给定时类别集与数值均由池驱动
     （含坦克/载具等池内新增类别）—— 匹配界面 f5 / 战斗内 f2/f14 同源同值、
-    消耗后递减；None 回退静态 BF_RES_CATS 初始表。"""
+    消耗后递减；None 回退静态 BF_RES_CATS 初始表。
+
+    资源逐点挂所属方（Assault 末点=防守方见 _accesspoint_layout）。"""
     res_msgs = []
     for tmpl, owner in _accesspoint_layout(preset_id, defender_faction,
                                            attacker_faction):

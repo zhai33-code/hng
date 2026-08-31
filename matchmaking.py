@@ -35,7 +35,8 @@ from protocol import (
 )
 from state import FLASH_SESSIONS, PLAYER_SELECTED_CHAR, PUBLIC_HOST, STORE
 from wardb import (
-    _load_accesspoint_templates, _load_capturepoint_templates, _load_preset,
+    _load_accesspoint_templates, _load_capturepoint_templates,
+    _load_objective_capturepoints, _load_preset, _missiontype_for_gamemap,
     _rank_from_combat_xp, battlefield_entity_for_gamemap, battlefield_pos,
     commandnode_template, preset_scene, squad_template_for_character,
     squad_template_name,
@@ -908,6 +909,13 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
     afid = FACTION_ROW_IDS[ai_faction]       # AI 方 faction 行 id
     aps = _mission_accesspoints(gamemap_id)
     ours_ap, theirs_ap = aps[0], aps[1]
+    # ★按 missiontype 分支（assault-map-spawn-investigation.md §6.1/§6.2）：
+    # Assault 出兵点归进攻方、★末点留防守方（引擎判负条件：防守方 0 出兵点
+    # → "has lost their accesspoints" 秒判负 + AI 小队无处部署，0831 实测）。
+    # f4/f5 突击队与资源锚点随归属走；Encounter 维持交替（Mill 锚点）。
+    assault = _missiontype_for_gamemap(gamemap_id) == 1
+    if assault:
+        theirs_ap = aps[-1]
     m = b''
     m += pb_int32(1, 0)  # 他服私服实测 = 0（非 ResponseCodes.ok=1）
     m += pb_message(2, _msg_mission_info(mission_id, player_id, zulu_time,
@@ -938,13 +946,22 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
                         pb_int64(3, theirs_ap) +
                         pb_int64(4, theirs_counts.get(res_cat, 0)) +
                         pb_bool(5, res_air))
-    # f6 出兵点归属：首个=我方，其余交替（Mill 实测 8=我方, 15=AI）
-    for i, ap in enumerate(aps):
-        m += pb_message(6, pb_int64(1, ap) +
-                        pb_int64(2, ai_faction if i % 2 else player_faction))
-    # f7 据点初始归属：0=中立（他服私服实测 {3:120, 4:0}）
+    # f6 出兵点归属：Encounter 首个=我方、其余交替（Mill 实测 8=我方, 15=AI）；
+    # Assault 末点=防守方、其余归我方（进攻方）——与战斗侧 _accesspoint_layout 同规则
+    if assault:
+        for ap in aps:
+            owner = ai_faction if ap == aps[-1] else player_faction
+            m += pb_message(6, pb_int64(1, ap) + pb_int64(2, owner))
+    else:
+        for i, ap in enumerate(aps):
+            m += pb_message(6, pb_int64(1, ap) +
+                            pb_int64(2, ai_faction if i % 2 else player_faction))
+    # f7 据点初始归属：Encounter 全 0 中立（他服私服实测 {3:120, 4:0}）；
+    # Assault 中心 O 点=防守方（官方简报中心=守），连线段 X1/X2=0 中立
+    obj_cps = set(_load_objective_capturepoints(gamemap_id)) if assault else set()
     for cp in _mission_capturepoints(gamemap_id):
-        m += pb_message(7, pb_int32(3, cp) + pb_int32(4, 0))
+        cp_owner = ai_faction if cp in obj_cps else 0
+        m += pb_message(7, pb_int32(3, cp) + pb_int32(4, cp_owner))
     pos = battlefield_pos(MISSION_MAP_ENTITY_ID)
     m += pb_float(8, pos[0])   # posX（mapEntityId 对应 battlefield 行坐标）
     m += pb_float(9, pos[1])   # posY
@@ -2134,6 +2151,13 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     gamemap_id = int(_load_preset(preset).get(3, 0) or 0) or 13
     aps = _mission_accesspoints(gamemap_id)
     ours_ap, theirs_ap = aps[0], aps[1]
+    # ★按 missiontype 分支（assault-map-spawn-investigation.md §6.1/§6.2）：
+    # Assault 出兵点归进攻方、★末点留防守方（引擎判负条件：防守方 0 出兵点
+    # → "has lost their accesspoints" 秒判负 + AI 小队无处部署，0831 实测）。
+    # f4/f5 突击队与资源锚点随归属走；Encounter 维持交替（Mill 锚点 8=攻/15=守）。
+    assault = _missiontype_for_gamemap(gamemap_id) == 1
+    if assault:
+        theirs_ap = aps[-1]
     pos = battlefield_pos(int(details.get('map_entity_id') or 0)
                           or MISSION_MAP_ENTITY_ID)
 
@@ -2176,14 +2200,23 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
                         pb_int64(3, theirs_ap) +
                         pb_int64(4, dfd_counts.get(res_cat, 0)) +
                         pb_bool(5, res_air))
-    # f6 出兵点归属：首个=进攻方，其余交替（Mill 实测 8=进攻, 15=防守；
-    # f2 为 factionTemplateId）
-    for i, ap in enumerate(aps):
-        m += pb_message(6, pb_int64(1, ap) +
-                        pb_int64(2, defender if i % 2 else attacker))
-    # f7 据点初始归属：0=中立（他服私服实测 {3:120, 4:0}）
+    # f6 出兵点归属：Encounter 首个=进攻方、其余交替（Mill 实测 8=进攻,
+    # 15=防守；f2 为 factionTemplateId）；Assault 末点=防守方、其余归
+    # 进攻方——与战斗侧 _accesspoint_layout 同规则
+    if assault:
+        for ap in aps:
+            owner = defender if ap == aps[-1] else attacker
+            m += pb_message(6, pb_int64(1, ap) + pb_int64(2, owner))
+    else:
+        for i, ap in enumerate(aps):
+            m += pb_message(6, pb_int64(1, ap) +
+                            pb_int64(2, defender if i % 2 else attacker))
+    # f7 据点初始归属：Encounter 全 0 中立（他服私服实测 {3:120, 4:0}）；
+    # Assault 中心 O 点=防守方（官方简报中心=守），连线段 X1/X2=0 中立
+    obj_cps = set(_load_objective_capturepoints(gamemap_id)) if assault else set()
     for cp in _mission_capturepoints(gamemap_id):
-        m += pb_message(7, pb_int32(3, cp) + pb_int32(4, 0))
+        cp_owner = defender if cp in obj_cps else 0
+        m += pb_message(7, pb_int32(3, cp) + pb_int32(4, cp_owner))
     m += pb_float(8, pos[0])   # posX（battlefield 行坐标）
     m += pb_float(9, pos[1])   # posY
     return m
