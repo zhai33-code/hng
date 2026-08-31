@@ -59,6 +59,32 @@ from messages import (
     )
 
 
+# 官方 ResponseCodes（HnG_States/ResponseCodes.as）：no_name=53 / invalid_name=36
+RC_NO_NAME = 53
+RC_INVALID_NAME = 36
+
+# 官方命名规则（客户端契约）：min_name_length 校验=3；
+# 角色/武器名上限 NAME_MAX_LENGTH=20，小队名上限 SQUAD_NAME_LENGTH=15
+NAME_MIN_LENGTH = 3
+CHARACTER_NAME_MAX_LENGTH = 20
+SQUAD_NAME_MAX_LENGTH = 15
+
+
+def _official_name_error(name, max_length=CHARACTER_NAME_MAX_LENGTH):
+    """按官方规则校验名字，返回 ResponseCodes 错误码（0=合法）。
+
+    官方行为：trim 两侧空白后判定 —— 空 → no_name(53)；
+    长度 <3 或 >上限、含控制字符 → invalid_name(36)。"""
+    trimmed = (name or '').strip()
+    if not trimmed:
+        return RC_NO_NAME
+    if len(trimmed) < NAME_MIN_LENGTH or len(trimmed) > max_length:
+        return RC_INVALID_NAME
+    if any(ord(c) < 0x20 for c in trimmed):
+        return RC_INVALID_NAME
+    return 0
+
+
 async def _charge_player(sess, pricing_id, currency, conn=None, fraction=1.0):
     """按 pricing_id + 支付货币扣款，返回 (cost, ok)。定价缺失或货币类型无效时不扣款（返回 0, True）。
 

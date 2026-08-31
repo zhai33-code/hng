@@ -79,6 +79,12 @@ from protocol import (
 
 from state import FLASH_SESSIONS, PLAYER_SELECTED_CHAR, STORE, log
 
+from player_service import (
+    SQUAD_NAME_MAX_LENGTH,
+    _charge_player,
+    _official_name_error,
+    )
+
 from messages import _push_kvcs
 from matchmaking import _SOLO_SQUADS, _push_kvcs_delete
 from wardb import _rank_from_combat_xp, squad_template_for_character
@@ -934,17 +940,28 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
 
 
 async def handle_set_squad_details(sess, writer, cmd_id, req_type, proto):
-    """SetSquadDetailsRequest {characterId=1, squadName=2, ...}
-    → SetSquadDetailsResponse{response=1}。
+    """SetSquadDetailsRequest {characterId=1, squadName=2, pricingId=3, discountId=4,
+    saveSessionState=5, paymentCurrency=6} → SetSquadDetailsResponse{response=1}。
 
-    小队改名（squadName 非空时；官服改名收费，私服免费直接改）。"""
-    char_id, squad_name = 0, ''
+    官方语义（客户端 SquadService.renameSquad 契约）：
+    - 名字 trim 后 3..15（SQUAD_NAME_LENGTH）；空 → no_name(53)，
+      非法 → invalid_name(36)
+    - 仅队长（leader_character_id == 请求 characterId）可改名，否则 squad_not_owned(164)
+    - 按 pricingId + paymentCurrency 收费（squad_rename 10315 = 50金/8400银），
+      余额不足 → not_enough_credits(56)
+    - 改名后 SquadSession 行同步给全体在线成员
+    - 玩家无小队（未 CreateSquadRequest 建队/已解散）→ squad_not_found(161)"""
+    char_id, squad_name, pricing_id, currency = 0, '', 0, 0
     try:
         f = pb_parse(proto)
         char_id = int(f.get(1, 0) or 0)
         squad_name = _str(f.get(2, '') or '')
+        pricing_id = int(f.get(3, 0) or 0)
+        currency = int(f.get(6, 0) or 0)
     except Exception as e:
         log(f'      [squad] SetSquadDetails parse error: {e}')
+
+    squad_name = squad_name.strip()
 
     pid = await sess.ensure_player()
     code = RC_OK
@@ -952,21 +969,33 @@ async def handle_set_squad_details(sess, writer, cmd_id, req_type, proto):
     if pid is None or STORE is None:
         code = RC_SQUAD_NOT_FOUND
     else:
-        try:
-            squad = await STORE.get_squad_for_player(int(pid))
-            if squad is None:
+        name_err = _official_name_error(squad_name, max_length=SQUAD_NAME_MAX_LENGTH)
+        if name_err:
+            code = name_err
+        else:
+            try:
+                squad = (await STORE.get_squad_for_character(char_id)
+                         if char_id else None)
+                if squad is None:
+                    squad = await STORE.get_squad_for_player(int(pid))
+                if squad is None:
+                    code = RC_SQUAD_NOT_FOUND
+                elif int(squad.get('leader_character_id', 0) or 0) != char_id:
+                    code = RC_SQUAD_NOT_OWNED
+                else:
+                    cost, ok = await _charge_player(sess, pricing_id, currency)
+                    if not ok:
+                        code = 56  # not_enough_credits
+                    else:
+                        squad_id = squad['id']
+                        await STORE.rename_squad(squad_id, squad_name)
+                        log(f'      [DB] rename_squad id={squad_id} '
+                            f'name={squad_name!r} cost={cost}')
+            except Exception as e:
+                log(f'      [DB] set_squad_details failed: {e}')
                 code = RC_SQUAD_NOT_FOUND
-            else:
-                squad_id = squad['id']
-                if squad_name:
-                    await STORE.rename_squad(squad_id, squad_name)
-                    log(f'      [DB] rename_squad id={squad_id} '
-                        f'name={squad_name!r}')
-        except Exception as e:
-            log(f'      [DB] set_squad_details failed: {e}')
-            code = RC_SQUAD_NOT_FOUND
 
-    if code == RC_OK and squad_name and squad_id:
+    if code == RC_OK and squad_id:
         await push_squad_rows(sess, writer, squad_id)
         # 改名同步给全体在线成员
         await push_squad_rows_to_all_members(squad_id)

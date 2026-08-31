@@ -53,7 +53,14 @@ from messages import (
     _push_kvcs,
     )
 
-from player_service import _char_unlock_bits_for, _charge_player, _push_player_refresh
+from player_service import (
+    RC_INVALID_NAME,
+    RC_NO_NAME,
+    _char_unlock_bits_for,
+    _charge_player,
+    _official_name_error,
+    _push_player_refresh,
+    )
 
 from starting_gear import STARTING_GEAR
 
@@ -173,6 +180,20 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
         log(f'      CreateCharacter parse error: {e}')
         char_name = 'Soldier'
         char_pack_id = 0
+
+    # 官方规则校验：空名/非法名拒绝建号（no_name=53 / invalid_name=36）
+    name_err = _official_name_error(char_name)
+    if name_err:
+        resp_proto = pb_int32(1, name_err)
+        resp = build_response(cmd_id, 'CreateCharacterResponse', resp_proto)
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} CreateCharacterResponse '
+            f'(result={name_err} '
+            f'{"no_name" if name_err == RC_NO_NAME else "invalid_name"}) '
+            f'name={char_name!r}')
+        return
+    char_name = char_name.strip()
 
     # 从 ShopCharacterPacks 解析阵营/模板/军衔（如 pack 35 = Soviet Infantryman: faction=3, template=1）
     pack_info = CHARACTER_PACKS.get(char_pack_id)
@@ -448,6 +469,21 @@ async def handle_renamecharacterrequest(sess, writer, cmd_id, req_type, proto):
         rc_new_name = ''
         rc_pricing_id = 0
         rc_currency = 0
+
+    # 官方规则校验（trim 后 3..20；no_name=53 / invalid_name=36）——
+    # 校验先于扣款，杜绝白扣改名费后改名失败
+    rc_new_name = rc_new_name.strip()
+    name_err = _official_name_error(rc_new_name)
+    if name_err:
+        resp_proto = pb_int32(1, name_err)
+        resp = build_response(cmd_id, 'RenameCharacterResponse', resp_proto)
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} RenameCharacterResponse '
+            f'(result={name_err} '
+            f'{"no_name" if name_err == RC_NO_NAME else "invalid_name"}) '
+            f'name={rc_new_name!r}')
+        return
 
     # 扣款（改名费；无 pricing 时免费）
     cost, ok = await _charge_player(sess, rc_pricing_id, rc_currency)
