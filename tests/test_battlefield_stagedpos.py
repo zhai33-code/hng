@@ -138,7 +138,7 @@ check('大厅 f6 与战斗 layout 逐点同 owner',
       all(_f6.get(int(t)) == int(o) for t, o in _layout),
       f'f6={_f6} layout={_layout}')
 _bf = warserver_messages._msg_response_battlefield_settings(
-    10, 2, 3, True, 1, 0, None, counts_by_faction=None)
+    10, 2, 3, True, False, 1, 0, None, counts_by_faction=None)
 _f12 = _repeated_map(_bf, 12, 3, 1)                 # f3=模板 f1=owner
 check('BattleFieldSettings f12 accesspoints owner 与 layout 同值',
       _f12 and len(_f12) == len(_layout) and
@@ -170,7 +170,7 @@ else:
           all(_f6a.get(int(t)) == int(o) for t, o in _lay26),
           f'f6={_f6a} layout={_lay26}')
     _bf26 = warserver_messages._msg_response_battlefield_settings(
-        26, 2, 3, True, 1, 0, None, counts_by_faction=None)
+        26, 2, 3, True, False, 1, 0, None, counts_by_faction=None)
     _f12a = _repeated_map(_bf26, 12, 3, 1)
     check('BattleFieldSettings f12 Assault 与 layout 同源（末点=防守方）',
           _f12a and len(_f12a) == len(_lay26) and

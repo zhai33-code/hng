@@ -1381,11 +1381,19 @@ async def _start_match(match):
     preset = int(match.preset_id)
     gamemode_id = int(match.players[0].gamemode_id) if match.players else 0
     attacker, defender, one_sided = _split_factions(match.players)
-    # ★ AI 补位策略（2026-08-27 调整）：所有非战争模式一律 enable_bots=True
-    #   ——超时补位局、单侧局、凑够人的双侧真人局均带 AI；
-    #   战争模式（gamemode 10）纯真人：ai_fill_after=0 不超时补位，
-    #   双侧凑齐真人也不掺 AI。
-    enable_bots = (int(gamemode_id) != 10)
+    # ★ AI 策略（2026-09-01 按官方实现复刻 killfeed 阵营默认名）：官方两套
+    #   bot 系统按模式互斥（战斗服 player.dll 逆向实锤）：
+    #   - 训练模式（gamemode 1）f20 enableBots=True：战斗服本地 bot
+    #     （CreateSoldierEntity a6≠0 → SpawnBot，身份名=avatar 模板名；
+    #     官方训练 preset 9/10/11 f7=0 本就无 SA bot）
+    #   - 多人模式（3/4/5/6/11 及未知）f31 enableSaBots=True：SA bot
+    #     （CreateSoldierEntity a6=0 → GetFactionDefaultCharName，killfeed
+    #     显示 Soldat/Red Army Man/Recruit——官方多人局行为；数量取战斗服
+    #     本地 missionpreset f7 aiSaBotCountPerFaction，多人兜底 preset 实测
+    #     均 >0）；f20 同关，避免两套 bot 混编出两种名字
+    #   - 战争模式（gamemode 10）纯真人：两开关全关（凑够真人才开局）
+    enable_bots = (int(gamemode_id) == 1)
+    enable_sa_bots = (int(gamemode_id) not in (1, 10))
 
     # ★ 防御（非战争模式同局最多两阵营）：combat server 只按攻防两阵营
     #   配出生侧，撮合若带出第三阵营（US/GE/SU 同池），第三阵营玩家进图
@@ -1543,7 +1551,7 @@ async def _start_match(match):
         'preset': preset, 'gamemode': gamemode_id,
         'ai_fill': bool(match.ai_fill), 'map_entity_id': map_entity_id,
         'attacker_faction': attacker, 'defender_faction': defender,
-        'enable_bots': enable_bots,
+        'enable_bots': enable_bots, 'enable_sa_bots': enable_sa_bots,
         # 成局时刻（monotonic）：等待期中途加入窗口（mm_config.JOIN_WINDOW）
         # 从此起算；release_match 随详情一并清理
         'formed_at': time.monotonic(),
@@ -1561,6 +1569,7 @@ async def _start_match(match):
     _init_mission_resources(mission_id, gamemode_id, attacker, defender)
     _log(f'match formed: mission={mission_id}, preset={preset}, map='
          f'{combat_map}, players={len(match.players)}, ai_fill={match.ai_fill}, '
+         f'bots={enable_bots}, sa_bots={enable_sa_bots}, '
          f'attacker={attacker}, defender={defender}, udp/{port}, '
          f'weather tod={_MM_MISSION_DETAILS[mission_id]["weather_tod"]}/'
          f'cond={_MM_MISSION_DETAILS[mission_id]["weather_condition"]}'

@@ -713,6 +713,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             preset_id = int(det['preset'])
             attacker_faction, defender_faction = fp
             enable_bots = bool(det.get('enable_bots', True))
+            enable_sa_bots = bool(det.get('enable_sa_bots', False))
             # 本局天气/时段（成局时随机抽取，与简报 MissionInfo f12/f13 同源）
             weather_tod = int(det.get('weather_tod', 1))
             weather_condition = int(det.get('weather_condition', 0))
@@ -730,13 +731,16 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             defender_faction = BF_DEFENDER_FACTION_ID
             attacker_faction = 3
             enable_bots = True
+            enable_sa_bots = False
             weather_tod = 1
             weather_condition = 0
             timeofday = None
         # f14 资源从本局资源池渲染（与匹配界面 f5 / 轮询 f2 同源同值）
         resp_proto = _msg_response_battlefield_settings(
             preset_id, defender_faction, attacker_faction, enable_bots,
-            weather_tod, weather_condition, timeofday,
+            enable_sa_bots=enable_sa_bots,
+            weather_time_of_day=weather_tod, weather_condition=weather_condition,
+            timeofday=timeofday,
             counts_by_faction=matchmaking.mission_resource_pool(missionid))
         resp = build_response(cmd_id, 'ResponseBattleFieldSettings', resp_proto)
         writer.write(resp)
@@ -748,7 +752,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         log(f'GAME S->C cmd={cmd_id:<4} ResponseBattleFieldSettings '
             f'(mission={missionid}, preset={int(preset.get(1, 0))}, '
             f'map gamemap={int(preset.get(3, 0))}, {_name!r}, '
-            f'bots={enable_bots}, weather tod={weather_tod}/'
+            f'bots={enable_bots}, sa_bots={enable_sa_bots}, weather tod={weather_tod}/'
             f'cond={weather_condition} @{timeofday}h, {len(resp_proto)}B)')
         # 通知 matchmaking：该 missionid 的专用服握手完成，可推 Admitted
         ready_mid = missionid

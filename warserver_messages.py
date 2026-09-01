@@ -565,6 +565,7 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
                                         defender_faction=BF_DEFENDER_FACTION_ID,
                                         attacker_faction=3,
                                         enable_bots=True,
+                                        enable_sa_bots=False,
                                         weather_time_of_day=1,
                                         weather_condition=0,
                                         timeofday=None,
@@ -591,8 +592,15 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
       preset_id        missionpreset 行 id（地图链入口）
       defender_faction 防守方 factionTemplateId（1US/2GE/3SU）
       attacker_faction 进攻方 factionTemplateId
-      enable_bots      非战争模式恒 True（超时补位/单侧/双侧真人均带 AI）；
-                      战争模式（gamemode 10）False（纯真人）
+      enable_bots      f20 enableBots——战斗服本地 bot 系统（CreateSoldierEntity
+                      a6≠0 → SpawnBot，身份名=avatar 模板名）：官方训练局
+                      （preset 9/10/11）即此路径；战争模式（gamemode 10）False
+      enable_sa_bots  f31 enableSaBots——官方 SA bot 系统（sub_180334460 门控
+                      *(mgr+405)，数量=战斗服本地 missionpreset f7
+                      aiSaBotCountPerFaction；出生 CreateSoldierEntity a6=0 →
+                      GetFactionDefaultCharName，killfeed 显示阵营默认名
+                      Soldat/Red Army Man/Recruit）。官方多人局（preset 1/8/
+                      19-29 等 f7>0）即此路径（与 f20 互斥，避免两套 bot 混编）
     """
     preset = _load_preset(preset_id)
     preset_id = int(preset.get(1, preset_id))
@@ -648,7 +656,7 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     m += pb_message(18, _msg_battlefield_settings_faction(2, 2))  # 18 GE
     m += pb_message(18, _msg_battlefield_settings_faction(3, 3))  # 18 SU（factions 表必须含 factionId=3，否则 AddTeam team=3 越界崩溃）
     m += pb_int32(19, max_players)                 # 19 maxTotalPlayers
-    m += pb_bool(20, enable_bots)                  # 20 enableBots（AI 补位局 True）
+    m += pb_bool(20, enable_bots)                  # 20 enableBots（本地 bot：官方训练局路径）
     m += pb_int32(21, weather_time_of_day)         # 21 weatherTimeOfDay
     m += pb_int32(22, weather_condition)           # 22 weatherCondition
     m += pb_string(23, name)                       # 23 metricsMissionName
@@ -663,5 +671,5 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     pos = battlefield_pos(battlefield_entity_for_gamemap(gamemap_id)) or (0.0, 0.0)
     m += pb_float(29, pos[0])                      # 29 stagedPosX
     m += pb_float(30, pos[1])                      # 30 stagedPosY
-    m += pb_bool(31, False)                        # 31 enableSaBots
+    m += pb_bool(31, enable_sa_bots)                # 31 enableSaBots（SA bot：官方多人局路径，killfeed=阵营默认名）
     return m
