@@ -110,10 +110,12 @@ def test_earnings_value_crash_bytes():
 class _FakeStore:
     """记录入库调用的 STORE 替身。"""
 
-    def __init__(self):
+    def __init__(self, grant_daily=False):
         self.saved = None
         self.currency = []
         self.xp = []
+        self.daily_calls = []
+        self.grant_daily = grant_daily
 
     async def save_battle_report(self, report, players):
         self.saved = (report, players)
@@ -126,6 +128,10 @@ class _FakeStore:
     async def add_combat_xp(self, pid, cid, xp):
         self.xp.append((pid, cid, xp))
         return xp
+
+    async def consume_daily_bonus(self, pid, cid):
+        self.daily_calls.append((pid, cid))
+        return self.grant_daily
 
     async def add_battle_pass_score(self, pid, season, score):
         return score
@@ -181,6 +187,58 @@ def test_ribbon_start_end_and_vet_bonus_persisted():
     assert fake.xp == [(1, 4, 1875)], fake.xp
     # PlayerBattleResult 货币 120cr/340wf → +25% 入账
     assert fake.currency == [(1, 150, 425)], fake.currency
+    # 默认（资格已用/不可用）：无每日加成，行为不变
+    assert fake.daily_calls == [(1, 4)], fake.daily_calls
+    assert 'xpDailyBonus' not in ch
+
+
+def test_daily_first_battle_bonus():
+    """每日首战 +50% XP：资格可用 → 基础 1500 + 老兵 375 + 首战 750。"""
+    fake = _FakeStore(grant_daily=True)
+    old = combat_handlers.STORE
+    combat_handlers.STORE = fake
+    try:
+        writer = _MockWriter()
+        asyncio.run(combat_handlers.handle_announce_battlefield_earnings(
+            _MockSess(), writer, 200, 'AnnounceBattleFieldEarningsRequest',
+            _build_earnings_request()))
+    finally:
+        combat_handlers.STORE = old
+    assert fake.saved, '战报未入库'
+    _, players = fake.saved
+    ch = players[0]['characters'][0]
+    # 资格消费恰一次，+50% 随战报入库（结算界面 f9 xpDailyBonus）
+    assert fake.daily_calls == [(1, 4)], fake.daily_calls
+    assert ch['xpDailyBonus'] == 750, ch['xpDailyBonus']
+    # 入账 = 基础 1500 + 老兵 375 + 首战 750
+    assert fake.xp == [(1, 4, 2625)], fake.xp
+
+
+def test_daily_bonus_not_consumed_without_xp_gain():
+    """无 XP 收益（endXp<=startXp）不消费首战资格。"""
+    earn = pb_varint(1, 5678)
+    char = pb_varint(1, 4) + pb_varint(2, 1000) + pb_varint(3, 1000) \
+        + pb_msg(11, earn)
+    player = (pb_varint(1, 1) + pb_varint(4, 500) + pb_msg(9, b'G')
+              + pb_varint(10, 0) + pb_msg(11, char))
+    faction = pb_varint(1, 2) + pb_msg(2, player)
+    report = (pb_varint(1, 730433917100003) + pb_varint(2, 2)
+              + pb_varint(3, 3) + pb_varint(4, 900) + pb_varint(5, 1787750000)
+              + pb_msg(6, faction))
+    proto = (pb_varint(1, 100003) + pb_varint(2, 730433917100003)
+             + pb_varint(3, 10) + pb_msg(4, report))
+
+    fake = _FakeStore(grant_daily=True)
+    old = combat_handlers.STORE
+    combat_handlers.STORE = fake
+    try:
+        asyncio.run(combat_handlers.handle_announce_battlefield_earnings(
+            _MockSess(), _MockWriter(), 200,
+            'AnnounceBattleFieldEarningsRequest', proto))
+    finally:
+        combat_handlers.STORE = old
+    assert fake.daily_calls == [], fake.daily_calls
+    assert fake.xp == [], fake.xp
 
 
 def test_msid_synthesized_when_missing():
@@ -228,8 +286,11 @@ def test_battlereport_ribbon_and_vet_encoding():
         'characterId': 4, 'startXp': 1000, 'endXp': 2500,
         'creditEarned': 2101, 'creditVetBonus': 525,
         'warfundEarned': 5678, 'warfundVetBonus': 1419,
+        'xpDailyBonus': 750,
         'ribbons': [{'id': 13, 'start': 3, 'end': 8}],
     })
+    # f9 xpDailyBonus（每日首战 +50%）编码
+    assert pb_varint(9, 750) in m
     assert pb_msg(13, pb_varint(1, 13) + pb_varint(2, 3)
                   + pb_varint(3, 8)) in m
     assert pb_msg(10, pb_varint(1, 2101) + pb_varint(2, 525)) in m

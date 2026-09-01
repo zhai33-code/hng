@@ -38,7 +38,8 @@ from wardb import (
     _capturepoint_ap_map, _load_accesspoint_templates,
     _load_capturepoint_templates, _load_objective_capturepoints,
     _load_preset, _missiontype_for_gamemap, _rank_from_combat_xp,
-    assault_ap_decision, battlefield_entity_for_gamemap, battlefield_pos,
+    army_resource_categories, assault_ap_decision,
+    battlefield_entity_for_gamemap, battlefield_pos,
     commandnode_template, is_general_character, preset_scene,
     squad_template_for_character, squad_template_name,
 )
@@ -461,6 +462,9 @@ FACTION_ROW_IDS = {tmpl: tmpl for tmpl in (1, 2, 3)}
 # combat.py f5 home_ap 仍锚真实守方线出兵点（引擎判负/部署必需）
 ASSAULT_DEFENDER_LOGO_AP = 8
 FACTION_SUPREME_COMMANDS = {tmpl: random.getrandbits(63) for tmpl in (1, 2, 3)}
+# 与上面配对的 CommandNodeDefinition 行 id（客户端 CommandnodeTable 由
+# CommandNodeDefinition + CommandNodeWarInstance 两行 join 而成）
+FACTION_SUPREME_COMMAND_DEFS = {tmpl: random.getrandbits(63) for tmpl in (1, 2, 3)}
 
 
 def _rival_faction(faction):
@@ -508,6 +512,89 @@ def _msg_faction_rows():
         m += pb_float(7, 1.0)                                  # underdogBonusWarfundsMultiplier
         rows.append(m)
     return rows
+
+
+def _msg_supreme_command_rows():
+    """KVS 'CommandNodeDefinition' + 'CommandNodeWarInstance' 行（三阵营最高司令部）。
+
+    客户端 CommandnodeTable 由 CommandNodeDefinitionTable × CommandNodeWarInstanceTable
+    两行按 commandNodeDefinitionId join 而成；战争图"阵营资源总览"窗口
+    （FactionResourceOverviewMediator.setupProductionOverview）查
+    getFromId(faction.supremecommand) 返回 null 时会 dispatch
+    subscribeResourceViewSignal 重订 resourceview 再查——缺这两行数据时
+    形成每秒上千次 unsub/sub 的请求死循环（2026-09-01 realtest_game.log
+    80 分钟 16 万行事故）。两行都推即可让查找命中、循环终止。
+    行结构按反编译 proto-as3-classes/HnG_States 字段号编码。
+    """
+    defs, instances = [], []
+    now_ms = int(time.time() * 1000)
+    for tmpl, fid in FACTION_ROW_IDS.items():
+        d = pb_int64(1, FACTION_SUPREME_COMMAND_DEFS[tmpl])    # id
+        d += pb_string(2, 'Supreme Command')                    # name
+        d += pb_string(3, 'HQ')                                 # abbreviation
+        d += pb_int64(4, 0)                                     # ownerPlayerId
+        d += pb_int64(5, tmpl)                                   # factionTemplateId
+        d += pb_int64(6, commandnode_template(tmpl, 'infantry'))  # commandNodeTemplateId
+        d += pb_int32(7, 0)                                     # rank
+        d += pb_int64(8, 0)                                     # supplyResourceCategoryId
+        d += pb_int64(9, 0)                                     # generalCharacterId
+        d += pb_int64(10, now_ms)                               # statUpdateTimeStamp
+        d += pb_int32(11, 0)                                    # suppliedOnCreation
+        defs.append(d)
+
+        w = pb_int64(1, FACTION_SUPREME_COMMANDS[tmpl])         # id（=faction.supremecommand）
+        w += pb_int64(2, FACTION_SUPREME_COMMAND_DEFS[tmpl])    # commandNodeDefinitionId
+        w += pb_int64(3, 0)                                     # parentCommandNodeInstanceId
+        w += pb_int64(4, fid)                                   # factionId
+        w += pb_int64(5, 0)                                     # mapEntityId
+        w += pb_int64(6, 3)                                     # mapEntityTypeId（3=SUPPLYLINE）
+        w += pb_int64(7, _WAR_ID)                               # warId
+        w += pb_int32(8, 0)                                     # morale
+        w += pb_int64(9, now_ms)                                # lastReset
+        w += pb_int32(10, 1)                                    # isDeployed
+        w += pb_int32(11, 0)                                    # hasGottenSoldierResourcesForFree
+        w += pb_int32(12, 0)                                    # hasGottenVehicleResourcesForFree
+        w += pb_int32(13, 100)                                  # maxMorale
+        w += pb_float(14, 1.0)                                  # moraleGainModifier
+        instances.append(w)
+    return defs, instances
+
+
+def _msg_faction_resource_rows():
+    """KVS 'FactionResourceProduction' + 'FactionResourceConsumption' 行
+    （三阵营 × 全部 armyresourcecategory 分类）：阵营资源总览窗口数据源，
+    缺 FactionResourceProduction 行时客户端每分类 dd.error 并留空。
+    时间戳为 Zulu 'YYYYMMDDHHmmss'（TimeUtilities.convertZuluTimeToMilliseconds），
+    nextRunTimeStamp 取当前时间 +1 小时（倒计时展示值）。"""
+    prods, cons = [], []
+    next_ts = time.strftime('%Y%m%d%H%M%S', time.gmtime(time.time() + 3600))
+    prev_ts = time.strftime('%Y%m%d%H%M%S', time.gmtime())
+    for tmpl, fid in FACTION_ROW_IDS.items():
+        hq = FACTION_SUPREME_COMMANDS[tmpl]
+        for cat, prod_val in army_resource_categories():
+            p = pb_int64(1, fid * 1000 + cat)                # id（faction×分类 唯一）
+            p += pb_int64(2, fid)                              # factionId
+            p += pb_int64(3, _WAR_ID)                          # warId
+            p += pb_int64(4, hq)                               # factionHQCommandNodeWarInstanceId
+            p += pb_int64(5, cat)                              # armyResourceCategoryId
+            p += pb_int64(6, 0)                                # armyResourceProductionTemplateId（窗口不读）
+            p += pb_string(7, next_ts)                         # nextRunTimeStamp
+            p += pb_int32(8, max(1, int(round(prod_val * 10))))  # nextProductionValue
+            p += pb_int32(9, 0)                                # warStartValue
+            prods.append(p)
+
+            c = pb_int64(1, fid * 1000 + cat)                # id
+            c += pb_int64(2, fid)                              # factionId
+            c += pb_int64(3, _WAR_ID)                          # warId
+            c += pb_int64(4, hq)                               # factionHQCommandNodeWarInstanceId
+            c += pb_int64(5, cat)                              # armyResourceCategoryId
+            c += pb_string(6, prev_ts)                         # previousConsumptionTimeStamp
+            c += pb_int32(7, 0)                                # previousConsumptionValue
+            c += pb_int32(8, 0)                                # supplyQueueHead
+            c += pb_int32(9, 0)                                # supplyQueueTail
+            cons.append(c)
+    return prods, cons
+
 AI_MISSIONPRESET = 10                   # mission_info f3（AI 模式=10；多人模式=29）
 AI_PLAYER_COUNT = 2                     # mission_info f9（他服单人AI局实测=2）
 
@@ -610,9 +697,11 @@ def _pool_counts(pool, faction):
     return force_pool.counts_for(None, faction)
 
 
-def consume_mission_resource(mission_id, faction, cat, n=1):
-    """玩家出生消耗资源（按兵种类别扣 n）。返回扣后余量；池/类别缺失返回 None。"""
-    return force_pool.consume(mission_id, faction, cat, n)
+def consume_mission_resource(mission_id, faction, cat, n=1, ap=None):
+    """玩家出生消耗资源（按兵种类别扣 n；ap 给定时攻方同步扣分线池）。
+
+    返回扣后余量；池/类别缺失返回 None。"""
+    return force_pool.consume(mission_id, faction, cat, n, ap=ap)
 
 
 def release_mission_resources(mission_id):
@@ -778,6 +867,18 @@ PMS_TO_SESSION = {}         # pms_id -> {player_id, char_id, gamertag, faction,
 def _zulu_now():
     """客户端 TimeUtilities 解析的 UTC 时间字符串 YYYYMMDDHHmmssZ。"""
     return time.strftime('%Y%m%d%H%M%S', time.gmtime()) + 'Z'
+
+
+def _zulu_activated(offset_sec=3600):
+    """MissionInfo.activationTimeStamp 专用：取过去时间。
+
+    客户端 MissionUtilities.checkIfBattleIsActivated 用
+    serverTime >= activationTimeStamp 判定战局已激活；发当前时间会因
+    客户端 serverTime 同步延迟判为未激活 → 大厅地图详情页显示
+    "战斗准备完毕于xxx"（战争模式组队倒计时文案）。本服战局即时开打，
+    activation 一律回溯 1 小时。"""
+    return time.strftime('%Y%m%d%H%M%S',
+                         time.gmtime(time.time() - offset_sec)) + 'Z'
 
 
 # ---------------------------------------------------------------- 推送
@@ -959,23 +1060,22 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
     afid = FACTION_ROW_IDS[ai_faction]       # AI 方 faction 行 id
     aps = _mission_accesspoints(gamemap_id)   # 不截断（5 线图全参与）
     ours_ap, theirs_ap = aps[0], aps[1]
-    # ★按 missiontype 分支（assault-map-spawn-investigation.md §6.1/§6.2）：
+    # ★按 missiontype 分支（assault-map-spawn-investigation.md §9.2）：
     # Assault 出兵线随机激活（wardb.assault_ap_decision，按 mission_id 播种，
     # 与战斗侧 _accesspoint_layout/BattleFieldSettings f12 同源同值）：
-    # 防守方随机 1 条（引擎判负约束：守方 0 出兵点 → "has lost their
-    # accesspoints" 秒判负 + AI 小队无处部署，0831 实测）、我方（进攻方）
-    # 随机 2~3 条、★未激活线不开启。Encounter（Mill 等无连线图）维持
-    # 原有交替方案不改动。
+    # 守方 = O 锚 1234567890（引擎虚拟 AP：战斗侧 f12 收编 + f14 挂资源
+    # → 守方小队/坦克部署中心 O 区）、我方（进攻方）随机 2~3 条边线、
+    # ★未激活线不开启。Encounter（Mill 等无连线图）维持原有交替方案不改动。
     assault = _missiontype_for_gamemap(gamemap_id) == 1
     owner_map = None
     d_ap = None
     atk_aps = ()
     if assault:
         d_ap, a_aps, _inactive = assault_ap_decision(gamemap_id, mission_id)
-        theirs_ap = d_ap
+        theirs_ap = d_ap   # = O 锚 1234567890（f5 守方资源锚，同战斗 f14）
         ours_ap = min(a_aps) if a_aps else aps[0]
         atk_aps = set(int(t) for t in a_aps)
-        owner_map = {int(d_ap): ai_faction}
+        owner_map = {int(d_ap): ai_faction}   # O 锚不在边线 aps → f6 不下发
         for t in a_aps:
             owner_map[int(t)] = player_faction
     m = b''
@@ -991,7 +1091,7 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
     # 客户端 setupMissionAssaultTeamOnMap 次选路径把阵营 logo 画在
     # ★地图中心（O 点区域，官方简报守方 logo 位置），而非外围守方线
     # （BattlefieldUtilities.as L99-105；f4 只驱动大厅 logo 定位，
-    # 战斗侧 home_ap 走 combat.py f5 仍锚真实守方线，两者独立）
+    # 战斗侧 home_ap 走 combat.py f5 锚 O 锚 1234567890，两者独立）
     for cmd_node in _assault_team_nodes(player_faction, mission_id):
         m += pb_message(4, pb_int64(1, rfid) + pb_int64(2, cmd_node) +
                         pb_int64(3, ours_ap) + pb_int64(4, 0))
@@ -1016,13 +1116,12 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
                         pb_int64(4, theirs_counts.get(res_cat, 0)) +
                         pb_bool(5, res_air))
     # f6 出兵点归属：Encounter 首个=我方、其余交替（Mill 实测 8=我方, 15=AI）；
-    # Assault 展示层只发★攻方激活线（官方简报守方仅拥有中心 O 点——
-    # 守方线/未激活线均不进 f6，图上不显示）——与战斗侧 _accesspoint_layout
-    # 同 mission_id 同源（战斗 f12 仍含守方线：引擎判负/部署必需）
+    # Assault 展示层只发★攻方激活线（官方简报守方仅拥有中心 O 点——由 f7
+    # 涂守方色 + f4 logo 画中心；守方 O 锚为虚拟点不在边线 aps → 不进 f6）
+    # ——与战斗侧 _accesspoint_layout 同 mission_id 同源（战斗 f12 含守方
+    # O 锚：引擎判负检查/部署必需）
     if owner_map is not None:
         for ap in aps:
-            if int(ap) == int(d_ap):
-                continue        # 守方线：展示层不下发（logo 由 f4 画中心）
             if int(ap) not in owner_map:
                 continue        # 未激活线：不开启不下发
             m += pb_message(6, pb_int64(1, ap) +
@@ -1070,19 +1169,27 @@ def _multi_first(f, fn, default=0):
 def _split_factions(entries):
     """阵营分组 → (attacker_faction, defender_faction, 单侧真人)。
 
-    最简平衡规则（计划 Assumption 5）：玩家保留各自角色 faction，
-    人数最多组为进攻方、次多组为防守方；不足两个阵营时防守方由 AI 补位
-    （ai_fill 局 / 同阵营匹配常见路径）。
+    玩家保留各自角色 faction；参战两阵营仍按人数前两选取（同人数按
+    阵营 id 升序稳定），★攻防角色成局时掷硬币随机（2026-09-01：原
+    "人数最多组恒进攻"使同人数对局固定低 id 阵营进攻，改随机对半开）。
+    不足两个阵营时防守方由 AI 补位（ai_fill 局 / 同阵营匹配常见路径，
+    ★玩家攻防角色同样掷硬币——玩家可能当守方打 AI（守方出兵线/
+    判负条件由 assault_ap_decision 引擎侧对称支持））。
     """
     groups = {}
     for e in entries:
         groups.setdefault(int(e.faction), []).append(e)
     if len(groups) >= 2:
         ordered = sorted(groups, key=lambda fc: (-len(groups[fc]), fc))
-        return ordered[0], ordered[1], False
-    attacker = next(iter(groups), 3)
-    defender = _rival_faction(attacker)
-    return attacker, defender, True
+        attacker, defender = ordered[0], ordered[1]
+        if random.random() < 0.5:
+            attacker, defender = defender, attacker
+        return attacker, defender, False
+    player_faction = next(iter(groups), 3)
+    ai_faction = _rival_faction(player_faction)
+    if random.random() < 0.5:
+        return ai_faction, player_faction, True
+    return player_faction, ai_faction, True
 
 
 def _prune_match_factions(match, attacker, defender, gamemode_id):
@@ -2268,7 +2375,7 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
       时保留无成员名单的 AI 方条目
     - f4/f5 突击队/资源：本局 force_pool 抽取的 AT 名单与资源池（类别为
       库值），突击队模板按【参战阵营】查 commandnodetemplate，
-      "我方" = 进攻方（人数最多组），AI 方 = 防守方
+      "我方" = 进攻方（_split_factions 成局随机），AI 方 = 防守方
     - 出兵点/据点模板按本局 gamemap 查表；f8/f9 战局位置 = mapEntityId 对应
       battlefield 行坐标（简报战场名与地图标记一致）
     """
@@ -2282,23 +2389,23 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     gamemap_id = int(_load_preset(preset).get(3, 0) or 0) or 13
     aps = _mission_accesspoints(gamemap_id)   # 不截断（5 线图全参与）
     ours_ap, theirs_ap = aps[0], aps[1]
-    # ★按 missiontype 分支（assault-map-spawn-investigation.md §6.1/§6.2）：
+    # ★按 missiontype 分支（assault-map-spawn-investigation.md §9.2）：
     # Assault 出兵线随机激活（wardb.assault_ap_decision，按 mission_id 播种，
     # 与战斗侧 _accesspoint_layout/BattleFieldSettings f12 同源同值）：
-    # 防守方随机 1 条（引擎判负约束：守方 0 出兵点 → "has lost their
-    # accesspoints" 秒判负 + AI 小队无处部署，0831 实测）、进攻方随机
-    # 2~3 条、★未激活线不开启。Encounter（Mill 等无连线图）维持原有
-    # 交替方案不改动（Mill 锚点 8=攻/15=守）。
+    # 守方 = O 锚 1234567890（引擎虚拟 AP：战斗侧 f12 收编 + f14 挂资源
+    # → 守方小队/坦克部署中心 O 区）、进攻方随机 2~3 条边线、★未激活线
+    # 不开启。Encounter（Mill 等无连线图）维持原有交替方案不改动
+    # （Mill 锚点 8=攻/15=守）。
     assault = _missiontype_for_gamemap(gamemap_id) == 1
     owner_map = None
     d_ap = None
     atk_aps = ()
     if assault:
         d_ap, a_aps, _inactive = assault_ap_decision(gamemap_id, mission_id)
-        theirs_ap = d_ap
+        theirs_ap = d_ap   # = O 锚 1234567890（f5 守方资源锚，同战斗 f14）
         ours_ap = min(a_aps) if a_aps else aps[0]
         atk_aps = set(int(t) for t in a_aps)
-        owner_map = {int(d_ap): defender}
+        owner_map = {int(d_ap): defender}       # O 锚不在边线 aps → f6 不下发
         for t in a_aps:
             owner_map[int(t)] = attacker
     pos = battlefield_pos(int(details.get('map_entity_id') or 0)
@@ -2323,7 +2430,7 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     m += pb_message(3, dfd)
     # f4 突击队：本局 AT 抽取名单跨阵营翻译（无池回退官方锚点 ×2）；
     # ★守方锚 ASSAULT_DEFENDER_LOGO_AP（客户端次选路径画地图中心=O 区域，
-    # 见单人版注释；战斗侧 home_ap 独立锚真实守方线）
+    # 见单人版注释；战斗侧 home_ap 独立锚 O 锚 1234567890）
     for cmd_node in _assault_team_nodes(attacker, mission_id):
         m += pb_message(4, pb_int64(1, rfid) + pb_int64(2, cmd_node) +
                         pb_int64(3, ours_ap) + pb_int64(4, 0))
@@ -2349,12 +2456,11 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
                         pb_bool(5, res_air))
     # f6 出兵点归属：Encounter 首个=进攻方、其余交替（Mill 实测 8=进攻,
     # 15=防守；f2 为 factionTemplateId）；Assault 展示层只发★攻方激活线
-    # （官方简报守方仅拥有中心 O 点，守方线/未激活线不进 f6）——与战斗侧
-    # _accesspoint_layout 同 mission_id 同源（战斗 f12 仍含守方线）
+    # （官方简报守方仅拥有中心 O 点——由 f7 涂守方色 + f4 logo 画中心；
+    # 守方 O 锚为虚拟点不在边线 aps → 不进 f6）——与战斗侧
+    # _accesspoint_layout 同 mission_id 同源（战斗 f12 含守方 O 锚）
     if owner_map is not None:
         for ap in aps:
-            if int(ap) == int(d_ap):
-                continue        # 守方线：展示层不下发（logo 由 f4 画中心）
             if int(ap) not in owner_map:
                 continue        # 未激活线：不开启不下发
             m += pb_message(6, pb_int64(1, ap) +
@@ -2411,12 +2517,12 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
             _log(f'S->C cmd={cmd_id:<4} GetMissionDetailsResponse '
                  f'(mission_invalid: faction fields, mission={mid})')
             return
-        resp_proto = _msg_mission_details_response_multi(mid, details, _zulu_now())
+        resp_proto = _msg_mission_details_response_multi(mid, details, _zulu_activated())
         mode = 'multi'
     else:
         # 角色建号即写 faction，无默认值必要（无 faction 的角色不存在）
         resp_proto = _msg_mission_details_response(
-            mid, details['player_id'], details['gamertag'], _zulu_now(),
+            mid, details['player_id'], details['gamertag'], _zulu_activated(),
             int(details['faction']))
         mode = 'AI mode'
     resp = build_response(cmd_id, 'GetMissionDetailsResponse', resp_proto)

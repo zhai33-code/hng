@@ -390,6 +390,7 @@ async def _msg_player_for(sess, gamertag=None):
     cur = {'credits': 100000, 'warfunds': 100000, 'gold': 100000}
     tutorials_completed = 0
     faction = None
+    total_score = 0
     pid = await sess.ensure_player()
     if pid is not None:
         try:
@@ -404,9 +405,20 @@ async def _msg_player_for(sess, gamertag=None):
             faction = await STORE.get_player_faction(pid)
         except Exception as e:
             log(f'[DB] get_player_faction failed: {e}')
+        # ★ totalScore（player f36）：统计界面"分数"显示值 = 全角色 score 汇总
+        #   （type-6 上报的 PlayerScore 优先，legacy 结算键 score 回落，二者
+        #   同源不叠加）。此前恒发 0 → 统计页分数为 0（2026-09-01）。
+        try:
+            for ch in await STORE.list_characters(pid):
+                st = await STORE.get_stats(ch['id']) or {}
+                v = st.get('PlayerScore', st.get('score', 0))
+                total_score += int(v or 0)
+        except Exception as e:
+            log(f'[DB] totalScore sum failed: {e}')
     return msg_player(gamertag or sess.username or 'DemoPlayer',
                       tutorials_completed=tutorials_completed,
-                      pid=pid or 1, faction=faction, **cur)
+                      pid=pid or 1, faction=faction, total_score=total_score,
+                      **cur)
 
 
 

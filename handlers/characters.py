@@ -78,6 +78,7 @@ async def handle_requestreadcharacterstats(sess, writer, cmd_id, req_type, proto
     for cid in char_ids:
         ribbons = {}
         combat_xp = 0
+        cstats = {}
         if pid is not None:
             try:
                 weapon_templates = [w['template_id'] for w in await STORE.list_weapons(pid)
@@ -95,11 +96,19 @@ async def handle_requestreadcharacterstats(sess, writer, cmd_id, req_type, proto
                 combat_xp = await STORE.get_combat_xp(pid, cid)
             except Exception as e:
                 log(f'[DB] load ribbon attributes failed: {e}')
+            # ★ 2026-09-01 统计界面修复：character_stats 全量回读（type-6 战斗
+            #   上报落库的 WIRE 名 + w/v/gm 维度键）→ 击杀/死亡/游玩时间/
+            #   武器击杀等全部字段（此前只发 XP，其余 0 → 统计页全空）。
+            #   构建逻辑与 game_server（hng.exe 路径）共用 messages 的映射表。
+            try:
+                cstats = await STORE.get_stats(int(cid)) or {}
+            except Exception as e:
+                log(f'[DB] get_stats failed (char={cid}): {e}')
         log(f'      stats entry char={cid}: ribbons={sorted(ribbons.items())} '
-            f'combatXp={combat_xp}')
+            f'combatXp={combat_xp} statsKeys={len(cstats)}')
         resp_proto += pb_message(1,
                                  _msg_character_stats_entry(cid, sorted(ribbons.items()),
-                                                            combat_xp))
+                                                            combat_xp, cstats))
 
     resp = build_response(cmd_id, 'ResponseReadCharacterStats', resp_proto)
     writer.write(resp)
@@ -1104,6 +1113,10 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
         if sd_tab:
             await _repush_depot_new_item(sess, writer, pid)
     await _push_player_refresh(sess, writer)
+    # 生涯军令 45 eDepot（客户端无上报点，物品入仓即完成）+ 推行实时刷新
+    if updated and pid is not None:
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid, 45)
 
 
 async def handle_sendupgradestodepotrequest(sess, writer, cmd_id, req_type, proto):

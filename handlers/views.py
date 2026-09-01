@@ -34,7 +34,11 @@ from player_service import (
     _push_stored_soldier_data,
     )
 
-from matchmaking import _msg_faction_rows
+from matchmaking import (
+    _msg_faction_resource_rows,
+    _msg_faction_rows,
+    _msg_supreme_command_rows,
+    )
 
 from .career import (
     push_battle_pass_row,
@@ -57,6 +61,13 @@ from .squad import push_squad_rows
 # （带 ":port" 会被整体当主机名解析失败 → 超时；实测 50010/80/50080 都 Timeout）。
 # 20201 由 _start_ping_responder 监听并应答。地址取 PUBLIC_HOST（外网开服=公网 IP）。
 _HC_HOST = PUBLIC_HOST
+
+# subscriberesourceview 的 ★CommandnodeTable fill 推送开关（登录卡死排查）
+# 根因已修：CommandNodeWarInstance.mapEntityTypeId=0 不属于枚举 1/2/3，客户端
+# AssaultTeamResources.updateAssaultTeamMapEntity 走 getBattlefieldForMapEntity(0,0)
+# 返回 null 后取 .bftitle → NPE 中断 ServiceHandler 响应处理 → 登录卡在
+# "设置最终细节"。改为 3(SUPPLYLINE) 后该分支 location="" 直接 return。
+_RESOURCE_FILL_ENABLED = True
 
 
 async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
@@ -136,6 +147,28 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         # 空表会导致 HnGGUICampaignCarousel RangeError 崩溃(10005)。
         await writer.drain()
         log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (shop data, {sent_count} tables, {total_bytes}B)')
+
+    if req_type.lower() == 'subscriberesourceview' and _RESOURCE_FILL_ENABLED:
+        # 最高司令部指挥节点（CommandNodeDefinition + CommandNodeWarInstance 各 3 行）：
+        # 阵营资源总览窗口查不到 faction.supremecommand 节点时会无限重订
+        # resourceview（2026-09-01 每秒上千次 unsub/sub 死循环），必须随订阅推送。
+        # 必须在下方 subscriberesponse 之前发送——客户端收到 response 即触发
+        # resourceViewSubscribedSignal → setupProductionOverview 重查。
+        # ⚠ 2026-09-02 登录卡死排查：此推送启用后客户端停在"设置最终细节"，
+        # cmd=22 QueryShopWarBondItemsRequest 不再发出。待逐表定位后恢复。
+        defs, instances = _msg_supreme_command_rows()
+        for row in defs:
+            await _push_kvcs(writer, cmd_id, b'CommandNodeDefinition', row)
+        for row in instances:
+            await _push_kvcs(writer, cmd_id, b'CommandNodeWarInstance', row)
+        # 资源总览窗口的产量/消耗行（三阵营 × 全部分类）
+        prods, cons = _msg_faction_resource_rows()
+        for row in prods:
+            await _push_kvcs(writer, cmd_id, b'FactionResourceProduction', row)
+        for row in cons:
+            await _push_kvcs(writer, cmd_id, b'FactionResourceConsumption', row)
+        log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (supreme command ×3 factions, '
+            f'resource production/consumption ×{len(prods)}) ★CommandnodeTable fill')
 
     # 跟踪 PLAYER_VIEW 的 cmd_id，用于购买后推送 player 更新
     if req_type.lower() == 'subscribeplayerview':

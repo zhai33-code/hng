@@ -62,7 +62,7 @@ from matchmaking import (
     _msg_solo_squad_session,
     _push_kvcs,
     _push_kvcs_delete,
-    _zulu_now,
+    _zulu_activated,
     release_match,
     reset_real_squad_to_lobby,
     )
@@ -165,7 +165,7 @@ async def handle_get_mission_list(sess, writer, cmd_id, req_type, proto):
         log(f'      [mission] GetMissionList parse error: {e}')
 
     pid = await sess.ensure_player()
-    zulu = _zulu_now()
+    zulu = _zulu_activated()   # 过去时间：checkIfBattleIsActivated=true，隐藏"战斗准备完毕于xxx"
 
     # 侧面记录当前选中士兵（GetMissionList 在玩家点进战斗界面时携带
     # characterId，是"当前选中"最频繁的感知点；内存 + DB 双写）

@@ -857,6 +857,9 @@ async def handle_repairweaponammorequest(sess, writer, cmd_id, req_type, proto):
                         break
         except Exception as e:
             log(f'[DB] reload ammo after repair failed: {e}')
+    # 生涯军令 7 eRefillWeaponAmmo（客户端无上报点）+ 推行实时刷新
+    from handlers.career import complete_order_and_push
+    await complete_order_and_push(sess, writer, pid, 7)
 
 
 async def handle_renameweaponrequest(sess, writer, cmd_id, req_type, proto):
@@ -988,6 +991,9 @@ async def handle_repairweaponrequest(sess, writer, cmd_id, req_type, proto):
         except Exception as e:
             log(f'[DB] reload weapon after repair failed: {e}')
     await _push_player_refresh(sess, writer)
+    # 生涯军令 6 eRepairWeapon（客户端无上报点）+ 推行实时刷新
+    from handlers.career import complete_order_and_push
+    await complete_order_and_push(sess, writer, pid, 6)
 
 
 async def handle_repairweaponmodifierrequest(sess, writer, cmd_id, req_type, proto):
@@ -1141,6 +1147,11 @@ async def handle_setweaponmodifierrequest(sess, writer, cmd_id, req_type, proto)
                         f'weaponId={m["weapon_id"]})')
         except Exception as e:
             log(f'[DB] reload modifier after equip failed: {e}')
+
+    # 生涯军令 30 eEquipWeaponUpgrade（配件挂接到武器，状态推导）+ 推行刷新
+    if pid is not None and sm_do_equip:
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid)
 
 
 async def handle_setweaponautorepairrequest(sess, writer, cmd_id, req_type, proto):

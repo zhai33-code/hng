@@ -11,6 +11,11 @@
  5. game_server._group_dim_stats 维度分组（wv 前缀不误入 w 组）
  6. RequestReadCharacterStats 端到端：f1-f48 标量回读 + f50/f51/f53
     vehicleStatistics/weaponStatistics/gamemodeStatistics 数组下发
+ 7. （2026-09-01 统计界面修复）Flash 菜单端 _msg_character_stats_entry：
+    cstats=None 退化 / 全量回读（legacy 回落、f36 跳过、复合武器 id）/
+    f53 gm 合并为 gameMode=0（客户端 setGameModeStats 只接受 0）
+ 8. （2026-09-01 分数修复）player f36 totalScore：msg_player 编码 +
+    _msg_player_for 全角色汇总（PlayerScore 优先、legacy score 回落不叠加）
 """
 import asyncio
 import os
@@ -224,10 +229,115 @@ async def test_read_character_stats():
               veh.get(1, [0])[0] == 678 and veh.get(2, [0])[0] == 2
               and veh.get(3, [0])[0] == 1, f'veh={veh}')
         gms = _pb_multi(cs[53][0])
-        check('stats f53 GameModeStats gameMode=4 cPCaptures=3',
-              gms.get(1, [0])[0] == 4 and gms.get(2, [0])[0] == 3, f'gm={gms}')
+        # 2026-09-01：客户端 setGameModeStats 只接受 gameMode==0，服务端把
+        # 所有 gm 组合并成一条 gameMode=0 回发（gm4 → 合并进 0）
+        check('stats f53 GameModeStats 合并为 gameMode=0 cPCaptures=3',
+              gms.get(1, [0])[0] == 0 and gms.get(2, [0])[0] == 3, f'gm={gms}')
     finally:
         game_server.STORE = old
+
+
+def test_character_stats_entry_menu():
+    """Flash 菜单端统计入口（2026-09-01 统计界面修复）：
+    messages.character_stats_payload / _msg_character_stats_entry(cstats)。"""
+    import messages
+    # 1. cstats=None 退化为旧行为：仅 f35 XP，其余标量 0，无维度数组
+    m = messages._msg_character_stats_entry(31, [(13, 2)], 851)
+    ent = _pb_multi(m)
+    cs = _pb_multi(ent[2][0])
+    check('menu 无 cstats 退化：f35 xp=851 / f2 kills=0 / f56 存在',
+          cs.get(35, [0])[0] == 851 and cs.get(2, [0])[0] == 0
+          and cs.get(56, [b''])[0] == b'', f'f35={cs.get(35)}')
+    check('menu 无 cstats 退化：无 f50/f51/f53 数组',
+          50 not in cs and 51 not in cs and 53 not in cs)
+    check('menu entry 布局：f1 characterId / f3 ribbon',
+          ent.get(1, [0])[0] == 31 and _pb_multi(ent[3][0]).get(1, [0])[0] == 13)
+    # 2. 全量回读：WIRE 名 + legacy 回落 + f36 跳过
+    m = messages._msg_character_stats_entry(31, [], 851, {
+        'PlayerScore': 336, 'PlayerKills': 24, 'PlayerDeaths': 3,
+        'time_active': 484,            # legacy 回落（PlayerTimePlayed 缺失）
+        'player_damage': 1569,         # legacy 回落（f22）
+        'w590340/WeaponKills': 4,      # 高 16 位带载具 id 的复合武器键
+    })
+    cs = _pb_multi(_pb_multi(m)[2][0])
+    check('menu 全量：f1/f2/f3 score/kills/deaths',
+          cs.get(1, [0])[0] == 336 and cs.get(2, [0])[0] == 24
+          and cs.get(3, [0])[0] == 3)
+    check('menu 全量：f14 timePlayed 走 legacy time_active=484',
+          cs.get(14, [0])[0] == 484, f'f14={cs.get(14)}')
+    check('menu 全量：f22 damageDealt 走 legacy player_damage=1569',
+          cs.get(22, [0])[0] == 1569)
+    check('menu 全量：f36 不存在（proto 无此字段）', 36 not in cs)
+    wep = _pb_multi(cs[51][0])
+    check('menu 全量：f51 复合武器 id 590340 原样透传 kills=4',
+          wep.get(1, [0])[0] == 590340 and wep.get(5, [0])[0] == 4)
+    # 3. f53 gm 合并：客户端 setGameModeStats 只接受 gameMode==0，
+    #    gm1 组的"击杀占领中敌人"等必须并入 gameMode=0 条目
+    m = messages._msg_character_stats_entry(31, [], 0, {
+        'gm0/GamemodeCPCaptures': 2, 'gm0/GamemodeCPNotSpotted': 1,
+        'gm1/GamemodeKillAnEnemyCapturing': 2,
+        'gm1/GamemodeKillAnEnemyWhileCapturing': 10,
+    })
+    cs = _pb_multi(_pb_multi(m)[2][0])
+    gms = _pb_multi(cs[53][0])
+    check('menu f53 合并：单条 gameMode=0',
+          len(cs[53]) == 1 and gms.get(1, [0])[0] == 0, f'n={len(cs.get(53, []))}')
+    check('menu f53 合并：gm0 键保留 cPCaptures=2 cpNotSpotted=1',
+          gms.get(2, [0])[0] == 2 and gms.get(9, [0])[0] == 1)
+    check('menu f53 合并：gm1 键并入 killAnEnemyCapturing=2 whileCapturing=10',
+          gms.get(7, [0])[0] == 2 and gms.get(10, [0])[0] == 10, f'gm={gms}')
+
+
+def test_msg_player_total_score():
+    """player f36 totalScore（2026-09-01 统计页分数修复）：
+    统计界面"分数"读 Global.currentPlayer.totalScore（player proto f36）。"""
+    from protocol import msg_player
+    f = _pb_multi(msg_player('tester', total_score=1122))
+    check('player f36 totalScore=1122', f.get(36, [0])[0] == 1122,
+          f'f36={f.get(36)}')
+    f = _pb_multi(msg_player('tester'))
+    check('player f36 缺省为 0', f.get(36, [0])[0] == 0)
+
+
+async def test_msg_player_for_total_score():
+    """_msg_player_for 全角色 score 汇总（PlayerScore 优先、legacy score 回落，
+    同角色二者同时存在时不叠加）。"""
+    import player_service
+
+    class MenuFakeStore:
+        async def get_currency(self, pid):
+            return {'credits': 1, 'warfunds': 2, 'gold': 3}
+
+        async def get_tutorials_completed(self, pid):
+            return 0
+
+        async def get_player_faction(self, pid):
+            return None
+
+        async def list_characters(self, pid):
+            return [{'id': 31}, {'id': 53}, {'id': 7}]
+
+        async def get_stats(self, cid):
+            return {31: {'PlayerScore': 900, 'score': 999},   # WIRE 优先不叠加
+                    53: {'score': 222},                        # legacy 回落
+                    7: {},                                     # 无统计 → 0
+                    }[cid]
+
+    class FakeSess:
+        username = 'tester'
+
+        async def ensure_player(self):
+            return 7
+
+    old = player_service.STORE
+    player_service.STORE = MenuFakeStore()
+    try:
+        m = await player_service._msg_player_for(FakeSess())
+        f = _pb_multi(m)
+        check('_msg_player_for f36 totalScore=900+222=1122（不叠加 legacy）',
+              f.get(36, [0])[0] == 1122, f'f36={f.get(36)}')
+    finally:
+        player_service.STORE = old
 
 
 async def run():
@@ -237,6 +347,9 @@ async def run():
     test_build_totals()
     test_group_dim()
     await test_read_character_stats()
+    test_character_stats_entry_menu()
+    test_msg_player_total_score()
+    await test_msg_player_for_total_score()
 
 
 def main():

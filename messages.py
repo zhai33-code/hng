@@ -330,18 +330,167 @@ def _msg_ribbon(ribbon_template_id, total_xp):
     return m
 
 
-def _msg_character_stats_entry(char_id, ribbons, combat_xp=0):
-    """构建 statrequests.ResponseReadCharacterStatsEntry proto：
-    characterId=1, alltimeCharacterStatistics=2, attributes=3 (repeated Ribbon)。
-    alltimeCharacterStatistics.characterXp 是字段 35（客户端 Global.characterExperience
-    ["combat"] 从这里读取，用于军衔进度条）；其余统计字段暂为 0。"""
+# ---------------------------------------------------------------------------
+# CharacterStats 标量字段（f1-f48）→ character_stats 键。
+# 键序 = 优先级：type-6 统计上报落库的 WIRE 名（statistics_server.py
+# WIRE_STAT_NAMES）优先，战斗结算 legacy 键（combat.py）回落。
+# f35 characterXp 单独走 characters.combat_xp，不在此表。
+# game_server（hng.exe 路径）与 handlers/characters.py（Flash 菜单路径）
+# 共用 —— 菜单统计界面（击杀/死亡/游玩时间/武器击杀）读的就是后者。
+# ---------------------------------------------------------------------------
+_CS_SCALAR_KEYS = {
+    1: ('PlayerScore', 'score'),
+    2: ('PlayerKills', 'kills'),
+    3: ('PlayerDeaths', 'deaths'),
+    4: ('PlayerSuicides',),
+    5: ('PlayerSpawns',),
+    6: ('PlayerBestMultiKill',),
+    7: ('PlayerSaviorKills',),
+    8: ('PlayerRunDistance',),
+    9: ('PlayerWalkDistance',),
+    10: ('PlayerSprintDistance',),
+    11: ('PlayerSwimDistance',),
+    12: ('PlayerCrouchDistance',),
+    13: ('PlayerTimeOnFoot',),
+    14: ('PlayerTimePlayed', 'time_active'),
+    15: ('PlayerTimeCrouched',),
+    16: ('PlayerParachuteTime',),
+    17: ('PlayerParachuteFreefallTime',),
+    18: ('PlayerParachuteFreefallDist',),
+    19: ('PlayerParachuteSpawns',),
+    20: ('PlayerParachuteEscape',),
+    21: ('PlayerSessionsPlayed',),
+    22: ('PlayerDamageDealt', 'player_damage'),
+    23: ('PlayerParachuteJumpsSuccessfull',),
+    24: ('PlayerFreefallJumps',),
+    25: ('PlayerTeamKills',),
+    26: ('PlayerRevengeKills',),
+    27: ('PlayerTeamScoreboard_3_4_5',),
+    28: ('PlayerTeamScoreboard_2',),
+    29: ('PlayerTeamScoreboard_1',),
+    30: ('PlayerScoreboard_1',),
+    31: ('PlayerBattlesWithoutDying',),
+    32: ('PlayerNrOfMultiKill',),
+    33: ('PlayerNrOfBattleWith1000ShotsFired',),
+    34: ('PlayerNrOfBattleWithKillSameEnemy4Times',),
+    37: ('PlayerNrOfBattleInfantryKillXArmor',),
+    38: ('PlayerNrOfBattleArmorKillXArmor',),
+    39: ('PlayerNrOfBattlePlaneKillXArmor',),
+    40: ('PlayerNrOfBattleInfantryKillXInfantry',),
+    41: ('PlayerNrOfBattleArmorKillXInfantry',),
+    42: ('PlayerNrOfBattlePlaneKillXInfantry',),
+    43: ('PlayerNrOfBattleXSaviorKills',),
+    44: ('PlayerNrOfBattleXRevengeKills',),
+    45: ('PlayerNrOfBattleXHeadshots',),
+    46: ('PlayerNrOfBattleXKnifeKills',),
+    47: ('PlayerNrOfBattleXGrenadeKills',),
+    48: ('PlayerNrOfBattleXPistolKills',),
+}
+
+# WeaponStats f2-f18 / VehicleStats f2-f7 / GameModeStats f2-f15
+# → 维度键后缀名（statistics_server._stat_db_key 写入的 w<id>/v<id>/gm<id> 前缀）
+_WEAPON_FIELDS = {
+    2: 'WeaponShotsFired', 3: 'WeaponHeadShots', 4: 'WeaponHits',
+    5: 'WeaponKills', 6: 'WeaponKilled', 7: 'WeaponTimeSpent',
+    8: 'WeaponPlayerKills', 9: 'WeaponMostHitsInARow',
+    10: 'WeaponDamageToPlayers', 11: 'WeaponDamageCloseRange',
+    12: 'WeaponDamageMidLowRange', 13: 'WeaponDamageMidHighRange',
+    14: 'WeaponDamageFarRange', 15: 'WeaponKillsCloseRange',
+    16: 'WeaponKillsMidLowRange', 17: 'WeaponKillsMidHighRange',
+    18: 'WeaponKillsFarRange',
+}
+_VEHICLE_FIELDS = {
+    2: 'VehicleDestroyed', 3: 'VehicleLost', 4: 'VehicleDistDriven',
+    5: 'VehicleDistDrivenWPassanger', 6: 'VehicleTimeSpent',
+    7: 'VehicleDamageDealt',
+}
+_GAMEMODE_FIELDS = {
+    2: 'GamemodeCPCaptures', 3: 'GamemodeCPAssists',
+    4: 'GamemodeCPTotalInfluence', 5: 'GamemodeResourcesCaptured',
+    6: 'GamemodeResourcesTotalInfluence', 7: 'GamemodeKillAnEnemyCapturing',
+    8: 'GamemodeKilledWhileCapturing', 9: 'GamemodeCPNotSpotted',
+    10: 'GamemodeKillAnEnemyWhileCapturing', 11: 'GamemodeAssaultAttackerWon',
+    12: 'GamemodeAssaultDefenderWon', 13: 'GamemodeAssaultBattles',
+    14: 'GamemodeSkirmishBattlesWon', 15: 'GamemodeSkirmishBattles',
+}
+
+
+def _group_dim_stats(stats, prefix):
+    """按 'w'/'v'/'gm' 前缀把 character_stats 键分组 → {维度id: {名: 值}}。
+
+    键格式见 statistics_server._stat_db_key（'w<id>/<Name>' 等）；
+    'wv<id>_<id>/'（武器×载具段）不以纯数字跟斜杠 → isdigit 过滤掉。
+    """
+    groups = {}
+    plen = len(prefix)
+    for key, val in stats.items():
+        if not key.startswith(prefix):
+            continue
+        sid, _, name = key[plen:].partition('/')
+        if not name or not sid.isdigit():
+            continue
+        groups.setdefault(int(sid), {})[name] = val
+    return groups
+
+
+def character_stats_payload(cstats, combat_xp=0):
+    """构建 CharacterStats（ResponseReadCharacterStatsEntry.f2）payload。
+
+    cstats = character_stats 全量键值（STORE.get_stats；type-6 统计上报经
+    statistics_server 落库的 WIRE 名 + w/v/gm 维度前缀键）。回填全部统计：
+    f1-f48 标量（WIRE 名优先、legacy 结算键回落）、f50/f51/f53 载具/武器/
+    模式维度数组；f35 characterXp ← combat_xp（characters 表，客户端
+    Global.characterExperience["combat"] 军衔进度条）。
+    game_server（hng.exe 路径）与 _msg_character_stats_entry（Flash 菜单
+    路径）共用，避免两份字段映射漂移。"""
+    cstats = cstats or {}
     stats = b''
     for field_num in range(1, 50):  # fields 1-49 (skip 36, which is missing in proto)
         if field_num == 36:
             continue
-        val = combat_xp if field_num == 35 else 0
+        if field_num == 35:
+            stats += pb_int32(field_num, int(combat_xp))
+            continue
+        val = 0
+        for key in _CS_SCALAR_KEYS.get(field_num, ()):
+            if key in cstats:
+                val = int(cstats[key])
+                break
         stats += pb_int32(field_num, val)
+    # f50 vehicleStatistics / f51 weaponStatistics / f53 gamemodeStatistics
+    for vid, grp in sorted(_group_dim_stats(cstats, 'v').items()):
+        m = pb_int32(1, vid)
+        for fn, name in _VEHICLE_FIELDS.items():
+            m += pb_int32(fn, int(grp.get(name, 0) or 0))
+        stats += pb_message(50, m)
+    for wid, grp in sorted(_group_dim_stats(cstats, 'w').items()):
+        m = pb_int32(1, wid)
+        for fn, name in _WEAPON_FIELDS.items():
+            m += pb_int32(fn, int(grp.get(name, 0) or 0))
+        stats += pb_message(51, m)
+    # f53 gamemodeStatistics：客户端 PlayerStatsMediator.setGameModeStats 只接受
+    # gameMode==0 的条目，非 0 一律丢弃（"Gamemode stats not taken"）。战斗端
+    # 上报时占领类统计走 gm0、击杀占领中敌人等走实际模式 id（gm1…），若按
+    # 原样分组回发，后者在界面上永远缺失 → 合并所有 gm 组为一条 gameMode=0
+    # （实测两组键集合不相交，按名求和不会重复计数）。
+    gm_merged = {}
+    for grp in _group_dim_stats(cstats, 'gm').values():
+        for name, val in grp.items():
+            gm_merged[name] = gm_merged.get(name, 0) + (val or 0)
+    if gm_merged:
+        m = pb_int32(1, 0)
+        for fn, name in _GAMEMODE_FIELDS.items():
+            m += pb_int32(fn, int(gm_merged.get(name, 0) or 0))
+        stats += pb_message(53, m)
     stats += pb_string(56, '')  # key (required string)
+    return stats
+
+
+def _msg_character_stats_entry(char_id, ribbons, combat_xp=0, cstats=None):
+    """构建 statrequests.ResponseReadCharacterStatsEntry proto：
+    characterId=1, alltimeCharacterStatistics=2, attributes=3 (repeated Ribbon)。
+    统计字段构建委托 character_stats_payload（见其 docstring）。"""
+    stats = character_stats_payload(cstats, combat_xp)
     m = b''
     m += pb_int64(1, char_id)          # characterId
     m += pb_message(2, stats)          # alltimeCharacterStatistics

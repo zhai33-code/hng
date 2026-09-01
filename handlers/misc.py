@@ -104,6 +104,12 @@ async def handle_set_equipmentselection(sess, writer, cmd_id, req_type, proto):
             log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
                 f'(weapon id={wa["id"]} slot={wa["container_slot"]})')
 
+    # 生涯军令 18 eEquipSMG / 28 eEquipAntiTankWeapon（装备类别状态推导）
+    # + 推行实时刷新
+    if pid is not None and int(equip_slot) > 0:
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid)
+
 
 
 async def handle_remove_equipmentselection(sess, writer, cmd_id, req_type, proto):

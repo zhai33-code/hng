@@ -803,6 +803,21 @@ def weapon_template_clipcount(template_id):
     return _WT_CLIPCOUNT.get(int(template_id), 0)
 
 
+# weapontemplate f57 weaponcategoryid（客户端 WeaponCategory 枚举：
+# 8=AntiTankWeapon 16=Submachinegun 10=CloseCombat 17=Handgun 等，
+# swf HnG_States.WeaponCategory + WeaponTemplateSchema 逆向确认）
+_WT_CATEGORY = None
+
+
+def weapon_template_category(template_id):
+    """weapontemplate f57 weaponcategoryid，全表缓存后按模板查（未知 0）。"""
+    global _WT_CATEGORY
+    if _WT_CATEGORY is None:
+        _WT_CATEGORY = {int(f.get(1, 0) or 0): int(f.get(57, 0) or 0)
+                        for f in _parse_wardb_table('weapontemplate')}
+    return _WT_CATEGORY.get(int(template_id), 0)
+
+
 def spawn_clips_for(clip_count, template_id):
     """出生弹夹数推导（PlayerSettings WeaponSetting f7 / WeaponSetting f7）：
     clip_count<0 → 1（最少）、==0 → T（默认）、>0 → 2T-1（最大）。"""
@@ -876,16 +891,28 @@ def _capturepoint_ap_map(gamemap_id):
     return mapping
 
 
+O_ANCHOR_AP_TEMPLATE = 1234567890
+"""Assault 图 O 锚虚拟出兵点模板 id（引擎硬编码，player.dll sub_1803AD540
+O 锚分支写 AP+128=1234567890，无对应 accesspointtemplate 表行）。守方 f12
+收编 + f14 资源挂此点 → 置 HasResources 位 → 小队/坦克部署到中心 O 区
+（assault-map-spawn-investigation.md §9.2）。"""
+
+
 def assault_ap_decision(gamemap_id, mission_id):
     """Assault 图出兵线激活决策（每局一次，按 mission_id 播种确定性）。
 
-    2026-09-01 随机化（用户需求）：防守方随机获 1 条出兵线（引擎判负
-    约束：守方恒 ≥1 出兵点，player.dll team.cpp sub_1803D30B0——
-    0 出兵点 → "has lost their accesspoints" 秒判负 + AI 小队无处
-    部署，0831 实测）；进攻方随机激活 2~3 条进攻线（2 或 3 随机，
-    受图内点数封顶——"根据地图而定"）；★未激活线直接不开启（不出现在
-    BattleFieldSettings f12 / 大厅简报 f6 / 战斗 layout 中，即官方
-    Airfield"有时仅 3 条激活"的语义，图上不显示该线）。
+    2026-09-02 O 锚方案（§9.2，替代 2026-09-01 的"守方随机 1 条边线"）：
+    守方不再分边线出兵点，改分 O 锚 1234567890（引擎 gamemode Setup 无条件
+    创建的虚拟 AP，sub_1803A0500/sub_1803AD540 实证）——f12 发
+    {1234567890, 守方} 收编 O 锚（同时满足 SetupGame 守线判负检查
+    sub_1803EDFA0，无 "#error1 Not enough free accesspoints"）；f14 守方
+    资源挂 O 锚 → sub_1803ADF00 置 HasResources 位 → 守方小队候选过滤
+    （sub_180398A10）通过 → Relocated 到 O → 载具在 O 区（Airfield 机场）
+    出生。进攻方随机激活 3..n 条边线（n=图内出兵点数，等概率——官方
+    Assault 语义"不一定占满攻击线，有时仅 3 条"，4 线图 3/4 随机、
+    5 线图 3/4/5 随机（可全开）；不足 3 线的图开全部）；
+    ★未激活线直接不开启（不出现在 BattleFieldSettings f12 / 大厅简报 f6 /
+    战斗 layout 中，图上不显示）。
 
     seeded RNG（random.Random(mission_id)）保证同一局内多处调用决策
     一致：BattleFieldSettings 握手 f12、combat.py 10s 轮询 f2/f3/f5、
@@ -894,9 +921,9 @@ def assault_ap_decision(gamemap_id, mission_id):
     大厅图标与进战出生侧错位。
 
     返回 (defender_ap, attacker_aps, inactive_aps)：
-      defender_ap   守方出兵点模板 id（随机 1 个）
-      attacker_aps  攻方激活线（2~3 个，min(随机值, 图点数-1)）
-      inactive_aps  未开启线（不进任何消息；可能空）
+      defender_ap   守方出兵点模板 id（恒 O_ANCHOR_AP_TEMPLATE=1234567890）
+      attacker_aps  攻方激活边线（3..n 个等概率，n=图内出兵点数）
+      inactive_aps  未开启边线（不进任何消息；可能空）
     """
     key = (int(gamemap_id), int(mission_id or 0))
     if key in _AP_DECISION_CACHE:
@@ -907,10 +934,12 @@ def assault_ap_decision(gamemap_id, mission_id):
     rng = random.Random(key[1])
     rng.shuffle(aps)
     n = len(aps)
-    defender_ap = aps[0] if n else 0
-    atk_n = min(rng.choice((2, 3)), max(n - 1, 1)) if n > 1 else 0
-    attacker_aps = aps[1:1 + atk_n]
-    inactive_aps = aps[1 + atk_n:]
+    defender_ap = O_ANCHOR_AP_TEMPLATE
+    # randint(3, max(n,3)) 防 n<3 时 randint 下界>上界；min(...,n) → 不足
+    # 3 线的图开全部
+    atk_n = min(rng.randint(3, max(n, 3)), n) if n else 0
+    attacker_aps = aps[:atk_n]
+    inactive_aps = aps[atk_n:]
     _AP_DECISION_CACHE[key] = (defender_ap, attacker_aps, inactive_aps)
     return _AP_DECISION_CACHE[key]
 
@@ -1005,6 +1034,35 @@ def _missiontype_for_gamemap(gamemap_id):
 
 
 _COMMANDNODE_NAME_CACHE = {}     # factionTemplateId -> {兵种名: 行 id}
+
+
+_ARMY_RESOURCE_CATEGORY_CACHE = None
+
+
+def army_resource_categories():
+    """armyresourcecategory 表 [(行 id, 生产值 f6 float), ...]（缓存）。
+
+    阵营资源总览窗口（FactionResourceOverviewMediator）按分类渲染行，
+    FactionResourceProduction/Consumption 行需逐分类配对推送。"""
+    global _ARMY_RESOURCE_CATEGORY_CACHE
+    if _ARMY_RESOURCE_CATEGORY_CACHE is None:
+        out = []
+        try:
+            for r in _parse_wardb_table('armyresourcecategory'):
+                rid = int(r.get(1, 0) or 0)
+                if not rid:
+                    continue
+                f6 = r.get(6, b'')
+                try:
+                    prod = struct.unpack('<f', f6)[0] if isinstance(
+                        f6, (bytes, bytearray)) else float(f6 or 0)
+                except Exception:
+                    prod = 0.0
+                out.append((rid, prod))
+        except Exception as e:
+            log(f'[!] armyresourcecategory parse failed: {e}')
+        _ARMY_RESOURCE_CATEGORY_CACHE = out
+    return _ARMY_RESOURCE_CATEGORY_CACHE
 
 
 def commandnode_template(faction, name):

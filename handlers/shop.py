@@ -6,8 +6,10 @@
 """
 
 
+import os
 import struct
 import time
+import xml.etree.ElementTree as ET
 
 from protocol import (
     Chunk,
@@ -21,20 +23,38 @@ from protocol import (
     )
 
 from state import (
+    GAME_DIR,
     STORE,
     log,
     )
 
 from wardb import (
+    _AMMO_MAXCOND,
     _CUR_NAME,
+    _EXPERIENCE_LEVELS,
     _RIBBON_LEVEL_XP,
     _RIBBON_META_LEVEL,
     _RIBBON_UPGRADES,
+    _VEHICLE_VARIANT_PARENT,
+    _default_ammo_for,
+    _default_vehicle_ammo_for,
+    _parse_wardb_table,
     _rank_from_combat_xp,
+    default_uniform_variant,
+    vehicle_full_condition,
+    MEMBERSHIP_DAYS_BY_ID,
     )
 
 from messages import (
     _msg_character,
+    _msg_uniform_part,
+    _msg_uniform_variant,
+    _msg_vehicle,
+    _msg_vehicle_ammo,
+    _msg_weapon,
+    _msg_weapon_ammo,
+    _msg_weapon_modifier,
+    _msg_weapon_variant,
     _push_kvcs,
     )
 
@@ -45,6 +65,370 @@ from player_service import (
     _push_player_refresh,
     )
 
+from handlers.economy import (
+    _BOOSTER_MINUTES,
+    push_booster_rows,
+    push_membership_rows,
+    )
+
+
+# ===== StoreBundle 发货数据（模块加载时从 WarDatabase 构建一次）=====
+# bundleId -> (targetType, factionTemplateIds, identifier, itemsXml)
+_STORE_BUNDLES = {}
+for _f in _parse_wardb_table('StoreBundle'):
+    _ttype = _f.get(3, b'')
+    _factions = _f.get(4, b'')
+    _ident = _f.get(2, b'')
+    _items = _f.get(7, b'')
+    _STORE_BUNDLES[int(_f.get(1, 0))] = (
+        _ttype.decode('utf-8', 'replace') if isinstance(_ttype, bytes) else str(_ttype),
+        _factions.decode('utf-8', 'replace') if isinstance(_factions, bytes) else str(_factions),
+        _ident.decode('utf-8', 'replace') if isinstance(_ident, bytes) else str(_ident),
+        _items.decode('utf-8', 'replace') if isinstance(_items, bytes) else str(_items),
+        )
+
+# WeaponVariantTemplate { id=1, name=2, weaponTemplateId=3, ... }
+# → (武器名, 武器基础模板 id)：礼包 items 里的 WeaponVariantTemplate 是商店
+# 武器商品（含皮肤），创建武器实例需要基础模板 + 变体模板两个字段
+_WEAPON_VARIANT_META = {}
+for _f in _parse_wardb_table('WeaponVariantTemplate'):
+    _n = _f.get(2, b'')
+    _WEAPON_VARIANT_META[int(_f.get(1, 0))] = (
+        _n.decode('utf-8', 'replace') if isinstance(_n, bytes) else str(_n),
+        int(_f.get(3, 0)))
+
+# 变体图标可用性：带变体的武器客户端请求 images/Weapons/<武器模板>_<变体模板>.png
+# （Thumbnails/ 同理），加载失败记入 _dontTryLoad → 图标空白整个会话不重试。
+# 客户端素材库并不包含全部变体组合——Factory（出厂全新款）95/97 缺失（官方同步
+# 清单里就没有），皮肤也有零星缺口。仅当变体图标存在时才挂变体发货；否则按裸
+# 武器发货（客户端回落基础图标 <武器模板>.png，与普通武器购买一致）。
+# 变体只影响外观（Factory/Used 是成色状态，其余是皮肤），属性与裸武器完全相同。
+_VARIANT_ICON_OK = set()
+for _vid, (_n, _wt) in _WEAPON_VARIANT_META.items():
+    _root = os.path.join(GAME_DIR, 'images', 'Weapons', f'{_wt}_{_vid}.png')
+    _thumb = os.path.join(GAME_DIR, 'images', 'Weapons', 'Thumbnails',
+                          f'{_wt}_{_vid}.png')
+    if os.path.isfile(_root) and os.path.isfile(_thumb):
+        _VARIANT_ICON_OK.add(_vid)
+
+# weaponAmmoMapping / WeaponModMapping：mappingId → 弹药/配件模板 id
+# （礼包 items 里嵌套在 WeaponVariantTemplate 下的是 mapping id，不是模板 id）
+_AMMO_TPL_BY_MAPPING = {}
+for _f in _parse_wardb_table('weaponAmmoMapping'):
+    _AMMO_TPL_BY_MAPPING[int(_f.get(1, 0))] = int(_f.get(3, 0))
+_MOD_TPL_BY_MAPPING = {}
+for _f in _parse_wardb_table('WeaponModMapping'):
+    _MOD_TPL_BY_MAPPING[int(_f.get(1, 0))] = int(_f.get(2, 0))
+
+
+def _first_faction(factions_str):
+    """'1,2,3' → 1（礼包 factionTemplateIds 首个有效阵营）。"""
+    for part in str(factions_str).split(','):
+        part = part.strip()
+        if part.isdigit() and int(part) > 0:
+            return int(part)
+    return 1
+
+
+async def _bundle_deliver_weapon(sess, writer, pid, char_id, wvt_id, nested, equip_slot1):
+    """礼包武器发货：创建武器实例（含皮肤变体）+ 嵌套弹药/配件 + KVCS 推送。
+
+    nested 为 XML 子节点列表（weaponAmmoMapping / WeaponModMapping）；
+    未嵌套弹药映射时赠送默认弹药（与武器商店购买一致，首个装备槽 1）。
+    equip_slot1=True 时武器装备到角色主武器槽（新角色首发武器）。"""
+    meta = _WEAPON_VARIANT_META.get(int(wvt_id))
+    if meta is None:
+        log(f'      [bundle] weapon variant {wvt_id} not in WeaponVariantTemplate, skipped')
+        return
+    wname, wt = meta
+    # 变体图标缺失（如 Factory 成色款）→ 按裸武器发货，不挂变体
+    # （挂了客户端请求 <wt>_<wvt>.png 加载失败，图标空白且整个会话不重试）
+    use_variant = int(wvt_id) in _VARIANT_ICON_OK
+    if not use_variant:
+        log(f'      [bundle] weapon variant {wvt_id} ({wname}) icon missing, '
+            f'delivering plain weapon (base icon)')
+    w = await STORE.create_weapon(pid, wname, wt, char_id,
+                                  int(wvt_id) if use_variant else 0)
+    wid = w['id']
+    variant_id = 0
+    if use_variant:
+        vv = await STORE.create_weapon_variant(pid, wid, char_id, int(wvt_id))
+        variant_id = vv['id']
+        await STORE.set_weapon_variant(pid, wid, variant_id)
+    w['container_id'] = 0
+    w['container_slot'] = 0
+    if equip_slot1:
+        await STORE.update_weapon_container(pid, wid, char_id, 1)
+        w['container_id'] = int(char_id)
+        w['container_slot'] = 1
+
+    # 弹药：嵌套 mapping id 优先，否则按基础模板默认弹药
+    ammo_rows = []
+    nested_ammo = [int(c.get('id', 0) or 0) for c in nested
+                   if c.tag.lower() == 'weaponammomapping']
+    if nested_ammo:
+        for i, mid in enumerate(nested_ammo):
+            at = _AMMO_TPL_BY_MAPPING.get(mid)
+            if at is None:
+                log(f'      [bundle] ammo mapping {mid} unknown, skipped')
+                continue
+            slot = 1 if i == 0 else 0
+            a = await STORE.create_weapon_ammo(
+                pid, at, char_id, wid, slot,
+                _AMMO_MAXCOND.get(int(at), 100.0))
+            ammo_rows.append(a)
+    else:
+        for i, (_mid, at) in enumerate(_default_ammo_for(wt)):
+            slot = 1 if i == 0 else 0
+            a = await STORE.create_weapon_ammo(
+                pid, at, char_id, wid, slot,
+                _AMMO_MAXCOND.get(int(at), 100.0))
+            ammo_rows.append(a)
+
+    # 配件：嵌套 WeaponModMapping
+    mod_rows = []
+    for c in nested:
+        if c.tag.lower() != 'weaponmodmapping':
+            continue
+        mdt = _MOD_TPL_BY_MAPPING.get(int(c.get('id', 0) or 0))
+        if mdt is None:
+            log(f'      [bundle] mod mapping {c.get("id")} unknown, skipped')
+            continue
+        m = await STORE.create_weapon_modifier(pid, mdt, char_id, wid)
+        mod_rows.append(m)
+
+    # KVCS 推送（须在 character 行之后；调用方保证顺序）
+    if sess.soldier_view_cmd is not None:
+        if use_variant:
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponVariant',
+                             _msg_weapon_variant(variant_id, char_id, wid, int(wvt_id)))
+        wproto = _msg_weapon(wid, w.get('name', wname), w.get('template_id', wt),
+                             w.get('character_id', char_id), w['container_id'],
+                             w['container_slot'], variant_id,
+                             w.get('clip_count', 0), w.get('auto_repair', 0),
+                             w.get('condition', 1.0))
+        await _push_kvcs(writer, sess.soldier_view_cmd, b'weapon', wproto)
+        for a in ammo_rows:
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponAmmo',
+                             _msg_weapon_ammo(a['id'], a['ammo_template_id'],
+                                              a['character_id'], a['weapon_id'],
+                                              a['slot_index'], a['condition']))
+        for m in mod_rows:
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponModifier',
+                             _msg_weapon_modifier(m['id'], m['template_id'],
+                                                  m['character_id'], m['weapon_id'],
+                                                  m.get('auto_repair', 0),
+                                                  m.get('condition', 1.0)))
+        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (weapon id={wid}, '
+            f'variantTemplate={wvt_id}, ammo={len(ammo_rows)}, mods={len(mod_rows)}, '
+            f'char={char_id}) [bundle]')
+
+
+async def _bundle_deliver_vehicle(sess, writer, pid, char_id, vvt_id, equip_slot1):
+    """礼包载具发货：创建载具 + 默认载具弹药（按弹药仓顺延装备）+ KVCS 推送。"""
+    v = await STORE.create_vehicle(pid, int(vvt_id), char_id)
+    vid = v['id']
+    cond = v.get('condition')
+    if cond is None:
+        cond = vehicle_full_condition(int(vvt_id))
+    if equip_slot1:
+        await STORE.set_vehicle_equipment(pid, vid, char_id, 1)
+    ammo_rows = []
+    parent_vv = _VEHICLE_VARIANT_PARENT.get(int(vvt_id))
+    if parent_vv is not None:
+        storage_slots = {}
+        for (storage_id, at) in _default_vehicle_ammo_for(parent_vv):
+            slot_ammo = storage_slots.get(storage_id, 1)
+            storage_slots[storage_id] = slot_ammo + 1
+            va = await STORE.create_vehicle_ammo(
+                pid, at, vid, char_id, _AMMO_MAXCOND.get(int(at), 100.0))
+            await STORE.set_vehicle_ammo_equipment(pid, va['id'], storage_id,
+                                                   slot_ammo, True)
+            ammo_rows.append((storage_id, slot_ammo, va))
+    if sess.soldier_view_cmd is not None:
+        await _push_kvcs(writer, sess.soldier_view_cmd, b'Vehicle',
+                         _msg_vehicle(vid, int(vvt_id), char_id,
+                                      1 if equip_slot1 else 0, condition=cond))
+        for (storage_id, slot_ammo, va) in ammo_rows:
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo',
+                             _msg_vehicle_ammo(va['id'], va['ammo_template_id'],
+                                               vid, storage_id, slot_ammo,
+                                               char_id, va['condition']))
+        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (Vehicle '
+            f'id={vid}, variantTemplate={vvt_id}, ammo={len(ammo_rows)}, '
+            f'char={char_id}) [bundle]')
+
+
+async def _bundle_deliver_character(sess, writer, pid, el, factions_str, identifier):
+    """礼包新角色发货：创建角色（rank 属性 → 初始 combat_xp）+ KVCS 推送。
+
+    返回新角色 id；名字取 identifier 冒号后的兵种名（如
+    'US Soldier Pack: Medium Tanker' → 'Medium Tanker'），重名追加序号。"""
+    template = int(el.get('id', 0) or 0)
+    rank = int(el.get('rank', 0) or 0)
+    faction = int(el.get('factiontemplateid', 0) or 0) or _first_faction(factions_str)
+
+    base = identifier.split(':')[-1].strip() if ':' in identifier else ''
+    if not (3 <= len(base) <= 20):
+        base = 'Soldier'
+    existing = set()
+    try:
+        existing = {ch['name'] for ch in await STORE.list_characters(pid)}
+    except Exception as e:
+        log(f'[DB] list_characters for bundle name failed: {e}')
+    name, n = base, 2
+    while name in existing and n < 100:
+        suffix = f' {n}'
+        name = base[:20 - len(suffix)] + suffix
+        n += 1
+
+    start_xp = _EXPERIENCE_LEVELS[rank] if 0 <= rank < len(_EXPERIENCE_LEVELS) else 0
+    uv_template_id = default_uniform_variant(template, faction)
+    row = await STORE.create_character(pid, name, faction, template, start_xp,
+                                       uniform_variant_template_id=uv_template_id)
+    char_id = row['id']
+    uv_id = int(row.get('uniform_variant_id', 0) or 0)
+
+    if sess.soldier_view_cmd is not None:
+        # UniformVariant 必须先于 character 推送（客户端按 uniformVariantId
+        # 查本地表，实例未入表 → Error #1009 且中断 KVCS 发布循环）
+        if uv_id:
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'UniformVariant',
+                             _msg_uniform_variant(uv_id, uv_template_id, char_id))
+        bits = await _char_unlock_bits_for(sess, template, faction, char_id)
+        await _push_kvcs(writer, sess.soldier_view_cmd, b'character',
+                         _msg_character(name, faction, template,
+                                        _rank_from_combat_xp(start_xp), char_id,
+                                        bits, uniform_variant_id=uv_id))
+        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
+            f'{name!r}, template={template}, faction={faction}, rank={rank}, '
+            f'id={char_id}) [bundle]')
+    return char_id
+
+
+def _bundle_item_blocks(items_xml):
+    """解析 items XML，返回 <items> 根列表。
+
+    单根（常规礼包）→ [root]；多根（多阵营礼包，如 595230 每个
+    factionTemplateId 一个 <items>，武器各阵营不同）→ 包一层后取全部
+    <items> 子节点；无 <items> 标签的杂项 → 整体作为单根返回。"""
+    try:
+        root = ET.fromstring(items_xml)
+    except ET.ParseError:
+        root = ET.fromstring('<root>%s</root>' % items_xml)
+    if root.tag.lower() == 'items':
+        return [root]
+    blocks = [b for b in root if b.tag.lower() == 'items']
+    return blocks if blocks else [root]
+
+
+async def _deliver_store_bundle(sess, writer, pid, bundle_id, req_char_id):
+    """解析 StoreBundle.items XML 并逐项发货（入库 + KVCS 推送）。
+
+    支持的元素：charactertemplate（含嵌套武器/载具，创建新角色）、
+    WeaponVariantTemplate（含嵌套 weaponAmmoMapping/WeaponModMapping）、
+    VehicleVariantTemplate、RibbonBoosterTemplate、ShopMembershipItems、
+    gold、uniformparttemplate。返回 (加成数, 会员数) 供调用方决定是否
+    推送对应 KVCS 表。"""
+    info = _STORE_BUNDLES.get(int(bundle_id))
+    if info is None:
+        log(f'      [bundle] StoreBundle {bundle_id} not found in WarDatabase, '
+            f'nothing delivered')
+        return 0, 0
+    target_type, factions, identifier, items_xml = info
+    try:
+        blocks = _bundle_item_blocks(items_xml)
+    except Exception as e:
+        log(f'      [bundle] StoreBundle {bundle_id} items XML parse failed: {e}')
+        return 0, 0
+    root = blocks[0]
+    if len(blocks) > 1:
+        # 多阵营礼包：按请求角色阵营选取对应 <items factionTemplateId=N>，
+        # 角色未知/不匹配时回落首个块（避免三份全发——武器按阵营互斥）
+        try:
+            fac = None
+            for ch in await STORE.list_characters(pid):
+                if int(ch['id']) == int(req_char_id or 0):
+                    fac = str(int(ch['faction']))
+                    break
+            if fac:
+                for b in blocks:
+                    if (b.get('factionTemplateId') or '').strip() == fac:
+                        root = b
+                        break
+        except Exception as e:
+            log(f'      [bundle] faction block select failed: {e}')
+    log(f'      [bundle] delivering {identifier!r} (targetType={target_type}, '
+        f'{len(list(root))} top-level items)')
+
+    n_boosters = 0
+    n_memberships = 0
+    for el in list(root):
+        tag = el.tag.lower()
+        try:
+            if tag == 'charactertemplate':
+                # 新角色：嵌套武器/载具发给新角色；首件武器/载具装备槽 1
+                new_char = await _bundle_deliver_character(
+                    sess, writer, pid, el, factions, identifier)
+                first_weapon = True
+                first_vehicle = True
+                for sub in list(el):
+                    stag = sub.tag.lower()
+                    if stag == 'weaponvarianttemplate':
+                        await _bundle_deliver_weapon(
+                            sess, writer, pid, new_char, sub.get('id'),
+                            list(sub), equip_slot1=first_weapon)
+                        first_weapon = False
+                    elif stag == 'vehiclevarianttemplate':
+                        await _bundle_deliver_vehicle(
+                            sess, writer, pid, new_char, sub.get('id'),
+                            equip_slot1=first_vehicle)
+                        first_vehicle = False
+                    else:
+                        log(f'      [bundle] unknown nested element '
+                            f'<{sub.tag}> under charactertemplate, skipped')
+            elif tag == 'weaponvarianttemplate':
+                await _bundle_deliver_weapon(sess, writer, pid, req_char_id,
+                                             el.get('id'), list(el),
+                                             equip_slot1=False)
+            elif tag == 'vehiclevarianttemplate':
+                await _bundle_deliver_vehicle(sess, writer, pid, req_char_id,
+                                              el.get('id'), equip_slot1=False)
+            elif tag == 'ribbonboostertemplate':
+                await STORE.add_booster(pid, int(el.get('id', 0) or 0),
+                                        duration_minutes=_BOOSTER_MINUTES,
+                                        activate_now=False, is_ribbon=True)
+                n_boosters += 1
+            elif tag == 'shopmembershipitems':
+                mid = int(el.get('id', 0) or 0)
+                days = MEMBERSHIP_DAYS_BY_ID.get(mid, 30)
+                await STORE.add_membership(pid, mid, duration_days=days)
+                n_memberships += 1
+            elif tag == 'gold':
+                amount = int(el.get('amount', 0) or 0)
+                if amount:
+                    await STORE.add_currency(pid, gold=amount)
+                    log(f'      [bundle] granted {amount} gold')
+            elif tag == 'uniformparttemplate':
+                tid = int(el.get('id', 0) or 0)
+                part = await STORE.create_uniform_part(pid, req_char_id, tid, 1)
+                if sess.soldier_view_cmd is not None:
+                    await _push_kvcs(writer, sess.soldier_view_cmd, b'UniformPart',
+                                     _msg_uniform_part(part['id'], req_char_id,
+                                                       tid, 1))
+                    log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                        f'(UniformPart id={part["id"]}, template={tid}, '
+                        f'char={req_char_id}) [bundle]')
+            else:
+                log(f'      [bundle] unknown element <{el.tag}>, skipped')
+        except Exception as e:
+            # 单项失败不影响其余物品发货（钱已扣，尽量多发货并留日志排查）
+            log(f'[DB] bundle item <{el.tag} id={el.get("id")}> delivery '
+                f'failed: {e}')
+    log(f'      [bundle] {identifier!r} delivered: +{n_boosters} boosters, '
+        f'+{n_memberships} memberships')
+    return n_boosters, n_memberships
+
 
 async def handle_buystorebundlerequest(sess, writer, cmd_id, req_type, proto):
     # 商店捆绑包购买请求
@@ -53,6 +437,10 @@ async def handle_buystorebundlerequest(sess, writer, cmd_id, req_type, proto):
     # BuyStoreBundleResponse { int32 result=1; }
     # paymentCurrency: 1=Credits, 2=Warfunds, 3=Gold, 4=Tickets
     # ResponseCodes: ok=1, not_enough_gold=57, not_enough_credits=56, not_enough_warfunds=153
+    bundle_id = 0
+    pricing_id = 0
+    char_id = 0
+    currency = 0
     try:
         f = pb_parse(proto)
         bundle_id = f.get(1, 0)
@@ -76,13 +464,39 @@ async def handle_buystorebundlerequest(sess, writer, cmd_id, req_type, proto):
         log(f'S->C cmd={cmd_id:<4} BuyStoreBundleResponse (result=56 not_enough) cost={cost}')
         return
 
-    # 返回 result=1 (ok)，私服默认购买成功
-    # 客户端收到 ok 后 dispatch PurchaseCompletedSignal，显示购买成功弹窗
+    # ★ 发货：解析 WarDatabase StoreBundle.items XML，逐项入库并推送
+    #   （此前只扣款返回 ok，礼包物品从未入库——钱扣了东西不到账的根因）
+    n_boosters, n_memberships = 0, 0
+    pid = await sess.ensure_player()
+    if pid is not None and bundle_id:
+        try:
+            n_boosters, n_memberships = await _deliver_store_bundle(
+                sess, writer, pid, bundle_id, char_id)
+        except Exception as e:
+            log(f'[DB] deliver store bundle {bundle_id} failed: {e}')
+    elif pid is None:
+        log('      [bundle] no player id, delivery skipped')
+
+    # 返回 result=1 (ok)，客户端 dispatch PurchaseCompletedSignal 显示购买成功弹窗
     resp_proto = pb_int32(1, 1)  # result = 1 (ok)
     resp = build_response(cmd_id, 'BuyStoreBundleResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} BuyStoreBundleResponse (result=1 ok)')
+    log(f'S->C cmd={cmd_id:<4} BuyStoreBundleResponse (result=1 ok, delivered '
+        f'boosters={n_boosters}, memberships={n_memberships})')
+
+    # 加成/会员全量刷新（幂等）：有购买才推，避免无谓 KVCS
+    if pid is not None:
+        if n_boosters:
+            try:
+                await push_booster_rows(sess, writer, int(pid))
+            except Exception as e:
+                log(f'[DB] push booster rows after bundle failed: {e}')
+        if n_memberships:
+            try:
+                await push_membership_rows(sess, writer, int(pid))
+            except Exception as e:
+                log(f'[DB] push membership rows after bundle failed: {e}')
 
     # 通过 PLAYER_VIEW 推送更新后的 player 数据，刷新货币显示
     if sess.playerview_cmd is not None:
@@ -96,6 +510,38 @@ async def handle_buystorebundlerequest(sess, writer, cmd_id, req_type, proto):
         writer.write(cs_bytes)
         await writer.drain()
         log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet (player refresh, {len(player_proto)}B)')
+
+    # 发货后重推角色行：unlockBits 含新购物品解锁需求 → 客户端
+    # EquipmentItemItemRenderer.isUnlocked 判定立即生效；否则已拥有武器
+    # 以旧 unlockBits 评价 → 误报“该武器不适用于你所选的职业”直到重登。
+    # 新建角色的初始 character 行在嵌套武器入库前推送，bits 同样过期，一并重推。
+    if pid is not None and sess.soldier_view_cmd is not None:
+        try:
+            new_ts = int(time.time() * 1000)
+            for ch in await STORE.list_characters(pid):
+                bits = await _char_unlock_bits_for(sess, ch['template'],
+                                                   ch['faction'], ch['id'])
+                # 尾部字段传全：客户端 setObject 整体替换 schema，漏传
+                # head_id/previous_template 等会被抹回默认值（外观回退）
+                await _push_kvcs(writer, sess.soldier_view_cmd, b'character',
+                                 _msg_character(ch['name'], ch['faction'], ch['template'],
+                                                _rank_from_combat_xp(ch.get('combat_xp', 0)),
+                                                ch['id'], bits,
+                                                ch.get('combat_badge_0', 0),
+                                                ch.get('combat_badge_1', 0),
+                                                new_ts,
+                                                ch.get('uniform_variant_id', 0),
+                                                ch.get('headgear_id', 0),
+                                                1 if ch.get('is_deleted') else 0,
+                                                ch.get('previous_template', 0),
+                                                ch.get('head_id', 0),
+                                                0,
+                                                1 if ch.get('is_on_leave') else 0))
+                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
+                    f'{ch["name"]} re-pushed, unlockBits={sum(bits)} true, '
+                    f'statTs={new_ts}) [bundle]')
+        except Exception as e:
+            log(f'[DB] reload characters after bundle failed: {e}')
 
 
 

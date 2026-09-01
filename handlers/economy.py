@@ -256,6 +256,9 @@ async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto
             code = 64
     if granted:
         await _push_player_refresh(sess, writer)
+        # 生涯军令 12 eRedeemDailyReward（客户端无上报点）+ 推行实时刷新
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid, 12)
 
     resp = build_response(cmd_id, 'RedeemDailyLoginRewardResponse',
                           pb_int32(1, code))
@@ -550,6 +553,9 @@ async def handle_activate_booster(sess, writer, cmd_id, req_type, proto):
             code = 208
     if code == RC_OK and pid is not None:
         await push_booster_rows(sess, writer, int(pid))
+        # 生涯军令 46 eActivateRibbonXPBooster（客户端无上报点）+ 推行实时刷新
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid, 46)
 
     resp = build_response(cmd_id, 'ActivateBoosterResponse', pb_int32(1, code))
     writer.write(resp)
@@ -626,6 +632,9 @@ async def handle_activate_various_booster(sess, writer, cmd_id, req_type,
             code = 208
     if code == RC_OK and pid is not None:
         await push_booster_rows(sess, writer, int(pid))
+        # 生涯军令 46 eActivateRibbonXPBooster（客户端无上报点）+ 推行实时刷新
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid, 46)
 
     resp = build_response(cmd_id, 'ActivateVariousBoosterResponse',
                           pb_int32(1, code))

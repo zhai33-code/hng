@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """匹配池配置（纯数据模块）。
 
-gamemodeId 取值来源：客户端 GamemodesView.as（反编译实测）：
+gamemodeId 取值来源：客户端 MatchmakingDescription.as / GamemodesMediator.as（反编译实测）：
   1=First Encounter(训练, AI)  3=Capture&Hold Infantry  4=Capture&Hold Tanks/Battle
-  5=Assault Infantry  6=Assault Battle  10=War  11=Quick Play
+  5=Assault Infantry  6=Assault Battle  7=C&H Pilot(飞行员士兵 tile)  8=C&H Recon(侦察兵士兵 tile)
+  10=War  11=Quick Play(按阵营)  12=Quick Play(按士兵)  13=自选图  14=Quick Play(全模式)
 
 字段语义：
   min_players    成局所需最少玩家数（达到即撮合）
@@ -63,22 +64,37 @@ def _mode(name, min_players, max_players, ai_fill_after, fallback_presets=None):
 
 
 # 每模式匹配配置（gamemodeId → 参数）
-# fallback_presets：组内无人勾选地图时的随机兜底池（模式专属地图，
-# 数据源 missionpreset 表名称归类，preset → gamemap → scenefile 链见 wardb.py）。
-# ★ 2026-08-27 剔除本地缺失场景的 preset（客户端 _packed\Environments\Scenes\
+# fallback_presets：组内无人勾选地图时的随机兜底池，★ 2026-09-01 完全对齐
+# 官方运营版地图池（官方 1.10/1.14 更新日志 + wiki 交叉核对，preset f5 官方命名）：
+#   1  First Encounter(训练)：Samrée Depot(9) / Colmar Hamlet(10)
+#   3  C&H Infantry(=官方 Skirmish)：Sawmill / Hill 60 / Village Skirmish
+#   4  C&H Tank(官方 1.14 模式)：仅 Lunéville(12)
+#   5/6 staged Assault：官方 Assault Small 五图 Airfield(26)/Factory(27)/
+#      Forward Airfield(28)/Mountain Town(29)/Town(31)
+#   10 War：官方完整版 Assault 五图 Airfield(5)/Factory(6)/Forward Airfield(7)/
+#      Mountain(8)/Town(1345335)
+#   11 Quick Play：随机小图（同 staged Assault）
+# 官方未上线内容一并移除：Russian Encounter/Skirmish/Factory（东线内部开发）、
+# Vasyugan Fortification、City 三图、Gorge、Canal Bridge、Mountain Railroad。
+# ★ Airfield(5/26) 2026-08-27 曾因误判缺场景被剔除，2026-09-01 复核
+#   T02M04_AirField.fst 实际存在（_packed 与 combat-server\_packed 均有，
+#   文件名大写 F 与表内 Airfield 仅大小写差异，Windows 加载不受影响）已加回。
+# ★ 仍缺场景的 preset（客户端 _packed\Environments\Scenes\
 #   Gamemaps\ 无对应 .fst，进图必失败）：
-#   4 (T04M01_RussianFactory) / 26 (T02M04_Airfield) /
+#   4 (T04M01_RussianFactory) /
 #   400513682 (T03M01_CityRiver) / 595333531 (T03M03_CityBoulevard) /
 #   775928046 (T03M02_CityTrainStation)
 GAMEMODES = {
-    1:  _mode('training',         1,  1,  0,  [9, 10, 11]),            # 训练：单人立即开局
-    3:  _mode('capture_hold_inf', 2, 18, 30,  [19, 20, 21, 1, 373394539,
-                                               373394540, 373394541]),
-    4:  _mode('capture_hold_all', 2, 18, 30,  [12, 22, 23, 24, 25]),
-    5:  _mode('assault_infantry', 2, 18, 30,  [8, 1345335]),
-    6:  _mode('assault_battle',   2, 18, 30,  [27, 28, 29, 31]),
-    10: _mode('war',              2, 18, 0,   [27, 28, 29, 31]),   # 战争模式纯真人：不超时 AI 补位，凑够真人才开局（同 assault 小图兜底）
-    11: _mode('quickplay',        2, 18, 30,  [27, 28, 29, 31]),   # quickplay 无选图 → 随机小图
+    1:  _mode('training',         1,  1,  0,  [9, 10]),               # 官方 First Encounter：Depot / Mill
+    3:  _mode('capture_hold_inf', 2, 18, 30,  [373394539, 373394540,
+                                               373394541]),          # 官方 Skirmish 三图
+    4:  _mode('capture_hold_all', 2, 18, 30,  [12]),                  # 官方 C&H Tank：仅 Lunéville
+    7:  _mode('capture_hold_pilot', 2, 18, 30, [35]),                 # 官方 C&H Pilot：Lunéville（飞行员士兵专用 tile）
+    8:  _mode('capture_hold_recon', 2, 18, 30, [36]),                 # 官方 C&H Recon：Lunéville（侦察兵士兵专用 tile）
+    5:  _mode('assault_infantry', 2, 18, 30,  [26, 27, 28, 29, 31]),   # 官方 staged Assault Small
+    6:  _mode('assault_battle',   2, 18, 30,  [26, 27, 28, 29, 31]),   # 官方 staged Assault Small
+    10: _mode('war',              2, 18, 0,   [5, 6, 7, 8, 1345335]),  # 战争模式纯真人：官方完整版 Assault 图
+    11: _mode('quickplay',        2, 18, 30,  [27, 28, 29, 31]),      # quickplay 无选图 → 随机小图
 }
 DEFAULT_GAMEMODE = _mode('default', 2, 18, 30)    # 未知模式兜底
 

@@ -316,7 +316,7 @@ def msg_login2_challenge(salt_b64, temp_sid_b64, enc_key_b64):
 
 
 def msg_player(gamertag, credits=None, warfunds=None, gold=None,
-               tutorials_completed=0, pid=1, faction=None):
+               tutorials_completed=0, pid=1, faction=None, total_score=0):
     m = b''
     # 货币默认与数据库新账号默认值一致（新账号给默认货币）
     if credits is None:
@@ -366,7 +366,10 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     m += pb_int64(33, 0)                # goldBoughtSteam
     m += pb_float(34, 0.0)              # skillLevel
     m += pb_uint32(35, 0)               # invertmouseturret
-    m += pb_int64(36, 0)                # totalScore
+    # totalScore：统计界面"分数"读 Global.currentPlayer.totalScore（此处 f36），
+    # 不来自 CharacterStats——恒 0 会导致统计页分数显示 0（2026-09-01）。
+    # 同时驱动玩家等级进度（PlayerLevelUnlock 按 totalScore 阈值解锁）
+    m += pb_int64(36, int(total_score or 0))  # totalScore
     # unlockBits (field 37): repeated bool, 位索引 = PlayerLevelUnlock.id
     # 全 true = 解锁所有玩家级功能（War模式/匹配模式/职业等）
     m += pb_packed_bool(37, [True] * 41)  # PlayerLevelUnlock ids 1-40 all exist

@@ -65,7 +65,7 @@ def _msg_report_character(ch):
     m += pb_int32(6, 0)                       # xpCampaignBonus
     m += pb_int32(7, 0)                       # xpUnderdogBonus
     m += pb_int32(8, 0)                       # xpSquadVetBonus
-    m += pb_int32(9, 0)                       # xpDailyBonus
+    m += pb_int32(9, int(ch.get('xpDailyBonus', 0) or 0))  # 每日首战+50%
     m += pb_message(10, _msg_earnings(ch.get('creditEarned', 0),
                                       ch.get('creditVetBonus', 0)))
     m += pb_message(11, _msg_earnings(ch.get('warfundEarned', 0),

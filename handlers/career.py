@@ -55,7 +55,14 @@ from state import STORE, log
 
 from messages import _push_kvcs
 from player_service import _push_player_refresh
-from wardb import _parse_wardb_table
+from wardb import (
+    _parse_wardb_table,
+    _rank_from_combat_xp,
+    _ribbon_level_from_xp,
+    charactertemplate_actionid,
+    is_general_character,
+    weapon_template_category,
+    )
 
 
 # ------------------------------------------------------------- 模板缓存
@@ -162,13 +169,219 @@ async def _grant_reward_xml(pid, xml_str, tag):
     return granted
 
 
-# ------------------------------------------------------------- KVCS 推送
+# ------------------------------------------------------------- 状态推导补全
+
+# PlayerLevelUnlock（level=10 解锁项的最大 requiredScore）：玩家等级≥10 判定阈值
+_PLAYER_LEVEL10_SCORE = 20000
+
+
+async def revalidate_state_orders(pid):
+    """状态型生涯军令服务端推导补全（推 KVCS 前调用）。
+
+    客户端 46 种 ECareerOrderType 里只有 5 种有 UI 上报点（4 战争地图 /
+    8 快速战斗 / 9 读邮件 / 10 聊天频道 / 11 聊天消息），战斗侧另有部分
+    由 hng.exe 的 CareerOrderActionGameRequest 上报（实测 22 切兵 /
+    25 载具部署）；其余为状态型任务，官方由服务端从玩家数据推导。
+    这里按 DB 状态补全可判定的任务，已完成（progress>=1）的不重复累加。
+    """
+    if STORE is None:
+        return
+    try:
+        chars = await STORE.list_characters(pid)
+        weapons = await STORE.list_weapons(pid)
+        done = {oid for oid, (p, _st)
+                in (await STORE.list_career_orders(pid)).items() if p >= 1}
+    except Exception as e:
+        log(f'      [career] revalidate load failed: {e}')
+        return
+
+    actionids = [charactertemplate_actionid(c['template']) for c in chars]
+    is_general = [is_general_character(c['template']) for c in chars]
+    completed = set()
+
+    if any(w.get('character_id') for w in weapons):
+        completed.add(1)     # 装备武器
+    if weapons:
+        completed.add(2)     # 购买武器（宽松：拥有非空武器库）
+    if sum(1 for a in actionids if a == 2) >= 2:
+        completed.add(5)     # 拥有 2 个步兵
+    if {c['faction'] for c in chars} >= {1, 2, 3}:
+        completed.add(15)    # 三阵营各一个士兵
+    if 10 in actionids:
+        completed.add(33)    # 创建坦克兵
+    if any(a == 7 and not g for a, g in zip(actionids, is_general)):
+        completed.add(37)    # 创建伞兵（actionid=7 同将军，排除之）
+    if 11 in actionids:
+        completed.add(38)    # 创建飞行员
+    if 6 in actionids:
+        completed.add(39)    # 创建侦察兵
+    if any(is_general):
+        completed.add(41)    # 拥有将军
+
+    # ---- 装备状态类（weapons.container_id / vehicles.equipped_in_slot /
+    #      weapon_modifiers.weapon_id / vehicle_upgrades.equipped_slot_id /
+    #      vehicle_ammo.equipped_storage_id，非 0 即已装备）----
+    equipped_cats = {weapon_template_category(w['template_id'])
+                     for w in weapons if w.get('container_id')}
+    if 16 in equipped_cats:               # WeaponCategory.Submachinegun
+        completed.add(18)    # 装备冲锋枪
+    if 8 in equipped_cats:                # WeaponCategory.AntiTankWeapon
+        completed.add(28)    # 装备反坦克武器
+    if any(c.get('uniform_variant_id') or c.get('headgear_id') for c in chars):
+        completed.add(35)    # 更改士兵外观（非默认迷彩/头盔）
+    try:
+        vehicles = await STORE.list_vehicles(pid)
+    except Exception:
+        vehicles = []
+    if any(v.get('equipped_in_slot') for v in vehicles):
+        completed.add(24)    # 装备载具
+    if any(v.get('variant_id') for v in vehicles):
+        completed.add(36)    # 更改载具外观（非默认涂装）
+    try:
+        if any(m.get('weapon_id') for m
+               in await STORE.list_weapon_modifiers(pid)):
+            completed.add(30)    # 装备武器配件（挂接到武器）
+    except Exception:
+        pass
+    try:
+        if any(u.get('equipped_slot_id') for u
+               in await STORE.list_vehicle_upgrades(pid)):
+            completed.add(31)    # 装备载具升级
+    except Exception:
+        pass
+    try:
+        if any(a.get('equipped_storage_id') or a.get('slot_index') for a
+               in await STORE.list_vehicle_ammo(pid)):
+            completed.add(32)    # 装备载具自定义弹药
+    except Exception:
+        pass
+
+    total_score = 0
+    for c in chars:
+        try:
+            xps = await STORE.get_ribbon_xp(pid, c['id'])
+        except Exception:
+            xps = {}
+        if any(_ribbon_level_from_xp(v) >= 3 for v in xps.values()):
+            completed.add(16)    # 任意绶带到 3 级
+        if _rank_from_combat_xp(c['combat_xp']) >= 12:
+            completed.add(23)    # 任意士兵军衔 12
+        try:
+            st = await STORE.get_stats(c['id']) or {}
+            total_score += int(st.get('PlayerScore', st.get('score', 0)) or 0)
+        except Exception:
+            pass
+    if total_score >= _PLAYER_LEVEL10_SCORE:
+        completed.add(17)    # 玩家等级 10
+
+    newly = sorted(completed - done)
+    for oid in newly:
+        try:
+            await STORE.upsert_career_order_progress(pid, oid)
+            log(f'      [career] state order {oid} completed by revalidation')
+        except Exception as e:
+            log(f'      [career] revalidate order {oid} failed: {e}')
+    if newly:
+        log(f'      [career] revalidated {len(newly)} state order(s): {newly}')
+
+
+_MISSIONTYPE_CACHE = {}
+
+
+def _missiontype_for_preset(preset_id):
+    """missionpreset 表 id → missiontype（f4；1=Assault、3=Skirmish、
+    5-8=Encounter 系列即 Capture&Hold）。未知返回 0。"""
+    key = int(preset_id or 0)
+    if key in _MISSIONTYPE_CACHE:
+        return _MISSIONTYPE_CACHE[key]
+    mt = 0
+    for r in _parse_wardb_table('missionpreset'):
+        if int(r.get(1, 0) or 0) == key:
+            f4 = r.get(4, 0)
+            if not isinstance(f4, (bytes, bytearray)):
+                mt = int(f4 or 0)
+            break
+    _MISSIONTYPE_CACHE[key] = mt
+    return mt
+
+
+async def complete_battle_orders(pid, character_ids=(), missiontype=0):
+    """战斗结算挂钩：按本局模式与参战角色补全战斗型生涯军令。
+
+    - 3 eJoinBattle：任意一场战斗结算
+    - 29 ePlayCaptureAndHold：missiontype 5-8（Encounter 系列）
+    - 34 ePlayAssault：missiontype 1
+    - 21 eJoinAsTanker：参战角色含坦克兵（actionid=10）
+    - 40 ePlayWarBattle：战争模式（本服战局均 matchmaking 快速战，暂不判）
+    """
+    if STORE is None or not pid:
+        return
+    try:
+        done = {oid for oid, (p, _st)
+                in (await STORE.list_career_orders(pid)).items() if p >= 1}
+    except Exception:
+        return
+    orders = {3}
+    if missiontype == 1:
+        orders.add(34)
+    elif missiontype in (5, 6, 7, 8):
+        orders.add(29)
+    for cid in character_ids:
+        try:
+            ch = await STORE.get_character_any(pid, cid)
+        except Exception:
+            ch = None
+        if ch and charactertemplate_actionid(ch['template']) == 10:
+            orders.add(21)     # 以坦克兵参战
+            break
+    newly = sorted(orders - done)
+    for oid in newly:
+        try:
+            await STORE.upsert_career_order_progress(pid, oid)
+            log(f'      [career] battle order {oid} completed (player={pid})')
+        except Exception as e:
+            log(f'      [career] battle order {oid} failed: {e}')
+
+
+async def complete_order_once(pid, oid):
+    """动作型生涯军令单点补全（对应 handler 成功路径调用，幂等：
+    progress>=1 的不重复累加）。"""
+    if STORE is None or not pid:
+        return
+    try:
+        done = {o for o, (p, _st)
+                in (await STORE.list_career_orders(pid)).items() if p >= 1}
+        if oid in done:
+            return
+        await STORE.upsert_career_order_progress(pid, oid)
+        log(f'      [career] order {oid} completed by action hook '
+            f'(player={pid})')
+    except Exception as e:
+        log(f'      [career] order {oid} action hook failed: {e}')
+
+
+async def complete_order_and_push(sess, writer, pid, oid=None):
+    """动作型军令完成 + CareerOrder 行实时推送（大厅会话钩子统一入口）。
+
+    客户端军令 UI 只认 KVCS CareerOrder 行刷新 —— complete_order_once 只写
+    DB 不推的话，玩家要重登才能看到进度（"做了任务没反应"的根因）。
+    oid=None 时仅做状态推导补全 + 推行（装备类动作后调用，18/24/28/30/31/
+    32/35/36 等由 revalidate_state_orders 从 DB 状态推导）；
+    playerview 未订阅时仍会完成入库，下次登录/请求再收敛。"""
+    if not pid:
+        return
+    if oid is not None:
+        await complete_order_once(int(pid), oid)
+    await push_career_order_row(sess, writer, int(pid))
+
 
 async def push_career_order_row(sess, writer, pid):
     """推玩家 CareerOrder 进度行（单行 id=playerId）。
 
     progress 逗号串与 rewardReceivedBits 均为 47 槽（下标 0 占位），
     career_orders 表 status：0 进行中 1 已完成 2 已领取。"""
+    # 推行前先跑状态推导补全（客户端无上报点的任务按 DB 状态完成）
+    await revalidate_state_orders(pid)
     if STORE is None or sess.playerview_cmd is None:
         return
     try:

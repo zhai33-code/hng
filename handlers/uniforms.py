@@ -199,6 +199,12 @@ async def handle_setuniformvariantrequest(sess, writer, cmd_id, req_type, proto)
         except Exception as e:
             log(f'[DB] reload character after uniform set failed: {e}')
 
+    # 生涯军令 35 eChangeSoldierAppearance（uniform_variant_id 状态推导）
+    # + 推行实时刷新
+    if pid is not None and int(suv_variant_id) != 0:
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid)
+
 
 
 async def handle_purchaseuniformpartrequest(sess, writer, cmd_id, req_type, proto):
@@ -363,6 +369,11 @@ async def handle_setuniformpartrequest(sess, writer, cmd_id, req_type, proto):
                     f'{ch["name"]} re-pushed after headgear set)')
         except Exception as e:
             log(f'[DB] reload character after headgear set failed: {e}')
+
+    # 生涯军令 35 eChangeSoldierAppearance（headgear_id 状态推导）+ 推行刷新
+    if pid is not None and int(sp_part_id) != 0:
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid)
 
 
 HANDLERS = {

@@ -45,104 +45,20 @@ from warserver_messages import (
     )
 
 # ---------------------------------------------------------------------------
-# CharacterStats 标量字段（f1-f48）→ character_stats 键。
-# 键序 = 优先级：type-6 统计上报落库的 WIRE 名（statistics_server.py
-# WIRE_STAT_NAMES）优先，战斗结算 legacy 键（combat.py）回落。
-# f35 characterXp 单独走 characters.combat_xp，不在此表。
+# CharacterStats 字段映射表 / 维度分组 / payload 构建（_CS_SCALAR_KEYS /
+# _WEAPON_FIELDS / _VEHICLE_FIELDS / _GAMEMODE_FIELDS / _group_dim_stats /
+# character_stats_payload）：
+# 2026-09-01 下沉到 messages.py 与 Flash 菜单端（handlers/characters.py
+# RequestReadCharacterStats → 统计界面）共用，此处仅导入。
 # ---------------------------------------------------------------------------
-_CS_SCALAR_KEYS = {
-    1: ('PlayerScore', 'score'),
-    2: ('PlayerKills', 'kills'),
-    3: ('PlayerDeaths', 'deaths'),
-    4: ('PlayerSuicides',),
-    5: ('PlayerSpawns',),
-    6: ('PlayerBestMultiKill',),
-    7: ('PlayerSaviorKills',),
-    8: ('PlayerRunDistance',),
-    9: ('PlayerWalkDistance',),
-    10: ('PlayerSprintDistance',),
-    11: ('PlayerSwimDistance',),
-    12: ('PlayerCrouchDistance',),
-    13: ('PlayerTimeOnFoot',),
-    14: ('PlayerTimePlayed',),
-    15: ('PlayerTimeCrouched',),
-    16: ('PlayerParachuteTime',),
-    17: ('PlayerParachuteFreefallTime',),
-    18: ('PlayerParachuteFreefallDist',),
-    19: ('PlayerParachuteSpawns',),
-    20: ('PlayerParachuteEscape',),
-    21: ('PlayerSessionsPlayed',),
-    22: ('PlayerDamageDealt', 'player_damage'),
-    23: ('PlayerParachuteJumpsSuccessfull',),
-    24: ('PlayerFreefallJumps',),
-    25: ('PlayerTeamKills',),
-    26: ('PlayerRevengeKills',),
-    27: ('PlayerTeamScoreboard_3_4_5',),
-    28: ('PlayerTeamScoreboard_2',),
-    29: ('PlayerTeamScoreboard_1',),
-    30: ('PlayerScoreboard_1',),
-    31: ('PlayerBattlesWithoutDying',),
-    32: ('PlayerNrOfMultiKill',),
-    33: ('PlayerNrOfBattleWith1000ShotsFired',),
-    34: ('PlayerNrOfBattleWithKillSameEnemy4Times',),
-    37: ('PlayerNrOfBattleInfantryKillXArmor',),
-    38: ('PlayerNrOfBattleArmorKillXArmor',),
-    39: ('PlayerNrOfBattlePlaneKillXArmor',),
-    40: ('PlayerNrOfBattleInfantryKillXInfantry',),
-    41: ('PlayerNrOfBattleArmorKillXInfantry',),
-    42: ('PlayerNrOfBattlePlaneKillXInfantry',),
-    43: ('PlayerNrOfBattleXSaviorKills',),
-    44: ('PlayerNrOfBattleXRevengeKills',),
-    45: ('PlayerNrOfBattleXHeadshots',),
-    46: ('PlayerNrOfBattleXKnifeKills',),
-    47: ('PlayerNrOfBattleXGrenadeKills',),
-    48: ('PlayerNrOfBattleXPistolKills',),
-}
-
-# WeaponStats f2-f18 / VehicleStats f2-f7 / GameModeStats f2-f15
-# → 维度键后缀名（statistics_server._stat_db_key 写入的 w<id>/v<id>/gm<id> 前缀）
-_WEAPON_FIELDS = {
-    2: 'WeaponShotsFired', 3: 'WeaponHeadShots', 4: 'WeaponHits',
-    5: 'WeaponKills', 6: 'WeaponKilled', 7: 'WeaponTimeSpent',
-    8: 'WeaponPlayerKills', 9: 'WeaponMostHitsInARow',
-    10: 'WeaponDamageToPlayers', 11: 'WeaponDamageCloseRange',
-    12: 'WeaponDamageMidLowRange', 13: 'WeaponDamageMidHighRange',
-    14: 'WeaponDamageFarRange', 15: 'WeaponKillsCloseRange',
-    16: 'WeaponKillsMidLowRange', 17: 'WeaponKillsMidHighRange',
-    18: 'WeaponKillsFarRange',
-}
-_VEHICLE_FIELDS = {
-    2: 'VehicleDestroyed', 3: 'VehicleLost', 4: 'VehicleDistDriven',
-    5: 'VehicleDistDrivenWPassanger', 6: 'VehicleTimeSpent',
-    7: 'VehicleDamageDealt',
-}
-_GAMEMODE_FIELDS = {
-    2: 'GamemodeCPCaptures', 3: 'GamemodeCPAssists',
-    4: 'GamemodeCPTotalInfluence', 5: 'GamemodeResourcesCaptured',
-    6: 'GamemodeResourcesTotalInfluence', 7: 'GamemodeKillAnEnemyCapturing',
-    8: 'GamemodeKilledWhileCapturing', 9: 'GamemodeCPNotSpotted',
-    10: 'GamemodeKillAnEnemyWhileCapturing', 11: 'GamemodeAssaultAttackerWon',
-    12: 'GamemodeAssaultDefenderWon', 13: 'GamemodeAssaultBattles',
-    14: 'GamemodeSkirmishBattlesWon', 15: 'GamemodeSkirmishBattles',
-}
-
-
-def _group_dim_stats(stats, prefix):
-    """按 'w'/'v'/'gm' 前缀把 character_stats 键分组 → {维度id: {名: 值}}。
-
-    键格式见 statistics_server._stat_db_key（'w<id>/<Name>' 等）；
-    'wv<id>_<id>/'（武器×载具段）不以纯数字跟斜杠 → isdigit 过滤掉。
-    """
-    groups = {}
-    plen = len(prefix)
-    for key, val in stats.items():
-        if not key.startswith(prefix):
-            continue
-        sid, _, name = key[plen:].partition('/')
-        if not name or not sid.isdigit():
-            continue
-        groups.setdefault(int(sid), {})[name] = val
-    return groups
+from messages import (                     # noqa: E402（放在使用处附近便于对照）
+    _CS_SCALAR_KEYS,
+    _GAMEMODE_FIELDS,
+    _VEHICLE_FIELDS,
+    _WEAPON_FIELDS,
+    _group_dim_stats,
+    character_stats_payload,
+    )
 
 
 async def handle_request(sess, writer, cmd_id, req_type, proto):
@@ -358,10 +274,6 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                     pid_by_char[int(ch['id'])] = int(_s['player_id'])
             except Exception as e:
                 log(f'[DB] stats list_characters failed: {e}')
-        stat_fields = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-                       17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-                       31, 32, 33, 34, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-                       46, 47, 48)
         resp_proto = b''
         ribbon_count = 0
         n_vehicles = n_weapons = n_gamemodes = 0
@@ -376,37 +288,12 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                     cstats = await STORE.get_stats(int(cid)) or {}
                 except Exception as e:
                     log(f'[DB] stats get_stats failed (char={cid}): {e}')
-            cs = b''
-            for fn in stat_fields:
-                if fn == 35:                     # characterXp ← characters 表
-                    cs += pb_int32(fn, xp)
-                    continue
-                val = 0
-                for key in _CS_SCALAR_KEYS.get(fn, ()):
-                    if key in cstats:
-                        val = int(cstats[key])
-                        break
-                cs += pb_int32(fn, val)
-            # f50 vehicleStatistics / f51 weaponStatistics / f53 gamemodeStatistics
-            for vid, grp in sorted(_group_dim_stats(cstats, 'v').items()):
-                m = pb_int32(1, vid)
-                for fn, name in _VEHICLE_FIELDS.items():
-                    m += pb_int32(fn, int(grp.get(name, 0) or 0))
-                cs += pb_message(50, m)
-                n_vehicles += 1
-            for wid, grp in sorted(_group_dim_stats(cstats, 'w').items()):
-                m = pb_int32(1, wid)
-                for fn, name in _WEAPON_FIELDS.items():
-                    m += pb_int32(fn, int(grp.get(name, 0) or 0))
-                cs += pb_message(51, m)
-                n_weapons += 1
-            for gid, grp in sorted(_group_dim_stats(cstats, 'gm').items()):
-                m = pb_int32(1, gid)
-                for fn, name in _GAMEMODE_FIELDS.items():
-                    m += pb_int32(fn, int(grp.get(name, 0) or 0))
-                cs += pb_message(53, m)
-                n_gamemodes += 1
-            cs += pb_string(56, '')                      # key（required）
+            # ★ 2026-09-01 统计构建下沉 messages.character_stats_payload 与
+            #   Flash 菜单端共用（f53 并合并为 gameMode=0 —— 客户端只接受 0）
+            cs = character_stats_payload(cstats, xp)
+            n_vehicles += len(_group_dim_stats(cstats, 'v'))
+            n_weapons += len(_group_dim_stats(cstats, 'w'))
+            n_gamemodes += min(len(_group_dim_stats(cstats, 'gm')), 1)
             entry = pb_int64(1, cid)
             entry += pb_message(2, cs)
             if ch and STORE is not None:

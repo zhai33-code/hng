@@ -28,7 +28,9 @@
   pool(mission_id)                → {faction: {cat: count}} | None
   counts_for(mission_id, faction) → {cat: count}（无池回退锚点值）
   categories(...)                 → [(cat, spawnInAir)]（渲染类别序）
-  consume(mission_id, faction, cat, n=1)  出生扣减
+  consume(mission_id, faction, cat, n=1, ap=None)  出生扣减（ap → 同步扣分线池）
+  assign_lines(mission_id, n_lines, ap_templates)   攻方 AT 分线（官方语义，幂等）
+  line_counts(mission_id, line_idx) → {cat: count} | None（攻方某条激活线）
   release(mission_id)             局结束清理
   assault_team_names(mission_id)  → [AT 名] | None（f4 渲染跨阵营翻译用）
 """
@@ -65,14 +67,24 @@ _FAMILY_CAPS = {
 }
 
 # 模式 → 族抽数计划（键 = mm_config.GAMEMODES[*]['name']）
+# 官方对齐（2026-09-02）：
+# - 官方战争局兵力 = 将军部署的 AT 之和（WarDatabase 编制原值，不推导）；
+#   staged 对局固定小池（≈官方 First Encounter 锚点量级：步兵 432 ≈ 24/槽）
+# - 官方核心单位保底规则：步兵/伞兵 ≥12 出生/玩家槽、核心 ≥50% 槽位
+#   （18 人局 → ≥216）——下列各池步兵均满足
+# - war 为 AT 驱动大池（官方战争局典型 15~20 支 AT），staged 各模式按
+#   官方 staged 语义压到锚点量级
 MODE_PLANS = {
-    'capture_hold_inf': {'infantry': 6, 'recon': 2},
-    'capture_hold_all': {'infantry': 6, 'recon': 2, 'armor': 2, 'air': 2},
-    'assault_infantry': {'infantry': 8, 'recon': 2, 'para': 1},
-    'assault_battle': {'infantry': 8, 'recon': 2, 'para': 1,
-                       'armor': 3, 'air': 2},
+    'capture_hold_inf': {'infantry': 5, 'recon': 1},
+    'capture_hold_all': {'infantry': 4, 'recon': 1, 'armor': 2, 'air': 1},
+    'capture_hold_pilot': {'infantry': 3, 'air': 2},    # C&H Pilot：飞行员主力 + 步兵地面点
+    'capture_hold_recon': {'infantry': 3, 'recon': 3},  # C&H Recon：侦察主力 + 步兵
+    'assault_infantry': {'infantry': 6, 'recon': 1, 'para': 1},
+    'assault_battle': {'infantry': 7, 'recon': 1, 'para': 1,
+                       'armor': 2, 'air': 1},
 }
-MODE_PLANS['war'] = MODE_PLANS['assault_battle']
+MODE_PLANS['war'] = {'infantry': 9, 'recon': 2, 'para': 1,
+                     'armor': 3, 'air': 2}
 MODE_PLANS['quickplay'] = MODE_PLANS['capture_hold_all']
 DEFAULT_PLAN = MODE_PLANS['capture_hold_all']
 
@@ -115,33 +127,41 @@ _FALLBACK_COMP = {
 
 
 def _load_at_compositions():
-    """解析 AT 编制表 → {AT 名: {资源类别id: count}}（取任一阵营，编制同构）。"""
-    # commandnodetemplate id → 名字（f1 id f2 name f3 factionTemplateId）
+    """解析 AT 编制表 → {AT 名: {资源类别id: count}}（取单一阵营，编制同构）。
+
+    ★ 同名 AT 模板每阵营一行（US 1xx / GE 2xx / SU 3xx）——编制同构，
+    只取一个阵营的行；按名字跨阵营累加会 3 倍虚增（2026-09-02 实锤：
+    infantry 表值 90/阵营，累加后 270 → training 锚点池 1296 ≠ 官方抓包
+    432）。确定性取最小编号阵营。"""
+    # commandnodetemplate id → (名字, 阵营)（f1 id f2 name f3 factionTemplateId）
     names = {}
     try:
         for r in _parse_wardb_table('commandnodetemplate'):
             nid = int(r.get(1, 0) or 0)
             nm = r.get(2, b'')
             if nid and isinstance(nm, (bytes, bytearray)) and nm:
-                names[nid] = nm.decode('utf-8', 'replace')
+                names[nid] = (nm.decode('utf-8', 'replace'),
+                              int(r.get(3, 0) or 0))
     except Exception as e:
         log(f'[force_pool] commandnodetemplate parse failed: {e}')
         return {}
-    comp = {}
+    by_name = {}   # name -> {faction: {cat: count}}
     try:
         for r in _parse_wardb_table(
                 'commandnodetemplatearmyresourcetemplaterelation'):
             at_id = int(r.get(3, 0) or 0)   # f3 AT 模板 id
             cat = int(r.get(2, 0) or 0)     # f2 资源类别 id
             cnt = int(r.get(4, 0) or 0)     # f4 count
-            name = names.get(at_id)
-            if not name or not cat:
+            info = names.get(at_id)
+            if not info or not cat:
                 continue
-            comp.setdefault(name, {})[cat] = comp.get(name, {}).get(cat, 0) + cnt
+            nm, fac = info
+            fac_counts = by_name.setdefault(nm, {}).setdefault(fac, {})
+            fac_counts[cat] = fac_counts.get(cat, 0) + cnt
     except Exception as e:
         log(f'[force_pool] AT relation parse failed: {e}')
         return {}
-    return comp
+    return {nm: facs[min(facs)] for nm, facs in by_name.items()}
 
 
 _AT_COMP = _load_at_compositions() or dict(_FALLBACK_COMP)
@@ -192,7 +212,13 @@ def draw_at_names(gamemode_id):
 
 
 # ---------------------------------------------------------------- 每局池状态
-_MISSIONS = {}   # mission_id -> {'mode': 名, 'names': [AT 名], 'pool': {faction: {cat: count}}}
+# mission_id -> {'mode': 名, 'names': [AT 名],
+#                'attacker'/'defender': 阵营 id,
+#                'pool': {faction: {cat: count}}（主池=聚合，f5 简报/扣减基准）,
+#                'lines': [ [AT 名], ... ] 攻方分线（官方：每线=部署在该线的 AT）,
+#                'line_pool': [ {cat: count}, ... ] 各线资源（f14/f2 按线挂载）,
+#                'ap_line': {ap_tmpl: 线序} 攻方激活线 AP → 线（出生上报按线扣）}
+_MISSIONS = {}
 
 
 def init_mission(mission_id, gamemode_id, attacker, defender):
@@ -204,7 +230,9 @@ def init_mission(mission_id, gamemode_id, attacker, defender):
             counts[cat] = counts.get(cat, 0) + cnt
     _MISSIONS[int(mission_id)] = {
         'mode': mode_name, 'names': names,
+        'attacker': int(attacker), 'defender': int(defender),
         'pool': {int(attacker): dict(counts), int(defender): dict(counts)},
+        'lines': None, 'line_pool': None, 'ap_line': {},
     }
     log(f'[force_pool] mission={mission_id} mode={mode_name} '
         f'ATs[{len(names)}]={",".join(names)} pool={counts}')
@@ -245,8 +273,12 @@ def categories(mission_id=None, counts_by_faction=None):
     return [(c, c in _AIR_CATS) for c in cats]
 
 
-def consume(mission_id, faction, cat, n=1):
-    """出生消耗（按兵种类别扣 n）。返回扣后余量；池/类别缺失返回 None。"""
+def consume(mission_id, faction, cat, n=1, ap=None):
+    """出生消耗（按兵种类别扣 n）。返回扣后余量；池/类别缺失返回 None。
+
+    ap（ReportArmyResourceSpawnCount f1 出兵点模板）给定时，攻方出生同步
+    扣对应分线池（守方/未知 AP 只扣主池）—— f14/f2 按线挂载的数值随
+    出生上报递减，与引擎侧资源追踪一致。"""
     rec = _MISSIONS.get(int(mission_id or 0))
     if rec is None:
         return None
@@ -254,7 +286,61 @@ def consume(mission_id, faction, cat, n=1):
     if counts is None or int(cat) not in counts:
         return None
     counts[int(cat)] = max(0, counts[int(cat)] - int(n))
+    # 攻方分线池同步扣减（ap_line 由 assign_lines 按布局顺序记录）
+    if ap and int(faction) == rec.get('attacker'):
+        line_idx = rec.get('ap_line', {}).get(int(ap))
+        if line_idx is not None and rec.get('line_pool'):
+            line_counts_ = rec['line_pool'][line_idx]
+            if int(cat) in line_counts_:
+                line_counts_[int(cat)] = max(0, line_counts_[int(cat)] - int(n))
     return counts[int(cat)]
+
+
+def assign_lines(mission_id, n_lines, ap_templates=()):
+    """攻方 AT 名单稳定分线（官方语义：每条攻击线兵力 = 部署在该线的
+    AT 之和，全线总量 = 1 份池，不随激活线数翻倍；守方不分线——
+    全部守 O 锚，与官方守军集中防守一致）。
+
+    幂等：首次调用按 mission_id 播种洗牌蛇形均分并缓存；后续 f14 握手 /
+    f2 轮询复用同一分法（布局按 mission_id 确定性 → 同局同 n_lines）。
+    ap_templates：攻方激活线 AP 模板（布局顺序）→ 记 ap→线序映射，
+    ReportMissionStatus f2 出生上报按 AP 扣对应线池。
+    """
+    rec = _MISSIONS.get(int(mission_id))
+    if rec is None:
+        return
+    n = max(1, int(n_lines))
+    if rec.get('lines') is not None and len(rec['lines']) != n:
+        # 布局理论上确定；防御性重分（保持幂等约束）
+        rec['lines'] = rec['line_pool'] = None
+        rec['ap_line'] = {}
+    if rec.get('lines') is None:
+        rng = random.Random(int(mission_id) ^ 0xA77)
+        names = list(rec['names'])
+        rng.shuffle(names)
+        rec['lines'] = [names[i::n] for i in range(n)]
+        rec['line_pool'] = []
+        for line_names in rec['lines']:
+            lc = {}
+            for name in line_names:
+                for cat, cnt in _AT_COMP.get(name, {}).items():
+                    lc[cat] = lc.get(cat, 0) + cnt
+            rec['line_pool'].append(lc)
+    for i, ap in enumerate(ap_templates):
+        if i < n:
+            rec['ap_line'][int(ap)] = i
+
+
+def line_counts(mission_id, line_idx):
+    """攻方第 line_idx 条激活线的资源 {cat: count}（0-based，官方分线语义）。
+
+    未分线 / 越界返回 None（调用方回退全量池挂载）。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if not rec or not rec.get('line_pool'):
+        return None
+    if not (0 <= int(line_idx) < len(rec['line_pool'])):
+        return None
+    return rec['line_pool'][int(line_idx)]
 
 
 def release(mission_id):

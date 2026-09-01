@@ -145,12 +145,14 @@ check('BattleFieldSettings f12 accesspoints owner 与 layout 同值',
       all(_f12.get(int(t)) == int(o) for t, o in _layout),
       f'f12={_f12} layout={_layout}')
 
-print('== 5b) Assault 图（Airfield preset 26）：随机激活线（守方 1 + 攻方 2~3）')
-# 2026-09-01 随机化（wardb.assault_ap_decision，按 mission_id 播种确定性）：
-# 防守方随机 1 条出兵线（引擎判负约束：守方 0 出兵点 → "has lost their
-# accesspoints" 秒判负 + AI 小队无处部署，0831 实测）；进攻方随机 2~3 条
-# （受图点数封顶）；★未激活线不开启（不进 layout/f6/f12，非中立 owner=0）。
-# 三方（layout / 大厅简报 f6 / BattleFieldSettings f12）必须同 mission_id 同源。
+print('== 5b) Assault 图（Airfield preset 26）：O 锚守方 + 攻方随机 3..n 边线')
+# 2026-09-02 O 锚方案（assault-map-spawn-investigation.md §9.2，替代
+# 2026-09-01 的"守方随机 1 条边线"）：守方 = O 锚 1234567890（引擎虚拟
+# AP，f12 收编 + f14 挂资源 → HasResources 置位 → 守方小队/坦克部署
+# 中心 O 区）；进攻方随机激活 3..n 条边线（n=图内出兵点数等概率，
+# 官方语义"有时仅 3 条"，5 线图可全开）；★未激活线不开启（不进
+# layout/f6/f12，非中立 owner=0）。三方（layout / 大厅简报 f6 /
+# BattleFieldSettings f12）必须同 mission_id 同源。
 from wardb import (_load_objective_capturepoints, _load_preset as _lp,
                    _missiontype_for_gamemap, assault_ap_decision)
 if _missiontype_for_gamemap(int(_lp(26).get(3, 0) or 0)) != 1:
@@ -160,10 +162,11 @@ else:
     _MID = 990002
     _lay26 = _accesspoint_layout(26, 2, 3, mission_id=_MID)
     _owners26 = [int(o) for _, o in _lay26]
-    check('Airfield layout 守方恰 1 点、攻方 2~3 点（未激活线不出现）',
-          _owners26.count(2) == 1 and _owners26.count(3) in (2, 3) and
-          all(o in (2, 3) for o in _owners26) and len(_owners26) in (3, 4),
-          f'owners={_owners26}')
+    check('Airfield layout 守方恰 1 点=O 锚 1234567890、攻方 3~4 边线',
+          _owners26.count(2) == 1 and _owners26.count(3) in (3, 4) and
+          all(o in (2, 3) for o in _owners26) and len(_owners26) in (4, 5) and
+          any(int(t) == 1234567890 for t, o in _lay26 if int(o) == 2),
+          f'layout={_lay26}')
     check('同 mission_id 决策确定性（两次调用同布局）',
           _accesspoint_layout(26, 2, 3, mission_id=_MID) == _lay26 and
           assault_ap_decision(_gm26, _MID) == assault_ap_decision(_gm26, _MID),
@@ -171,12 +174,31 @@ else:
     # 多 mission_id 样本不变量（每局随机但结构恒成立）
     _bad = []
     for _m in (990010, 990011, 990012, 990013, 990014, 990015):
-        _ow = [int(o) for _, o in _accesspoint_layout(26, 2, 3, mission_id=_m)]
-        if not (_ow.count(2) == 1 and _ow.count(3) in (2, 3) and
-                all(o in (2, 3) for o in _ow)):
-            _bad.append((_m, _ow))
-    check('多局样本不变量恒成立（守 1 + 攻 2~3，无中立点）',
+        _lay = _accesspoint_layout(26, 2, 3, mission_id=_m)
+        _ow = [int(o) for _, o in _lay]
+        if not (_ow.count(2) == 1 and _ow.count(3) in (3, 4) and
+                all(o in (2, 3) for o in _ow) and
+                any(int(t) == 1234567890 for t, o in _lay if int(o) == 2)):
+            _bad.append((_m, _lay))
+    check('多局样本不变量恒成立（守方恒 O 锚 1 点 + 攻 3~4 边线，无中立点）',
           not _bad, f'bad={_bad}')
+    # 5 线图（Town gamemap 70439，preset 31）：攻方 3..5 等概率随机（可全开）
+    import wardb as _wardb_mod
+    _gm31 = int(_lp(31).get(3, 0) or 0)
+    if len(_wardb_mod._load_accesspoint_templates(_gm31)) == 5:
+        _seen5 = set()
+        _bad5 = []
+        for _m in range(990100, 990140):
+            _d, _a, _i = assault_ap_decision(_gm31, _m)
+            _seen5.add(len(_a))
+            if not (_d == 1234567890 and 3 <= len(_a) <= 5 and
+                    len(_a) + len(_i) == 5):
+                _bad5.append((_m, len(_a)))
+        check('Town(5线) 攻方 3..5 等概率随机（样本含全 3/4/5，守方恒 O 锚）',
+              not _bad5 and _seen5 == {3, 4, 5},
+              f'bad={_bad5} seen={sorted(_seen5)}')
+    else:
+        print('  SKIP 5 线图检查（本机 WarDatabase 无 5 出兵点 Assault 图）')
     _det26 = {'preset': 26, 'attacker_faction': 3, 'defender_faction': 2,
               'players': [{'player_id': 1, 'gamertag': 'atk1', 'faction': 3}],
               'map_entity_id': 112741325}

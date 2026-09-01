@@ -436,12 +436,13 @@ async def handle_report_mission_status(sess, writer, cmd_id, req_type, proto):
     spawned_total = 0
     for raw in _all(items, 2):
         sub = _split_fields(raw)
+        ap = int(_get(sub, 1, 0) or 0)      # f1 出兵点模板（攻方按线扣减）
         cat = int(_get(sub, 2, 0) or 0)
         cnt = int(_get(sub, 5, 0) or 0)
         fac = int(_get(sub, 6, 0) or 0)
         if not (mid and cat and cnt and fac):
             continue
-        left = matchmaking.consume_mission_resource(mid, fac, cat, cnt)
+        left = matchmaking.consume_mission_resource(mid, fac, cat, cnt, ap=ap)
         spawned_total += cnt
         if left is not None:
             log(f'      [combat] resource spawn: faction={fac} cat={cat} '
@@ -1120,6 +1121,27 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
             (not known_pids or pid in known_pids)
     report_id = 0
     if STORE is not None:
+        # 每日首战 +50% XP：须在 save_battle_report 之前消费资格并算好
+        # xpDailyBonus 写入 characters_json（战报 f9 才有真实值）；
+        # 无 XP 收益的角色不消费资格，bot/不可结算 pid 一并跳过
+        for p in br_players:
+            if not _is_settleable(p['player_id']):
+                continue
+            for ch in p['characters']:
+                if not ch['characterId'] or \
+                        max(0, ch['endXp'] - ch['startXp']) <= 0:
+                    continue
+                try:
+                    if await STORE.consume_daily_bonus(
+                            p['player_id'], ch['characterId']):
+                        ch['xpDailyBonus'] = \
+                            max(0, ch['endXp'] - ch['startXp']) * 50 // 100
+                        log(f'      [DB] daily first-battle bonus '
+                            f'player={p["player_id"]} '
+                            f'char={ch["characterId"]} '
+                            f'+{ch["xpDailyBonus"]} xp')
+                except Exception as e:
+                    log(f'      [DB] consume_daily_bonus failed: {e}')
         try:
             report_id = await STORE.save_battle_report(report, br_players)
             log(f'      [DB] battle_report saved id={report_id} '
@@ -1158,10 +1180,12 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                         # characterMaxedOutLabel"已晋升为将军"误导文案恒
                         # 显示，故 bonus 必须随基础 XP 实发
                         vet_xp = int(ch.get('xpVetBonus', 0) or 0)
+                        # 每日首战 +50% XP（save 前已消费资格算好入库）
+                        daily_xp = int(ch.get('xpDailyBonus', 0) or 0)
                         await STORE.add_combat_xp(pid, ch['characterId'],
-                                                  xp_delta + vet_xp)
+                                                  xp_delta + vet_xp + daily_xp)
                         log(f'      [DB] char {ch["characterId"]} '
-                            f'+{xp_delta} xp(+{vet_xp}vet)')
+                            f'+{xp_delta} xp(+{vet_xp}vet+{daily_xp}daily)')
                 # 战斗通行证分数：本局 battle score 计入当前激活赛季
                 # （未购买也累计，与官服一致；奖励仅已购买行可领）
                 if p['score']:
@@ -1184,6 +1208,18 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                             await STORE.add_stat(target, 'score', p['score'])
                         if p['captures']:
                             await STORE.add_stat(target, 'captures', p['captures'])
+                # 生涯军令战斗任务（3 任意战斗 / 29 CaH / 34 Assault /
+                # 21 坦克兵参战）：客户端无这些类型的上报点，结算时判定
+                try:
+                    from handlers.career import (
+                        _missiontype_for_preset, complete_battle_orders)
+                    det = matchmaking._MM_MISSION_DETAILS.get(
+                        report['mission_id']) or {}
+                    mt = _missiontype_for_preset(det.get('preset'))
+                    await complete_battle_orders(
+                        pid, [c['characterId'] for c in p['characters']], mt)
+                except Exception as e:
+                    log(f'      [career] battle orders (pid={pid}) failed: {e}')
             except Exception as e:
                 log(f'      [DB] battle player stats (pid={pid}) failed: {e}')
 

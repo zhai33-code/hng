@@ -411,6 +411,9 @@ async def handle_create_squad(sess, writer, cmd_id, req_type, proto):
 
     if code == RC_OK and squad_id:
         await push_squad_rows(sess, writer, squad_id)
+        # 生涯军令 27 eCreateSquad（客户端无上报点）+ 推行实时刷新
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid, 27)
 
     resp = build_response(cmd_id, 'CreateSquadResponse', pb_int32(1, code))
     writer.write(resp)
@@ -840,6 +843,12 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
                 except Exception as e:
                     log(f'      [squad] invite push to {invited_tag!r} '
                         f'failed: {e}')
+        # 生涯军令 26 eInviteFriend（客户端无上报点，映射到小队邀请）
+        # + 27 eCreateSquad（首次邀请隐式建队）+ 推行实时刷新
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid, 26)
+        if created_squad_id:
+            await complete_order_and_push(sess, writer, pid, 27)
 
     resp = build_response(cmd_id, 'SquadInvitePlayerResponse',
                           pb_int32(1, code))

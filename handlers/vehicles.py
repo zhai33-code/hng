@@ -332,6 +332,11 @@ async def handle_setvehiclevariantrequest(sess, writer, cmd_id, req_type, proto)
         log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
             f'(Vehicle id={sv_vehicle_id} re-pushed, variantId={sv_variant_id})')
 
+    # 生涯军令 36 eChangeVehicleAppearance（variant_id!=0 状态推导）+ 推行刷新
+    if pid is not None and int(sv_variant_id) != 0:
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid)
+
 
 
 async def handle_setvehicleequipmentrequest(sess, writer, cmd_id, req_type, proto):
@@ -377,6 +382,11 @@ async def handle_setvehicleequipmentrequest(sess, writer, cmd_id, req_type, prot
             await _push_kvcs(writer, sess.soldier_view_cmd, b'Vehicle', vproto)
             log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (Vehicle id={v["id"]}, '
                 f'charId={v["character_id"]}, slot={v["equipped_in_slot"]})')
+
+    # 生涯军令 24 eEquipVehicle（equipped_in_slot>0 状态推导）+ 推行实时刷新
+    if pid is not None and int(ve_slot) > 0:
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid)
 
 
 
@@ -535,6 +545,11 @@ async def handle_setvehicleupgraderequest(sess, writer, cmd_id, req_type, proto)
             await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleUpgrade', uproto)
             log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
                 f'(VehicleUpgrade id={u["id"]}, slot={u["equipped_slot_id"]})')
+
+    # 生涯军令 31 eEquipVehicleUpgrade（equipped_slot_id>0 状态推导）+ 推行刷新
+    if pid is not None and su_do_equip:
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid)
 
 
 
@@ -741,6 +756,11 @@ async def handle_setvehicleammorequest(sess, writer, cmd_id, req_type, proto):
                 f'(VehicleAmmo id={a["id"]}, storage={a["equipped_storage_id"]}, '
                 f'slot={a["slot_index"]})')
 
+    # 生涯军令 32 eEquipVehicleCustomAmmo（equipped_storage_id 状态推导）+ 推行刷新
+    if pid is not None and sa_do_equip:
+        from handlers.career import complete_order_and_push
+        await complete_order_and_push(sess, writer, pid)
+
 
 
 async def handle_repairvehicleammorequest(sess, writer, cmd_id, req_type, proto):
@@ -800,6 +820,9 @@ async def handle_repairvehicleammorequest(sess, writer, cmd_id, req_type, proto)
         await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo', aproto)
         log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
             f'(VehicleAmmo id={repaired["id"]} repaired, condition={maxcond})')
+    # 生涯军令 20 eRefillVehicleAmmo（客户端无上报点）+ 推行实时刷新
+    from handlers.career import complete_order_and_push
+    await complete_order_and_push(sess, writer, pid, 20)
 
 
 
@@ -918,6 +941,9 @@ async def handle_repairvehiclerequest(sess, writer, cmd_id, req_type, proto):
         except Exception as e:
             log(f'[KVCS] vehicle repair push failed: {e}')
     await _push_player_refresh(sess, writer)
+    # 生涯军令 19 eRepairVehicle（客户端无上报点）+ 推行实时刷新
+    from handlers.career import complete_order_and_push
+    await complete_order_and_push(sess, writer, pid, 19)
 
 
 async def handle_setvehicleautorepairrequest(sess, writer, cmd_id, req_type, proto):

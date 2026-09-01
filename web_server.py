@@ -349,6 +349,41 @@ def init(main_loop):
     _MAIN_LOOP = main_loop
 
 
+# 武器变体图标回退：客户端 HnGGUIWeaponImage 对带 equippedWeaponVariantId 的
+# 武器实例请求 images/Weapons/<tid>_<vid>.png（Thumbnails/ 同理），而本地素材库
+# 只有部分变体组合的图（如 90_341.png 存在、90_340.png 缺失）。变体图缺失时
+# 回退基础图标 <tid>.png，避免礼包发货的变体武器图标空白（loadFailed 后会被
+# 记入 _dontTryLoad，整个会话都不再重试）。
+_WEAPON_VARIANT_IMG_RE = re.compile(
+    r'^/+images/Weapons/(Thumbnails/)?(\d+)_(\d+)\.png$')
+
+
+def _serve_weapon_variant_fallback(handler, path):
+    m = _WEAPON_VARIANT_IMG_RE.match(path)
+    if not m:
+        return False
+    weapons_root = os.path.realpath(os.path.join(GAME_DIR, 'images', 'Weapons'))
+    rel_dir = 'images/Weapons/' + (m.group(1) or '')
+    full = os.path.realpath(
+        os.path.join(GAME_DIR, rel_dir, f'{m.group(2)}_{m.group(3)}.png'))
+    if not full.startswith(weapons_root + os.sep) or not os.path.isfile(full):
+        return False  # 变体图存在，交给静态处理器
+    base = os.path.realpath(os.path.join(GAME_DIR, rel_dir, f'{m.group(2)}.png'))
+    if not base.startswith(weapons_root + os.sep) or not os.path.isfile(base):
+        return False
+    ctype = mimetypes.guess_type(base)[0] or 'image/png'
+    with open(base, 'rb') as f:
+        body = f.read()
+    handler.send_response(200)
+    handler.send_header('Content-Type', ctype)
+    handler.send_header('Content-Length', str(len(body)))
+    handler.send_header('Cache-Control', 'no-cache')
+    handler.end_headers()
+    handler.wfile.write(body)
+    log(f'[HTTP] weapon variant icon fallback {path} -> {m.group(2)}.png')
+    return True
+
+
 def _serve_file(handler, path, cache=False):
     """下发 dist 内文件（realpath 前缀校验防穿越）。文件不存在返回 False。"""
     full = os.path.realpath(os.path.join(_WEB_DIST, path))
@@ -731,6 +766,9 @@ class HttpHandler(SimpleHTTPRequestHandler):
         # 安全校验：目录列表与敏感扩展名一律 404（统一在静态回退前拦截）
         if _deny_static(path):
             self.send_error(404, 'Not Found')
+            return
+        # 武器变体图标回退（须在静态处理器之前）
+        if _serve_weapon_variant_fallback(self, path):
             return
         # serve static files (language xml, etc.)
         super().do_GET()

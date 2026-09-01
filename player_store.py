@@ -256,6 +256,10 @@ ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS condition DOUBLE PRECISION NOT NUL
 ALTER TABLE vehicle_ammo ADD COLUMN IF NOT EXISTS spawn_clip_count INT NOT NULL DEFAULT 1;
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS squad_points INT NOT NULL DEFAULT 0;
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS receive_daily_bonus BOOLEAN NOT NULL DEFAULT TRUE;
+-- 每日首战 +50% XP：真实资格源（结算 consume_daily_bonus 消费时写入）。
+-- receive_daily_bonus 列保留兼容旧库，SELECT 侧改由本列惰性推导
+-- （COALESCE(last_daily_battle_at::date <> CURRENT_DATE, TRUE)，跨天自动回 TRUE）
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS last_daily_battle_at TIMESTAMPTZ;
 
 -- 玩家头盔/军装部件实例（PurchaseUniformPartRequest 购买；uniform_part_type 用 EUniformPartType
 -- 枚举：eHead=0, eHelmet=1, eJacket=2...；character.headgear_id 指向当前装备的部件实例 id）
@@ -907,7 +911,9 @@ class PlayerStore:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 'SELECT id, name, faction, template, combat_xp, combat_badge_0, combat_badge_1, '
-                'uniform_variant_id, headgear_id, squad_points, receive_daily_bonus, '
+                'uniform_variant_id, headgear_id, squad_points, '
+                'COALESCE(last_daily_battle_at::date <> CURRENT_DATE, TRUE) '
+                'AS receive_daily_bonus, '
                 'is_on_leave, previous_template, head_id '
                 'FROM characters WHERE player_id = $1 AND NOT is_deleted '
                 'ORDER BY id', player_id)
@@ -918,11 +924,29 @@ class PlayerStore:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 'SELECT id, name, faction, template, combat_xp, combat_badge_0, combat_badge_1, '
-                'uniform_variant_id, headgear_id, squad_points, receive_daily_bonus, '
+                'uniform_variant_id, headgear_id, squad_points, '
+                'COALESCE(last_daily_battle_at::date <> CURRENT_DATE, TRUE) '
+                'AS receive_daily_bonus, '
                 'is_on_leave, previous_template, head_id '
                 'FROM characters WHERE id = $1 AND player_id = $2 AND NOT is_deleted',
                 character_id, player_id)
             return dict(row) if row else None
+
+    async def consume_daily_bonus(self, player_id, character_id):
+        """每日首战 +50% XP 资格消费：当天未用则记账并返回 True。
+
+        单条 UPDATE 原子判定（WHERE 带资格条件 + RETURNING），当天已
+        消费（last_daily_battle_at 为今天）返回 False 不重复记账；
+        跨天后 SELECT 侧推导自动回 TRUE，无需定时任务。
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'UPDATE characters SET last_daily_battle_at = now() '
+                'WHERE id = $1 AND player_id = $2 AND NOT is_deleted '
+                'AND COALESCE(last_daily_battle_at::date <> CURRENT_DATE, TRUE) '
+                'RETURNING id',
+                int(character_id), int(player_id))
+            return row is not None
 
     async def create_character(self, player_id, name, faction, template, combat_xp=0,
                                uniform_variant_template_id=0):
