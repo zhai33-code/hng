@@ -34,6 +34,8 @@ from player_service import (
     _push_stored_soldier_data,
     )
 
+from matchmaking import _msg_faction_rows
+
 from .career import (
     push_battle_pass_row,
     push_career_order_row,
@@ -87,6 +89,15 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         writer.write(cs_bytes)
         await writer.drain()
         log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (player data, {len(player_proto)}B)')
+
+        # 3. faction 表 3 行（US/GE/SU）：客户端 FactionTable(xmlTag='faction')
+        #    只有收到 KVCS 才有数据。原先只在 JoinMM ok / 小队入队时推——排队前
+        #    打开战斗浏览器/战争图，getFromId(factionId) 返回 null → #1009；
+        #    且行 id 必须==factiontemplateid（见 matchmaking.FACTION_ROW_IDS），
+        #    登录即推保证 currentPlayer.factionid 的"我方"判定处处可用。
+        for faction_row in _msg_faction_rows():
+            await _push_kvcs(writer, cmd_id, b'faction', faction_row)
+        log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (faction ×3 rows) ★FactionTable fill')
 
     # 跟踪 SOLDIER_VIEW 的 cmd_id，用于后续推送 character 数据
     if req_type.lower() == 'subscribesoldierview':

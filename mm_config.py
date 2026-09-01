@@ -19,6 +19,7 @@ gamemodeId 取值来源：客户端 GamemodesView.as（反编译实测）：
   MM_SIMULATE_COMBAT     =1 时用内嵌模拟器代替 hng.exe（macOS/Linux 等无
                           Windows 客户端环境跑集成测试用；实例登记/端口
                           占用/并发上限/释放逻辑全部照常真实运转）
+  MM_SNOW_CHANCE         随机下雪概率 0.0-1.0（默认 0.3；0=关，见 SNOW_CHANCE）
 """
 import os
 
@@ -31,6 +32,18 @@ def _int_env(name, default=None):
         return int(v)
     except ValueError:
         print(f'[mm_config] WARNING: {name}={v!r} not an int, '
+              f'using default {default}')
+        return default
+
+
+def _float_env(name, default=None):
+    v = os.environ.get(name)
+    if v is None or v == '':
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        print(f'[mm_config] WARNING: {name}={v!r} not a float, '
               f'using default {default}')
         return default
 
@@ -116,3 +129,13 @@ FALLBACK_PRESET = 10
 # 模拟 combat server（macOS 等无 hng.exe 环境的集成测试）：不 spawn 进程，
 # 由 warserver 内嵌模拟——bind UDP 端口 + 直接完成 BattleFieldSettings 握手
 SIMULATE_COMBAT = bool(_int_env('MM_SIMULATE_COMBAT'))
+
+# 随机下雪概率（0.0-1.0）：成局时按此概率抽签，抽中则战斗服命令行加
+# /R seasonal.forceSnowEvent=1 强制开启引擎季节雪事件（渲染层功能，不走
+# 游戏协议；选项表见 docs/hng-combat-protocol.md §B.13 ZOption_Seasonal）。
+# 0=永不下雪，1=每局都下。MM_SNOW_CHANCE 环境变量覆盖，非法值回退 0.3。
+SNOW_CHANCE = _float_env('MM_SNOW_CHANCE', 1)
+if SNOW_CHANCE is None or not 0.0 <= SNOW_CHANCE <= 1.0:
+    print(f'[mm_config] WARNING: MM_SNOW_CHANCE={os.environ.get("MM_SNOW_CHANCE")!r} '
+          f'not in [0,1], using 0.3')
+    SNOW_CHANCE = 0.3

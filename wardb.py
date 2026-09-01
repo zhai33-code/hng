@@ -555,6 +555,30 @@ def charactertemplate_actionid(character_template_id):
     return _CHAR_TMPL_ACTIONID.get(int(character_template_id or 0), 0)
 
 
+def _build_general_template_ids():
+    """charactertemplate name='general' 的模板 id 集合（实测 id=7、cost=0）。"""
+    ids = set()
+    for f in _parse_wardb_table('charactertemplate'):
+        name = f.get(2, b'')
+        if isinstance(name, (bytes, bytearray)):
+            name = name.decode('utf-8', 'replace')
+        if str(name).strip().lower() == 'general':
+            ids.add(int(f.get(1, 0)))
+    return frozenset(ids)
+
+
+GENERAL_TEMPLATE_IDS = _build_general_template_ids()
+
+
+def is_general_character(character_template_id):
+    """是否将军兵种模板（charactertemplate name='general'）。
+
+    官方设计：将军只在大地图指挥 AssaultTeam，不能进 FPS 战斗局；其
+    actionid 与伞兵同为 7（引擎实体同款），匹配不挡会混进战斗当伞兵。
+    """
+    return int(character_template_id or 0) in GENERAL_TEMPLATE_IDS
+
+
 # SquadTemplate（WarDatabase/SquadTemplate 共 5 行）→ 官方小队类型名
 # （客户端 texts/HnG_Strategy_en.xml squadtemplate/NTitle，N=表 name 列）：
 # 1=Infantry Squad / 2=Fighter Squad / 3=Paratrooper Squad / 4=Armor Squad /

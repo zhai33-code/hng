@@ -38,8 +38,8 @@ from wardb import (
     _load_accesspoint_templates, _load_capturepoint_templates,
     _load_objective_capturepoints, _load_preset, _missiontype_for_gamemap,
     _rank_from_combat_xp, battlefield_entity_for_gamemap, battlefield_pos,
-    commandnode_template, preset_scene, squad_template_for_character,
-    squad_template_name,
+    commandnode_template, is_general_character, preset_scene,
+    squad_template_for_character, squad_template_name,
 )
 import mm_config
 import mm_pool
@@ -334,6 +334,9 @@ async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
         # 开局等待时间覆盖（秒），见文件头 COMBAT_START_COUNTDOWN_OVERRIDE 注释
         args += ['/R',
                  f'controllers.overrideStartCountdown={COMBAT_START_COUNTDOWN_OVERRIDE}']
+    # 本局抽中下雪（roll_weather 概率 mm_config.SNOW_CHANCE）：强制引擎
+    # 季节雪事件（渲染层，不走协议；MM_SIMULATE_COMBAT 分支已提前 return）
+    args += snow_r_args(mission_id)
     launch_args = args
     if os.environ.get('TTD_RECORD') and os.path.exists(TTD_EXE):
         os.makedirs(TTD_OUT_DIR, exist_ok=True)
@@ -435,13 +438,21 @@ MISSION_HOSTING_CENTER_ID = random.getrandbits(63)
 #   我方 6 队（303×2/320×2/316×2）+ AI 6 队（203×2/220×2/216×2），资源 20 条
 #   资源总量：步兵 90×4+36×2=432、汽车 30×2=60、摩托 12×2=24（与游戏内一致）
 
-# faction 表行 id / supremecommand：服务器侧运行时实体（客户端无本地表可查，
-# 任意值行为一致，仅要求 faction 行与 GMD/PMS/社交列表引用同源）→ 每次启动生成，
-# 与 _WAR_ID 同策略（原值为他服 solo_kvcs_dump2 回放 id，已清除）。
-# 客户端 FactionTable(xmlTag='faction') 只有收到这些 set 才有数据，
-# GetMissionDetailsResponse 的 f3/f4/f5 field1 必须用这些行 id（不是 1/2/3 小整数），
-# 否则 FactionTable.getFromId 返回 null → setPlayersInMatch TypeError #1009。
-FACTION_ROW_IDS = {tmpl: random.getrandbits(63) for tmpl in (1, 2, 3)}
+# faction 表行 id：★必须 == factiontemplateid（1=US/2=GE/3=SU），不能随机大数。
+# 反编译实证（客户端三个调用点传不同 id 空间给同一比较参数，同时成立唯有此解）：
+#   ① MissionDetailsMediator:259 setPlayersInMatch(…, factionTemplateId)→ 与
+#      faction.factiontemplateid 比较（模板 id 空间）
+#   ② MissionInformationWindowMediator:206 传 PMS f5 → 既要 getFromId(f5) 可查
+#      （行 id 空间）又要 Equals(factiontemplateid) 成立（模板 id 空间）
+#   ③ MissionsOverviewWindowMediator:255 传 getFactionIdFromTemplateId()（行 id）
+#   ④ MissionUtilities.updateFactionCounts: currentPlayer.factionid(player 行 f11
+#      =1/2/3) 与 faction 行 id Equals → 行 id 必须 ∈ {1,2,3}
+# 随机大数时所有"我方/敌方"判定永不相等：friendCount 永不命中、enemyCount 累加
+# 双方全部玩家（跨阵营俩人大厅全算"敌方"=同阵营观感）、简报我方不高亮、
+# setBasicInformation 恒判进攻方（2026-09-01 玩家反馈实锤）。
+# 客户端 FactionTable(xmlTag='faction') 只有收到这些 set 才有数据；行 id 与
+# GMD/PMS/社交列表引用同源即可（getFromId 有效性不受数值大小影响）。
+FACTION_ROW_IDS = {tmpl: tmpl for tmpl in (1, 2, 3)}
 FACTION_SUPREME_COMMANDS = {tmpl: random.getrandbits(63) for tmpl in (1, 2, 3)}
 
 
@@ -519,9 +530,22 @@ def roll_weather():
 
     返回 dict 直接并入 mission details：weather_tod / weather_condition /
     timeofday（战斗服 BattleFieldSettings f9/f21/f22 与简报 MissionInfo
-    f12/f13 均从这里取，保证简报图标与实际战斗一致）。"""
+    f12/f13 均从这里取，保证简报图标与实际战斗一致）；snow 为独立抽签的
+    季节雪事件开关（概率 mm_config.SNOW_CHANCE 默认 30%——雪是引擎渲染层
+    功能不走协议，简报不显示，仅经 snow_r_args 拼进战斗服命令行）。"""
     tod, cond, hour = random.choice(WEATHER_PRESETS)
-    return {'weather_tod': tod, 'weather_condition': cond, 'timeofday': hour}
+    return {'weather_tod': tod, 'weather_condition': cond, 'timeofday': hour,
+            'snow': random.random() < mm_config.SNOW_CHANCE}
+
+
+def snow_r_args(mission_id):
+    """本局抽中下雪时返回 seasonal 雪事件 /R 参数对（拼进 hng.exe 命令行）。
+
+    /R 必须用完整注册名（组.选项）；forceSnowEvent 为 float 默认 -1
+    （-1=跟随官方日期窗口），≥0 强制——传 1 即常开雪（docs §B.13）。"""
+    if _MM_MISSION_DETAILS.get(int(mission_id), {}).get('snow'):
+        return ['/R', 'seasonal.forceSnowEvent=1']
+    return []
 # f4 突击队构成：本局 force_pool 抽取的 AT 名单（双侧镜像，名单见
 # force_pool.init_mission 日志）。模板 id 是【阵营相关】库值
 # （commandnodetemplate f2 兵种名 × f3 阵营：infantry US=103/GE=203/SU=303），
@@ -631,6 +655,23 @@ def _next_match_id(seq):
     """局内动态 id 发号（[_MM_*] 序列共用：squad/metrics/battle session）。"""
     seq[0] += 1
     return seq[0]
+
+
+def _auto_squad_numbered_name(mission_id, fac, tmpl):
+    """散人自动凑队 / late-join 自建队的默认名编号：按本局 (阵营, 兵种模板)
+    从 1 起数，如 "Infantry Squad 1"、"Infantry Squad 2"。
+
+    引擎默认命名（AddSquad 空名分支）的计数器只按 squadTemplateId 全局
+    累计、跨阵营连续（AI 队第二阵营从 6 起）；SquadResponse f4 名非空时
+    引擎逐字使用，故编号须在登记时算好写入。真实小队（squad_db_id 非零，
+    用 DB 队名）不参与编号、也不占号。
+    """
+    n = 1 + sum(
+        1 for info in (_MM_MISSION_SQUADS.get(mission_id) or {}).values()
+        if not info.get('squad_db_id')
+        and int(info.get('faction', 0) or 0) == int(fac)
+        and int(info.get('template', 1) or 1) == int(tmpl))
+    return f'{squad_template_name(tmpl)} {n}'
 
 
 _MM_MISSION_DETAILS = {}    # mission_id -> {preset, players, map_entity_id, ai_fill, gamemode}
@@ -841,10 +882,11 @@ def _msg_player_mission_session(pms_id, player_id, gamertag, char_id, faction_id
     m += pb_string(3, gamertag)               # playerGamerTag
     m += pb_int64(4, char_id)                 # career id（他服实测=JoinMM f1/PlayerSettings f15）
     m += pb_int64(5, FACTION_ROW_IDS.get(int(faction_id), int(faction_id)))
-    # characterFactionId：必须是 KVS 'faction' 表行 id（FACTION_ROW_IDS 大数），
-    # 客户端 MissionInformationWindowMediator.setAccessPoints 用它
-    # FactionTable.getFromId() 查 faction 行——填 player_id/小整数都会查不到
-    # → null.factiontemplateid → TypeError #1009（切换阵营颜色按钮触发）
+    # characterFactionId：必须是 KVS 'faction' 表行 id（FACTION_ROW_IDS，行 id
+    # ==factiontemplateid=1/2/3）：客户端 setAccessPoints/getFromId 按它查 faction
+    # 行（行表未推/值不存在 → null 解引用 #1009），setPlayersInMatch/
+    # setBasicInformation 又拿它与 factiontemplateid/defenderFactionId 比较
+    # （"我方"高亮与攻防角色判定）——填 player_id 等无关值两处都会失效
     m += pb_string(6, char_name)              # characterName
     m += pb_int32(7, rank)                    # characterRank
     m += pb_int64(8, mission_id)              # missionId（客户端 /M 启动参数）
@@ -899,8 +941,9 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
                                         3: accessPointTemplateId, 4: count, 5: spawnInAir}
       f6 MissionDetailsAccessPoint ×2  {1: accessPointTemplateId, 2: factionTemplateId}
       f7 capturePointStatuses | f8 posX f32 | f9 posY f32
-    ★ f3/f4/f5 的 factionId 是 KVS 'faction' 表的行 id（FACTION_ROW_IDS 大数），
-      客户端 FactionTable.getFromId(行id) 解引用，行 id 不存在即 TypeError #1009。
+    ★ f3/f4/f5 的 factionId 是 KVS 'faction' 表的行 id（FACTION_ROW_IDS，
+      行 id==factiontemplateid=1/2/3），客户端 FactionTable.getFromId(行id)
+      解引用，行 id 不在已推送行表内即 TypeError #1009。
     出兵点/据点模板按 gamemap 查 WarDatabase（缺省 Mill=13）；突击队模板按
     参战阵营查 commandnodetemplate。
     """
@@ -1127,12 +1170,24 @@ def drop_player(pid):
 # （QueueEntry.group_key=squad_id，mm_pool 保证不拆队），成局同 mission 部署。
 # 官方对应行为：队长激活小队（SquadSession f12 matchMakeWarMissionFlag）。
 
+async def _char_is_general(player_id, character_id):
+    """玩家某角色是否将军（小队成员行无 template 字段，按 character_id 反查）。"""
+    try:
+        for ch in await STORE.list_characters(int(player_id)):
+            if int(ch['id']) == int(character_id):
+                return is_general_character(ch.get('template'))
+    except Exception as e:
+        _log(f'      [DB] char template lookup failed: {e}')
+    return False
+
+
 async def _squad_eligible_members(pid):
     """(squad, 可参战成员列表)；非小队场景返回 (None, None)。
 
     玩家在 DB 真实小队即走小队路径（即使队里只有自己在线——推真实
     小队行而非 solo 隐式行，避免同一玩家两张 SquadSession 冲突）。
-    可参战成员 = InLobby/Ready 且 Flash 会话在线（离线成员本局不部署）。
+    可参战成员 = InLobby/Ready 且 Flash 会话在线（离线成员本局不部署）
+    且当前角色非将军（官方设计将军不进 FPS 战斗）。
     自己当前 InBattle（如已在局中重复点匹配）→ 返回 (squad, []) 由
     调用方跳过排队。"""
     if STORE is None or pid is None:
@@ -1145,10 +1200,19 @@ async def _squad_eligible_members(pid):
     except Exception as e:
         _log(f'      [DB] squad lookup failed: {e}')
         return None, None
-    eligible = [m for m in members
-                if int(m['status']) in (2, 3)
-                and (s := FLASH_SESSIONS.get(m['gamertag'] or '')) is not None
-                and s.playerview_cmd is not None]
+    eligible = []
+    for m in members:
+        if int(m['status']) not in (2, 3):
+            continue
+        s = FLASH_SESSIONS.get(m['gamertag'] or '')
+        if s is None or s.playerview_cmd is None:
+            continue
+        # ★ 将军不参战：整队入池不经 _handle_join 单人校验，须在此过滤
+        if await _char_is_general(int(m['player_id']), int(m['character_id'])):
+            _log(f'      squad member {m["gamertag"]} skipped: '
+                 f'char {m["character_id"]} is general (cannot enter combat)')
+            continue
+        eligible.append(m)
     if not any(int(m['player_id']) == int(pid) for m in eligible):
         return squad, []         # 自己不在可参战列表（InBattle/离线）
     return squad, eligible
@@ -1396,9 +1460,8 @@ async def _start_match(match):
     #     （大厅 SetSquadDetails 传入），队长取 DB leader_character_id
     #   - 单人匹配玩家按阵营+兵种自动凑队（每队上限 _MM_SOLO_SQUAD_MAX，
     #     rank 最高者任队长、占 slot 0），队名用兵种对应官方小队模板名
-    #     （Infantry/Fighter/Paratrooper/Armor/Recon Squad）——大厅 UI 对
-    #     无小队玩家按兵种显示的默认名即此模板标题，局内 SquadResponse
-    #     f4 name 同源才能对上
+    #     （Infantry/Fighter/Paratrooper/Armor/Recon Squad）+ 按本局
+    #     (阵营, 兵种) 从 1 的编号（_auto_squad_numbered_name）
     # game_server SquadResponse 按登记表构建小队定义 → 同队成员进同一局内小队。
     def _register_mission_squad(sq_id, name, leader_char, fac, members,
                                 db_id=0, template=1):
@@ -1456,7 +1519,7 @@ async def _start_match(match):
                 leader = chunk[0]
                 _register_mission_squad(
                     _next_match_id(_MM_SQUAD_ID),
-                    squad_template_name(sq_tmpl),
+                    _auto_squad_numbered_name(mission_id, fac, sq_tmpl),
                     int(leader['entry'].char_id), fac, chunk,
                     template=sq_tmpl)
     if _MM_MISSION_SQUADS.get(mission_id):
@@ -1500,7 +1563,8 @@ async def _start_match(match):
          f'{combat_map}, players={len(match.players)}, ai_fill={match.ai_fill}, '
          f'attacker={attacker}, defender={defender}, udp/{port}, '
          f'weather tod={_MM_MISSION_DETAILS[mission_id]["weather_tod"]}/'
-         f'cond={_MM_MISSION_DETAILS[mission_id]["weather_condition"]}')
+         f'cond={_MM_MISSION_DETAILS[mission_id]["weather_condition"]}'
+         f'{" SNOW" if _MM_MISSION_DETAILS[mission_id].get("snow") else ""}')
 
     # 拉起本场专用服（/P 取第一名玩家 pms，仅 boot 参数）
     first_pms = sessions[0]['pms_id'] if sessions else 0
@@ -1707,7 +1771,7 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
     #     原小队行不在本局（被裁/解散）才降级散人路径
     #   - 散人中途加入补进同阵营、同兵种、未满员的单人凑成队（不动
     #     真实小队）；没有可补的队则自建一队（本人任队长），队名=本人
-    #     兵种官方小队模板名（与大厅 UI 默认名一致）。
+    #     兵种官方小队模板名 + 本局 (阵营, 兵种) 编号（不占已有号）。
     join_rank = int(ctx.get('rank', 0) or 0)
     join_tmpl = squad_template_for_character(ctx.get('char_template'))
     new_member = {'player_id': pid, 'char_id': int(e.char_id),
@@ -1743,7 +1807,7 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
     else:
         sq_id = _next_match_id(_MM_SQUAD_ID)
         _MM_MISSION_SQUADS.setdefault(mission_id, {})[sq_id] = {
-            'name': squad_template_name(join_tmpl),
+            'name': _auto_squad_numbered_name(mission_id, e.faction, join_tmpl),
             'leader_char_id': int(e.char_id), 'faction': int(e.faction),
             'squad_db_id': 0, 'template': int(join_tmpl),
             'members': [new_member]}
@@ -1858,6 +1922,18 @@ async def _handle_join(sess, writer, cmd_id, proto):
         writer.write(resp)
         await writer.drain()
         _log(f'S->C cmd={cmd_id:<4} JoinMatchMakingResponse (rejected: char {char_id} not found)')
+        return
+
+    # ★ 将军不参战（官方设计：General 只在大地图指挥 AssaultTeam，无战斗
+    #   实体；其 actionid 与伞兵同为 7，不挡会混进战斗当伞兵）。
+    #   排队/late-join/rejoin/快速游戏全经此处，单人路径一处拦截即覆盖。
+    #   与"角色不存在"同款拒绝（response=0）。
+    if is_general_character(int(char_info.get('template', 0) or 0)):
+        resp = build_response(cmd_id, 'JoinMatchMakingResponse', pb_int32(1, 0))
+        writer.write(resp)
+        await writer.drain()
+        _log(f'S->C cmd={cmd_id:<4} JoinMatchMakingResponse '
+             f'(rejected: char {char_id} is general — generals cannot enter combat)')
         return
 
     # 记录当前选中士兵（squad 入队规则需要：邀请时解析被邀者角色），

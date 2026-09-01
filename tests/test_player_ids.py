@@ -260,3 +260,168 @@ def test_settlement_bot_and_ghost_pids_filtered():
     # bot 角色 10001 不得产生任何统计写入
     assert all(cid != 10001 for cid, _, _ in fake.stats), \
         f'bot 角色 10001 不应写统计，实际 {fake.stats}'
+
+
+# ---------- 6. faction 行 id 空间对齐（2026-09-01 跨阵营"同阵营"显示事故） ----------
+# 事故：FACTION_ROW_IDS 用随机 63 位行 id，而客户端 currentPlayer.factionid
+# （player 行 f11=1/2/3）、MissionDetailsMediator 传的 factionTemplateId、
+# factiontemplateid 比较全是模板 id 空间 → 大厅"我方/敌方"判定永不相等：
+# friendCount 永不命中、enemyCount 把跨阵营双方全算敌方（=同阵营观感）、
+# 简报我方不高亮、攻防角色恒"进攻"。官服语义（客户端三处调用点反编译实证）
+# 唯一解：faction 表行 id == factiontemplateid。
+import matchmaking  # noqa: E402
+from protocol import (  # noqa: E402
+    pb_field_payload,
+    pb_parse_loose,
+    pb_split_top,
+    )
+
+
+def _split_factions(raw, fn):
+    """顶层 repeated 子消息 → [pb_parse_loose(子块)]（保序）。"""
+    return [pb_parse_loose(pb_field_payload(blk))
+            for _fn, blk in pb_split_top(raw) if _fn == fn]
+
+
+def test_faction_row_ids_identity_mapping():
+    """faction 行 id 必须 == factiontemplateid（官服语义，见
+    matchmaking.FACTION_ROW_IDS 注释的反编译证据链）。"""
+    assert matchmaking.FACTION_ROW_IDS == {1: 1, 2: 2, 3: 3}, \
+        f'FACTION_ROW_IDS 应为恒等映射，实际 {matchmaking.FACTION_ROW_IDS}'
+
+
+def test_faction_rows_id_equals_template():
+    """KVS faction 行 f1(id) 与 f2(factiontemplateid) 同值——客户端
+    getFromId(行id).factiontemplateid.Equals(currentPlayer.factionid)
+    链路两端才在同一空间。"""
+    for row in matchmaking._msg_faction_rows():
+        f = pb_parse_loose(row)
+        assert int(f[1]) == int(f[2]), \
+            f'faction 行 id({f[1]}) != factiontemplateid({f[2]})'
+
+
+def test_multi_gmd_f3_uses_template_ids_and_groups_by_faction():
+    """德军 A + 苏军 B 成局：GMD f3 每条的 factionId 必须落在模板 id 空间
+    （客户端 updateMissionDetailsFactionCounts 拿它 Equals
+    currentPlayer.factionid=1/2/3），且按阵营分组正确。"""
+    old_pos = matchmaking.battlefield_pos
+    matchmaking.battlefield_pos = lambda eid: (0.5, 0.5)   # macOS 无 WarDatabase
+    try:
+        det = {'preset': 10, 'attacker_faction': 2, 'defender_faction': 3,
+               'players': [{'player_id': 101, 'gamertag': 'A_german',
+                            'faction': 2},
+                           {'player_id': 202, 'gamertag': 'B_soviet',
+                            'faction': 3}],
+               'map_entity_id': 112741325}
+        raw = matchmaking._msg_mission_details_response_multi(990002, det,
+                                                              'zulu')
+    finally:
+        matchmaking.battlefield_pos = old_pos
+
+    groups = {}
+    for fac in _split_factions(raw, 3):
+        fid = int(fac[1])
+        assert fid in (1, 2, 3), \
+            f'f3 factionId={fid} 不在模板 id 空间（客户端我方判定永不相等）'
+        # players：子消息内 repeated f2 {1: gamertag}
+        players = [pb_parse_loose(pb_field_payload(blk))
+                   for _fn, blk in pb_split_top(_find_f3_block(raw, fid))
+                   if _fn == 2]
+        groups[fid] = [p[1] for p in players]
+    assert groups == {2: [b'A_german'], 3: [b'B_soviet']}, \
+        f'f3 分组/阵营 id 错误：{groups}'
+
+
+def _find_f3_block(raw, fid):
+    """取 f3 中 factionId==fid 的子消息原文（供拆其内层 repeated players）。"""
+    for _fn, blk in pb_split_top(raw):
+        if _fn != 3:
+            continue
+        inner = pb_parse_loose(pb_field_payload(blk))
+        if int(inner[1]) == fid:
+            return pb_field_payload(blk)
+    raise AssertionError(f'f3 无 factionId={fid} 条目')
+
+
+def test_pms_f5_character_faction_in_template_space():
+    """PMS f5 characterFactionId：客户端 setBasicInformation 拿它与
+    MissionInfo f8 defenderFactionId（模板 id）比较定攻防角色、
+    setPlayersInMatch 拿它与 factiontemplateid 比较高亮我方——必须
+    落在 1/2/3 模板空间（且是已推送 faction 行 id）。"""
+    m = matchmaking._msg_player_mission_session(
+        990003, 101, 'A_german', 55, 2, 'Hans', 5, 990002, 'zulu',
+        '1.2.3.4:15110')
+    f = read_fields(m)
+    assert f[5] == 2, f'PMS f5 应为 2(GE 模板 id)，实际 {f[5]}'
+
+
+# ---------- 7. 登录即推 faction 表（subscribeplayerview ★FactionTable fill） ----------
+# 修复点：faction 行原先只在 JoinMM ok / 小队入队时推——排队前客户端
+# FactionTable(xmlTag='faction') 为空，战斗浏览器/战争图 getFromId 返回
+# null → Error #1009；且行 id 必须==factiontemplateid（§6），登录即推
+# 保证 currentPlayer.factionid 的"我方"判定在所有界面处处可用。
+from protocol import Chunk, pb_parse  # noqa: E402
+from handlers import views as views_handlers  # noqa: E402
+
+
+class _LoginWriter:
+    """收集 handle_subscribe 全部写帧（war/player/faction KVCS + 响应）。"""
+
+    def __init__(self):
+        self.frames = []
+
+    def write(self, data):
+        self.frames.append(data)
+
+    async def drain(self):
+        pass
+
+
+class _LoginSess:
+    username = ''           # 空=不注册 FLASH_SESSIONS（不动全局状态）
+
+    async def ensure_player(self):
+        return None         # DB 不可用路径：默认值 + 跳过 career/economy 推送
+
+
+def _login_kvcs_tables(frames):
+    """全部写入帧 → [(table, fields)]（只收 KVCS set，忽略其他帧）。"""
+    out = []
+    for buf in frames:
+        root, _ = Chunk.parse(buf, 0)
+        title = root.subs[0]
+        if title.as_str() != 'KeyValueChangeSet':
+            continue                       # subscriberesponse 等非 KVCS 帧
+        action = title.subs[0]
+        assert action.as_str() == 'set', f'action={action.as_str()!r}'
+        for table in action.subs:
+            out.append((table.as_str(), pb_parse(table.subs[0].data)))
+    return out
+
+
+def test_subscribeplayerview_pushes_faction_rows():
+    """登录订阅必须推 faction 表 3 行（id==factiontemplateid），且在
+    subscriberesponse 之前——客户端 viewSubscribtionSynced 前数据须就位。"""
+    writer = _LoginWriter()
+    asyncio.run(views_handlers.handle_subscribe(
+        _LoginSess(), writer, 778899, 'subscribeplayerview', b''))
+
+    tables = _login_kvcs_tables(writer.frames)
+    seq = [t for t, _ in tables]
+    faction_rows = [f for t, f in tables if t == 'faction']
+
+    assert len(faction_rows) == 3, \
+        f'登录应推 faction ×3，实际 {len(faction_rows)}（seq={seq}）'
+    ids = sorted(int(f.get(1, 0) or 0) for f in faction_rows)
+    assert ids == [1, 2, 3], f'faction 行 id 必须==模板 id，实际 {ids}'
+    for f in faction_rows:
+        assert int(f.get(1, 0) or 0) == int(f.get(2, 0) or 0), \
+            f'faction 行 id({f.get(1)}) != factiontemplateid({f.get(2)})'
+
+    # 回归：war/player 基础推送仍在且先于 faction（不因新增推送破坏原链路）
+    assert seq[:2] == ['war', 'player'], f'war/player 应最先推送，实际 {seq}'
+
+    # faction 推送必须先于 subscriberesponse（最后一帧为响应帧）
+    last_root, _ = Chunk.parse(writer.frames[-1], 0)
+    assert last_root.subs[0].as_str() == 'subscriberesponse', \
+        f'最后一帧应为 subscriberesponse，实际 {last_root.subs[0].as_str()!r}'

@@ -355,6 +355,11 @@ def main():
                   matchmaking.PMS_TO_MISSION.get(r.get('pms_id')) == 900007]
         check('小队行缺失 → 降级散人队且 squad_db_id=0',
               len(sess9c) == 1 and sess9c[0].get('squad_db_id') == 0)
+        # 散人自建队默认名按本局 (阵营, 兵种) 从 1 编号（faction=3, tmpl=1）
+        auto9c = list(matchmaking._MM_MISSION_SQUADS[900007].values())
+        check('散人自建队默认名 → "Infantry Squad 1"（按阵营编号）',
+              len(auto9c) == 1 and auto9c[0]['name'] == 'Infantry Squad 1',
+              f'name={auto9c[0]["name"]!r}' if auto9c else 'no squad row')
 
         # ---- 12. _handle_join 小队分支路由：InBattle 掉线重连回原局 ----
         # 修复前：_squad_eligible_members 过滤 InBattle → (squad, []) →
@@ -426,6 +431,108 @@ def main():
             matchmaking._join_existing_mission = old_rejoin
             matchmaking._enqueue_squad = old_enqueue
             matchmaking.STORE = old_store
+
+        # ---- 13. 将军不参战（官方设计：General 只在大地图指挥）----
+        # 修复前：general（actionid=7 与伞兵同）不挡 → 混进战斗当伞兵。
+        from wardb import is_general_character
+
+        check('wardb：general 模板识别（id=7 命中，其余兵种/未知否）',
+              is_general_character(7) and not is_general_character(1)
+              and not is_general_character(4) and not is_general_character(0))
+
+        gpid = 999
+        calls13 = {'rejoin': [], 'enqueue': []}
+
+        class Store13:
+            async def list_characters(self, p):
+                return [{'id': 501, 'faction': 3, 'name': 'GenChar',
+                         'combat_xp': 0, 'template': 7}]
+
+        class Sess13:
+            player_id = gpid
+            username = 'GeneralUser'
+            playerview_cmd = None
+
+            async def ensure_player(self):
+                return gpid
+
+        async def fake_rejoin13(p, mid, e, c):
+            calls13['rejoin'].append(p)
+
+        async def fake_enqueue13(squad, members, gm, presets, req_mid):
+            calls13['enqueue'].append([m['player_id'] for m in members])
+
+        async def fake_eligible13(p):
+            return ({'id': 556}, [])       # 即便可达小队路径也应先被拒
+
+        old13 = (matchmaking.STORE, matchmaking._join_existing_mission,
+                 matchmaking._enqueue_squad, matchmaking._squad_eligible_members)
+        matchmaking.STORE = Store13()
+        matchmaking._join_existing_mission = fake_rejoin13
+        matchmaking._enqueue_squad = fake_enqueue13
+        matchmaking._squad_eligible_members = fake_eligible13
+        try:
+            w13 = FakeWriter()
+            asyncio.run(matchmaking._handle_join(
+                Sess13(), w13, 30, pb_varint(1, 501)))
+            check('将军 join → 拒绝（JoinMatchMakingResponse f1=0）',
+                  w13.data.endswith(b'\x08\x00'),
+                  f'data={w13.data!r}')
+            check('将军 join → 不入池不回局不进小队路径',
+                  not calls13['rejoin'] and not calls13['enqueue']
+                  and gpid not in matchmaking._MM_QUEUES
+                  and gpid not in matchmaking.PLAYER_SELECTED_CHAR,
+                  f'calls={calls13}')
+        finally:
+            matchmaking.STORE = old13[0]
+            matchmaking._join_existing_mission = old13[1]
+            matchmaking._enqueue_squad = old13[2]
+            matchmaking._squad_eligible_members = old13[3]
+        matchmaking.PLAYER_SELECTED_CHAR.pop(gpid, None)
+
+        # 小队成员含将军 → 整队入池时被过滤（成员行无 template，走 DB 反查）
+        from state import FLASH_SESSIONS
+
+        class Flash13:
+            playerview_cmd = 101
+
+        class Store13b:
+            async def get_squad_for_player(self, p):
+                return {'id': 556, 'name': 'MixedSquad'}
+
+            async def list_squad_members(self, sid):
+                return [
+                    {'player_id': 990, 'member_id': 9901, 'id': 9901,
+                     'gamertag': 'GenMate', 'char_name': 'GenChar',
+                     'combat_xp': 0, 'faction': 3, 'character_id': 501,
+                     'status': 2},
+                    {'player_id': 991, 'member_id': 9911, 'id': 9911,
+                     'gamertag': 'RifleMate', 'char_name': 'RifleChar',
+                     'combat_xp': 0, 'faction': 3, 'character_id': 502,
+                     'status': 2},
+                ]
+
+            async def list_characters(self, p):
+                # 990=将军成员（char 501/tmpl 7）991=步兵队长（char 502/tmpl 1）
+                if int(p) == 990:
+                    return [{'id': 501, 'faction': 3, 'name': 'GenChar',
+                             'combat_xp': 0, 'template': 7}]
+                return [{'id': 502, 'faction': 3, 'name': 'RifleChar',
+                         'combat_xp': 0, 'template': 1}]
+
+        FLASH_SESSIONS['GenMate'] = Flash13()
+        FLASH_SESSIONS['RifleMate'] = Flash13()
+        old13b = matchmaking.STORE
+        matchmaking.STORE = Store13b()
+        try:
+            _, elig13 = asyncio.run(matchmaking._squad_eligible_members(991))
+            check('小队整队入池：将军成员被过滤、步兵保留',
+                  [m['player_id'] for m in (elig13 or [])] == [991],
+                  f'eligible={[m["player_id"] for m in (elig13 or [])]}')
+        finally:
+            matchmaking.STORE = old13b
+            FLASH_SESSIONS.pop('GenMate', None)
+            FLASH_SESSIONS.pop('RifleMate', None)
 
         # ---- 清理（模块级全局，防污染其它测试） ----
         for mid in (900001, 900002, 900003, 900004, 900005, 900006, 900007):
