@@ -265,11 +265,12 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
     # ReportMissionStatusRequest f2 出生上报扣减后此处轮询即递减）
     res_msgs = _msg_army_resource_list(*_layout_args(),
                                        counts_by_faction=matchmaking.
-                                       mission_resource_pool(mid))
+                                       mission_resource_pool(mid),
+                                       mission_id=mid)
     for r in res_msgs:                               # f2 armyResourceList
         resp_proto += pb_message(2, r)
 
-    layout = _accesspoint_layout(*_layout_args())
+    layout = _accesspoint_layout(*_layout_args(), mission_id=mid)
     sent = getattr(sess, 'ap_owners_sent', None)
     if sent is None or getattr(sess, 'ap_sync_layout', None) != layout:
         # 新连接 / 布局变化：重置增量状态。战斗服连接初值已知（BFSettings
@@ -292,11 +293,21 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
     # f5 assaultTeams：每局一个突击队（commandNode 模板按玩家阵营查
     # WarDatabase/commandnodetemplate：infantry US=103/GE=203/SU=303；
     # 与 matchmaking._assault_team_nodes / 战局详情 f4 同源；
-    # mapEntityId 用 mission_info f5 同款 WarDatabase battlefield 真实行 id）。
+    # mapEntityId 用 mission_info f5 同款 WarDatabase battlefield 真实行 id。
+    # ★ home_ap（f15 accesspointTemplateId）按阵营锚定本方出兵点（2026-09-01
+    #   随机化后 layout 首点可能是守方点——攻方 session 锚到守方点 →
+    #   AddSquad 锚点在敌方点 + 重定位前判负风险）：每方取本方拥有的点中
+    #   id 最小者；无本方点回退 layout 首点（引擎 AddSquad sub_1802BA1D0）。
     at_count = 0
-    home_ap = int(layout[0][0]) if layout else 0
+    home_by_fac = {}
+    for tmpl, owner in layout:
+        o = int(owner)
+        if o and (o not in home_by_fac or int(tmpl) < home_by_fac[o]):
+            home_by_fac[o] = int(tmpl)
+    home_ap_default = int(layout[0][0]) if layout else 0
     for s in matchmaking.PMS_TO_SESSION.values():
         fac = int(s.get('faction', 3) or 3)
+        home_ap = home_by_fac.get(fac, home_ap_default)
         at = b''
         at += pb_int64(1, int(s.get('battle_session_id', 0) or 0))  # assaultTeamId
         at += pb_int64(2, int(s.get('player_id', 0) or 0))          # ownerPlayerId
@@ -976,27 +987,28 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                         # f12 xpStatValues：士兵详情"战斗经验明细"列表
                         # （MissionBattleReportDetailedPlayerInformation
                         # setDetailedInfoListItems 按统计分类展示）
-                        # ClientBattleStatRequirement{f1 statRequirementId,
-                        # f2 statValue, f3 xpValue(fixed32 float)}
+                        # BattleStatRequirement（spbc 描述符 0x1807B42D8）：
+                        # f1 statRequirementId(varint i64), f2 statValue(varint
+                        # i32), f3 xpValue(varint i32)——C→S 侧 xpValue 是
+                        # 整数 varint，不是 fixed32 float（S→C 的
+                        # ClientBattleStatRequirement 才是 float）
                         stats = []
                         for st_raw in _all(c, 12):
                             st = _split_fields(st_raw)
                             st_id = int(_get(st, 1, 0) or 0)
                             if not st_id:
                                 continue
-                            xp_raw = _get(st, 3, b'')
-                            xp_val = struct.unpack('<f', xp_raw)[0] \
-                                if isinstance(xp_raw, (bytes, bytearray)) \
-                                and len(xp_raw) == 4 else 0.0
                             stats.append({
                                 'id': st_id,
                                 'value': int(_get(st, 2, 0) or 0),
-                                'xp': round(float(xp_val), 2),
+                                'xp': float(int(_get(st, 3, 0) or 0)),
                             })
                         chars.append({
                             'characterId': int(_get(c, 1, 0) or 0),
                             'startXp': int(_get(c, 2, 0) or 0),
                             'endXp': int(_get(c, 3, 0) or 0),
+                            'xpVetBonus': max(0, int(_get(c, 3, 0) or 0) -
+                                              int(_get(c, 2, 0) or 0)) * 25 // 100,
                             'creditEarned': credit,
                             'creditVetBonus': credit * 25 // 100,
                             'warfundEarned': warfund,
@@ -1139,8 +1151,17 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 for ch in p['characters']:
                     xp_delta = max(0, ch['endXp'] - ch['startXp'])
                     if xp_delta:
-                        await STORE.add_combat_xp(pid, ch['characterId'], xp_delta)
-                        log(f'      [DB] char {ch["characterId"]} +{xp_delta} xp')
+                        # 老兵会员 +25% XP（与货币 +25% 同策略，parse 时已
+                        # 算好入库 characters_json）。结算界面 memberXpToShow
+                        # = 基础XP + xpVeteranBonus(f4)：会员身份为真而
+                        # bonus=0 时客户端误判"已达最高等级不再加成" →
+                        # characterMaxedOutLabel"已晋升为将军"误导文案恒
+                        # 显示，故 bonus 必须随基础 XP 实发
+                        vet_xp = int(ch.get('xpVetBonus', 0) or 0)
+                        await STORE.add_combat_xp(pid, ch['characterId'],
+                                                  xp_delta + vet_xp)
+                        log(f'      [DB] char {ch["characterId"]} '
+                            f'+{xp_delta} xp(+{vet_xp}vet)')
                 # 战斗通行证分数：本局 battle score 计入当前激活赛季
                 # （未购买也累计，与官服一致；奖励仅已购买行可领）
                 if p['score']:
@@ -1218,9 +1239,20 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
     # （PMS DELETE 清 rejoin + 战报通知触发结算界面）+ 释放本场
     # combat server 实例（杀进程/释放端口，触发排队战局拉起）
     _CAPTURE_OWNERS.clear()
+    # 本局实际获得 XP 的角色（结算角色行重推用）：mm_sess['char_id'] 记录
+    # 的是进队时角色，玩家部署阶段换兵不会回写——XP 落到实际参战角色上，
+    # 重推也必须按战报角色，否则客户端人物界面等级/XP 不刷新
+    earned_chars = {}
+    for p in br_players:
+        if p.get('is_bot') or not p['player_id']:
+            continue
+        ids = [ch['characterId'] for ch in p['characters']
+               if ch['characterId'] and max(0, ch['endXp'] - ch['startXp']) > 0]
+        if ids:
+            earned_chars.setdefault(p['player_id'], set()).update(ids)
     if mission_id:
         try:
-            await _finish_mission_sessions(mission_id, report_id)
+            await _finish_mission_sessions(mission_id, report_id, earned_chars)
         except Exception as e:
             log(f'      [combat] finish mission sessions failed: {e}')
         matchmaking.release_match(mission_id)
@@ -1265,8 +1297,13 @@ def _msg_battle_report_notification(notif_id, player_id, report_id):
     return m
 
 
-async def _finish_mission_sessions(mission_id, report_id):
+async def _finish_mission_sessions(mission_id, report_id, earned_chars=None):
     """战局正常结束（earnings 已入库）对局内每名玩家收尾。
+
+    earned_chars：{player_id → {本局实际获 XP 的 characterId}}（来自战报
+    BattleReportCharacter，实际参战角色——部署阶段换兵时会话 char_id
+    不会回写）。None（_watch_proc_exit 路径，无 earnings）时退回
+    mm_sess['char_id']。
 
     与 abandon（mission.py，玩家主动放弃路径）同款收尾序列，区别在触发方是
     服务器（战斗结束客户端不会发 AbandonMissionRequest——StatusMediator 卡
@@ -1351,11 +1388,15 @@ async def _finish_mission_sessions(mission_id, report_id):
         # 只显示登录时的旧值）；rank 提升时 checkRankWasUpdated 另弹升级窗口。
         # 尾部字段必须传全：客户端 setObject 整体替换 schema，漏传 head_id 等
         # 会被抹回默认值（外观回退根因）。
-        char_id = int(mm_sess.get('char_id', 0) or 0)
-        if char_id and STORE is not None and flash.soldier_view_cmd is not None:
+        char_ids = set(earned_chars.get(pid) or []) if earned_chars else set()
+        if not char_ids:
+            sess_cid = int(mm_sess.get('char_id', 0) or 0)
+            if sess_cid:
+                char_ids = {sess_cid}
+        if char_ids and STORE is not None and flash.soldier_view_cmd is not None:
             try:
                 for ch in await STORE.list_characters(pid):
-                    if int(ch['id']) != char_id:
+                    if int(ch['id']) not in char_ids:
                         continue
                     bits = await _char_unlock_bits_for(
                         flash, ch['template'], ch['faction'], ch['id'])
@@ -1379,7 +1420,6 @@ async def _finish_mission_sessions(mission_id, report_id):
                     log(f'S->C cmd={flash.soldier_view_cmd:<4} KeyValueChangeSet '
                         f'(character {ch["name"]} id={ch["id"]} re-pushed, '
                         f'rank={new_rank}, statTs={new_ts} ★settlement refresh)')
-                    break
             except Exception as e:
                 log(f'      [combat] settlement character re-push failed '
                     f'(player={pid}): {e}')

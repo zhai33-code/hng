@@ -26,6 +26,7 @@ from wardb import (
     _E_WEAPON_AMMO_MAPPING,
     _E_WEAPON_MOD_MAPPING,
     _ITEM_UNLOCK_UIDS,
+    _LEVEL0_UIDS,
     _MOD_MAPPING_IDS,
     _PRICING_MAP,
     _RANK_META_LEVEL,
@@ -218,6 +219,20 @@ async def _char_unlock_bits_for(sess, template, faction, char_id=0):
                 for (uid, meta_lv) in _RIBBON_META_LEVEL.get(str(ribbon_id), set()):
                     if meta_lv <= lv:
                         ids.add(uid)
+            # 勋带 0 级恒满足：无 XP 行的勋带等级视为 0（官方语义：勋带人人从
+            # 0 级开始，_ribbon_level_from_xp(0)==0），unlockMetaLevel==0 的解锁
+            # uid 对满足阵营/职业过滤的角色一律授予。客户端 hasCharacterUnlockedItem
+            # 纯按 unlockBits 判定（无 level 0 特判），缺这些位时兵种默认迷彩
+            # （uid 1156/1203-1216）会在军服界面显示成"需解锁"（2026-09-01 反馈）。
+            # level=0 条目不含 itemType=1（职业模板），不影响"职业招募走
+            # PlayerLevelUnlock"的设计；历史泄漏 uid（299/339/529/516/87/94/122/50）
+            # 均 level>=1，不由此路径授予。
+            for uid in _LEVEL0_UIDS:
+                _fac, _ct = _UNLOCK_UID_META.get(uid, (0, 0))
+                if (_fac and _fac != int(faction)) or \
+                   (_ct and _ct != int(template)):
+                    continue
+                ids.add(uid)
             # eRank（军衔）解锁：unlockType=2、metaName 恒 '0' 哨兵——
             # First Blood badge（rank 1）、职业模板（rank 5/6/8/9）、
             # 小队自定义点数（rank 12+）等 26 条。旧实现漏掉此路径，

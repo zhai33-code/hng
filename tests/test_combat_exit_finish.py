@@ -135,8 +135,50 @@ def test_watch_proc_exit_normal_path_no_finish():
         _cleanup(mid, pms, 'ExitGuyC')
 
 
+def test_finish_sessions_repush_earned_chars():
+    """结算角色行重推必须按战报实际获 XP 的角色，而非会话 char_id。
+
+    事故（2026-09-01）：进队时角色 11，部署阶段换兵为 12（会话 char_id
+    不回写），XP 落到 12 → 重推却推 11，人物界面等级/XP 不刷新。"""
+    mid, pms = 987004, 987104
+    writer = _MockWriter()
+    flash = types.SimpleNamespace(writer=writer, playerview_cmd=8,
+                                  soldier_view_cmd=9)
+    FLASH_SESSIONS['ExitGuyD'] = flash
+    matchmaking.PMS_TO_MISSION[pms] = mid
+    matchmaking.PMS_TO_SESSION[pms] = {
+        'player_id': 1, 'gamertag': 'ExitGuyD', 'squad_db_id': 0,
+        'char_id': 11}                       # 进队时角色（非实际参战）
+
+    class _Store:
+        @staticmethod
+        async def list_characters(pid):
+            return [{'id': 11, 'name': 'Konrad', 'faction': 2, 'template': 0,
+                     'combat_xp': 0},
+                    {'id': 12, 'name': 'Bastian', 'faction': 2, 'template': 0,
+                     'combat_xp': 70}]
+
+    old_store = combat_handlers.STORE
+    old_bits = combat_handlers._char_unlock_bits_for
+    combat_handlers.STORE = _Store()
+
+    async def _bits(sess, template, faction, char_id=0):
+        return []
+    combat_handlers._char_unlock_bits_for = _bits
+    try:
+        asyncio.run(combat_handlers._finish_mission_sessions(
+            mid, 555, {1: {12}}))             # 战报：实际获 XP 的是 12
+        assert b'Bastian' in writer.sent, '未重推实际参战角色 12'
+        assert b'Konrad' not in writer.sent, '不应重推会话残留角色 11'
+    finally:
+        combat_handlers.STORE = old_store
+        combat_handlers._char_unlock_bits_for = old_bits
+        _cleanup(mid, pms, 'ExitGuyD')
+
+
 if __name__ == '__main__':
     test_finish_sessions_without_report()
     test_watch_proc_exit_finishes_sessions()
     test_watch_proc_exit_normal_path_no_finish()
-    print('test_combat_exit_finish: 3 项全部通过')
+    test_finish_sessions_repush_earned_chars()
+    print('test_combat_exit_finish: 4 项全部通过')

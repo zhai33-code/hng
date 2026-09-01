@@ -145,45 +145,79 @@ check('BattleFieldSettings f12 accesspoints owner 与 layout 同值',
       all(_f12.get(int(t)) == int(o) for t, o in _layout),
       f'f12={_f12} layout={_layout}')
 
-print('== 5b) Assault 图（Airfield preset 26）：末点=防守方 其余=进攻方 + f7 O点=防守方')
-# assault-map-spawn-investigation.md §6.1/§6.2：Encounter 交替；Assault 出兵点
-# 归进攻方、★末点留防守方（引擎判负条件：0 出兵点 → "has lost their
-# accesspoints" 秒判负 + AI 小队无处部署，0831 实测）；f7 O 点=防守方。
+print('== 5b) Assault 图（Airfield preset 26）：随机激活线（守方 1 + 攻方 2~3）')
+# 2026-09-01 随机化（wardb.assault_ap_decision，按 mission_id 播种确定性）：
+# 防守方随机 1 条出兵线（引擎判负约束：守方 0 出兵点 → "has lost their
+# accesspoints" 秒判负 + AI 小队无处部署，0831 实测）；进攻方随机 2~3 条
+# （受图点数封顶）；★未激活线不开启（不进 layout/f6/f12，非中立 owner=0）。
+# 三方（layout / 大厅简报 f6 / BattleFieldSettings f12）必须同 mission_id 同源。
 from wardb import (_load_objective_capturepoints, _load_preset as _lp,
-                   _missiontype_for_gamemap)
+                   _missiontype_for_gamemap, assault_ap_decision)
 if _missiontype_for_gamemap(int(_lp(26).get(3, 0) or 0)) != 1:
     print('  SKIP 本机 WarDatabase 无 Airfield 行（preset 26 回退 Encounter），Assault 分支跳过')
 else:
-    _lay26 = _accesspoint_layout(26, 2, 3)
-    check('Airfield layout 末点=防守方(2) 其余=进攻方(3)',
-          _lay26 and len(_lay26) >= 3 and
-          all(o == (2 if i == len(_lay26) - 1 else 3)
-              for i, (_, o) in enumerate(_lay26)),
+    _gm26 = int(_lp(26).get(3, 0) or 0)
+    _MID = 990002
+    _lay26 = _accesspoint_layout(26, 2, 3, mission_id=_MID)
+    _owners26 = [int(o) for _, o in _lay26]
+    check('Airfield layout 守方恰 1 点、攻方 2~3 点（未激活线不出现）',
+          _owners26.count(2) == 1 and _owners26.count(3) in (2, 3) and
+          all(o in (2, 3) for o in _owners26) and len(_owners26) in (3, 4),
+          f'owners={_owners26}')
+    check('同 mission_id 决策确定性（两次调用同布局）',
+          _accesspoint_layout(26, 2, 3, mission_id=_MID) == _lay26 and
+          assault_ap_decision(_gm26, _MID) == assault_ap_decision(_gm26, _MID),
           f'layout={_lay26}')
+    # 多 mission_id 样本不变量（每局随机但结构恒成立）
+    _bad = []
+    for _m in (990010, 990011, 990012, 990013, 990014, 990015):
+        _ow = [int(o) for _, o in _accesspoint_layout(26, 2, 3, mission_id=_m)]
+        if not (_ow.count(2) == 1 and _ow.count(3) in (2, 3) and
+                all(o in (2, 3) for o in _ow)):
+            _bad.append((_m, _ow))
+    check('多局样本不变量恒成立（守 1 + 攻 2~3，无中立点）',
+          not _bad, f'bad={_bad}')
     _det26 = {'preset': 26, 'attacker_faction': 3, 'defender_faction': 2,
               'players': [{'player_id': 1, 'gamertag': 'atk1', 'faction': 3}],
               'map_entity_id': 112741325}
-    _mm26 = matchmaking._msg_mission_details_response_multi(990002, _det26, 'zulu')
+    _mm26 = matchmaking._msg_mission_details_response_multi(_MID, _det26, 'zulu')
+    # 展示层（大厅简报）：f6 只发攻方激活线（官方观感守方仅拥有 O 点，
+    # 守方线/未激活线不进 f6/f7 → 客户端 auto 激活线判定不画该线）
+    _atk26 = {int(t): int(o) for t, o in _lay26 if int(o) == 3}
     _f6a = _repeated_map(_mm26, 6, 1, 2)
-    check('大厅 f6 Assault 末点=防守方 其余=进攻方 且与 layout 同源',
-          _f6a and len(_f6a) == len(_lay26) and
-          all(_f6a.get(int(t)) == int(o) for t, o in _lay26),
-          f'f6={_f6a} layout={_lay26}')
+    check('大厅 f6 只发攻方激活线（守方线不进展示层，⊂ 战斗 layout）',
+          _f6a and _f6a == _atk26,
+          f'f6={_f6a} atk={_atk26}')
     _bf26 = warserver_messages._msg_response_battlefield_settings(
-        26, 2, 3, True, False, 1, 0, None, counts_by_faction=None)
+        26, 2, 3, True, False, 1, 0, None, counts_by_faction=None,
+        mission_id=_MID)
     _f12a = _repeated_map(_bf26, 12, 3, 1)
-    check('BattleFieldSettings f12 Assault 与 layout 同源（末点=防守方）',
+    check('BattleFieldSettings f12 Assault 与 layout 同源（同 mission_id）',
           _f12a and len(_f12a) == len(_lay26) and
           all(_f12a.get(int(t)) == int(o) for t, o in _lay26),
           f'f12={_f12a} layout={_lay26}')
     _objs = set(_load_objective_capturepoints(int(_lp(26).get(3, 0) or 0)))
     check('Airfield O 点识别非空（CapturepointTemplate f4 objectiveId）',
           bool(_objs), f'objs={_objs}')
+    # f7 只发 O 点(守) + 攻方激活线入口据点(挂攻方 AP，攻)——
+    # 守方线/未激活线/线中段据点均不下发（客户端 auto 激活线判定按
+    # f7 owner!=0 首字母 → 不发的线图上不画）
+    from wardb import _capturepoint_ap_map
+    _cp_ap26 = _capturepoint_ap_map(_gm26)
+    _expect_f7 = {cp: 2 for cp in _objs}
+    _expect_f7.update({cp: 3 for cp, ap in _cp_ap26.items()
+                       if ap in _atk26})
     _f7a = _repeated_map(_mm26, 7, 3, 4)             # f3=模板 f4=owner
-    check('大厅 f7 O点=防守方(2)、其余=0 中立',
-          _f7a and all(v == (2 if int(k) in _objs else 0)
-                       for k, v in _f7a.items()),
-          f'f7={_f7a} objs={_objs}')
+    check('大厅 f7 只发 O点(守)+攻方线入口(攻)（守方线/禁线据点不下发）',
+          _f7a and _f7a == _expect_f7,
+          f'f7={_f7a} expect={_expect_f7}')
+    # f4 守方突击队锚 ASSAULT_DEFENDER_LOGO_AP(8)（全库无据点挂靠 →
+    # 客户端次选路径画地图中心=O 区域）；攻方锚=攻方激活线最小 id
+    _f4a = _repeated_map(_mm26, 4, 3, 1)             # f3=锚点 f1=faction行id
+    check('f4 守方 logo 锚=8（画中心）、攻方锚=攻方线最小 id',
+          matchmaking.ASSAULT_DEFENDER_LOGO_AP in _f4a and
+          len(_f4a) == 2 and min(_atk26) in _f4a,
+          f'f4={_f4a}')
 
 print(f'\nresult: ok={ok} fail={fail}')
 sys.exit(1 if fail else 0)

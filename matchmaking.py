@@ -35,9 +35,10 @@ from protocol import (
 )
 from state import FLASH_SESSIONS, PLAYER_SELECTED_CHAR, PUBLIC_HOST, STORE
 from wardb import (
-    _load_accesspoint_templates, _load_capturepoint_templates,
-    _load_objective_capturepoints, _load_preset, _missiontype_for_gamemap,
-    _rank_from_combat_xp, battlefield_entity_for_gamemap, battlefield_pos,
+    _capturepoint_ap_map, _load_accesspoint_templates,
+    _load_capturepoint_templates, _load_objective_capturepoints,
+    _load_preset, _missiontype_for_gamemap, _rank_from_combat_xp,
+    assault_ap_decision, battlefield_entity_for_gamemap, battlefield_pos,
     commandnode_template, is_general_character, preset_scene,
     squad_template_for_character, squad_template_name,
 )
@@ -453,6 +454,12 @@ MISSION_HOSTING_CENTER_ID = random.getrandbits(63)
 # 客户端 FactionTable(xmlTag='faction') 只有收到这些 set 才有数据；行 id 与
 # GMD/PMS/社交列表引用同源即可（getFromId 有效性不受数值大小影响）。
 FACTION_ROW_IDS = {tmpl: tmpl for tmpl in (1, 2, 3)}
+
+# Assault 简报守方阵营 logo 锚点：Mill A 点（全库无据点挂靠 AP）——客户端
+# setupMissionAssaultTeamOnMap 次选路径把 logo 画在地图中心（O 点区域，
+# BattlefieldUtilities.as L99-105）；f4 仅驱动大厅 logo 定位，战斗侧
+# combat.py f5 home_ap 仍锚真实守方线出兵点（引擎判负/部署必需）
+ASSAULT_DEFENDER_LOGO_AP = 8
 FACTION_SUPREME_COMMANDS = {tmpl: random.getrandbits(63) for tmpl in (1, 2, 3)}
 
 
@@ -950,15 +957,27 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
     ai_faction = _rival_faction(player_faction)
     rfid = FACTION_ROW_IDS[player_faction]   # 我方 faction 行 id
     afid = FACTION_ROW_IDS[ai_faction]       # AI 方 faction 行 id
-    aps = _mission_accesspoints(gamemap_id)
+    aps = _mission_accesspoints(gamemap_id)   # 不截断（5 线图全参与）
     ours_ap, theirs_ap = aps[0], aps[1]
     # ★按 missiontype 分支（assault-map-spawn-investigation.md §6.1/§6.2）：
-    # Assault 出兵点归进攻方、★末点留防守方（引擎判负条件：防守方 0 出兵点
-    # → "has lost their accesspoints" 秒判负 + AI 小队无处部署，0831 实测）。
-    # f4/f5 突击队与资源锚点随归属走；Encounter 维持交替（Mill 锚点）。
+    # Assault 出兵线随机激活（wardb.assault_ap_decision，按 mission_id 播种，
+    # 与战斗侧 _accesspoint_layout/BattleFieldSettings f12 同源同值）：
+    # 防守方随机 1 条（引擎判负约束：守方 0 出兵点 → "has lost their
+    # accesspoints" 秒判负 + AI 小队无处部署，0831 实测）、我方（进攻方）
+    # 随机 2~3 条、★未激活线不开启。Encounter（Mill 等无连线图）维持
+    # 原有交替方案不改动。
     assault = _missiontype_for_gamemap(gamemap_id) == 1
+    owner_map = None
+    d_ap = None
+    atk_aps = ()
     if assault:
-        theirs_ap = aps[-1]
+        d_ap, a_aps, _inactive = assault_ap_decision(gamemap_id, mission_id)
+        theirs_ap = d_ap
+        ours_ap = min(a_aps) if a_aps else aps[0]
+        atk_aps = set(int(t) for t in a_aps)
+        owner_map = {int(d_ap): ai_faction}
+        for t in a_aps:
+            owner_map[int(t)] = player_faction
     m = b''
     m += pb_int32(1, 0)  # 他服私服实测 = 0（非 ResponseCodes.ok=1）
     m += pb_message(2, _msg_mission_info(mission_id, player_id, zulu_time,
@@ -967,13 +986,20 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
     m += pb_message(3, pb_int64(1, rfid) +
                     pb_message(2, pb_string(1, gamertag)))
     m += pb_message(3, pb_int64(1, afid))
-    # f4 突击队：本局 AT 抽取名单跨阵营翻译（无池回退官方锚点 ×2）
+    # f4 突击队：本局 AT 抽取名单跨阵营翻译（无池回退官方锚点 ×2）；
+    # ★守方锚 ASSAULT_DEFENDER_LOGO_AP（Mill A 点，全库无据点挂靠）——
+    # 客户端 setupMissionAssaultTeamOnMap 次选路径把阵营 logo 画在
+    # ★地图中心（O 点区域，官方简报守方 logo 位置），而非外围守方线
+    # （BattlefieldUtilities.as L99-105；f4 只驱动大厅 logo 定位，
+    # 战斗侧 home_ap 走 combat.py f5 仍锚真实守方线，两者独立）
     for cmd_node in _assault_team_nodes(player_faction, mission_id):
         m += pb_message(4, pb_int64(1, rfid) + pb_int64(2, cmd_node) +
                         pb_int64(3, ours_ap) + pb_int64(4, 0))
+    defender_logo_ap = (ASSAULT_DEFENDER_LOGO_AP
+                        if assault else theirs_ap)
     for cmd_node in _assault_team_nodes(ai_faction, mission_id):
         m += pb_message(4, pb_int64(1, afid) + pb_int64(2, cmd_node) +
-                        pb_int64(3, theirs_ap) + pb_int64(4, 0))
+                        pb_int64(3, defender_logo_ap) + pb_int64(4, 0))
     # f5 资源：从本局资源池渲染（与战斗内 f2/f14 同源同值，消耗后递减）；
     # 每方每类一条挂该方出兵点（客户端跨点求和 → 显示即池剩余量）
     pool = mission_resource_pool(mission_id)
@@ -990,21 +1016,41 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
                         pb_int64(4, theirs_counts.get(res_cat, 0)) +
                         pb_bool(5, res_air))
     # f6 出兵点归属：Encounter 首个=我方、其余交替（Mill 实测 8=我方, 15=AI）；
-    # Assault 末点=防守方、其余归我方（进攻方）——与战斗侧 _accesspoint_layout 同规则
-    if assault:
+    # Assault 展示层只发★攻方激活线（官方简报守方仅拥有中心 O 点——
+    # 守方线/未激活线均不进 f6，图上不显示）——与战斗侧 _accesspoint_layout
+    # 同 mission_id 同源（战斗 f12 仍含守方线：引擎判负/部署必需）
+    if owner_map is not None:
         for ap in aps:
-            owner = ai_faction if ap == aps[-1] else player_faction
-            m += pb_message(6, pb_int64(1, ap) + pb_int64(2, owner))
+            if int(ap) == int(d_ap):
+                continue        # 守方线：展示层不下发（logo 由 f4 画中心）
+            if int(ap) not in owner_map:
+                continue        # 未激活线：不开启不下发
+            m += pb_message(6, pb_int64(1, ap) +
+                            pb_int64(2, owner_map[int(ap)]))
     else:
         for i, ap in enumerate(aps):
             m += pb_message(6, pb_int64(1, ap) +
                             pb_int64(2, ai_faction if i % 2 else player_faction))
     # f7 据点初始归属：Encounter 全 0 中立（他服私服实测 {3:120, 4:0}）；
-    # Assault 中心 O 点=防守方（官方简报中心=守），连线段 X1/X2=0 中立
+    # Assault 只发★O 点（守方）+ 攻方激活线入口据点（挂攻方 AP，攻方色）
+    # ——客户端 auto 路径 getAutoGeneratedActiveLines 按 owner!=0 据点名
+    # 首字母判激活线（BattlefieldStatusView.as L152-171/L310-327，需
+    # MissionInfo f7 isAutogenerated=1 已恒发）：守方线/未激活线据点不发
+    # → 图上不画该线；O 点（objectiveId 恒显示）涂守方色=官方观感
     obj_cps = set(_load_objective_capturepoints(gamemap_id)) if assault else set()
-    for cp in _mission_capturepoints(gamemap_id):
-        cp_owner = ai_faction if cp in obj_cps else 0
-        m += pb_message(7, pb_int32(3, cp) + pb_int32(4, cp_owner))
+    if assault:
+        cp_ap = _capturepoint_ap_map(gamemap_id)
+        for cp in _mission_capturepoints(gamemap_id):
+            if cp in obj_cps:
+                cp_owner = ai_faction
+            elif cp_ap.get(cp) in atk_aps:
+                cp_owner = player_faction
+            else:
+                continue        # 守方线/未激活线/线中段：展示层不下发
+            m += pb_message(7, pb_int32(3, cp) + pb_int32(4, cp_owner))
+    else:
+        for cp in _mission_capturepoints(gamemap_id):
+            m += pb_message(7, pb_int32(3, cp) + pb_int32(4, 0))
     pos = battlefield_pos(MISSION_MAP_ENTITY_ID)
     m += pb_float(8, pos[0])   # posX（mapEntityId 对应 battlefield 行坐标）
     m += pb_float(9, pos[1])   # posY
@@ -2234,15 +2280,27 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     afid = FACTION_ROW_IDS[defender]
     preset = int(details.get('preset') or 0) or AI_MISSIONPRESET
     gamemap_id = int(_load_preset(preset).get(3, 0) or 0) or 13
-    aps = _mission_accesspoints(gamemap_id)
+    aps = _mission_accesspoints(gamemap_id)   # 不截断（5 线图全参与）
     ours_ap, theirs_ap = aps[0], aps[1]
     # ★按 missiontype 分支（assault-map-spawn-investigation.md §6.1/§6.2）：
-    # Assault 出兵点归进攻方、★末点留防守方（引擎判负条件：防守方 0 出兵点
-    # → "has lost their accesspoints" 秒判负 + AI 小队无处部署，0831 实测）。
-    # f4/f5 突击队与资源锚点随归属走；Encounter 维持交替（Mill 锚点 8=攻/15=守）。
+    # Assault 出兵线随机激活（wardb.assault_ap_decision，按 mission_id 播种，
+    # 与战斗侧 _accesspoint_layout/BattleFieldSettings f12 同源同值）：
+    # 防守方随机 1 条（引擎判负约束：守方 0 出兵点 → "has lost their
+    # accesspoints" 秒判负 + AI 小队无处部署，0831 实测）、进攻方随机
+    # 2~3 条、★未激活线不开启。Encounter（Mill 等无连线图）维持原有
+    # 交替方案不改动（Mill 锚点 8=攻/15=守）。
     assault = _missiontype_for_gamemap(gamemap_id) == 1
+    owner_map = None
+    d_ap = None
+    atk_aps = ()
     if assault:
-        theirs_ap = aps[-1]
+        d_ap, a_aps, _inactive = assault_ap_decision(gamemap_id, mission_id)
+        theirs_ap = d_ap
+        ours_ap = min(a_aps) if a_aps else aps[0]
+        atk_aps = set(int(t) for t in a_aps)
+        owner_map = {int(d_ap): defender}
+        for t in a_aps:
+            owner_map[int(t)] = attacker
     pos = battlefield_pos(int(details.get('map_entity_id') or 0)
                           or MISSION_MAP_ENTITY_ID)
 
@@ -2263,13 +2321,17 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     for tag in dtag:
         dfd += pb_message(2, pb_string(1, tag))
     m += pb_message(3, dfd)
-    # f4 突击队：本局 AT 抽取名单跨阵营翻译（无池回退官方锚点 ×2）
+    # f4 突击队：本局 AT 抽取名单跨阵营翻译（无池回退官方锚点 ×2）；
+    # ★守方锚 ASSAULT_DEFENDER_LOGO_AP（客户端次选路径画地图中心=O 区域，
+    # 见单人版注释；战斗侧 home_ap 独立锚真实守方线）
     for cmd_node in _assault_team_nodes(attacker, mission_id):
         m += pb_message(4, pb_int64(1, rfid) + pb_int64(2, cmd_node) +
                         pb_int64(3, ours_ap) + pb_int64(4, 0))
+    defender_logo_ap = (ASSAULT_DEFENDER_LOGO_AP
+                        if assault else theirs_ap)
     for cmd_node in _assault_team_nodes(defender, mission_id):
         m += pb_message(4, pb_int64(1, afid) + pb_int64(2, cmd_node) +
-                        pb_int64(3, theirs_ap) + pb_int64(4, 0))
+                        pb_int64(3, defender_logo_ap) + pb_int64(4, 0))
     # f5 资源：从本局资源池渲染（与战斗内 f2/f14 同源同值，消耗后递减）；
     # 每方每类一条挂该方出兵点（客户端跨点求和 → 显示即池剩余量）
     pool = mission_resource_pool(mission_id)
@@ -2286,22 +2348,39 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
                         pb_int64(4, dfd_counts.get(res_cat, 0)) +
                         pb_bool(5, res_air))
     # f6 出兵点归属：Encounter 首个=进攻方、其余交替（Mill 实测 8=进攻,
-    # 15=防守；f2 为 factionTemplateId）；Assault 末点=防守方、其余归
-    # 进攻方——与战斗侧 _accesspoint_layout 同规则
-    if assault:
+    # 15=防守；f2 为 factionTemplateId）；Assault 展示层只发★攻方激活线
+    # （官方简报守方仅拥有中心 O 点，守方线/未激活线不进 f6）——与战斗侧
+    # _accesspoint_layout 同 mission_id 同源（战斗 f12 仍含守方线）
+    if owner_map is not None:
         for ap in aps:
-            owner = defender if ap == aps[-1] else attacker
-            m += pb_message(6, pb_int64(1, ap) + pb_int64(2, owner))
+            if int(ap) == int(d_ap):
+                continue        # 守方线：展示层不下发（logo 由 f4 画中心）
+            if int(ap) not in owner_map:
+                continue        # 未激活线：不开启不下发
+            m += pb_message(6, pb_int64(1, ap) +
+                            pb_int64(2, owner_map[int(ap)]))
     else:
         for i, ap in enumerate(aps):
             m += pb_message(6, pb_int64(1, ap) +
                             pb_int64(2, defender if i % 2 else attacker))
     # f7 据点初始归属：Encounter 全 0 中立（他服私服实测 {3:120, 4:0}）；
-    # Assault 中心 O 点=防守方（官方简报中心=守），连线段 X1/X2=0 中立
+    # Assault 只发★O 点（守方）+ 攻方激活线入口据点（挂攻方 AP，攻方色）
+    # ——客户端 auto 激活线判定见单人版注释：守方线/未激活线据点不发
+    # → 图上不画该线；O 点涂守方色=官方观感
     obj_cps = set(_load_objective_capturepoints(gamemap_id)) if assault else set()
-    for cp in _mission_capturepoints(gamemap_id):
-        cp_owner = defender if cp in obj_cps else 0
-        m += pb_message(7, pb_int32(3, cp) + pb_int32(4, cp_owner))
+    if assault:
+        cp_ap = _capturepoint_ap_map(gamemap_id)
+        for cp in _mission_capturepoints(gamemap_id):
+            if cp in obj_cps:
+                cp_owner = defender
+            elif cp_ap.get(cp) in atk_aps:
+                cp_owner = attacker
+            else:
+                continue        # 守方线/未激活线/线中段：展示层不下发
+            m += pb_message(7, pb_int32(3, cp) + pb_int32(4, cp_owner))
+    else:
+        for cp in _mission_capturepoints(gamemap_id):
+            m += pb_message(7, pb_int32(3, cp) + pb_int32(4, 0))
     m += pb_float(8, pos[0])   # posX（battlefield 行坐标）
     m += pb_float(9, pos[1])   # posY
     return m

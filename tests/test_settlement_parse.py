@@ -113,6 +113,7 @@ class _FakeStore:
     def __init__(self):
         self.saved = None
         self.currency = []
+        self.xp = []
 
     async def save_battle_report(self, report, players):
         self.saved = (report, players)
@@ -123,6 +124,7 @@ class _FakeStore:
         return {'credits': credits, 'warfunds': warfunds}
 
     async def add_combat_xp(self, pid, cid, xp):
+        self.xp.append((pid, cid, xp))
         return xp
 
     async def add_battle_pass_score(self, pid, season, score):
@@ -174,6 +176,9 @@ def test_ribbon_start_end_and_vet_bonus_persisted():
     # f10 嵌套 valueEarned=2101 / f11=5678 → 老兵 +25%
     assert ch['creditEarned'] == 2101 and ch['creditVetBonus'] == 525
     assert ch['warfundEarned'] == 5678 and ch['warfundVetBonus'] == 1419
+    # startXp=1000→endXp=2500：基础 1500 + 25%老兵加成 375 一并入账
+    assert ch['xpVetBonus'] == 375, ch['xpVetBonus']
+    assert fake.xp == [(1, 4, 1875)], fake.xp
     # PlayerBattleResult 货币 120cr/340wf → +25% 入账
     assert fake.currency == [(1, 150, 425)], fake.currency
 
@@ -247,10 +252,10 @@ def _pb_fixed32(field, value):
 
 def test_capturepoints_and_xpstats_parse_and_persist():
     """f7 据点归属 + 角色 f12 xpStatValues 解析入库（结算界面缺项补全）。"""
-    # BattleReportCharacter f12：ClientBattleStatRequirement
-    # {f1 statRequirementId, f2 statValue, f3 xpValue(fixed32)}
+    # BattleReportCharacter f12：BattleStatRequirement（spbc 描述符
+    # 0x1807B42D8 实锤：C→S 侧 f3 xpValue 是 varint int32，非 fixed32 float）
     stat = (pb_varint(1, 5001) + pb_varint(2, 7)
-            + _pb_fixed32(3, 12.5))
+            + pb_varint(3, 12))
     earn = pb_varint(1, 5678)
     char = (pb_varint(1, 4) + pb_varint(2, 1000) + pb_varint(3, 2500)
             + pb_msg(11, earn) + pb_msg(12, stat))
@@ -280,9 +285,11 @@ def test_capturepoints_and_xpstats_parse_and_persist():
     # f7 据点归属透传入库
     assert rep['capturepoints'] == [{'id': 101, 'owner': 3},
                                     {'id': 102, 'owner': 0}], rep['capturepoints']
-    # 角色 f12 统计项：id/value/xp（float）
+    # 角色 f12 统计项：id/value/xp（varint int → float 落库）
     ch = players[0]['characters'][0]
-    assert ch['stats'] == [{'id': 5001, 'value': 7, 'xp': 12.5}], ch['stats']
+    assert ch['stats'] == [{'id': 5001, 'value': 7, 'xp': 12.0}], ch['stats']
+    # XP 老兵加成（endXp-startXp=1500 → +25%）：随战报入库 + 结算入账
+    assert ch['xpVetBonus'] == 375, ch['xpVetBonus']
 
 
 def test_capturepoints_fallback_from_status_overlay():

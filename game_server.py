@@ -735,13 +735,16 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             weather_tod = 1
             weather_condition = 0
             timeofday = None
-        # f14 资源从本局资源池渲染（与匹配界面 f5 / 轮询 f2 同源同值）
+        # f14 资源从本局资源池渲染（与匹配界面 f5 / 轮询 f2 同源同值）；
+        # mission_id = Assault 出兵线随机激活种子（与大厅简报 f6 / 轮询
+        # f3/f5 必须同值，wardb.assault_ap_decision 详见）
         resp_proto = _msg_response_battlefield_settings(
             preset_id, defender_faction, attacker_faction, enable_bots,
             enable_sa_bots=enable_sa_bots,
             weather_time_of_day=weather_tod, weather_condition=weather_condition,
             timeofday=timeofday,
-            counts_by_faction=matchmaking.mission_resource_pool(missionid))
+            counts_by_faction=matchmaking.mission_resource_pool(missionid),
+            mission_id=missionid)
         resp = build_response(cmd_id, 'ResponseBattleFieldSettings', resp_proto)
         writer.write(resp)
         await writer.drain()

@@ -180,26 +180,43 @@ async def push_ticket_rows(sess, writer, pid, timed=False):
 
 
 async def push_membership_rows(sess, writer, pid):
-    """推送会员 KVCS 行（PlayerMembershipItem 表）。"""
+    """推送会员 KVCS 行（PlayerMembershipItem 表）。
+
+    推送前先清扫：删已过期行、无进行中行时激活最老排队行（官方语义：
+    同一时刻只有一份在跑，多份按购买顺序排队激活）。行序保证进行中行在
+    最前（客户端 getCurrentMembership 取第一行判 isPremium）；排队行
+    expireDate/timeLeft 发空串（isCurrentMembership=false，客户端 tooltip
+    按 ShopMembershipItems.durationDays 累加排队天数算最终到期）。"""
     if STORE is None or sess.playerview_cmd is None:
         return
     try:
+        deleted, activated = await STORE.sweep_memberships(
+            pid, MEMBERSHIP_DAYS_BY_ID, _MEMBERSHIP_DAYS)
+        if deleted or activated:
+            log(f'      [DB] membership sweep player={pid}: deleted {deleted} '
+                f'expired row(s)'
+                + (f', activated id={activated["id"]} '
+                   f'template={activated["template_id"]} '
+                   f'days={activated["days"]}' if activated else ''))
         rows = await STORE.list_memberships(pid)
     except Exception as e:
         log(f'      [DB] list_memberships failed: {e}')
         return
+    queued = sum(1 for r in rows if not r['expires_at'])
     for r in rows:
+        exp = _zulu(r['expires_at'])
         m = pb_int64(1, r['id'])                          # id
         m += pb_int64(2, pid)                             # playerId
         m += pb_int64(3, r['template_id'])                # shopMembershipItemsId
         m += pb_string(4, _zulu(r['started_at']))         # acquisitionDate
-        m += pb_string(5, _zulu(r['expires_at']))         # expireDate
-        m += pb_string(7, _zulu(r['expires_at']))         # timeLeft
+        m += pb_string(5, exp)                            # expireDate
+        m += pb_string(7, exp)                            # timeLeft
         m += pb_bool(8, False)                            # onPause
         await _push_kvcs(writer, sess.playerview_cmd, b'PlayerMembershipItem', m)
     if rows:
         log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
-            f'(PlayerMembershipItem x{len(rows)}, player={pid})')
+            f'(PlayerMembershipItem x{len(rows)}, player={pid}, '
+            f'{len(rows) - queued} running, {queued} queued)')
 
 
 async def push_economy_rows(sess, writer, pid):
@@ -432,11 +449,17 @@ async def handle_add_membership(sess, writer, cmd_id, req_type, proto):
                 raise _PaymentFailed()
             if pid is not None and template_id:
                 days = MEMBERSHIP_DAYS_BY_ID.get(template_id, _MEMBERSHIP_DAYS)
-                await STORE.add_membership(int(pid), template_id,
-                                           duration_days=days,
-                                           conn=tx)
-                log(f'      [DB] add_membership player={pid} '
-                    f'template={template_id} days={days}')
+                row = await STORE.add_membership(int(pid), template_id,
+                                                 duration_days=days,
+                                                 conn=tx)
+                if row['expires_at'] is None:
+                    log(f'      [DB] add_membership player={pid} '
+                        f'template={template_id} days={days} queued '
+                        f'(row {row["id"]}, membership already active)')
+                else:
+                    log(f'      [DB] add_membership player={pid} '
+                        f'template={template_id} days={days} started '
+                        f'(row {row["id"]})')
     except _PaymentFailed:
         code = _NOT_ENOUGH.get(currency, 56)
     except Exception as e:

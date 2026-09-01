@@ -2367,15 +2367,64 @@ class PlayerStore:
 
     async def add_membership(self, player_id, template_id, duration_days=30,
                              conn=None):
-        """购买会员（AddMembershipRequest）。返回 membership 行 id。
-        传入 conn 时并入外部事务（与扣款同生共死）。"""
+        """购买会员（AddMembershipRequest）。返回插入行 {id, expires_at}。
+        传入 conn 时并入外部事务（与扣款同生共死）。
+
+        官方排队语义（客户端 PlayerModel：isCurrentMembership = expireDate
+        非空，getCurrentMembership 只认第一行判 isPremium，最终到期 =
+        当前行到期 + Σ排队行 durationDays）：已有进行中的会员
+        （expires_at > now()）→ 插排队行 expires_at=NULL，前一份到期后由
+        sweep_memberships 激活；没有 → 立即起跑。EXISTS 判定并入同一条
+        INSERT...SELECT，避免"先查后插"窗口。"""
         async with self._conn(conn) as c:
-            mid = await c.fetchval(
-                'INSERT INTO player_memberships (player_id, membership_template_id, '
-                'started_at, expires_at) VALUES ($1, $2, now(), '
-                'now() + make_interval(days => $3)) RETURNING id',
+            row = await c.fetchrow(
+                'INSERT INTO player_memberships (player_id, '
+                'membership_template_id, started_at, expires_at) '
+                'SELECT $1, $2, now(), CASE WHEN EXISTS ('
+                '  SELECT 1 FROM player_memberships WHERE player_id = $1 '
+                '  AND expires_at IS NOT NULL AND expires_at > now()) '
+                'THEN NULL ELSE now() + make_interval(days => $3) END '
+                'RETURNING id, expires_at',
                 int(player_id), int(template_id), int(duration_days))
-        return int(mid)
+        return {'id': int(row['id']), 'expires_at': row['expires_at']}
+
+    async def sweep_memberships(self, player_id, days_by_template=None,
+                                default_days=30):
+        """会员行清扫+激活（登录回放/购买后推送前调用）。
+
+        1) 删已过期行——客户端 getCurrentMembership 取表中第一行（不校验
+           是否已过期），残留过期行会把老兵判定永久卡成 false；
+        2) 无进行中行时激活最老排队行（expires_at=NULL → now() ~
+           now()+days，天数按 days_by_template[membership_template_id]）。
+        返回 (删除行数, 激活行 {id, template_id, days} 或 None)。"""
+        if days_by_template is None:
+            days_by_template = {}
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                tag = await conn.execute(
+                    'DELETE FROM player_memberships WHERE player_id = $1 '
+                    'AND expires_at IS NOT NULL AND expires_at <= now()',
+                    int(player_id))
+                deleted = int(tag.split()[-1]) if tag else 0
+                row = await conn.fetchrow(
+                    'SELECT m.id, m.membership_template_id '
+                    'FROM player_memberships m WHERE m.player_id = $1 '
+                    'AND m.expires_at IS NULL AND NOT EXISTS ('
+                    '  SELECT 1 FROM player_memberships r '
+                    '  WHERE r.player_id = $1 AND r.expires_at IS NOT NULL '
+                    '  AND r.expires_at > now()) '
+                    'ORDER BY m.id LIMIT 1', int(player_id))
+                if row is None:
+                    return deleted, None
+                days = int(days_by_template.get(
+                    int(row['membership_template_id']), default_days))
+                await conn.execute(
+                    'UPDATE player_memberships SET started_at = now(), '
+                    'expires_at = now() + make_interval(days => $2) '
+                    'WHERE id = $1', int(row['id']), days)
+                return deleted, {'id': int(row['id']),
+                                 'template_id': int(row['membership_template_id']),
+                                 'days': days}
 
     async def get_active_membership(self, player_id):
         """未过期的最新会员行或 None。"""
@@ -2512,11 +2561,16 @@ class PlayerStore:
                  'expires_at': r['expires_at']} for r in rows]
 
     async def list_memberships(self, player_id):
-        """玩家会员行（PlayerMembershipItem KVCS 源）。"""
+        """玩家会员行（PlayerMembershipItem KVCS 源）。
+
+        进行中行（expires_at 非空，过期行已由 sweep_memberships 删除）
+        在前、排队行（expires_at IS NULL）在后——客户端 getCurrentMembership
+        取表中第一行判 isPremium，行序即推送序，必须 running 在最前。"""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 'SELECT id, membership_template_id, started_at, expires_at '
-                'FROM player_memberships WHERE player_id = $1 ORDER BY id',
+                'FROM player_memberships WHERE player_id = $1 '
+                'ORDER BY (expires_at IS NULL), id',
                 int(player_id))
         return [{'id': int(r['id']),
                  'template_id': int(r['membership_template_id']),

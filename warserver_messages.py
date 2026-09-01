@@ -32,6 +32,7 @@ from wardb import (
     _load_preset,
     _rank_from_combat_xp,
     _ribbon_level_from_xp,
+    assault_ap_decision,
     battlefield_entity_for_gamemap,
     battlefield_pos,
     charactertemplate_actionid,
@@ -467,16 +468,18 @@ BF_RES_CATS = (
 
 def _accesspoint_layout(preset_id=MISSION_PRESET_ID,
                         defender_faction=BF_DEFENDER_FACTION_ID,
-                        attacker_faction=3):
+                        attacker_faction=3,
+                        mission_id=None):
     """本局通道点布局：[(accesspointtemplate, owner factionId), ...]（最多 4 点 A-D）。
 
     ★归属按 missiontype 分支（preset f4；1=Assault / 5=Encounter，
     assault-map-spawn-investigation.md §6.1）：
-    - Assault（Airfield 式四角围攻中心）：出兵点全在边缘四角且**全归进攻方**，
-      防守方 0 出兵点（靠中心 O 点出生，载具出生实体只在 O3 机场）。
-      此前对所有地图统一交替分配，防守方分到边缘角落 → 引擎
-      `Squad Relocated to Accesspoint` + f14 资源挂点 → 防守方坦克出生在
-      战斗线最边缘（2026-08-28 排查）。
+    - Assault（Airfield 式四角围攻中心）：出兵线随机激活（wardb.
+      assault_ap_decision，按 mission_id 播种确定性）——防守方随机 1 条
+      （引擎判负约束：守方 0 出兵点 → "has lost their accesspoints" 秒判负
+      + AI 小队无处部署，0831 实测）；进攻方随机 2~3 条（受图点数封顶）；
+      ★未激活线直接不进本列表（不开启——不出现在 f12/图上，官方 Airfield
+      "有时仅 3 条激活"语义；不是中立 owner=0）。
     - Encounter（Mill 式两点对峙）：交替分配，首点=进攻方出生侧（他服抓包
       实测 Mill：模板 8=进攻、15=防守）。★必须与大厅简报
       GetMissionDetailsResponse f6 同规则——起始方向互换会导致"大厅概览图
@@ -484,25 +487,28 @@ def _accesspoint_layout(preset_id=MISSION_PRESET_ID,
     combat.py 的 ActiveMissionRequestEventListResponse f3 归属状态与此同源
     （ReportMissionStatusRequest f4 捕获上报可覆盖 combat._CAPTURE_OWNERS）。
     preset_id 由匹配池成局时下发（不同地图 → 不同模板组）。
+    mission_id： Assault 决策种子——同一局的握手 f12 / 轮询 f2/f3/f5 /
+    大厅简报 f6 必须传同一值（否则随机布局不同 → 增量同步错乱 + 图标错位）；
+    None/0 时 seed=0 仍确定性（兼容旧默认路径）。
     """
     preset = _load_preset(preset_id)
     gamemap_id = int(preset.get(3, 0) or 0)      # preset f3 → gamemap 表行
     missiontype = int(preset.get(4, 0) or 0)     # preset f4 → missiontype
     ap_templates = _load_accesspoint_templates(gamemap_id)
-    aps4 = ap_templates[:4]                      # 最多 4 点（A-D）
+    aps4 = ap_templates                          # 不截断（5 线图 A-E 全参与）
     layout = []
     if missiontype == 1:
-        # Assault：外围出兵点归进攻方，★末点留防守方——引擎侧防守方 0
-        # 出兵点时 AI 小队无处部署（0831 实测 15:15 局防守方 0 兵力）且
-        # player.dll team.cpp 判负条件 v23=2 触发 "has lost their
-        # accesspoints" 秒判负（15:07 局开局 2 分 48 秒即 Gameover）。
+        # Assault：随机激活守方 1 条 + 攻方 2~3 条，未激活线不开启。
         # O 点归属走 BattleFieldSettings f3 defender（H3 已实测证实，
-        # 与出兵点归属无关）→ 末点给防守方不影响 O3 机场归防守方，
-        # 代价仅该线 X1 开局归防守方（§6.2 可接受）。
-        for i, tmpl in enumerate(aps4):
-            owner = (defender_faction if i == len(aps4) - 1
-                     else attacker_faction)
-            layout.append((tmpl, owner))
+        # 与出兵点归属无关）→ 守方线在哪不影响 O3 机场归防守方，代价仅
+        # 该线 X1 开局归防守方（§6.2 可接受）。
+        d_ap, a_aps, _inactive = assault_ap_decision(gamemap_id, mission_id)
+        for tmpl in aps4:
+            if tmpl == d_ap:
+                layout.append((tmpl, defender_faction))
+            elif tmpl in a_aps:
+                layout.append((tmpl, attacker_faction))
+            # 未激活线：跳过（不开启）
     else:                                        # Encounter：交替（首点=进攻方）
         for i, tmpl in enumerate(aps4):
             owner = attacker_faction if (i % 2 == 0) else defender_faction
@@ -513,7 +519,8 @@ def _accesspoint_layout(preset_id=MISSION_PRESET_ID,
 def _msg_army_resource_list(preset_id=MISSION_PRESET_ID,
                             defender_faction=BF_DEFENDER_FACTION_ID,
                             attacker_faction=3,
-                            counts_by_faction=None):
+                            counts_by_faction=None,
+                            mission_id=None):
     """ActionGameArmyResourceDefinition 条目列表：每 (faction, accesspointtemplate) × 池内类别。
 
     ResponseBattleFieldSettings f14 与 ActiveMissionRequestEventListResponse f2
@@ -522,11 +529,14 @@ def _msg_army_resource_list(preset_id=MISSION_PRESET_ID,
     force_pool.init_mission 抽 AT 生成），给定时类别集与数值均由池驱动
     （含坦克/载具等池内新增类别）—— 匹配界面 f5 / 战斗内 f2/f14 同源同值、
     消耗后递减；None 回退静态 BF_RES_CATS 初始表。
+    mission_id：Assault 随机布局种子（未激活线不进 layout → 此处自然不挂
+    资源；须与 _accesspoint_layout 同值）。
 
-    资源逐点挂所属方（Assault 末点=防守方见 _accesspoint_layout）。"""
+    资源逐点挂所属方（Assault 随机激活线见 _accesspoint_layout）。"""
     res_msgs = []
     for tmpl, owner in _accesspoint_layout(preset_id, defender_faction,
-                                           attacker_faction):
+                                           attacker_faction,
+                                           mission_id=mission_id):
         pool_counts = counts_by_faction.get(int(owner)) \
             if counts_by_faction else None
         if pool_counts is not None:
@@ -569,7 +579,8 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
                                         weather_time_of_day=1,
                                         weather_condition=0,
                                         timeofday=None,
-                                        counts_by_faction=None):
+                                        counts_by_faction=None,
+                                        mission_id=None):
     """构建 ResponseBattleFieldSettings（31 字段，spbc 描述符 @0x1807B1120）。
 
     天气/时段：weather_time_of_day / weather_condition 取客户端枚举
@@ -615,13 +626,14 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
         timeofday = _TOD_HOURS.get(weather_time_of_day, 12.0)
     timeofday = float(timeofday)
 
-    # f12 accesspoints：每个模板一个点，owner 交替 attacker/defender
-    # （首点=进攻方，与大厅简报 f6 同规则——详见 _accesspoint_layout）。
+    # f12 accesspoints：每个模板一个点（owner 首点=进攻方，与大厅简报 f6
+    # 同规则——详见 _accesspoint_layout；Assault 随机激活线，未开启线不在此）。
     # accesspointid 为运行时 id（真实局由 warserver 生成，私服固定自增段），
     # 低 32 位必须非零（sub_1803A7350 以低 32 位做非零校验后查 type25 树）。
     ap_msgs = []
     for i, (tmpl, owner) in enumerate(_accesspoint_layout(
-            preset_id, defender_faction, attacker_faction)):
+            preset_id, defender_faction, attacker_faction,
+            mission_id=mission_id)):
         ap = b''
         ap += pb_int64(1, owner)          # accesspointowner（factionId）
         ap += pb_int64(2, 880001 + i)     # accesspointid ★动态构建（非回放值）
@@ -633,7 +645,8 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     # counts_by_faction=每局资源池 → 与匹配界面 f5 同值，消耗后递减）
     res_msgs = _msg_army_resource_list(preset_id, defender_faction,
                                        attacker_faction,
-                                       counts_by_faction=counts_by_faction)
+                                       counts_by_faction=counts_by_faction,
+                                       mission_id=mission_id)
 
     m = b''
     m += pb_int64(1, 1)                            # 1 battlefieldid（battlefield 表行 1）

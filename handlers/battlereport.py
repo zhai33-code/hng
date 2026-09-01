@@ -60,7 +60,7 @@ def _msg_report_character(ch):
     m += pb_int64(1, int(ch.get('characterId', 0) or 0))
     m += pb_int32(2, int(ch.get('startXp', 0) or 0))
     m += pb_int32(3, int(ch.get('endXp', 0) or 0))
-    m += pb_int32(4, 0)                       # xpVeteranBonus
+    m += pb_int32(4, int(ch.get('xpVetBonus', 0) or 0))  # xpVeteranBonus(+25%实发)
     m += pb_int32(5, 0)                       # xpBoosterBonus
     m += pb_int32(6, 0)                       # xpCampaignBonus
     m += pb_int32(7, 0)                       # xpUnderdogBonus
