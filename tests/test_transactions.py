@@ -164,11 +164,13 @@ async def main():
                 "INSERT INTO voucher_packs (pack_name, items_json, max_redemptions) "
                 "VALUES ('TXNPACK', $1::jsonb, 1)",
                 '[{"type":"credits","amount":888}]')
+        pre = await bal('credits')
         code = await st.redeem_voucher(pid, 'txnpack')
         check('有效 key 记 pending（code=1）', code == 1, f'code={code}')
         base = await bal('credits')
-        check('输码不立即发钱（发放延迟到选士兵）', base == 2500,
-              f'credits={base}')
+        # step3 claim_daily_reward 只标记不发钱，余额应保持输码前值
+        check('输码不立即发钱（发放延迟到选士兵）', base == pre,
+              f'credits={base} pre={pre}')
         code1b = await st.redeem_voucher(pid, 'TXNPACK')
         check('pending 期间重复输码幂等 code=1', code1b == 1, f'code={code1b}')
         pend = await st.voucher_pending_packs(pid)

@@ -512,37 +512,8 @@ async def handle_buystorebundlerequest(sess, writer, cmd_id, req_type, proto):
         await writer.drain()
         log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet (player refresh, {len(player_proto)}B)')
 
-    # 发货后重推角色行：unlockBits 含新购物品解锁需求 → 客户端
-    # EquipmentItemItemRenderer.isUnlocked 判定立即生效；否则已拥有武器
-    # 以旧 unlockBits 评价 → 误报“该武器不适用于你所选的职业”直到重登。
-    # 新建角色的初始 character 行在嵌套武器入库前推送，bits 同样过期，一并重推。
-    if pid is not None and sess.soldier_view_cmd is not None:
-        try:
-            new_ts = int(time.time() * 1000)
-            for ch in await STORE.list_characters(pid):
-                bits = await _char_unlock_bits_for(sess, ch['template'],
-                                                   ch['faction'], ch['id'])
-                # 尾部字段传全：客户端 setObject 整体替换 schema，漏传
-                # head_id/previous_template 等会被抹回默认值（外观回退）
-                await _push_kvcs(writer, sess.soldier_view_cmd, b'character',
-                                 _msg_character(ch['name'], ch['faction'], ch['template'],
-                                                _rank_from_combat_xp(ch.get('combat_xp', 0)),
-                                                ch['id'], bits,
-                                                ch.get('combat_badge_0', 0),
-                                                ch.get('combat_badge_1', 0),
-                                                new_ts,
-                                                ch.get('uniform_variant_id', 0),
-                                                ch.get('headgear_id', 0),
-                                                1 if ch.get('is_deleted') else 0,
-                                                ch.get('previous_template', 0),
-                                                ch.get('head_id', 0),
-                                                0,
-                                                1 if ch.get('is_on_leave') else 0))
-                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
-                    f'{ch["name"]} re-pushed, unlockBits={sum(bits)} true, '
-                    f'statTs={new_ts}) [bundle]')
-        except Exception as e:
-            log(f'[DB] reload characters after bundle failed: {e}')
+    # 发货后重推角色行（unlockBits 刷新，新购物品立即解锁可用）
+    await _repush_characters_after_delivery(sess, writer, int(pid) if pid is not None else None)
 
 
 
@@ -638,6 +609,42 @@ async def _deliver_voucher_items(sess, writer, pid, char_id, items):
     return n_boosters, n_memberships, currency
 
 
+async def _repush_characters_after_delivery(sess, writer, pid):
+    """发货后重推角色行：unlockBits 含新购物品解锁需求 → 客户端
+    EquipmentItemItemRenderer.isUnlocked 判定立即生效；否则已拥有武器
+    以旧 unlockBits 评价 → 误报“该武器不适用于你所选的职业”直到重登。
+    新建角色的初始 character 行在嵌套武器入库前推送，bits 同样过期，一并重推。
+    （BuyStoreBundle 与兑换码 voucher claim 共用）"""
+    if pid is None or sess.soldier_view_cmd is None:
+        return
+    try:
+        new_ts = int(time.time() * 1000)
+        for ch in await STORE.list_characters(pid):
+            bits = await _char_unlock_bits_for(sess, ch['template'],
+                                               ch['faction'], ch['id'])
+            # 尾部字段传全：客户端 setObject 整体替换 schema，漏传
+            # head_id/previous_template 等会被抹回默认值（外观回退）
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'character',
+                             _msg_character(ch['name'], ch['faction'], ch['template'],
+                                            _rank_from_combat_xp(ch.get('combat_xp', 0)),
+                                            ch['id'], bits,
+                                            ch.get('combat_badge_0', 0),
+                                            ch.get('combat_badge_1', 0),
+                                            new_ts,
+                                            ch.get('uniform_variant_id', 0),
+                                            ch.get('headgear_id', 0),
+                                            1 if ch.get('is_deleted') else 0,
+                                            ch.get('previous_template', 0),
+                                            ch.get('head_id', 0),
+                                            0,
+                                            1 if ch.get('is_on_leave') else 0))
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (character '
+                f'{ch["name"]} re-pushed, unlockBits={sum(bits)} true, '
+                f'statTs={new_ts}) [delivery]')
+    except Exception as e:
+        log(f'[DB] reload characters after delivery failed: {e}')
+
+
 def _voucher_pack_info_msg(pack):
     """VoucherPackInfo {identifier=1, factionTemplateId=2, status=3,
     names=4 repeated {language=1, name=2}, items=5 repeated
@@ -710,6 +717,9 @@ async def handle_queryvoucherpacksrequest(sess, writer, cmd_id, req_type, proto)
                             await _push_player_refresh(sess, writer)
                         except Exception as e:
                             log(f'[DB] player refresh after voucher failed: {e}')
+                    # 发货后重推角色行（与 BuyStoreBundle 一致）：unlockBits
+                    # 刷新，新武器/皮肤当场解锁可用，无需重登
+                    await _repush_characters_after_delivery(sess, writer, int(pid))
             else:
                 packs = await STORE.voucher_pending_packs(int(pid))
                 need_char = bool(packs)
