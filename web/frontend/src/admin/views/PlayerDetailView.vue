@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { get, post } from '../api'
+import { fmtTime, fmtNum } from '../format'
 
 interface CharacterRow {
   id: number
@@ -15,6 +16,8 @@ interface CharacterRow {
   rank: number
   badge_0: string
   badge_1: string
+  badge_0_id: number
+  badge_1_id: number
   created_at: string
 }
 
@@ -32,9 +35,14 @@ interface PlayerDetail {
   recent_battles: {
     id: number
     mission_id: number
+    mode_name: string
+    map_name: string
+    preset_name: string
     winner_faction_id: number
-    battle_start_time: string | null
+    winner_faction: string
+    battle_start_at: string | null
     created_at: string
+    own: { score: number; kills: number; deaths: number; captures: number }
   }[]
 }
 
@@ -43,10 +51,32 @@ const playerId = computed(() => Number(route.params.id))
 const loading = ref(true)
 const data = ref<PlayerDetail | null>(null)
 
+// ---- 阵营分组（tab）----
+const activeFaction = ref<string>('')
+/** 按 faction id 升序分组（1=US/2=GE/3=SU），tab 内不再显示阵营列 */
+const factionGroups = computed(() => {
+  const chars = data.value?.characters ?? []
+  const groups: { faction: number; name: string; characters: CharacterRow[] }[] = []
+  for (const c of [...chars].sort((a, b) => a.faction - b.faction)) {
+    const last = groups[groups.length - 1]
+    if (last && last.faction === c.faction) {
+      last.characters.push(c)
+    } else {
+      groups.push({ faction: c.faction, name: c.faction_name, characters: [c] })
+    }
+  }
+  return groups
+})
+
 async function load() {
   loading.value = true
   try {
     data.value = await get<PlayerDetail>(`/players/${playerId.value}`)
+    // 默认选中第一个阵营 tab（当前选中阵营不存在时重置）
+    const ids = factionGroups.value.map((g) => String(g.faction))
+    if (!ids.includes(activeFaction.value)) {
+      activeFaction.value = ids[0] ?? ''
+    }
   } catch (e: unknown) {
     ElMessage.error((e as Error).message || '加载失败')
   } finally {
@@ -55,17 +85,13 @@ async function load() {
 }
 onMounted(load)
 
-function fmtTime(s: string | null): string {
-  return s ? s.replace('T', ' ').slice(0, 19) : '-'
-}
-
-function fmtNum(n: number): string {
-  return (n ?? 0).toLocaleString('en-US')
-}
-
 /** 军衔徽章：客户端 images/Rank/{faction}_{branch}_{rank}.png（找不到则隐藏） */
 function rankIcon(c: CharacterRow): string {
   return `/icons/Rank/${c.faction}_1_${c.rank}.png`
+}
+/** 战斗徽章：客户端 images/CombatBadges/{badgeTemplate id}.png（无图或 0 则只显示文字） */
+function badgeSrc(id: number): string {
+  return id ? `/icons/CombatBadges/${id}.png` : ''
 }
 function onImgError(e: Event) {
   ;(e.target as HTMLElement).style.display = 'none'
@@ -194,53 +220,82 @@ async function onToggleBan() {
         <div style="font-weight: 700; margin-bottom: 12px">
           角色（{{ data.characters.length }}）
         </div>
-        <el-table v-if="data.characters.length" :data="data.characters" size="small">
-          <el-table-column label="" width="70">
-            <template #default="{ row }">
-              <img class="rank-badge" :src="rankIcon(row)" :alt="`军衔 ${row.rank}`"
-                   @error="onImgError" />
+        <el-tabs v-if="factionGroups.length" v-model="activeFaction">
+          <el-tab-pane v-for="g in factionGroups" :key="g.faction" :name="String(g.faction)">
+            <template #label>
+              {{ g.name }}（{{ g.characters.length }}）
             </template>
-          </el-table-column>
-          <el-table-column prop="name" label="角色名" min-width="140" />
-          <el-table-column prop="class_name" label="兵种" min-width="150" />
-          <el-table-column prop="faction_name" label="阵营" width="110" />
-          <el-table-column prop="rank" label="军衔" width="70" />
-          <el-table-column label="战斗经验" width="110" align="right">
-            <template #default="{ row }">{{ fmtNum(row.combat_xp) }}</template>
-          </el-table-column>
-          <el-table-column label="战斗徽章" min-width="200">
-            <template #default="{ row }">
-              <span v-if="row.badge_0 || row.badge_1">
-                {{ [row.badge_0, row.badge_1].filter(Boolean).join(' / ') }}
-              </span>
-              <span v-else>-</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="操作" width="100" fixed="right">
-            <template #default="{ row }">
-              <RouterLink :to="`/players/${playerId}/characters/${row.id}`">
-                <el-button size="small" text type="primary">装备明细</el-button>
-              </RouterLink>
-            </template>
-          </el-table-column>
-        </el-table>
+            <el-table :data="g.characters" size="small">
+              <el-table-column label="" width="100">
+                <template #default="{ row }">
+                  <img class="rank-badge" :src="rankIcon(row)" :alt="`军衔 ${row.rank}`"
+                       @error="onImgError" />
+                </template>
+              </el-table-column>
+              <el-table-column prop="name" label="角色名" />
+              <el-table-column prop="class_name" label="兵种" />
+              <el-table-column prop="rank" label="军衔" />
+              <el-table-column label="战斗经验" >
+                <template #default="{ row }">{{ fmtNum(row.combat_xp) }}</template>
+              </el-table-column>
+              <el-table-column label="战斗徽章" >
+                <template #default="{ row }">
+                  <!-- 图标在上、文字在下 -->
+                  <div v-if="row.badge_0 || row.badge_1" class="badges">
+                    <div v-for="b in [{ id: row.badge_0_id, name: row.badge_0 },
+                                      { id: row.badge_1_id, name: row.badge_1 }].filter(b => b.name)"
+                         :key="b.id" class="badge-item">
+                      <img v-if="badgeSrc(b.id)" class="combat-badge" :src="badgeSrc(b.id)"
+                           :alt="b.name" :title="b.name" @error="onImgError" />
+                      <span class="badge-name">{{ b.name }}</span>
+                    </div>
+                  </div>
+                  <span v-else>-</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="操作" fixed="right">
+                <template #default="{ row }">
+                  <RouterLink :to="`/players/${playerId}/characters/${row.id}`">
+                    <el-button size="small" text type="primary">装备明细</el-button>
+                  </RouterLink>
+                </template>
+              </el-table-column>
+            </el-table>
+          </el-tab-pane>
+        </el-tabs>
         <el-empty v-else description="该玩家暂无角色" :image-size="60" />
       </div>
 
       <div class="panel">
-        <div style="font-weight: 700; margin-bottom: 12px">最近战报</div>
+        <div style="font-weight: 700; margin-bottom: 12px">最近参战（{{ data.recent_battles.length }}）</div>
         <el-table v-if="data.recent_battles.length" :data="data.recent_battles" size="small">
           <el-table-column prop="id" label="战报 ID" width="90" />
+          <el-table-column label="模式 / 地图" min-width="180">
+            <template #default="{ row }">
+              {{ row.mode_name || row.preset_name }} / {{ row.map_name || '-' }}
+            </template>
+          </el-table-column>
           <el-table-column prop="mission_id" label="任务 ID" width="90" />
-          <el-table-column prop="winner_faction_id" label="获胜阵营" width="100" />
+          <el-table-column label="获胜阵营" width="110">
+            <template #default="{ row }">{{ row.winner_faction || '-' }}</template>
+          </el-table-column>
+          <el-table-column label="本人得分" width="90" align="right">
+            <template #default="{ row }">{{ fmtNum(row.own.score) }}</template>
+          </el-table-column>
+          <el-table-column label="击杀/死亡" width="100" align="center">
+            <template #default="{ row }">{{ row.own.kills }} / {{ row.own.deaths }}</template>
+          </el-table-column>
+          <el-table-column label="占点" width="70" align="right">
+            <template #default="{ row }">{{ row.own.captures }}</template>
+          </el-table-column>
           <el-table-column label="战斗开始" min-width="165">
-            <template #default="{ row }">{{ fmtTime(row.battle_start_time) }}</template>
+            <template #default="{ row }">{{ fmtTime(row.battle_start_at) }}</template>
           </el-table-column>
           <el-table-column label="记录时间" min-width="165">
             <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
           </el-table-column>
         </el-table>
-        <el-empty v-else description="暂无战报" :image-size="60" />
+        <el-empty v-else description="暂无参战记录" :image-size="60" />
       </div>
     </template>
   </div>

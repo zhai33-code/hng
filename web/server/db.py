@@ -44,6 +44,34 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_created
 ALTER TABLE players ADD COLUMN IF NOT EXISTS banned BOOL NOT NULL DEFAULT FALSE;
 -- 软删除标记（游戏登录侧 get_password 排除已删除账号 → 拒登；置空即恢复）
 ALTER TABLE players ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+-- 举报处理标记（管理端写入；游戏服只写举报本身）
+ALTER TABLE player_reports ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+ALTER TABLE player_reports ADD COLUMN IF NOT EXISTS resolved_by TEXT NOT NULL DEFAULT '';
+
+-- 兑换码兑换记录（游戏服 redeem_voucher 写入；管理端读取展示）
+ALTER TABLE voucher_packs ADD COLUMN IF NOT EXISTS redeemed_by BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE voucher_packs ADD COLUMN IF NOT EXISTS redeemed_at TIMESTAMPTZ;
+-- 批次备注（管理端生成时填写，便于区分用途）
+ALTER TABLE voucher_packs ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
+
+-- 兑换码体系 v2（docs/voucher-redemption-design.md）：时效 + 限量/无限次 + 道具
+-- player_id 是购买流程遗留，管理端生成不传 → 改可空
+ALTER TABLE voucher_packs ALTER COLUMN player_id DROP NOT NULL;
+ALTER TABLE voucher_packs ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+-- 1=一码一用（存量语义）；N=限量 N 次；0=无限次（每人仍限一次，靠流水 UNIQUE）
+ALTER TABLE voucher_packs ADD COLUMN IF NOT EXISTS max_redemptions INT NOT NULL DEFAULT 1;
+-- 兑换流水：UNIQUE(码, 玩家) = 每人限一次；status 1=pending(待选士兵) 2=granted 3=耗尽跳过
+CREATE TABLE IF NOT EXISTS voucher_redemptions (
+    id SERIAL PRIMARY KEY,
+    voucher_pack_id INT NOT NULL REFERENCES voucher_packs(id) ON DELETE CASCADE,
+    player_id BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    character_id BIGINT NOT NULL DEFAULT 0,
+    status SMALLINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    granted_at TIMESTAMPTZ,
+    UNIQUE (voucher_pack_id, player_id)
+);
 """
 
 

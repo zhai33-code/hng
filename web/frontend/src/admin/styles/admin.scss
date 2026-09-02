@@ -295,6 +295,41 @@
   flex-shrink: 0;
 }
 
+// 战斗徽章（CombatBadges/{id}.png）——图标在上、文字在下
+.badges {
+  display: flex;
+  gap: 14px;
+}
+
+.badge-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 88px;
+
+  .combat-badge {
+    width: 48px;
+    height: 48px;
+    object-fit: contain;
+    flex-shrink: 0;
+  }
+
+  // 名字区固定两行高度：名称长短不再影响行与行之间的对齐
+  .badge-name {
+    font-size: 11px;
+    line-height: 1.35;
+    height: 30px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    color: #9a947e;
+    text-align: center;
+    word-break: break-word;
+    overflow: hidden;
+  }
+}
+
 // 响应式：窄屏收起侧栏为横向菜单
 @media (max-width: 860px) {
   .admin-layout {

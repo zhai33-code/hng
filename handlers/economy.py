@@ -290,7 +290,12 @@ async def handle_set_daily_reward(sess, writer, cmd_id, req_type, proto):
 # ------------------------------------------------------------- 兑换券
 
 async def handle_redeem_voucher(sess, writer, cmd_id, req_type, proto):
-    """RedeemVoucherRequest {voucherKey=1} → RedeemVoucherResponse{result=1}。"""
+    """RedeemVoucherRequest {voucherKey=1} → RedeemVoucherResponse{result=1}。
+
+    统一弹窗流程（docs/voucher-redemption-design.md）：输码只记 pending
+    流水，不立即发放；客户端收到 ok/168 后自动重发
+    QueryVoucherPacksRequest{0} → 264 弹士兵选择 → 选定后 Query{charId}
+    才真正发货。code：1 ok / 165 invalid / 168 used / 280 expired。"""
     key = ''
     try:
         f = pb_parse(proto)
@@ -299,16 +304,14 @@ async def handle_redeem_voucher(sess, writer, cmd_id, req_type, proto):
         log(f'      [economy] RedeemVoucher parse error: {e}')
 
     pid = await sess.ensure_player()
-    code, granted = 165, {}
+    code = 165
     if pid is not None and STORE is not None and key:
         try:
-            code, granted = await STORE.redeem_voucher(int(pid), key)
+            code = await STORE.redeem_voucher(int(pid), key)
             log(f'      [DB] redeem_voucher player={pid} key={key!r}: '
-                f'code={code} granted={granted}')
+                f'code={code}')
         except Exception as e:
             log(f'      [DB] redeem_voucher failed: {e}')
-    if granted:
-        await _push_player_refresh(sess, writer)
 
     resp = build_response(cmd_id, 'RedeemVoucherResponse', pb_int32(1, code))
     writer.write(resp)

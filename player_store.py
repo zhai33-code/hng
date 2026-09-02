@@ -398,6 +398,27 @@ CREATE TABLE IF NOT EXISTS voucher_packs (
     pack_name TEXT NOT NULL, items_json JSONB NOT NULL DEFAULT '[]',
     redeemed BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 兑换记录（谁在何时兑换；管理端 db.py 迁移同步追加，两侧幂等）
+ALTER TABLE voucher_packs ADD COLUMN IF NOT EXISTS redeemed_by BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE voucher_packs ADD COLUMN IF NOT EXISTS redeemed_at TIMESTAMPTZ;
+ALTER TABLE voucher_packs ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
+-- 兑换码体系 v2（docs/voucher-redemption-design.md）：时效 + 限量/无限次 + 道具
+-- player_id 是购买流程遗留，管理端生成不传 → 改可空
+ALTER TABLE voucher_packs ALTER COLUMN player_id DROP NOT NULL;
+ALTER TABLE voucher_packs ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+-- 1=一码一用（存量语义）；N=限量 N 次；0=无限次（每人仍限一次，靠流水 UNIQUE）
+ALTER TABLE voucher_packs ADD COLUMN IF NOT EXISTS max_redemptions INT NOT NULL DEFAULT 1;
+-- 兑换流水：UNIQUE(码, 玩家) = 每人限一次；status 1=pending(待选士兵) 2=granted 3=耗尽跳过
+CREATE TABLE IF NOT EXISTS voucher_redemptions (
+    id SERIAL PRIMARY KEY,
+    voucher_pack_id INT NOT NULL REFERENCES voucher_packs(id) ON DELETE CASCADE,
+    player_id BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    character_id BIGINT NOT NULL DEFAULT 0,
+    status SMALLINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    granted_at TIMESTAMPTZ,
+    UNIQUE (voucher_pack_id, player_id)
+);
 
 -- 角色统计（AddGeneralStats/AddCharacterStatisticsRequest 写，RequestXPs/Sum/Session 读）
 CREATE TABLE IF NOT EXISTS character_stats (
@@ -2325,42 +2346,114 @@ class PlayerStore:
         return True, int(credits)
 
     async def redeem_voucher(self, player_id, key):
-        """兑换券（RedeemVoucherRequest）：key 匹配 voucher_packs.pack_name，
-        未兑换 → 发放 items_json 货币并置 redeemed。
-        返回 (code, granted)：1 ok / 165 invalid_key / 168 already_used。
+        """兑换码 v2（RedeemVoucherRequest）：校验 + 记 pending 流水，不立即发放。
 
-        置 redeemed 与发钱在同一事务内（FOR UPDATE 锁行防并发双兑）。"""
+        统一走弹窗流程（docs/voucher-redemption-design.md）：输码成功只记
+        pending，客户端自动发 QueryVoucherPacksRequest{0} → 264 弹士兵选择 →
+        玩家选定后 Query{charId} 才真正发货（voucher_claim）。
+        返回 code：1 ok（含 pending 幂等重入）/ 165 invalid_key /
+        168 already_used（本玩家已兑或总量耗尽）/ 280 expired。
+
+        FOR UPDATE 锁包行防并发；已用次数 = granted 流水数 + legacy redeemed
+        （旧流程直接置位无流水，兼容存量一码一用语义）。"""
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    'SELECT id, items_json, redeemed FROM voucher_packs '
-                    'WHERE lower(pack_name) = lower($1) FOR UPDATE', str(key or ''))
+                    'SELECT id, redeemed, expires_at, max_redemptions '
+                    'FROM voucher_packs WHERE lower(pack_name) = lower($1) '
+                    'FOR UPDATE', str(key or ''))
                 if row is None:
-                    return 165, {}
-                if row['redeemed']:
-                    return 168, {}
+                    return 165
+                if row['expires_at'] is not None:
+                    # 过期时间在锁行后取库端 now() 判定，避免本地时钟偏差
+                    expired = await conn.fetchval(
+                        'SELECT $1 <= now()', row['expires_at'])
+                    if expired:
+                        return 280
+                granted_n = int(await conn.fetchval(
+                    'SELECT count(*) FROM voucher_redemptions '
+                    'WHERE voucher_pack_id = $1 AND status = 2', row['id']))
+                used = granted_n + (1 if row['redeemed'] else 0)
+                max_n = int(row['max_redemptions'] or 0)
+                mine = await conn.fetchrow(
+                    'SELECT status FROM voucher_redemptions '
+                    'WHERE voucher_pack_id = $1 AND player_id = $2',
+                    row['id'], int(player_id))
+                if mine is not None:
+                    # 本玩家已有流水：granted=已兑过 168；pending=幂等重入 1
+                    return 168 if mine['status'] == 2 else 1
+                if max_n > 0 and used >= max_n:
+                    return 168
                 await conn.execute(
-                    'UPDATE voucher_packs SET redeemed = TRUE WHERE id = $1',
-                    row['id'])
-                try:
-                    items = json.loads(row['items_json'] or '[]')
-                except Exception:
-                    items = []
-                granted = {}
-                for it in items:
-                    t = str(it.get('type', '')).lower()
-                    if t in ('credits', 'warfunds', 'gold'):
-                        granted[t] = granted.get(t, 0) + int(it.get('amount', 0) or 0)
-                if granted:
-                    sets, args = [], [int(player_id)]
-                    for k in ('credits', 'warfunds', 'gold'):
-                        if granted.get(k):
-                            args.append(int(granted[k]))
-                            sets.append(f'{k} = {k} + ${len(args)}')
+                    'INSERT INTO voucher_redemptions (voucher_pack_id, player_id) '
+                    'VALUES ($1, $2)', row['id'], int(player_id))
+                return 1
+
+    async def voucher_pending_packs(self, player_id):
+        """待选士兵的兑换包（QueryVoucherPacksRequest characterId=0 → 264）。
+
+        返回 [{pack_name, note, items}]，items 为 items_json 解析结果。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT v.pack_name, v.note, v.items_json '
+                'FROM voucher_redemptions r '
+                'JOIN voucher_packs v ON v.id = r.voucher_pack_id '
+                'WHERE r.player_id = $1 AND r.status = 1 ORDER BY r.id',
+                int(player_id))
+        packs = []
+        for r in rows:
+            try:
+                items = json.loads(r['items_json'] or '[]')
+            except Exception:
+                items = []
+            packs.append({'pack_name': r['pack_name'], 'note': r['note'],
+                          'items': items})
+        return packs
+
+    async def voucher_claim(self, player_id, character_id):
+        """选士兵后确认发货（QueryVoucherPacksRequest characterId>0）。
+
+        pending → granted（记录所选角色）；限量码在锁行后重检总量，
+        已耗尽的 pending 行置 status=3 跳过（宁缺毋错，不重复发放）。
+        返回本次确认发放的包列表 [{pack_name, note, items}]，
+        实际物品发放由调用方（shop.py _deliver_voucher_items）执行——
+        先标记后发放：发放中途失败不会导致重试时二次发放。"""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                pend = await conn.fetch(
+                    'SELECT r.id AS rid, v.id AS vid, v.pack_name, v.note, '
+                    'v.items_json, v.max_redemptions '
+                    'FROM voucher_redemptions r '
+                    'JOIN voucher_packs v ON v.id = r.voucher_pack_id '
+                    'WHERE r.player_id = $1 AND r.status = 1 '
+                    'ORDER BY r.id FOR UPDATE OF r, v', int(player_id))
+                packs = []
+                for r in pend:
+                    # 锁住包行后重检：并发 claim 同一限量码时，后到者在此
+                    # 读到先到者已提交的 granted 计数（READ COMMITTED 每条
+                    # 语句取新快照）
+                    used = int(await conn.fetchval(
+                        'SELECT count(*) FROM voucher_redemptions '
+                        'WHERE voucher_pack_id = $1 AND status = 2',
+                        r['vid']))
+                    max_n = int(r['max_redemptions'] or 0)
+                    if max_n > 0 and used >= max_n:
+                        # 输码与发货之间被其他玩家抢先兑完（限量码竞态）
+                        await conn.execute(
+                            'UPDATE voucher_redemptions SET status = 3 '
+                            'WHERE id = $1', r['rid'])
+                        continue
                     await conn.execute(
-                        'UPDATE players SET ' + ', '.join(sets) + ' WHERE id = $1',
-                        *args)
-        return 1, granted
+                        'UPDATE voucher_redemptions SET status = 2, '
+                        'character_id = $2, granted_at = now() WHERE id = $1',
+                        r['rid'], int(character_id or 0))
+                    try:
+                        items = json.loads(r['items_json'] or '[]')
+                    except Exception:
+                        items = []
+                    packs.append({'pack_name': r['pack_name'],
+                                  'note': r['note'], 'items': items})
+                return packs
 
     async def add_warbond(self, player_id, template_id, conn=None):
         """购买战争债券（AddWarBondRequest）。返回债券条目 id。

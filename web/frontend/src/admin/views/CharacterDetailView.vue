@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { get } from '../api'
+import { fmtTime } from '../format'
 
 interface WeaponItem {
   id: number
@@ -39,6 +40,8 @@ interface CharacterDetail {
     rank: number
     badge_0: string
     badge_1: string
+    badge_0_id: number
+    badge_1_id: number
     created_at: string
   }
   weapons: WeaponItem[]
@@ -72,10 +75,6 @@ async function load() {
   }
 }
 onMounted(load)
-
-function fmtTime(s: string | null): string {
-  return s ? s.replace('T', ' ').slice(0, 19) : '-'
-}
 
 /** 武器图标：客户端 images/Weapons/{weaponTemplate id}.png */
 function weaponIcon(w: WeaponItem): string {
@@ -129,14 +128,22 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
       <div class="panel char-head">
         <img class="rank-badge" :src="rankIcon()" :alt="`军衔 ${data.character.rank}`"
              @error="onImgError" />
+        <!-- 战斗徽章：图标在上、文字在下 -->
+        <div v-if="data.character.badge_0 || data.character.badge_1" class="badges">
+          <div v-for="b in [{ id: data.character.badge_0_id, name: data.character.badge_0 },
+                            { id: data.character.badge_1_id, name: data.character.badge_1 }].filter(b => b.name)"
+               :key="b.id" class="badge-item">
+            <img class="combat-badge"
+                 :src="b.id ? `/icons/CombatBadges/${b.id}.png` : ''"
+                 :alt="b.name" :title="b.name" @error="onImgError" />
+            <span class="badge-name">{{ b.name }}</span>
+          </div>
+        </div>
         <div class="char-info">
           <div class="char-name">{{ data.character.name }}</div>
           <div class="char-meta">
             {{ data.character.class_name }} · {{ data.character.faction_name }} ·
             军衔 {{ data.character.rank }} · 战斗经验 {{ data.character.combat_xp }}
-            <template v-if="data.character.badge_0 || data.character.badge_1">
-              · 徽章 {{ [data.character.badge_0, data.character.badge_1].filter(Boolean).join(' / ') }}
-            </template>
             · 创建于 {{ fmtTime(data.character.created_at) }}
           </div>
         </div>

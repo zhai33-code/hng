@@ -42,6 +42,21 @@ export const router = createRouter({
       component: () => import('./views/BattlesView.vue'),
     },
     {
+      path: '/reports',
+      name: 'reports',
+      component: () => import('./views/ReportsView.vue'),
+    },
+    {
+      path: '/mail',
+      name: 'mail',
+      component: () => import('./views/MailView.vue'),
+    },
+    {
+      path: '/vouchers',
+      name: 'vouchers',
+      component: () => import('./views/VouchersView.vue'),
+    },
+    {
       path: '/status',
       name: 'status',
       component: () => import('./views/StatusView.vue'),

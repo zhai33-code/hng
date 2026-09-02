@@ -43,6 +43,7 @@ from wardb import (
     default_uniform_variant,
     vehicle_full_condition,
     MEMBERSHIP_DAYS_BY_ID,
+    BOOSTER_MINUTES_BY_ID,
     )
 
 from messages import (
@@ -580,20 +581,157 @@ async def handle_queryshopwarbonditemsrequest(sess, writer, cmd_id, req_type, pr
 
 
 
+async def _deliver_voucher_items(sess, writer, pid, char_id, items):
+    """兑换码物品发货（入库 + KVCS 推送），复用商店礼包的发放基建。
+
+    items 为 items_json 解析结果：货币 {"type","amount"}、道具 {"type","id"}。
+    返回 (勋带加成数, 会员数, 是否发了货币) 供调用方决定推送。"""
+    n_boosters = 0
+    n_memberships = 0
+    currency = False
+    cur = {'credits': 0, 'warfunds': 0, 'gold': 0}
+    for it in items or []:
+        t = str(it.get('type', '')).lower()
+        try:
+            if t in ('credits', 'warfunds', 'gold'):
+                amt = int(it.get('amount', 0) or 0)
+                if amt:
+                    cur[t] += amt
+            elif t == 'weaponvarianttemplate':
+                await _bundle_deliver_weapon(sess, writer, pid, char_id,
+                                             int(it.get('id', 0) or 0),
+                                             [], equip_slot1=False)
+            elif t == 'vehiclevarianttemplate':
+                await _bundle_deliver_vehicle(sess, writer, pid, char_id,
+                                              int(it.get('id', 0) or 0),
+                                              equip_slot1=False)
+            elif t == 'uniformparttemplate':
+                tid = int(it.get('id', 0) or 0)
+                part = await STORE.create_uniform_part(pid, char_id, tid, 1)
+                if sess.soldier_view_cmd is not None:
+                    await _push_kvcs(writer, sess.soldier_view_cmd,
+                                     b'UniformPart',
+                                     _msg_uniform_part(part['id'], char_id,
+                                                       tid, 1))
+            elif t == 'ribbonboostertemplate':
+                bid = int(it.get('id', 0) or 0)
+                await STORE.add_booster(pid, bid,
+                                        duration_minutes=BOOSTER_MINUTES_BY_ID.get(
+                                            bid, _BOOSTER_MINUTES),
+                                        activate_now=False, is_ribbon=True)
+                n_boosters += 1
+            elif t == 'shopmembershipitems':
+                mid = int(it.get('id', 0) or 0)
+                days = MEMBERSHIP_DAYS_BY_ID.get(mid, 30)
+                await STORE.add_membership(pid, mid, duration_days=days)
+                n_memberships += 1
+            else:
+                log(f'      [voucher] unsupported item type {t!r}, skipped')
+        except Exception as e:
+            # 单项失败不阻断整包（voucher_claim 已先标记 granted，宁缺毋错）
+            log(f'      [voucher] deliver item {t} failed: {e}')
+    if any(cur.values()):
+        await STORE.add_currency(pid, credits=cur['credits'],
+                                 warfunds=cur['warfunds'], gold=cur['gold'])
+        currency = True
+        log(f'      [voucher] granted currency {cur}')
+    return n_boosters, n_memberships, currency
+
+
+def _voucher_pack_info_msg(pack):
+    """VoucherPackInfo {identifier=1, factionTemplateId=2, status=3,
+    names=4 repeated {language=1, name=2}, items=5 repeated
+    {objectType=1, objectId=2}}——客户端 BundleWindow 按 objectType 本地化
+    渲染明细（货币 objectId=数量，道具 objectId=模板 id）。"""
+    note = (pack.get('note') or '').strip()
+    m = pb_string(1, note or pack['pack_name'])   # identifier
+    m += pb_int64(2, 0)                            # factionTemplateId
+    m += pb_int32(3, 1)                            # status = granted
+    nm = pb_string(1, 'en') + pb_string(2, note or '补给包')
+    m += pb_message(4, nm)
+    for it in pack.get('items') or []:
+        t = str(it.get('type', ''))
+        oid = (int(it.get('amount', 0) or 0)
+               if t in ('credits', 'warfunds', 'gold')
+               else int(it.get('id', 0) or 0))
+        im = pb_string(1, t) + pb_int64(2, oid)
+        m += pb_message(5, im)
+    return m
+
+
 async def handle_queryvoucherpacksrequest(sess, writer, cmd_id, req_type, proto):
-    # 查询兑换券包，返回空列表（无待兑换券包）
-    # QueryVoucherPacksResponse { int32 response=1; repeated VoucherPackInfo infos=2;
-    #   string validFactionTemplateIds=3; string validCharacterTemplateIds=4; }
-    # 客户端 ServiceHandler 的请求队列是严格串行的：
-    # 一个请求没收到响应，后续所有请求（包括购买）都会堵在队列里（左上角 loading 转圈）
-    resp_proto = b''
-    resp_proto += pb_int32(1, 1)       # response = 1 (ok)
-    resp_proto += pb_string(3, '')      # validFactionTemplateIds (空)
-    resp_proto += pb_string(4, '')      # validCharacterTemplateIds (空)
+    """QueryVoucherPacksRequest {characterId=1} → 兑换码统一弹窗流程。
+
+    characterId=0（登录自动检查 / 输码后回查）：有 pending 包 → 264
+    （客户端弹士兵选择轮播；valid ids 留空 = 全部士兵可选）；
+    characterId>0（玩家已选定士兵）：voucher_claim 标记 granted 后逐包发货，
+    回 ok + infos[]，客户端 BundleWindow 显示"你收到了补给"明细。
+    客户端 ServiceHandler 的请求队列是严格串行的：
+    一个请求没收到响应，后续所有请求（包括购买）都会堵在队列里（左上角 loading 转圈）。
+    """
+    char_id = 0
+    try:
+        f = pb_parse(proto)
+        char_id = int(f.get(1, 0) or 0)
+    except Exception as e:
+        log(f'      [voucher] QueryVoucherPacks parse error: {e}')
+
+    pid = await sess.ensure_player()
+    packs = []
+    need_char = False
+    if pid is not None and STORE is not None:
+        try:
+            if char_id:
+                # 校验角色归属（失败 → ok 空列表，宁缺毋错；pending 保留待重选）
+                ch = await STORE.get_character(int(pid), char_id)
+                if ch is not None:
+                    packs = await STORE.voucher_claim(int(pid), char_id)
+                    n_boosters = n_memberships = 0
+                    has_currency = False
+                    for pack in packs:
+                        b, m, c = await _deliver_voucher_items(
+                            sess, writer, int(pid), char_id, pack['items'])
+                        n_boosters += b
+                        n_memberships += m
+                        has_currency = has_currency or c
+                    # 加成/会员/货币全量刷新（幂等，照搬 BuyStoreBundle 推送模式）
+                    if n_boosters:
+                        try:
+                            await push_booster_rows(sess, writer, int(pid))
+                        except Exception as e:
+                            log(f'[DB] push booster rows after voucher failed: {e}')
+                    if n_memberships:
+                        try:
+                            await push_membership_rows(sess, writer, int(pid))
+                        except Exception as e:
+                            log(f'[DB] push membership rows after voucher failed: {e}')
+                    if has_currency:
+                        try:
+                            await _push_player_refresh(sess, writer)
+                        except Exception as e:
+                            log(f'[DB] player refresh after voucher failed: {e}')
+            else:
+                packs = await STORE.voucher_pending_packs(int(pid))
+                need_char = bool(packs)
+        except Exception as e:
+            log(f'      [DB] voucher query/claim failed: {e}')
+            packs = []
+
+    resp_proto = pb_int32(1, 264 if need_char else 1)
+    if not need_char:
+        for pack in packs:
+            resp_proto += pb_message(2, _voucher_pack_info_msg(pack))
+    resp_proto += pb_string(3, '')   # validFactionTemplateIds（空 = 不限）
+    resp_proto += pb_string(4, '')   # validCharacterTemplateIds（空 = 不限）
     resp = build_response(cmd_id, 'QueryVoucherPacksResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} QueryVoucherPacksResponse (0 voucher packs)')
+    if need_char:
+        log(f'S->C cmd={cmd_id:<4} QueryVoucherPacksResponse '
+            f'(264 character_id_needed, {len(packs)} pending packs)')
+    else:
+        log(f'S->C cmd={cmd_id:<4} QueryVoucherPacksResponse '
+            f'(ok, {len(packs)} packs granted, char={char_id})')
 
 
 

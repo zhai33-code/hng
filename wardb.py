@@ -143,6 +143,14 @@ MEMBERSHIP_DAYS_BY_ID = {
     for f in _parse_wardb_table('ShopMembershipItems') if int(f.get(1, 0))
 }
 
+# RibbonBoosterTemplate { id=1, ribbonId=2, minutes=3, multiplier=4(fixed32) }
+# 勋带加成时长（分钟）：按模板发（24h 券不能发成 4h），WarDatabase 缺失时空表
+# → 调用方回退 _BOOSTER_MINUTES
+BOOSTER_MINUTES_BY_ID = {
+    int(f.get(1, 0)): int(f.get(3, 0))
+    for f in _parse_wardb_table('RibbonBoosterTemplate') if int(f.get(1, 0))
+}
+
 # 可购买物品类 unlockItemType 的全量解锁 uid 集合（白名单式统一剔除）。
 # CharacterUnlockTemplate.unlockSequence 实际是该角色类型「全部勋带路径条目」
 # 的清单——物品类 uid 一律不能随默认序列授予。历史四轮同根因泄漏：

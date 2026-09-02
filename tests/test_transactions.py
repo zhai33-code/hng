@@ -6,7 +6,7 @@
      - 余额不足拒绝且余额不变 / 无效货币 / 并发不超扣不丢更新
   2. STORE.transaction() 上下文：块内异常整体回滚（扣款+发货同生共死）
   3. redeem_daily_reward：当天幂等 + 并发只有一个发放（防双领）
-  4. redeem_voucher：兑换事务 + 并发只有一个 code=1（防双兑）
+  4. redeem_voucher v2：pending 流水 + 时效(280)/限量/无限次 + legacy 兼容 + 并发
   5. claim_battle_pass_reward：FOR UPDATE 行锁 + 幂等 + 并发防双领
   6. claim_career_order：fallback 查询在连接归还前执行（连接释放 bug 回归）
   7. soft_delete_character：最后一个角色拒删 + 软删与装备退仓同事务
@@ -159,36 +159,112 @@ async def main():
         check('并发双领只发一次（FOR UPDATE）', cr2 == 2500, f'credits={cr2}')
 
         # ---------------------------------------------------------------- 4
-        print('== 4. redeem_voucher 事务 + 防双兑 ==')
+        print('== 4. redeem_voucher v2（pending 流水 + 时效/限量/无限）==')
+        # v2 统一弹窗流程：输码只记 pending（不发钱），发货在 voucher_claim
         async with st.pool.acquire() as c:
             await c.execute(
-                "INSERT INTO voucher_packs (player_id, pack_name, items_json) "
-                "VALUES ($1, 'TXNPACK', $2::jsonb)",
-                pid, '[{"type":"credits","amount":888}]')
-        code, granted = await st.redeem_voucher(pid, 'txnpack')
-        check('有效 key 兑换成功', code == 1 and granted.get('credits') == 888,
-              f'code={code} granted={granted}')
+                "INSERT INTO voucher_packs (pack_name, items_json, max_redemptions) "
+                "VALUES ('TXNPACK', $1::jsonb, 1)",
+                '[{"type":"credits","amount":888}]')
+        code = await st.redeem_voucher(pid, 'txnpack')
+        check('有效 key 记 pending（code=1）', code == 1, f'code={code}')
         base = await bal('credits')
-        check('兑换发放到账', base == 2500 + 888, f'credits={base}')
-        code2, _ = await st.redeem_voucher(pid, 'TXNPACK')
-        check('重复兑换返回 168', code2 == 168, f'code={code2}')
-        code3, _ = await st.redeem_voucher(pid, 'NO_SUCH_KEY')
+        check('输码不立即发钱（发放延迟到选士兵）', base == 2500,
+              f'credits={base}')
+        code1b = await st.redeem_voucher(pid, 'TXNPACK')
+        check('pending 期间重复输码幂等 code=1', code1b == 1, f'code={code1b}')
+        pend = await st.voucher_pending_packs(pid)
+        check('pending 查询返回 1 包含 items',
+              len(pend) == 1 and pend[0]['items'][0]['amount'] == 888,
+              f'pend={pend}')
+        # 选士兵确认：grant 返回包列表（实际发放由 shop.py 执行）
+        await st.create_character(pid, 'v2char', 1, 1)
+        chars = await st.list_characters(pid)
+        packs = await st.voucher_claim(pid, chars[0]['id'])
+        check('claim 返回待发 1 包', len(packs) == 1, f'packs={packs}')
+        code2 = await st.redeem_voucher(pid, 'TXNPACK')
+        check('已兑过再输码返回 168', code2 == 168, f'code={code2}')
+        pend2 = await st.voucher_pending_packs(pid)
+        check('claim 后 pending 清空', pend2 == [], f'pend={pend2}')
+        code3 = await st.redeem_voucher(pid, 'NO_SUCH_KEY')
         check('无效 key 返回 165', code3 == 165, f'code={code3}')
 
-        # 并发双兑：fresh voucher
+        # 过期：expires_at 已过 → 280
         async with st.pool.acquire() as c:
             await c.execute(
-                "INSERT INTO voucher_packs (player_id, pack_name, items_json) "
-                "VALUES ($1, 'TXNRACE', $2::jsonb)",
-                pid, '[{"type":"gold","amount":77}]')
-        before = await bal('gold')
+                "INSERT INTO voucher_packs (pack_name, items_json, expires_at) "
+                "VALUES ('TXNEXP', $1::jsonb, now() - interval '1 hour')",
+                '[{"type":"gold","amount":1}]')
+        code_exp = await st.redeem_voucher(pid, 'TXNEXP')
+        check('过期码返回 280', code_exp == 280, f'code={code_exp}')
+
+        # 限量 2 次：两个玩家各兑一次后耗尽
+        async with st.pool.acquire() as c:
+            await c.execute(
+                "INSERT INTO voucher_packs (pack_name, items_json, max_redemptions) "
+                "VALUES ('TXNLIM', $1::jsonb, 2)",
+                '[{"type":"gold","amount":5}]')
+        c1 = await st.redeem_voucher(pid, 'TXNLIM')
+        c2 = await st.redeem_voucher(pid2, 'TXNLIM')
+        check('限量 2 次两玩家均 ok', c1 == 1 and c2 == 1,
+              f'c1={c1} c2={c2}')
+        await st.voucher_claim(pid, chars[0]['id'])
+        await st.create_character(pid2, 'v2char2', 1, 1)
+        chars2 = await st.list_characters(pid2)
+        await st.voucher_claim(pid2, chars2[0]['id'])
+        pid3 = await st.create_player(f'{uname}_c', 'txn-test')
+        c3 = await st.redeem_voucher(pid3, 'TXNLIM')
+        check('第三次兑换返回 168（耗尽）', c3 == 168, f'c3={c3}')
+
+        # 无限次（max=0）：每人限一次（UNIQUE 流水），多人可兑
+        async with st.pool.acquire() as c:
+            await c.execute(
+                "INSERT INTO voucher_packs (pack_name, items_json, max_redemptions) "
+                "VALUES ('TXNINF', $1::jsonb, 0)",
+                '[{"type":"gold","amount":9}]')
+        i1 = await st.redeem_voucher(pid, 'TXNINF')
+        i1b = await st.redeem_voucher(pid, 'TXNINF')
+        i2 = await st.redeem_voucher(pid2, 'TXNINF')
+        check('无限码多人各 ok + 同人限一次（168）',
+              i1 == 1 and i1b == 1 and i2 == 1,
+              f'i1={i1} i1b={i1b} i2={i2}')
+        # 无限码同人 claim 后再输码 → 168
+        await st.voucher_claim(pid, chars[0]['id'])
+        i1c = await st.redeem_voucher(pid, 'TXNINF')
+        check('无限码同人已兑过 → 168', i1c == 168, f'i1c={i1c}')
+
+        # legacy 兑换位（v1 直接置 redeemed 无流水）仍按已用计
+        async with st.pool.acquire() as c:
+            await c.execute(
+                "INSERT INTO voucher_packs (pack_name, items_json, redeemed) "
+                "VALUES ('TXNLEGACY', $1::jsonb, TRUE)",
+                '[{"type":"gold","amount":1}]')
+        cleg = await st.redeem_voucher(pid, 'TXNLEGACY')
+        check('legacy redeemed 码 → 168', cleg == 168, f'code={cleg}')
+
+        # 并发双兑：fresh voucher，同一玩家并发输码
+        async with st.pool.acquire() as c:
+            await c.execute(
+                "INSERT INTO voucher_packs (pack_name, items_json) "
+                "VALUES ('TXNRACE', $1::jsonb)",
+                '[{"type":"gold","amount":77}]')
         codes = await asyncio.gather(
             st.redeem_voucher(pid, 'TXNRACE'),
             st.redeem_voucher(pid, 'TXNRACE'))
-        n_ok = sum(1 for cd, _ in codes if cd == 1)
-        check('并发双兑只有一个 code=1', n_ok == 1, f'codes={[cd for cd, _ in codes]}')
-        check('并发双兑只发一次', await bal('gold') == before + 77,
-              f'gold={await bal("gold")} (before={before})')
+        check('并发输码均 code=1（同一 pending 幂等，无双流水）',
+              codes[0] == 1 and codes[1] == 1, f'codes={codes}')
+        async with st.pool.acquire() as c:
+            n_rows = int(await c.fetchval(
+                'SELECT count(*) FROM voucher_redemptions r '
+                'JOIN voucher_packs v ON v.id = r.voucher_pack_id '
+                "WHERE v.pack_name = 'TXNRACE'"))
+        check('并发输码只落一行 pending（UNIQUE）', n_rows == 1,
+              f'rows={n_rows}')
+        # 清理 §4 临时角色（硬删；soft_delete 会因"最后一个角色不许删"拒删），
+        # 恢复 §7"最后一个角色"前提（每号 0 个活跃角色）
+        async with st.pool.acquire() as c:
+            await c.execute('DELETE FROM characters WHERE id = ANY($1::bigint[])',
+                            [chars[0]['id'], chars2[0]['id']])
 
         # ---------------------------------------------------------------- 5
         print('== 5. claim_battle_pass_reward 幂等 + 防双领 ==')
@@ -323,15 +399,21 @@ async def main():
               f'leader={leader} expect={pid}')
     finally:
         # ---------------------------------------------------------------- cleanup
-        print('== 9. 清理测试数据 ==')
+        print('== 9. 清理测试数据（硬删，可对线上库运行）==')
         async with st.pool.acquire() as c:
-            for u in (uname, f'{uname}_b'):
+            for u in (uname, f'{uname}_b', f'{uname}_c'):
                 await c.execute('DELETE FROM companies WHERE leader_player_id IN '
                                 '(SELECT id FROM players WHERE username = $1)', u)
             n = await c.execute(
-                'DELETE FROM players WHERE username IN ($1, $2)',
-                uname, f'{uname}_b')
+                'DELETE FROM players WHERE username IN ($1, $2, $3)',
+                uname, f'{uname}_b', f'{uname}_c')
+            # §4 兑换码测试包：无 player_id 关联，不随账号级联删，须显式硬删
+            # （流水表 FK ON DELETE CASCADE 随包删除）
+            nv = await c.execute(
+                "DELETE FROM voucher_packs WHERE pack_name IN "
+                "('TXNPACK', 'TXNEXP', 'TXNLIM', 'TXNINF', 'TXNLEGACY', 'TXNRACE')")
         print(f'  已删除测试账号（含级联数据）rowcount={n}')
+        print(f'  已删除测试兑换码 rowcount={nv}')
         await st.close()
 
     print(f'\n结果: PASS={PASS} FAIL={FAIL}')

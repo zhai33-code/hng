@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
-"""管理 API：玩家列表/详情、角色装备明细、玩家操作（重置密码/货币/封禁）。"""
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+"""管理 API：玩家列表/详情、角色装备明细、玩家操作（重置密码/货币/封禁）。
+
+SQL 与组装在 services/players_svc.py；本层只做参数解析、审计与响应。
+"""
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 
-from .. import audit, auth, wardb_meta
-from .. import db
+from .. import audit, auth, db
+from ..services import players_svc
+from . import api_errors
 
 router = APIRouter(prefix='/api/players', tags=['players'],
                    dependencies=[Depends(auth.current_admin)])
@@ -17,36 +21,8 @@ async def list_players(page: int = Query(1, ge=1),
                        order: str = Query('created_desc'),
                        state: str = Query('active')):
     """玩家分页列表（q 按用户名包含匹配；state=active/deleted/all 软删除筛选）。"""
-    assert db.pool is not None
-    conds: list[str] = []
-    args: list = []
-    if q:
-        args.append(f'%{q}%')
-        conds.append(f'username ILIKE ${len(args)}')
-    if state == 'active':
-        conds.append('deleted_at IS NULL')
-    elif state == 'deleted':
-        conds.append('deleted_at IS NOT NULL')
-    where = ('WHERE ' + ' AND '.join(conds)) if conds else ''
-    order_sql = {
-        'created_desc': 'created_at DESC',
-        'created_asc': 'created_at ASC',
-        'name_asc': 'username ASC',
-        'name_desc': 'username DESC',
-    }.get(order, 'created_at DESC')
-    async with db.pool.acquire() as conn:
-        total = await conn.fetchval(
-            f'SELECT count(*) FROM players {where}', *args)
-        rows = await conn.fetch(
-            f'SELECT id, username, credits, warfunds, gold, banned, '
-            f'deleted_at, created_at '
-            f'FROM players {where} ORDER BY {order_sql} '
-            f'LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}',
-            *args, page_size, (page - 1) * page_size)
-    return {
-        'total': total,
-        'items': [dict(r) for r in rows],
-    }
+    return await players_svc.list_players(
+        db.pool, page=page, page_size=page_size, q=q, order=order, state=state)
 
 
 class BatchDeleteBody(BaseModel):
@@ -55,190 +31,30 @@ class BatchDeleteBody(BaseModel):
 
 
 @router.post('/batch-delete', dependencies=[Depends(auth.write_guard)])
+@api_errors
 async def batch_delete(body: BatchDeleteBody, request: Request,
                        admin: auth.AdminUser = Depends(auth.current_admin)):
-    """批量删除账号（多选）。
-
-    软删除：players.deleted_at 置为 now()，账号数据保留，登录侧拒登；
-    硬删除：DELETE players，经 FK ON DELETE CASCADE 级联清掉角色/装备等
-    全部关联数据（战报 battle_report_players 无外键，历史战报保留）。
-    """
-    # 去重 + 上限（防误粘贴超大列表）
-    ids = list(dict.fromkeys(body.ids))
-    if not ids:
-        raise HTTPException(400, '未选择任何账号')
-    if len(ids) > 500:
-        raise HTTPException(400, '单次最多操作 500 个账号')
-    assert db.pool is not None
-    async with db.pool.acquire() as conn:
-        if body.hard:
-            rows = await conn.fetch(
-                'DELETE FROM players WHERE id = ANY($1) '
-                'RETURNING username', ids)
-        else:
-            rows = await conn.fetch(
-                'UPDATE players SET deleted_at = now() '
-                'WHERE id = ANY($1) AND deleted_at IS NULL '
-                'RETURNING username', ids)
-    if not rows:
-        raise HTTPException(404, '账号不存在（或已软删除）')
-    names = [r['username'] for r in rows]
+    """批量删除账号（多选；软删除可恢复，硬删除级联清关联数据）。"""
+    result = await players_svc.batch_delete(db.pool, body.ids, body.hard)
     await audit.record(admin, request,
                        'hard_delete' if body.hard else 'soft_delete',
-                       ', '.join(names),
-                       {'count': len(names), 'ids': ids})
-    return {'ok': True, 'count': len(names),
-            'usernames': names}
+                       ', '.join(result['usernames']),
+                       {'count': result['count'], 'ids': body.ids})
+    return {'ok': True, **result}
 
 
 @router.get('/{player_id}')
+@api_errors
 async def player_detail(player_id: int):
-    """玩家账号级详情：账号信息 + 三货币 + 角色概览 + 最近战报。"""
-    assert db.pool is not None
-    async with db.pool.acquire() as conn:
-        p = await conn.fetchrow(
-            'SELECT id, username, credits, warfunds, gold, banned, created_at '
-            'FROM players WHERE id = $1', player_id)
-        if p is None:
-            raise HTTPException(404, '玩家不存在')
-        chars = await conn.fetch(
-            'SELECT id, name, faction, template, combat_xp, '
-            'combat_badge_0, combat_badge_1, created_at '
-            'FROM characters WHERE player_id = $1 ORDER BY id', player_id)
-        battles = await conn.fetch(
-            'SELECT id, mission_id, winner_faction_id, battle_start_time, '
-            'created_at FROM battle_reports '
-            'ORDER BY created_at DESC LIMIT 5')
-    return {
-        'player': dict(p),
-        'characters': [{
-            'id': c['id'],
-            'name': c['name'],
-            'faction': c['faction'],
-            'faction_name': wardb_meta.faction_name(c['faction']),
-            'template': c['template'],
-            'class_name': wardb_meta.character_name(c['template']),
-            'combat_xp': int(c['combat_xp']),
-            'rank': wardb_meta.rank_from_xp(int(c['combat_xp'])),
-            'badge_0': wardb_meta.badge_name(int(c['combat_badge_0'])),
-            'badge_1': wardb_meta.badge_name(int(c['combat_badge_1'])),
-            'created_at': c['created_at'],
-        } for c in chars],
-        'recent_battles': [dict(b) for b in battles],
-    }
+    """玩家账号级详情：账号信息 + 三货币 + 角色概览 + 该玩家最近参战记录。"""
+    return await players_svc.player_detail(db.pool, player_id)
 
 
 @router.get('/{player_id}/characters/{character_id}')
+@api_errors
 async def character_detail(player_id: int, character_id: int):
     """角色装备明细：武器（含配件/弹药）、载具（含升级件）、勋带、徽章。"""
-    assert db.pool is not None
-    async with db.pool.acquire() as conn:
-        c = await conn.fetchrow(
-            'SELECT id, player_id, name, faction, template, combat_xp, '
-            'combat_badge_0, combat_badge_1, created_at '
-            'FROM characters WHERE id = $1', character_id)
-        if c is None or int(c['player_id']) != player_id:
-            raise HTTPException(404, '角色不存在')
-
-        weapons = await conn.fetch(
-            'SELECT id, name, template_id, character_id, container_id, '
-            'container_slot, variant_template_id, variant_id, created_at '
-            'FROM weapons WHERE player_id = $1 AND (character_id = $2 '
-            'OR character_id = 0) ORDER BY id', player_id, character_id)
-        modifiers = await conn.fetch(
-            'SELECT id, template_id, weapon_id, created_at FROM weapon_modifiers '
-            'WHERE player_id = $1 AND (character_id = $2 OR character_id = 0)',
-            player_id, character_id)
-        ammo = await conn.fetch(
-            'SELECT id, ammo_template_id, weapon_id, slot_index, "condition" '
-            'FROM weapon_ammo WHERE player_id = $1 '
-            'AND (character_id = $2 OR character_id = 0)',
-            player_id, character_id)
-        vehicles = await conn.fetch(
-            'SELECT id, vehicle_variant_template_id, equipped_in_slot, '
-            'created_at FROM vehicles WHERE player_id = $1 '
-            'AND (character_id = $2 OR character_id = 0)',
-            player_id, character_id)
-        upgrades = await conn.fetch(
-            'SELECT id, upgrade_template_id, vehicle_id, equipped_slot_id '
-            'FROM vehicle_upgrades WHERE player_id = $1 '
-            'AND (character_id = $2 OR character_id = 0)',
-            player_id, character_id)
-        ribbons = await conn.fetch(
-            'SELECT ribbon_template_id, total_xp FROM character_ribbon_xp '
-            'WHERE character_id = $1 ORDER BY ribbon_template_id', character_id)
-
-    # 武器 -> 组装配件/弹药；载具 -> 组装升级件
-    mod_by_weapon: dict[int, list] = {}
-    for m in modifiers:
-        mod_by_weapon.setdefault(int(m['weapon_id']), []).append({
-            'id': m['id'],
-            'template_id': m['template_id'],
-            'name': wardb_meta.modifier_name(int(m['template_id'])),
-        })
-    ammo_by_weapon: dict[int, list] = {}
-    for a in ammo:
-        ammo_by_weapon.setdefault(int(a['weapon_id']), []).append({
-            'id': a['id'],
-            'template_id': a['ammo_template_id'],
-            'name': wardb_meta.ammo_name(int(a['ammo_template_id'])),
-            'slot_index': a['slot_index'],
-            'condition': float(a['condition']),
-        })
-    upg_by_vehicle: dict[int, list] = {}
-    for u in upgrades:
-        upg_by_vehicle.setdefault(int(u['vehicle_id']), []).append({
-            'id': u['id'],
-            'template_id': u['upgrade_template_id'],
-            'equipped_slot_id': int(u['equipped_slot_id']),
-        })
-
-    return {
-        'character': {
-            'id': c['id'],
-            'name': c['name'],
-            'faction': c['faction'],
-            'faction_name': wardb_meta.faction_name(c['faction']),
-            'template': c['template'],
-            'class_name': wardb_meta.character_name(c['template']),
-            'combat_xp': int(c['combat_xp']),
-            'rank': wardb_meta.rank_from_xp(int(c['combat_xp'])),
-            'badge_0': wardb_meta.badge_name(int(c['combat_badge_0'])),
-            'badge_1': wardb_meta.badge_name(int(c['combat_badge_1'])),
-            'created_at': c['created_at'],
-        },
-        'weapons': [{
-            'id': w['id'],
-            'name': w['name'],
-            'template_id': w['template_id'],
-            'template_name': wardb_meta.weapon_name(int(w['template_id'])),
-            'variant_template_id': int(w['variant_template_id']),
-            'equipped': int(w['character_id']) == character_id,
-            'container_id': int(w['container_id']),
-            'container_slot': int(w['container_slot']),
-            'modifiers': mod_by_weapon.get(int(w['id']), []),
-            'ammo': ammo_by_weapon.get(int(w['id']), []),
-        } for w in weapons],
-        'vehicles': [{
-            'id': v['id'],
-            'variant_template_id': v['vehicle_variant_template_id'],
-            **wardb_meta.vehicle_info(int(v['vehicle_variant_template_id'])),
-            'equipped_in_slot': int(v['equipped_in_slot']),
-            'upgrades': upg_by_vehicle.get(int(v['id']), []),
-        } for v in vehicles],
-        'ribbons': [{
-            'ribbon_template_id': r['ribbon_template_id'],
-            'name': wardb_meta.ribbon_name(int(r['ribbon_template_id'])),
-            # 后端直接拼好最终路径：专属图或类别底图（官方 Specialist 渲染方式），前端零试错
-            'icon': wardb_meta.ribbon_icon(int(r['ribbon_template_id'])),
-            # 官方 pip 叠加图（灰度武器/载具图，与底图同画布）+ 缺失回退全尺寸图标
-            'overlay_icon': wardb_meta.ribbon_overlay(int(r['ribbon_template_id'])),
-            'overlay_fallback': wardb_meta.ribbon_overlay_fallback(int(r['ribbon_template_id'])),
-            # 官方 PipTransform 摆放参数（scale/x/y），前端按此缩放定位叠加
-            'overlay_style': wardb_meta.ribbon_overlay_style(int(r['ribbon_template_id'])),
-            'total_xp': float(r['total_xp']),
-        } for r in ribbons],
-    }
+    return await players_svc.character_detail(db.pool, player_id, character_id)
 
 
 # ---------------- 玩家操作（写操作：write_guard CSRF + 审计）----------------
@@ -249,20 +65,13 @@ class ResetPasswordBody(BaseModel):
 
 @router.post('/{player_id}/reset-password',
              dependencies=[Depends(auth.write_guard)])
+@api_errors
 async def reset_password(player_id: int, body: ResetPasswordBody,
                          request: Request,
                          admin: auth.AdminUser = Depends(auth.current_admin)):
-    pw = body.new_password
-    if not (4 <= len(pw) <= 64):
-        raise HTTPException(400, '密码长度需为 4-64 位')
-    assert db.pool is not None
-    async with db.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            'UPDATE players SET password = $1 WHERE id = $2 '
-            'RETURNING username', pw, player_id)
-    if row is None:
-        raise HTTPException(404, '玩家不存在')
-    await audit.record(admin, request, 'reset_password', row['username'])
+    username = await players_svc.reset_password(
+        db.pool, player_id, body.new_password)
+    await audit.record(admin, request, 'reset_password', username)
     return {'ok': True}
 
 
@@ -272,28 +81,16 @@ class CurrencyBody(BaseModel):
 
 
 @router.post('/{player_id}/currency', dependencies=[Depends(auth.write_guard)])
+@api_errors
 async def adjust_currency(player_id: int, body: CurrencyBody,
                           request: Request,
                           admin: auth.AdminUser = Depends(auth.current_admin)):
-    if body.currency not in ('credits', 'warfunds', 'gold'):
-        raise HTTPException(400, '非法货币类型')
-    if body.delta == 0 or abs(body.delta) > 10 ** 9:
-        raise HTTPException(400, '变动值非法')
-    assert db.pool is not None
-    async with db.pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(
-                f'UPDATE players SET {body.currency} = {body.currency} + $1 '
-                f'WHERE id = $2 RETURNING username, {body.currency}',
-                body.delta, player_id)
-            if row is None:
-                raise HTTPException(404, '玩家不存在')
-            if int(row[body.currency]) < 0:
-                raise HTTPException(400, '扣减后余额不能为负')
-    await audit.record(admin, request, 'adjust_currency', row['username'],
+    result = await players_svc.adjust_currency(
+        db.pool, player_id, body.currency, body.delta)
+    await audit.record(admin, request, 'adjust_currency', result['username'],
                        {'currency': body.currency, 'delta': body.delta,
-                        'after': int(row[body.currency])})
-    return {'ok': True, 'balance': int(row[body.currency])}
+                        'after': result['balance']})
+    return {'ok': True, 'balance': result['balance']}
 
 
 class BanBody(BaseModel):
@@ -301,16 +98,11 @@ class BanBody(BaseModel):
 
 
 @router.post('/{player_id}/ban', dependencies=[Depends(auth.write_guard)])
+@api_errors
 async def set_ban(player_id: int, body: BanBody,
                   request: Request,
                   admin: auth.AdminUser = Depends(auth.current_admin)):
-    assert db.pool is not None
-    async with db.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            'UPDATE players SET banned = $1 WHERE id = $2 RETURNING username',
-            body.banned, player_id)
-    if row is None:
-        raise HTTPException(404, '玩家不存在')
-    await audit.record(admin, request, 'set_ban', row['username'],
+    result = await players_svc.set_ban(db.pool, player_id, body.banned)
+    await audit.record(admin, request, 'set_ban', result['username'],
                        {'banned': body.banned})
     return {'ok': True, 'banned': body.banned}

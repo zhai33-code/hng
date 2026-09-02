@@ -2,6 +2,7 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { get } from '../api'
+import { fmtTime } from '../format'
 
 interface DashboardData {
   players: number
@@ -73,10 +74,6 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (onlineTimer) clearInterval(onlineTimer)
 })
-
-function fmtTime(s: string | null): string {
-  return s ? s.replace('T', ' ').slice(0, 19) : '-'
-}
 
 const FACTION_NAMES: Record<number, string> = { 1: '美', 2: '德', 3: '苏' }
 const factionName = (f: number | null | undefined) =>

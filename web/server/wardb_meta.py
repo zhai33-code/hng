@@ -10,6 +10,8 @@ from .templates_data import (
     BADGES,
     CHARACTERS,
     FACTIONS,
+    MISSION_MODE_NAMES,
+    MISSION_PRESETS,
     MODIFIERS,
     RANK_THRESHOLDS,
     RIBBONS,
@@ -123,6 +125,17 @@ def character_name(template_id: int) -> str:
 
 def faction_name(faction_id: int) -> str:
     return FACTIONS.get(faction_id, str(faction_id))
+
+
+def preset_info(preset_id: int) -> dict:
+    """战报 preset -> {name 官方全名, mode_name 中文模式名, map 地图名}；未收录回退 '#<id>'。"""
+    p = MISSION_PRESETS.get(int(preset_id))
+    if not p:
+        return {'name': f'#{preset_id}', 'mode': '', 'mode_name': '',
+                'map': ''}
+    return {'name': p['name'], 'mode': p['mode'],
+            'mode_name': MISSION_MODE_NAMES.get(p['mode'], p['mode']),
+            'map': p['map']}
 
 
 def badge_name(template_id: int) -> str:

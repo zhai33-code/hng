@@ -3,6 +3,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { get, post } from '../api'
+import { fmtTime, fmtNum } from '../format'
 
 interface PlayerRow {
   id: number
@@ -81,12 +82,23 @@ async function onDelete(hard: boolean) {
   }
 }
 
-function fmtTime(s: string | null): string {
-  return s ? s.replace('T', ' ').slice(0, 19) : '-'
-}
-
-function fmtNum(n: number): string {
-  return (n ?? 0).toLocaleString('en-US')
+// ---- 封禁/解封（列表行级）----
+async function onToggleBan(row: PlayerRow) {
+  const banned = !row.banned
+  try {
+    await ElMessageBox.confirm(
+      `确认${banned ? '封禁' : '解封'}玩家 ${row.username}？`,
+      banned ? '封禁玩家' : '解除封禁', { type: 'warning' })
+  } catch {
+    return
+  }
+  try {
+    await post(`/players/${row.id}/ban`, { banned })
+    ElMessage.success(banned ? '已封禁' : '已解封')
+    load()
+  } catch (e: unknown) {
+    ElMessage.error((e as Error).message || '操作失败')
+  }
 }
 
 onMounted(load)
@@ -147,10 +159,15 @@ onMounted(load)
       <el-table-column label="注册时间" min-width="165">
         <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="90" fixed="right">
+      <el-table-column label="操作" width="150" fixed="right">
         <template #default="{ row }">
           <el-button size="small" text type="primary"
                      @click="router.push(`/players/${row.id}`)">详情</el-button>
+          <el-button v-if="!row.deleted_at" size="small" text
+                     :type="row.banned ? 'success' : 'danger'"
+                     @click="onToggleBan(row)">
+            {{ row.banned ? '解封' : '封禁' }}
+          </el-button>
         </template>
       </el-table-column>
     </el-table>
