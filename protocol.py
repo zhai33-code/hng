@@ -317,7 +317,7 @@ def msg_login2_challenge(salt_b64, temp_sid_b64, enc_key_b64):
 
 def msg_player(gamertag, credits=None, warfunds=None, gold=None,
                tutorials_completed=0, pid=1, faction=None, total_score=0,
-               first_action_date=''):
+               first_action_date='', level=None):
     m = b''
     # 货币默认与数据库新账号默认值一致（新账号给默认货币）
     if credits is None:
@@ -373,10 +373,19 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     # 不来自 CharacterStats——恒 0 会导致统计页分数显示 0（2026-09-01）。
     # 同时驱动玩家等级进度（PlayerLevelUnlock 按 totalScore 阈值解锁）
     m += pb_int64(36, int(total_score or 0))  # totalScore
-    # unlockBits (field 37): repeated bool, 位索引 = PlayerLevelUnlock.id
-    # 全 true = 解锁所有玩家级功能（War模式/匹配模式/职业等）
-    m += pb_packed_bool(37, [True] * 41)  # PlayerLevelUnlock ids 1-40 all exist
-    m += pb_int32(38, 1)                # level
+    # level（f38）：客户端 currentPlayer.level，matchmaking 地图/模式列表按
+    # missionpreset min/maxPlayerLevel 过滤用它（恒 1 会藏高级地图）；
+    # None 时按 totalScore 经 PlayerLevel 阈值推导（与客户端 playerLevel 一致）
+    if level is None:
+        from wardb import player_level_from_score
+        level = player_level_from_score(int(total_score or 0))
+    # unlockBits (field 37): repeated bool, 位索引 = PlayerLevelUnlock.id。
+    # 客户端 hasPlayerLevelUnlock 用它门控 War 模式（eWar lv10）/匹配模式
+    # （eMissionType）/武器组等——必须按等级置位，全 true 会让低级玩家
+    # 也解锁全部模式（进展限制失效）；角色模板位恒 false（避免 fake 招募槽）
+    from wardb import player_unlock_bits_for_level
+    m += pb_packed_bool(37, player_unlock_bits_for_level(int(level)))
+    m += pb_int32(38, int(level))     # level
     m += pb_varint(40, 0)               # isDeleted (required bool=false)
     m += pb_string(41, 'EUR')          # currencyCode
     m += pb_string(42, 'EU')           # currencyRegion

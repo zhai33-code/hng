@@ -1542,6 +1542,15 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None):
             except Exception as e:
                 log(f'      [combat] settlement character re-push failed '
                     f'(player={pid}): {e}')
+        # 进展 tab 等级检测：totalScore 跨过 PlayerLevel 阈值时发放
+        # PlayerLevelUnlock 各级 credits/gold/warfunds 奖励 + 升级/
+        # 新模式解锁 Notification 弹窗（players.level_granted 防重发）
+        try:
+            from .progression import check_player_level
+            await check_player_level(flash, flash.writer, pid, notify=True)
+        except Exception as e:
+            log(f'      [combat] player level check failed '
+                f'(player={pid}): {e}')
     # 内部状态清理（无论 Flash 连接是否在线）
     for pms_id in my_pms:
         s = matchmaking.PMS_TO_SESSION.pop(pms_id, None)

@@ -77,6 +77,9 @@ ALTER TABLE players ADD COLUMN IF NOT EXISTS warfunds BIGINT NOT NULL DEFAULT 10
 ALTER TABLE players ADD COLUMN IF NOT EXISTS gold     BIGINT NOT NULL DEFAULT 100000;
 -- 软删除标记（管理后台写入；登录侧 get_password 排除已删除账号 → 拒登）
 ALTER TABLE players ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+-- 玩家等级奖励已发到的等级（进展 tab：PlayerLevelUnlock 每级 credits/gold/
+-- warfunds 奖励只发一次；默认 1 = 1 级起步无奖励，存量玩家下次检测时补发）
+ALTER TABLE players ADD COLUMN IF NOT EXISTS level_granted INT NOT NULL DEFAULT 1;
 -- 存量库兜底：players_id_seq 仍处撞号区（<1e6，如 BIGSERIAL 时代建的库）时
 -- 抬到 1e6（不低于已用 max id+1）；已迁移过的库不受影响
 DO $$
@@ -927,6 +930,19 @@ class PlayerStore:
             await conn.execute(
                 'UPDATE players SET tutorials_completed = $1 WHERE id = $2',
                 int(value), int(player_id))
+
+    async def get_level_granted(self, player_id):
+        """玩家等级奖励已发到的等级（进展 tab PlayerLevelUnlock 奖励防重发）。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT level_granted FROM players WHERE id = $1', player_id)
+        return int(row['level_granted']) if row else 1
+
+    async def set_level_granted(self, player_id, level):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE players SET level_granted = $1 WHERE id = $2',
+                int(level), int(player_id))
 
     # ---- characters ----
 

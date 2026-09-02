@@ -184,11 +184,20 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
         char_pack_id = f.get(2, 0)
         if isinstance(char_pack_id, bytes):
             char_pack_id = int.from_bytes(char_pack_id, 'little')
-        log(f'      CreateCharacter: name={char_name}, packId={char_pack_id}')
+        char_pricing_id = f.get(3, 0)
+        if isinstance(char_pricing_id, bytes):
+            char_pricing_id = int.from_bytes(char_pricing_id, 'little')
+        char_currency = f.get(5, 1)
+        if isinstance(char_currency, bytes):
+            char_currency = int.from_bytes(char_currency, 'little')
+        log(f'      CreateCharacter: name={char_name}, packId={char_pack_id}, '
+            f'pricingId={char_pricing_id}, currency={char_currency}')
     except Exception as e:
         log(f'      CreateCharacter parse error: {e}')
         char_name = 'Soldier'
         char_pack_id = 0
+        char_pricing_id = 0
+        char_currency = 1
 
     # 官方规则校验：空名/非法名拒绝建号（no_name=53 / invalid_name=36）
     name_err = _official_name_error(char_name)
@@ -224,6 +233,38 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
     db_created = False
     uv_template_id = default_uniform_variant(template, faction)
     pid = await sess.ensure_player()
+
+    # 收费判定（镜像客户端 SoldierShopMediator.isSoldierFree）：该阵营首个
+    # 该兵种且包军衔<1（fake soldier 占位槽 / 新手首兵）免费；其余（商店购买
+    # 额外/高军衔兵）按 Pricing 定价扣款；pricingId<=0 / 定价缺失 / 0 价同样
+    # 免费（_charge_player 口径）。余额不足：返回货币对应错误码不建号
+    # （ResponseCodes: n_credits=56 / n_gold=57 / n_warfunds=153）。
+    first_free = False
+    if rank < 1 and pid is not None:
+        try:
+            owned = await STORE.list_characters(pid)
+            first_free = not any(c['faction'] == faction and c['template'] == template
+                                 for c in owned)
+        except Exception as e:
+            log(f'[DB] list_characters for charge check failed: {e}')
+    paid_cost = 0
+    paid_key = None
+    if not first_free:
+        cost, ok = await _charge_player(sess, char_pricing_id, char_currency)
+        if not ok:
+            rc = {1: 56, 3: 57, 2: 153}.get(int(char_currency or 1), 56)
+            resp = build_response(cmd_id, 'CreateCharacterResponse', pb_int32(1, rc))
+            writer.write(resp)
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} CreateCharacterResponse (result={rc} '
+                f'{"n_credits" if rc == 56 else "n_gold" if rc == 57 else "n_warfunds"}) '
+                f'cost={cost} name={char_name!r}')
+            return
+        if cost > 0:
+            paid_cost = cost
+            paid_key = {1: 'credits', 2: 'warfunds', 3: 'gold'}.get(
+                int(char_currency or 1))
+
     if pid is not None:
         try:
             row = await STORE.create_character(
@@ -234,6 +275,14 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
             db_created = True
         except Exception as e:
             log(f'[DB] create_character failed: {e}')
+            # 建号失败但已扣款 → 退款，杜绝钱号两空
+            if paid_cost and paid_key:
+                try:
+                    await STORE.add_currency(pid, **{paid_key: paid_cost})
+                    log(f'      [MONEY] refund +{paid_cost} {paid_key} '
+                        f'(create failed)')
+                except Exception as re_:
+                    log(f'[DB] refund after create failure failed: {re_}')
     log(f'      character id={char_id}')
 
     # 1. 返回 CreateCharacterResponse (result=1 ok)

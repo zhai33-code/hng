@@ -237,6 +237,20 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
                 except Exception as e:
                     log(f'      [DB] touch_daily_login failed: {e}')
             await push_player_offer_metrics_row(sess, writer, int(pid))
+            # 进展 tab 等级补发：totalScore 已跨过 PlayerLevel 阈值但奖励
+            # 未发（历史数据 / 服务器停机期间结算）时登录即入账；升级则
+            # 重推 player 行（上面第 99 行推的是发奖前的旧货币/等级）。
+            try:
+                from .progression import check_player_level
+                leveled = await check_player_level(sess, writer, int(pid),
+                                                   notify=False)
+                if leveled:
+                    player_proto = await _msg_player_for(sess)
+                    await _push_kvcs(writer, cmd_id, b'player', player_proto)
+                    log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet '
+                        f'(player refreshed, progression level-up ★进展奖励补发)')
+            except Exception as e:
+                log(f'      [views] progression level check failed: {e}')
 
     resp = build_response(cmd_id, 'subscriberesponse')
     writer.write(resp)

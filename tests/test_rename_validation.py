@@ -349,6 +349,52 @@ async def test_create_character_handler():
     check('建号 21 字符超长名 → 36',
           response_code(writer, 'CreateCharacterResponse') == RC_INVALID_NAME)
 
+    # ---- 收费判定（镜像客户端 isSoldierFree）----
+
+    async def run_charge(proto, store, charge):
+        sess, writer = FakeSess(), FakeWriter()
+        with patched(chars_mod, STORE=store, _charge_player=charge):
+            await chars_mod.handle_createcharacterrequest(
+                sess, writer, CMD, 'CreateCharacterRequest', proto)
+        return writer
+
+    # 该阵营首个该兵种（rank<1）→ 免费：不扣款直接建号（fake slot / 新手）
+    store, charge = FakeCharStore(), FakeCharge()
+    proto = pb_string(1, 'IvanPetrov') + pb_varint(2, 35) \
+        + pb_varint(3, 543) + pb_varint(5, 1)
+    writer = await run_charge(proto, store, charge)
+    check('首个该兵种 rank0 → result=1 免费建号',
+          response_code(writer, 'CreateCharacterResponse') == 1)
+    check('首个该兵种：未扣款', not charge.calls)
+    check('首个该兵种：已落库', len(store.creates) == 1)
+
+    # 已拥有同兵种（第二个步兵）→ 扣款路径
+    store, charge = FakeCharStore(), FakeCharge()
+    store.chars = [{'id': 7, 'faction': 3, 'template': 1}]
+    writer = await run_charge(proto, store, charge)
+    check('第二个同兵种 → result=1 且扣款 (543, Credits)',
+          response_code(writer, 'CreateCharacterResponse') == 1
+          and charge.calls == [(543, 1)])
+    check('第二个同兵种：已落库', len(store.creates) == 1)
+
+    # 已拥有同兵种 + 余额不足 → 56 不建号
+    store, charge = FakeCharStore(), FakeCharge(ok=False)
+    store.chars = [{'id': 7, 'faction': 3, 'template': 1}]
+    writer = await run_charge(proto, store, charge)
+    check('余额不足 → result=56 n_credits',
+          response_code(writer, 'CreateCharacterResponse') == 56)
+    check('余额不足：未落库', not store.creates)
+
+    # 高军衔包（rank>=1）即使无拥有也扣款
+    store, charge = FakeCharStore(), FakeCharge()
+    proto_rank = pb_string(1, 'IvanPetrov') + pb_varint(2, 17) \
+        + pb_varint(3, 543) + pb_varint(5, 1)
+    writer = await run_charge(proto_rank, store, charge)
+    check('高军衔包 rank12 → 扣款后建号',
+          response_code(writer, 'CreateCharacterResponse') == 1
+          and charge.calls == [(543, 1)])
+    check('高军衔包：已落库', len(store.creates) == 1)
+
 
 async def test_set_squad_details_handler():
     print('== 3c. handle_set_squad_details（mock） ==')

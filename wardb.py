@@ -27,11 +27,14 @@ try:
     _prog_max = max(PROGRESSION_UNLOCK_IDS) if PROGRESSION_UNLOCK_IDS else 0
     _player_max = max(PLAYER_LEVEL_UNLOCK_IDS) if PLAYER_LEVEL_UNLOCK_IDS else 0
     _prog_set = set(PROGRESSION_UNLOCK_IDS)
-    # 角色模板解锁的 PlayerLevelUnlock id（unlockItemType==eCharacterTemplate，解析自
-    # WarDatabase/PlayerLevelUnlock）：置 true 会让客户端为每个阵营×每个已解锁模板生成
-    # 一个"可招募"占位士兵（fake slot），点击就弹输入名字创建。保持未解锁，
-    # 客户端只显示默认步兵槽位，与官方一致。
+    # 角色模板解锁的 PlayerLevelUnlock id（unlockItemType==eCharacterTemplate）：
+    # 7=伞兵(lv6) 9=侦察(lv9) 11=坦克兵(lv5) 12=飞行员(lv8) 26=将军(lv12)。
+    # 按等级置位后客户端为每个阵营×已解锁兵种生成"可招募"占位士兵（fake
+    # slot），点击弹输入名字 → CreateCharacterRequest（按定价扣银币建号，
+    # 服务器 CHARACTER_PACKS 全支持）。将军（26）例外：将军不随等级赠送
+    # （官方需 17 级军衔角色 + 单独解锁链路），恒 false。
     _PLAYER_CHARACTER_TEMPLATE_UNLOCKS = {7, 9, 11, 12, 26}
+    _PLAYER_GENERAL_UNLOCK_ID = 26
     _player_set = set(PLAYER_LEVEL_UNLOCK_IDS) - _PLAYER_CHARACTER_TEMPLATE_UNLOCKS
     _char_unlock_bits = [i in _prog_set for i in range(_prog_max + 1)]
     _player_unlock_bits = [i in _player_set for i in range(_player_max + 1)]
@@ -498,6 +501,96 @@ def _build_rank_meta_level():
 
 
 _RANK_META_LEVEL = _build_rank_meta_level()
+
+
+# ---- 玩家等级（进展 tab：PlayerLevel / PlayerLevelUnlock）----
+# PlayerLevel { id=1(等级), value=2(该级 totalScore 阈值) }：
+# 客户端 PlayerSchema.playerLevel 按 totalScore(f36) 对阈值表取最大等级。
+# PlayerLevelUnlock { id=1, unlockMetaLevel=2(等级), unlockItemType=3,
+#   unlockItemId=4(数额/模板id), available=6, unlockable=7 }。
+# EPlayerLevelUnlockItemType: eCharacterTemplate=1, eMissionType=2, eGoldBonus=3,
+# eCreditsBonus=4, eWarfundsBonus=5, eMembershipItem=6, eWar=7, eWeaponGroup=8,
+# eFactions=9, eMatchmakingGroup=10, eReferralBonus=11。
+def _build_player_levels():
+    return sorted((int(f.get(1, 0)), int(f.get(2, 0)))
+                  for f in _parse_wardb_table('PlayerLevel'))
+
+
+_PLAYER_LEVELS = _build_player_levels()
+
+
+def player_level_from_score(score):
+    """totalScore → 玩家等级（客户端 PlayerSchema.playerLevel 同款算法）。"""
+    lvl = 0
+    for lv, threshold in _PLAYER_LEVELS:
+        if threshold <= int(score) and lv > lvl:
+            lvl = lv
+    return lvl
+
+
+def _build_level_unlocks():
+    """PlayerLevelUnlock → {等级: {'credits'/'gold'/'warfunds': 数额,
+    'modes': [任务类型 id]}}。available && unlockable 才计入（客户端
+    PlayerModel.addToUnlockLevel 同款过滤）。"""
+    rewards = {}
+    for f in _parse_wardb_table('PlayerLevelUnlock'):
+        if not int(f.get(6, 0)) or not int(f.get(7, 0)):
+            continue
+        lv = int(f.get(2, 0))
+        itype = int(f.get(3, 0))
+        item = int(f.get(4, 0))
+        if item < 0:
+            item = 0
+        ent = rewards.setdefault(lv, {'credits': 0, 'gold': 0,
+                                      'warfunds': 0, 'modes': []})
+        if itype == 3:            # eGoldBonus
+            ent['gold'] += item
+        elif itype == 4:          # eCreditsBonus
+            ent['credits'] += item
+        elif itype == 5:          # eWarfundsBonus
+            ent['warfunds'] += item
+        elif itype == 2 and item != 1:
+            # eMissionType（1=默认 Assault，客户端 NotificationModel 跳过）
+            ent['modes'].append(item)
+    return rewards
+
+
+_LEVEL_UNLOCKS = _build_level_unlocks()
+
+
+def _build_player_level_unlock_meta():
+    """PlayerLevelUnlock 行 id → (unlockMetaLevel, available)。
+    供 player unlockBits 按等级置位。"""
+    meta = {}
+    for f in _parse_wardb_table('PlayerLevelUnlock'):
+        uid = int(f.get(1, 0))
+        if uid <= 0:
+            continue
+        meta[uid] = (int(f.get(2, 0)), int(f.get(6, 0)))
+    return meta
+
+
+_PLAYER_LEVEL_UNLOCK_META = _build_player_level_unlock_meta()
+_PLAYER_LEVEL_UNLOCK_MAX = (max(_PLAYER_LEVEL_UNLOCK_META)
+                            if _PLAYER_LEVEL_UNLOCK_META else 0)
+
+
+def player_unlock_bits_for_level(level):
+    """按玩家等级生成 player unlockBits（位索引 = PlayerLevelUnlock.id）。
+
+    客户端 PlayerUtilities.hasPlayerLevelUnlock 读该位图门控 War 模式
+    （eWar lv10）/匹配模式（eMissionType）/武器组（eWeaponGroup）等——
+    全 true 会让低级玩家也解锁全部模式（进展限制失效的根因）。
+    位 true = 条目 available 且 unlockMetaLevel <= level；
+    将军（_PLAYER_GENERAL_UNLOCK_ID）恒 false（不随等级赠送）；
+    其余兵种（坦克兵 lv5/伞兵 lv6/飞行员 lv8/侦察 lv9）按等级置位 →
+    客户端生成"可招募"占位士兵，招募走 CreateCharacterRequest。"""
+    lvl = int(level)
+    return [uid in _PLAYER_LEVEL_UNLOCK_META
+            and _PLAYER_LEVEL_UNLOCK_META[uid][1] != 0
+            and _PLAYER_LEVEL_UNLOCK_META[uid][0] <= lvl
+            and uid != _PLAYER_GENERAL_UNLOCK_ID
+            for uid in range(_PLAYER_LEVEL_UNLOCK_MAX + 1)]
 
 
 # ribbonlevel { id=1(等级), value=2(该级经验阈值) }：勋带单源 = total_xp 经阈值推导等级
