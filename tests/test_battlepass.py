@@ -95,6 +95,7 @@ class _MockSess:
     """career/combat handler 所需的最小 session 替身。"""
 
     playerview_cmd = 77
+    soldier_view_cmd = None
     combat_mission = 100003
     game_mission = 100003
     username = None
@@ -139,6 +140,16 @@ def test_season_starting_fields():
         check(f"season {s['id']} 起始值 (1,10,0)",
               (s['s_tier'], s['s_lvl'], s['s_score']) == (1, 10, 0),
               f"got {(s['s_tier'], s['s_lvl'], s['s_score'])}")
+    # 仅当前赛季延期 activeTo，其余保留原始值（全部延期会导致客户端
+    # battlePassCollection 给 4 个赛季都加"当前赛季"标签）
+    for s in seasons:
+        if s['id'] == career._ACTIVE_SEASON:
+            check(f"season {s['id']} activeTo 延期到 2099",
+                  s['to'] == career._SEASON_EXTENDED_TO, f"to={s['to']}")
+        else:
+            check(f"season {s['id']} activeTo 保留原始值（非 2099）",
+                  s['to'] != career._SEASON_EXTENDED_TO
+                  and s['to'].startswith('20'), f"to={s['to']}")
 
 
 def test_push_season_templates_schema():
@@ -218,7 +229,8 @@ async def db_tests():
     import matchmaking     # noqa: F401
     import sys as _sys
     for _name in ('player_service', 'matchmaking',
-                  'handlers.career', 'handlers.combat'):
+                  'handlers.career', 'handlers.combat',
+                  'handlers.shop', 'handlers.economy'):
         _mod = _sys.modules.get(_name)
         if _mod is not None:
             _mod.STORE = st
@@ -246,20 +258,46 @@ async def db_tests():
         bp = await st.get_battle_pass(pid, season)
         check('两局累计 score=800', bp['score'] == 800, f"score={bp['score']}")
 
-        # ---- 2. 买层级设值（只升不降）
+        # ---- 2. 买层级设值（只升不降）+ 立即发放奖励
         print('== 2. 买层级设值 ==')
+        # 领奖要求 purchased（客户端同样只有 owned 才能买层级），先购买赛季
+        await st.purchase_battle_pass(pid, season, 0)
+        cur_before_tier = await st.get_currency(pid)
+        writer = _MockWriter()
         await career_handlers.handle_purchase_battle_pass_tier(
-            _MockSess(pid), _MockWriter(), 210,
+            _MockSess(pid), writer, 210,
             'PurchaseBattlePassTierRequest', pb_varint(1, 371))
         bp = await st.get_battle_pass(pid, season)
         check('买 req=1000 层级：score 800 → 1000（设值）',
               bp['score'] == 1000, f"score={bp['score']}")
+        # 客户端买层级后不另发领奖请求（响应处理直接读 field 2 弹窗），
+        # 服务器必须当场发放已达成的奖励
+        check('买层级后奖励即时入账（credits/warfunds 增加）',
+              (await st.get_currency(pid))['credits'] > cur_before_tier['credits'],
+              f'before={cur_before_tier} after={await st.get_currency(pid)}')
+        # 物品类奖励也要实际落库（旧 bug：只入账货币，加成/会员/武器全跳过）
+        n_boosters = len(await st.list_boosters(pid))
+        n_memberships = len(await st.list_memberships(pid))
+        n_weapons = len(await st.list_weapons(pid))
+        check('买层级后加成落库（ribbon/普通 booster）',
+              n_boosters >= 6, f'boosters={n_boosters}')
+        check('买层级后会员落库（shopmembershipitems）',
+              n_memberships >= 1, f'memberships={n_memberships}')
+        check('买层级后武器落库（weaponvarianttemplate x3）',
+              n_weapons >= 3, f'weapons={n_weapons}')
+        check('买层级后 claimed 落库',
+              len(bp['claimed']) == 11, f'claimed={len(bp["claimed"])}')
+        check('买层级响应含 rewardedBattlePassTemplates（field 2）',
+              b'PurchaseBattlePassTierResponse' in writer.sent
+              and writer.sent.count(b'\x12') >= 11)
         await career_handlers.handle_purchase_battle_pass_tier(
             _MockSess(pid), _MockWriter(), 211,
             'PurchaseBattlePassTierRequest', pb_varint(1, 371))
         bp = await st.get_battle_pass(pid, season)
         check('重复买同层级不重复累加（旧 bug：会变 2000）',
               bp['score'] == 1000, f"score={bp['score']}")
+        check('重复买同层级不重复入账（claimed 幂等）',
+              len(bp['claimed']) == 11, f'claimed={len(bp["claimed"])}')
 
         # ---- 3. 购买通行证（非默认赛季）→ 按请求赛季推 battle_pass 行
         print('== 3. 按请求赛季推行 ==')
@@ -278,6 +316,10 @@ async def db_tests():
                   f.get(5) == other_season, f'f5={f.get(5)}')
             check('行 isPurchased = true', f.get(7) == 1)
             check('行 score = 1500', f.get(6) == 1500, f'f6={f.get(6)}')
+            # unlockDateTime 非空 → 客户端 canBeActivated=true（已结束赛季
+            # 购买后靠该字段显示"激活"按钮，旧 bug：恒推空串导致只能重复购买）
+            check('行 unlockDateTime 非空（已解锁可激活）',
+                  bool(f.get(11, b'')), f'f11={f.get(11)!r}')
 
         # ---- 4. 领奖：按请求赛季领取 + 奖励入账
         print('== 4. 领奖入账 ==')
@@ -329,6 +371,47 @@ async def db_tests():
               and got[0]['winner_faction_id'] == 3
               and got[0]['mission_time_seconds'] == 900,
               f'rid_keep={rid_keep} rid_empty={rid_empty}')
+
+        # ---- 4.6 激活切换涨分赛季（客户端"激活"语义：切到哪个涨哪个）
+        print('== 4.6 激活切换涨分赛季 ==')
+        # season3 已购买（第 3 节），激活它
+        await career_handlers.handle_activate_battle_pass_season(
+            _MockSess(pid), _MockWriter(), 215,
+            'ActivateBattlePassSeasonRequest', pb_varint(1, other_season))
+        bp3 = await st.get_battle_pass(pid, other_season)
+        check('season3 激活成功（is_active=true）',
+              bp3['active'] is True, f'bp3={bp3}')
+        season_row = await st.get_battle_pass(pid, season)
+        check('season4 未激活（互斥）', season_row['active'] is False,
+              f'bp4={season_row}')
+        # 结算 → 分数进激活的 season3，不进 season4
+        s4_before = season_row['score']
+        s3_before = bp3['score']
+        await combat_handlers.handle_announce_battlefield_earnings(
+            _MockSess(), _MockWriter(), 200,
+            'AnnounceBattleFieldEarningsRequest',
+            _earnings_request(pid, char_id, 200))
+        bp3 = await st.get_battle_pass(pid, other_season)
+        season_row = await st.get_battle_pass(pid, season)
+        check('激活 season3 后结算涨 season3',
+              bp3['score'] == s3_before + 200,
+              f"s3 {s3_before} -> {bp3['score']}")
+        check('season4 不再涨（旧 bug：硬编码恒涨 season4）',
+              season_row['score'] == s4_before,
+              f"s4 {s4_before} -> {season_row['score']}")
+        # 全量推行（登录路径）：有进度的赛季都要推，否则客户端查看
+        # 未推的赛季回落 startingScore=0（"登录后进度归零"根因）
+        writer = _MockWriter()
+        await career_handlers.push_all_battle_pass_rows(
+            _MockSess(pid), writer, pid)
+        all_rows = _kvcs_rows(writer.sent, b'battle_pass')
+        pushed_seasons = sorted(f.get(5) for f in all_rows)
+        check('登录全量推行：赛季 3/4 各一行（赛季 1/2 无进度不推）',
+              pushed_seasons == [3, 4], f'seasons={pushed_seasons}')
+        s3_row = next((f for f in all_rows if f.get(5) == 3), None)
+        check('全量推行带最新分数（season3 score=1700）',
+              s3_row is not None and s3_row.get(6) == 1700,
+              f's3_row={s3_row}')
 
         # ---- 5. 结算响应先行不受影响（回归保护；空 STORE，不写真实库）
         print('== 5. 结算响应回归 ==')

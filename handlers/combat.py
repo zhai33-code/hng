@@ -1261,13 +1261,19 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                                                   xp_delta + vet_xp + daily_xp)
                         log(f'      [DB] char {ch["characterId"]} '
                             f'+{xp_delta} xp(+{vet_xp}vet+{daily_xp}daily)')
-                # 战斗通行证分数：本局 battle score 计入当前激活赛季
-                # （未购买也累计，与官服一致；奖励仅已购买行可领）
+                # 战斗通行证分数：计入玩家激活的赛季（客户端"激活"切换
+                # 语义：切到哪个赛季就涨哪个），未激活任何赛季回落当前
+                # 赛季（与官服一致：未购买也累计，奖励仅已购买行可领）
                 if p['score']:
+                    try:
+                        bp_season = await STORE.get_active_battle_pass_season(
+                            pid) or _BP_ACTIVE_SEASON
+                    except Exception:
+                        bp_season = _BP_ACTIVE_SEASON
                     bp_score = await STORE.add_battle_pass_score(
-                        pid, _BP_ACTIVE_SEASON, p['score'])
+                        pid, bp_season, p['score'])
                     log(f'      [DB] battle pass +{p["score"]} -> {bp_score} '
-                        f'(player={pid})')
+                        f'(season={bp_season}, player={pid})')
                 if p['kills'] or p['deaths'] or p['score'] or p['captures']:
                     target = p['characters'][0]['characterId'] if p['characters'] else 0
                     if not target:

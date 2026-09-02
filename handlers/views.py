@@ -43,7 +43,7 @@ from matchmaking import (
 import login_queue
 
 from .career import (
-    push_battle_pass_row,
+    push_all_battle_pass_rows,
     push_career_order_row,
     push_season_templates,
     )
@@ -200,7 +200,9 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         if pid is not None:
             await push_career_order_row(sess, writer, int(pid))
             await push_season_templates(sess, writer)
-            await push_battle_pass_row(sess, writer, int(pid))
+            # 全部有进度的赛季行都推（客户端 BattlePassTable 只有推过的
+            # 行，只推默认赛季的话其他赛季查看时回落 startingScore=0）
+            await push_all_battle_pass_rows(sess, writer, int(pid))
             # Tutorial 行（已触发教程集）：客户端 TutorialTable 只认 KVCS 行，
             # 不推则战报关闭后 wasTriggered(CAREER_ORDER_TUTORIAL_ID=2) 恒
             # false → 每次都切士兵界面重播生涯军令引导

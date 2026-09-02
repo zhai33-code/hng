@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import asyncpg
 
@@ -560,6 +561,13 @@ END $$;
 
 -- battle_pass_progress：激活态（购买后需手动激活才计 isActive）
 ALTER TABLE battle_pass_progress ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- battle_pass_progress：解锁时间（Zulu 'YYYYMMDDHHMMSSZ'）。客户端 canBeActivated
+-- 要求 isRunning（activeTo 未过期）或 unlockDateTime 非空——已结束赛季购买后
+-- 只有该字段非空才会显示"激活"按钮；回填历史已购行
+ALTER TABLE battle_pass_progress ADD COLUMN IF NOT EXISTS unlock_at TEXT NOT NULL DEFAULT '';
+UPDATE battle_pass_progress SET unlock_at = '20990101000000Z'
+WHERE purchased AND unlock_at = '';
 
 -- ===== U4 迁移（任务/社交域）=====
 -- 举报（AddPlayerReportRequest 持久化）
@@ -1859,10 +1867,10 @@ class PlayerStore:
     # ------------------------------------------------------------- battle pass
 
     async def get_battle_pass(self, player_id, season_id):
-        """读取通行证进度行：{score, purchased, active, claimed} 或 None。"""
+        """读取通行证进度行：{score, purchased, active, claimed, unlock} 或 None。"""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                'SELECT xp, purchased, is_active, claimed_tiers '
+                'SELECT xp, purchased, is_active, claimed_tiers, unlock_at '
                 'FROM battle_pass_progress WHERE player_id = $1 AND season_id = $2',
                 player_id, int(season_id))
         if row is None:
@@ -1872,6 +1880,7 @@ class PlayerStore:
             'purchased': bool(row['purchased']),
             'active': bool(row['is_active']),
             'claimed': json.loads(row['claimed_tiers'] or '[]'),
+            'unlock': row['unlock_at'] or '',
         }
 
     async def add_battle_pass_score(self, player_id, season_id, delta):
@@ -1915,24 +1924,49 @@ class PlayerStore:
                     'UPDATE players SET gold = gold - $2 WHERE id = $1 '
                     'RETURNING gold', player_id, int(gold_cost))
                 await conn.execute(
-                    'INSERT INTO battle_pass_progress (player_id, season_id, purchased) '
-                    'VALUES ($1, $2, TRUE) '
+                    'INSERT INTO battle_pass_progress '
+                    '    (player_id, season_id, purchased, unlock_at) '
+                    'VALUES ($1, $2, TRUE, $3) '
                     'ON CONFLICT (player_id, season_id) '
-                    'DO UPDATE SET purchased = TRUE',
-                    player_id, int(season_id))
+                    'DO UPDATE SET purchased = TRUE, unlock_at = $3',
+                    player_id, int(season_id),
+                    datetime.utcnow().strftime('%Y%m%d%H%M%SZ'))
         return True, int(gold)
 
     async def activate_battle_pass(self, player_id, season_id):
-        """激活已购买的通行证（is_active=true，需先 purchased）。返回是否激活成功。"""
+        """激活已购买的通行证（is_active=true，需先 purchased）。
+
+        互斥激活：同一玩家同时只有一个激活赛季（客户端 activeOrNewest
+        先取 isActive 行；多个同时为真时行为不确定），激活成功后把
+        其他赛季的 is_active 清掉。返回是否激活成功。"""
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                'INSERT INTO battle_pass_progress (player_id, season_id) '
-                'VALUES ($1, $2) '
-                'ON CONFLICT (player_id, season_id) DO UPDATE SET is_active = TRUE '
-                'WHERE battle_pass_progress.purchased '
-                'RETURNING is_active',
-                player_id, int(season_id))
-        return bool(row['is_active']) if row else False
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    'INSERT INTO battle_pass_progress (player_id, season_id) '
+                    'VALUES ($1, $2) '
+                    'ON CONFLICT (player_id, season_id) DO UPDATE SET is_active = TRUE '
+                    'WHERE battle_pass_progress.purchased '
+                    'RETURNING is_active',
+                    player_id, int(season_id))
+                ok = bool(row['is_active']) if row else False
+                if ok:
+                    await conn.execute(
+                        'UPDATE battle_pass_progress SET is_active = FALSE '
+                        'WHERE player_id = $1 AND season_id <> $2',
+                        player_id, int(season_id))
+        return ok
+
+    async def get_active_battle_pass_season(self, player_id):
+        """玩家当前激活的通行证赛季 id（无激活行返回 None）。
+
+        结算涨分路由用：激活哪个赛季就涨哪个（客户端"激活"切换语义），
+        未激活任何赛季时由调用方回落到当前赛季。"""
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval(
+                'SELECT season_id FROM battle_pass_progress '
+                'WHERE player_id = $1 AND is_active AND purchased '
+                'ORDER BY season_id DESC LIMIT 1', player_id)
+        return int(val) if val is not None else None
 
     async def claim_battle_pass_reward(self, player_id, season_id, template_id):
         """领取通行证奖励模板：写 claimed_tiers（幂等，需已购买）。

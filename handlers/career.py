@@ -53,9 +53,17 @@ from protocol import (
     )
 from state import STORE, log
 
-from messages import _push_kvcs
+from messages import _push_kvcs, _msg_uniform_part, _msg_uniform_variant
 from player_service import _push_player_refresh
+from handlers.economy import (
+    _BOOSTER_MINUTES,
+    push_booster_rows,
+    push_membership_rows,
+    push_ticket_rows,
+    )
 from wardb import (
+    BOOSTER_MINUTES_BY_ID,
+    MEMBERSHIP_DAYS_BY_ID,
     _parse_wardb_table,
     _rank_from_combat_xp,
     _ribbon_level_from_xp,
@@ -72,7 +80,10 @@ _BP_TEMPLATES = None      # [{id, tier, level, loc, image, reward, season, req}]
 _CAREER_TEMPLATES = None  # {template_id: (type, required_count, rewards_xml)}
 
 # 赛季延期目标（Zulu）：本地 WarDatabase 里 4 个赛季 activeTo 全部是
-# 2022/2023 已过期，延期后 battlePassIsRunning() 为 true，通行证界面可用。
+# 2022/2023 已过期，仅当前赛季（_ACTIVE_SEASON）延期到 2099 让
+# battlePassIsRunning() 为 true、通行证界面可用；其余赛季保留原始
+# activeTo（客户端 battlePassCollection 对每个 activeTo>now 的赛季都加
+# "当前赛季"标签，全部延期会导致 4 个赛季同时显示进行中）。
 _SEASON_EXTENDED_TO = '20990101000000Z'
 
 # 当前激活赛季（最新 id）：battle_pass 行与延期模板都指向它。
@@ -86,17 +97,19 @@ def _str(v):
 
 
 def _bp_seasons():
-    """battle_pass_season_template 行缓存（activeTo 已延期）。"""
+    """battle_pass_season_template 行缓存（仅当前赛季 activeTo 延期）。"""
     global _BP_SEASONS
     if _BP_SEASONS is None:
         rows = []
         for f in _parse_wardb_table('battle_pass_season_template'):
+            sid = int(f.get(1, 0) or 0)
             rows.append({
-                'id': int(f.get(1, 0) or 0),
+                'id': sid,
                 'name': _str(f.get(2, '')),
                 'loc': _str(f.get(3, '')),
                 'from': _str(f.get(4, '')),
-                'to': _SEASON_EXTENDED_TO,
+                'to': (_SEASON_EXTENDED_TO if sid == _ACTIVE_SEASON
+                       else _str(f.get(5, ''))),
                 's_tier': int(f.get(6, 1) or 1),
                 's_lvl': int(f.get(7, 10) or 10),
                 's_score': int(f.get(8, 0) or 0),
@@ -142,9 +155,20 @@ def _career_templates():
 
 # ------------------------------------------------------------- 奖励入账
 
-async def _grant_reward_xml(pid, xml_str, tag):
-    """解析奖励 XML（<items target='player'><credits amount='2000'/></items>），
-    credits/warfunds/gold 入账，其他物品类型记日志跳过。"""
+async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
+    """解析奖励 XML（<items target='player|depot'>…</items>）并入账。
+
+    支持 battle_pass_template / CareerOrderTemplate 奖励全集：
+    - 货币：credits / warfunds / gold
+    - 加成：ribbonboostertemplate / boostertemplate（Booster KVCS 推送）
+    - 会员：shopmembershipitems（Membership KVCS 推送）
+    - 门票：tickettemplate / tickettimedtemplate（Ticket KVCS 推送）
+    - 武器/载具变体：发到当前选中角色（复用商店礼包发货，含默认弹药）
+    - 军服：uniformvarianttemplate / uniformparttemplate
+    暂不支持（需载具/武器/进度绑定，官服为 depot 账户级库存）：
+    vehicleupgradetemplate / tracereffecttemplate / progressionunlock，
+    命中时记日志跳过。返回入账摘要列表。
+    """
     granted = []
     try:
         root = ET.fromstring(xml_str)
@@ -153,19 +177,105 @@ async def _grant_reward_xml(pid, xml_str, tag):
         return granted
     if STORE is None:
         return granted
+
+    # 武器/载具/军服需要挂角色：优先当前选中角色，回落首个角色
+    need_char = any(el.tag.lower() in (
+        'weaponvarianttemplate', 'vehiclevarianttemplate',
+        'uniformvarianttemplate', 'uniformparttemplate') for el in root)
+    char_id = None
+    if need_char:
+        try:
+            char_id = await STORE.get_player_selected_char(int(pid))
+            if not char_id:
+                chars = await STORE.list_characters(int(pid))
+                char_id = int(chars[0]['id']) if chars else None
+        except Exception as e:
+            log(f'      [career] reward char resolve failed ({tag}): {e}')
+
     delta = {}
+    n_boosters = n_memberships = n_tickets = n_timed = 0
     for item in root:
-        obj = item.tag
+        obj = item.tag.lower()
+        tid = int(item.get('id', 0) or 0)
         amount = int(float(item.get('amount', '0') or 0))
-        if obj in ('credits', 'warfunds', 'gold') and amount > 0:
-            delta[obj] = delta.get(obj, 0) + amount
-            granted.append(f'{obj}+{amount}')
+        try:
+            if obj in ('credits', 'warfunds', 'gold') and amount > 0:
+                delta[obj] = delta.get(obj, 0) + amount
+                granted.append(f'{obj}+{amount}')
+            elif obj in ('ribbonboostertemplate', 'boostertemplate'):
+                await STORE.add_booster(
+                    pid, tid,
+                    duration_minutes=BOOSTER_MINUTES_BY_ID.get(
+                        tid, _BOOSTER_MINUTES),
+                    activate_now=False,
+                    is_ribbon=(obj == 'ribbonboostertemplate'))
+                n_boosters += 1
+                granted.append(f'{obj}#{tid}')
+            elif obj == 'shopmembershipitems':
+                await STORE.add_membership(
+                    pid, tid,
+                    duration_days=MEMBERSHIP_DAYS_BY_ID.get(tid, 30))
+                n_memberships += 1
+                granted.append(f'membership#{tid}')
+            elif obj == 'tickettemplate':
+                await STORE.add_ticket(pid, tid, is_timed=False)
+                n_tickets += 1
+                granted.append(f'ticket#{tid}')
+            elif obj == 'tickettimedtemplate':
+                await STORE.add_ticket(pid, tid, is_timed=True)
+                n_timed += 1
+                granted.append(f'tickettimed#{tid}')
+            elif obj == 'weaponvarianttemplate':
+                if char_id:
+                    from handlers.shop import _bundle_deliver_weapon
+                    await _bundle_deliver_weapon(
+                        sess, writer, pid, char_id, tid, [],
+                        equip_slot1=False)
+                    granted.append(f'weapon#{tid}')
+            elif obj == 'vehiclevarianttemplate':
+                if char_id:
+                    from handlers.shop import _bundle_deliver_vehicle
+                    await _bundle_deliver_vehicle(
+                        sess, writer, pid, char_id, tid, equip_slot1=False)
+                    granted.append(f'vehicle#{tid}')
+            elif obj == 'uniformvarianttemplate':
+                if char_id:
+                    uv = await STORE.create_uniform_variant(pid, tid, char_id)
+                    if sess.soldier_view_cmd is not None:
+                        await _push_kvcs(
+                            writer, sess.soldier_view_cmd, b'UniformVariant',
+                            _msg_uniform_variant(uv['id'], tid, char_id))
+                    granted.append(f'uniformvariant#{tid}')
+            elif obj == 'uniformparttemplate':
+                if char_id:
+                    part = await STORE.create_uniform_part(pid, char_id, tid, 1)
+                    if sess.soldier_view_cmd is not None:
+                        await _push_kvcs(
+                            writer, sess.soldier_view_cmd, b'UniformPart',
+                            _msg_uniform_part(part['id'], char_id, tid, 1))
+                    granted.append(f'uniformpart#{tid}')
+            else:
+                log(f'      [career] reward item skipped ({tag}): '
+                    f'<{item.tag} id={tid}>')
+        except Exception as e:
+            # 单项失败不影响其余奖励发货
+            log(f'      [career] reward item <{item.tag} id={tid}> '
+                f'grant failed ({tag}): {e}')
     if delta:
         # 原子增量入账（读-改-写绝对值会覆盖并发变动，如结算加钱）
         await STORE.add_currency(pid, **delta)
-    skipped = [item.tag for item in root if item.tag not in delta]
-    if skipped:
-        log(f'      [career] reward items skipped ({tag}): {skipped}')
+    # 库存表 KVCS 推送（有该类物品发放时）
+    try:
+        if n_boosters:
+            await push_booster_rows(sess, writer, int(pid))
+        if n_tickets:
+            await push_ticket_rows(sess, writer, int(pid))
+        if n_timed:
+            await push_ticket_rows(sess, writer, int(pid), timed=True)
+        if n_memberships:
+            await push_membership_rows(sess, writer, int(pid))
+    except Exception as e:
+        log(f'      [career] reward row push failed ({tag}): {e}')
     return granted
 
 
@@ -405,7 +515,7 @@ async def push_career_order_row(sess, writer, pid):
 
 
 def _msg_battle_pass_row(row_id, pid, season, score, purchased, active,
-                         pending, received, tier=1, level=1):
+                         pending, received, tier=1, level=1, unlock=''):
     """battle_pass 进度行 proto。"""
     m = pb_int64(1, row_id)
     m += pb_int32(2, tier)
@@ -417,7 +527,9 @@ def _msg_battle_pass_row(row_id, pid, season, score, purchased, active,
     m += pb_string(8, ','.join(str(x) for x in pending))
     m += pb_string(9, ','.join(str(x) for x in received))
     m += pb_bool(10, active)
-    m += pb_string(11, '')                  # unlockDateTime（未用解锁流程）
+    # unlockDateTime 非空 = 已解锁可随时激活（客户端 canBeActivated 判定：
+    # 赛季已结束时 isPurchased && unlockDateTime.length 才显示"激活"按钮）
+    m += pb_string(11, unlock)
     return m
 
 
@@ -443,20 +555,33 @@ async def push_battle_pass_row(sess, writer, pid, season_id=_ACTIVE_SEASON):
                if t['season'] == season_id and t['req'] <= score
                and t['id'] not in received]
     row_id = pid * 100 + season_id
+    # 已购行兜底非空解锁时间（迁移前旧行 unlock_at 为空时也显示激活按钮）
+    unlock = bp.get('unlock') or ('20990101000000Z' if bp['purchased'] else '')
     m = _msg_battle_pass_row(row_id, pid, season_id, score,
                              bp['purchased'], bp['active'], pending, received,
-                             tier, level)
+                             tier, level, unlock)
     await _push_kvcs(writer, sess.playerview_cmd, b'battle_pass', m)
     log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
         f'(battle_pass id={row_id}, score={score}, tier={tier}, lvl={level}, '
         f'pending={len(pending)})')
 
 
-async def push_season_templates(sess, writer):
-    """推延期赛季模板行（battle_pass_season_template 表 UPDATE）。
+async def push_all_battle_pass_rows(sess, writer, pid):
+    """推玩家全部有进度的 battle_pass 行（每个赛季一行）。
 
-    本地文件 4 赛季全部过期；KVCS 覆盖 activeTo 为 2099 后
-    BattlePassModel.battlePassIsRunning() 为 true，通行证界面显示进行中。"""
+    登录/激活切换用：客户端 BattlePassTable 只有已推过的行，查看
+    未推的赛季会回落到模板默认值（startingScore=0）——"登录后进度
+    归零"的根因。无进度行的赛季 push_battle_pass_row 自行跳过。"""
+    for s in _bp_seasons():
+        await push_battle_pass_row(sess, writer, pid, s['id'])
+
+
+async def push_season_templates(sess, writer):
+    """推赛季模板行（battle_pass_season_template 表 UPDATE）。
+
+    本地文件 4 赛季全部过期；仅当前赛季的 activeTo 延期为 2099，KVCS
+    覆盖后 BattlePassModel.battlePassIsRunning() 为 true，通行证界面
+    显示进行中；其余赛季保留原始 activeTo（历史赛季不显示进行中）。"""
     if sess.playerview_cmd is None:
         return
     for s in _bp_seasons():
@@ -542,7 +667,8 @@ async def handle_claim_career_order_reward(sess, writer, cmd_id, req_type, proto
         if ok:
             tpl = _career_templates().get(template_id)
             if tpl:
-                granted = await _grant_reward_xml(int(pid), tpl[2],
+                granted = await _grant_reward_xml(sess, writer, int(pid),
+                                                  tpl[2],
                                                   f'career order {template_id}')
                 if granted:
                     log(f'      [MONEY] career order {template_id} reward: '
@@ -590,7 +716,7 @@ async def handle_get_battle_pass_season(sess, writer, cmd_id, req_type, proto):
     pid = await sess.ensure_player()
     if pid is not None:
         await push_season_templates(sess, writer)
-        await push_battle_pass_row(sess, writer, int(pid))
+        await push_all_battle_pass_rows(sess, writer, int(pid))
 
     resp = build_response(cmd_id, 'GetBattlePassSeasonResponse', resp_proto)
     writer.write(resp)
@@ -616,7 +742,10 @@ async def handle_activate_battle_pass_season(sess, writer, cmd_id, req_type, pro
             log(f'      [DB] activate battle pass season {season_id}: {ok}')
         except Exception as e:
             log(f'      [DB] activate_battle_pass failed: {e}')
-        await push_battle_pass_row(sess, writer, int(pid), season_id)
+        # 互斥激活后旧激活行 isActive 变 false：把所有有进度的赛季行
+        # 都推一遍（无进度行的赛季 push_battle_pass_row 自行跳过），
+        # 客户端才能看到切换后的激活态
+        await push_all_battle_pass_rows(sess, writer, int(pid))
 
     resp = build_response(cmd_id, 'ActivateBattlePassSeasonResponse', pb_int32(1, 1))
     writer.write(resp)
@@ -658,9 +787,12 @@ async def handle_purchase_battle_pass_season(sess, writer, cmd_id, req_type, pro
 
 async def handle_purchase_battle_pass_tier(sess, writer, cmd_id, req_type, proto):
     """PurchaseBattlePassTierRequest {battlePassTemplateId=1 playerId=2 pricingId=3
-    discountId=4 paymentCurrency=5} → PurchaseBattlePassTierResponse{response=1}。
+    discountId=4 paymentCurrency=5} → PurchaseBattlePassTierResponse
+    {response=1, rewardedBattlePassTemplates=2}。
 
-    购买层级完成：score 提升到该模板 requiredScore + battle_pass 行刷新。"""
+    购买层级完成：score 提升到该模板 requiredScore（只升不降），并立即
+    发放所有已达成的奖励（客户端响应处理从 field 2 读奖励列表弹窗，
+    不会另发 ReceiveBattlePassRewardRequest）。"""
     template_id = 0
     try:
         f = pb_parse(proto)
@@ -668,6 +800,8 @@ async def handle_purchase_battle_pass_tier(sess, writer, cmd_id, req_type, proto
     except Exception as e:
         log(f'      [career] PurchaseBattlePassTier parse error: {e}')
 
+    resp_proto = pb_int32(1, 1)
+    granted_templates = []
     pid = await sess.ensure_player()
     if pid is not None and STORE is not None and template_id:
         tpl = next((t for t in _bp_templates() if t['id'] == template_id), None)
@@ -680,13 +814,53 @@ async def handle_purchase_battle_pass_tier(sess, writer, cmd_id, req_type, proto
                     f'score -> {score}')
             except Exception as e:
                 log(f'      [DB] set_battle_pass_score failed: {e}')
+            # 立即发放买层级跳过等级的奖励并在响应带回（弹奖励窗）
+            granted_templates, granted_ids = await _claim_reached_rewards(
+                sess, writer, int(pid), tpl['season'])
+            for m in granted_templates:
+                resp_proto += pb_message(2, m)
+            if granted_ids:
+                log(f'      [MONEY] battle pass tier purchase rewards: '
+                    f'{granted_ids}')
+                await _push_player_refresh(sess, writer)
             await push_battle_pass_row(sess, writer, int(pid), tpl['season'])
 
-    resp = build_response(cmd_id, 'PurchaseBattlePassTierResponse', pb_int32(1, 1))
+    resp = build_response(cmd_id, 'PurchaseBattlePassTierResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} PurchaseBattlePassTierResponse '
-        f'(response=1, template={template_id})')
+        f'(response=1, template={template_id}, '
+        f'rewarded={len(granted_templates)})')
+
+
+async def _claim_reached_rewards(sess, writer, pid, season_id):
+    """领取该赛季所有已达成分数且未领取的通行证奖励。
+
+    返回 (granted_templates, granted_ids)：granted_templates 为
+    BattlePassTemplate proto 列表（响应 field 2 用），granted_ids 为
+    模板 id 列表（日志用）。领奖与入账幂等（claimed_tiers 查重）。"""
+    granted_templates = []
+    granted_ids = []
+    try:
+        bp = await STORE.get_battle_pass(pid, season_id)
+    except Exception as e:
+        log(f'      [DB] get_battle_pass failed: {e}')
+        return granted_templates, granted_ids
+    if bp is None:
+        return granted_templates, granted_ids
+    score = bp['score']
+    received = [int(x) for x in bp.get('claimed', [])]
+    for t in _bp_templates():
+        if (t['season'] == season_id and t['req'] <= score
+                and t['id'] not in received):
+            first, _ = await STORE.claim_battle_pass_reward(
+                pid, season_id, t['id'])
+            if first:
+                granted_ids.append(t['id'])
+                await _grant_reward_xml(sess, writer, pid, t['reward'],
+                                        f'battle pass tier {t["id"]}')
+                granted_templates.append(_msg_bp_template(t))
+    return granted_templates, granted_ids
 
 
 async def handle_receive_battle_pass_reward(sess, writer, cmd_id, req_type, proto):
@@ -708,29 +882,14 @@ async def handle_receive_battle_pass_reward(sess, writer, cmd_id, req_type, prot
     resp_proto = pb_int32(1, 1)
     pid = await sess.ensure_player()
     if pid is not None and STORE is not None:
-        try:
-            bp = await STORE.get_battle_pass(int(pid), season_id)
-        except Exception as e:
-            log(f'      [DB] get_battle_pass failed: {e}')
-            bp = None
-        if bp is not None:
-            score = bp['score']
-            received = [int(x) for x in bp.get('claimed', [])]
-            granted_ids = []
-            for t in _bp_templates():
-                if (t['season'] == season_id and t['req'] <= score
-                        and t['id'] not in received):
-                    first, _ = await STORE.claim_battle_pass_reward(
-                        int(pid), season_id, t['id'])
-                    if first:
-                        granted_ids.append(t['id'])
-                        await _grant_reward_xml(int(pid), t['reward'],
-                                                f'battle pass tier {t["id"]}')
-                        resp_proto += pb_message(2, _msg_bp_template(t))
-            if granted_ids:
-                log(f'      [MONEY] battle pass rewards granted: {granted_ids}')
-                await _push_player_refresh(sess, writer)
-            await push_battle_pass_row(sess, writer, int(pid), season_id)
+        granted_templates, granted_ids = await _claim_reached_rewards(
+            sess, writer, int(pid), season_id)
+        for m in granted_templates:
+            resp_proto += pb_message(2, m)
+        if granted_ids:
+            log(f'      [MONEY] battle pass rewards granted: {granted_ids}')
+            await _push_player_refresh(sess, writer)
+        await push_battle_pass_row(sess, writer, int(pid), season_id)
 
     resp = build_response(cmd_id, 'ReceiveBattlePassRewardResponse', resp_proto)
     writer.write(resp)
