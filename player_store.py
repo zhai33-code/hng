@@ -2171,6 +2171,28 @@ class PlayerStore:
                 int(player_id), [int(x) for x in message_ids], bool(value))
         return _rowcount(n)
 
+    async def list_mail_recipient_rows(self, player_id, limit=200):
+        """收件箱行（客户端 MessageRecipient KVCS 表的数据源）。
+
+        本库一封邮件一行（send_mail 按收件人各插一行），因此
+        MessageRecipient.id = messageId = mail_messages.id；
+        客户端读写/删除标记请求回写的也是这组 id（set_mail_flag）。"""
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                'SELECT id, is_read, deleted FROM mail_messages '
+                'WHERE recipient_id = $1 ORDER BY id DESC LIMIT $2',
+                int(player_id), int(limit))
+
+    async def get_mail_rows(self, player_id, message_ids):
+        """按 id 取本人邮件行（标记回推用），返回与 list_mail_recipient_rows
+        同构的行（id/is_read/deleted）。"""
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                'SELECT id, is_read, deleted FROM mail_messages '
+                'WHERE recipient_id = $1 AND id = ANY($2::bigint[]) '
+                'ORDER BY id',
+                int(player_id), [int(x) for x in message_ids])
+
     # ------------------------------------------------------------- 聊天频道
 
     async def create_channel(self, name, owner_id, tab='general', password='',

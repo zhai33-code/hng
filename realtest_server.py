@@ -305,6 +305,10 @@ async def main():
                 log(f'[DB] restored {len(loaded)} player_selected_char rows')
         except Exception as e:
             log(f'[DB] load_all_selected_chars failed: {e}')
+        # 新邮件事件监听（LISTEN hng_new_mail）：管理端 web 发信后 NOTIFY，
+        # 游戏服零轮询实时推 MessageRecipient KVCS 给在线会话
+        from handlers.social import start_mail_listener
+        start_mail_listener()
     except Exception as e:
         log(f'[DB] PostgreSQL UNAVAILABLE ({e}) -- 持久化已禁用')
     # HTTP 线程模块注入主 loop（/register 经它投递 create_player 协程）

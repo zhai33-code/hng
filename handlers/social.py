@@ -58,6 +58,7 @@
   already_friend=3 invite_pending=253 invite_accepted=254。
 """
 
+import asyncio
 import time
 
 from protocol import (
@@ -699,6 +700,10 @@ async def handle_send_mail_message(sess, writer, cmd_id, req_type, proto):
                 ids = await STORE.send_mail(int(pid), rids, subject, text,
                                             reply_to)
                 sent = len(ids)
+                # 进程内直推：同进程写入无 NOTIFY，在线收件人即时到账
+                for rid in rids:
+                    if int(rid) != int(pid):
+                        await push_mail_to_player(int(rid))
         except Exception as e:
             log(f'      [DB] send_mail failed: {e}')
 
@@ -708,6 +713,123 @@ async def handle_send_mail_message(sess, writer, cmd_id, req_type, proto):
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} SendMailMessageResponse '
         f'(recipients={len(tags)}, sent={sent}, response={code})')
+
+
+async def push_mail_recipient_rows(sess, writer, pid, rows):
+    """推送收件箱 MessageRecipient 行（MessageRecipientTable.xmlTag）。
+
+    客户端邮箱 UI / 主菜单未读角标的唯一数据源：MessagesWindowMediator
+    只对已有 MessageRecipient 行的 messageId 发 GetMailMessagesRequest 拉
+    正文——不推则邮箱恒空、GetMailMessages 一次都不发（2026-09-02 管理端
+    发邮件玩家收不到的根因）。行 id = messageId = mail_messages.id，
+    与 set_mail_flag 回写的 id 同源。"""
+    if sess.playerview_cmd is None:
+        return
+    for r in rows:
+        m = pb_int64(1, r['id'])                    # id
+        m += pb_int64(2, pid)                       # playerId
+        m += pb_int64(3, r['id'])                   # messageId
+        m += pb_bool(4, r['is_read'])               # isRead
+        m += pb_bool(5, r['deleted'])               # isDeleted
+        await _push_kvcs(writer, sess.playerview_cmd, b'MessageRecipient', m)
+    if rows:
+        log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+            f'(MessageRecipient x{len(rows)}, player={pid})')
+
+
+async def push_new_mail_rows(sess, writer):
+    """推送尚未推给该会话的收件箱行（登录全量 + 在线增量共用）。
+
+    每个会话记一份已推 id 集合（sess.mail_pushed_ids），周期轮询只补差量，
+    避免重复 ADD 导致未读角标反复 +1。已推行的 is_read/is_deleted 变更
+    不重推：自己的改动手里已有，跨端改动重登即同步。"""
+    if STORE is None or sess.playerview_cmd is None:
+        return
+    pid = await sess.ensure_player()
+    if pid is None:
+        return
+    pushed = getattr(sess, 'mail_pushed_ids', None)
+    if pushed is None:
+        pushed = sess.mail_pushed_ids = set()
+    try:
+        rows = await STORE.list_mail_recipient_rows(int(pid))
+    except Exception as e:
+        log(f'      [DB] list_mail_recipient_rows failed: {e}')
+        return
+    new_rows = [r for r in rows if r['id'] not in pushed]
+    if not new_rows:
+        return
+    await push_mail_recipient_rows(sess, writer, int(pid), new_rows)
+    for r in new_rows:
+        pushed.add(r['id'])
+
+
+async def push_mail_to_player(pid):
+    """玩家有新邮件时实时推送（在线才推；离线下次登录订阅时全量拉到）。"""
+    if STORE is None:
+        return
+    try:
+        name = await STORE.get_username(int(pid))
+    except Exception as e:
+        log(f'      [DB] get_username failed: {e}')
+        return
+    sess = FLASH_SESSIONS.get(name or '')
+    if sess is not None and sess.playerview_cmd is not None:
+        await push_new_mail_rows(sess, sess.writer)
+
+
+# 管理端 web 与游戏服不同进程，经 PostgreSQL LISTEN/NOTIFY 事件驱动中转：
+# 管理端写 mail_messages 后 NOTIFY hng_new_mail，游戏服监听到即推送给在线
+# 会话（零轮询；通知只在 COMMIT 后送达，未提交事务不会误推）
+MAIL_NOTIFY_CHANNEL = 'hng_new_mail'
+
+
+def _on_mail_notify(conn, pid, channel, payload):
+    """NOTIFY 回调（asyncpg 在连接的事件循环里同步调用，只做调度）。"""
+    pids = []
+    for part in (payload or '').split(','):
+        part = part.strip()
+        if part.isdigit():
+            pids.append(int(part))
+    if pids:
+        # 定向推：payload 带收件人 id（单发）
+        for tp in pids:
+            asyncio.ensure_future(push_mail_to_player(tp))
+    else:
+        # 全服群发 / 兜底：推所有在线会话的差量
+        for sess in list(FLASH_SESSIONS.values()):
+            asyncio.ensure_future(push_new_mail_rows(sess, sess.writer))
+
+
+async def _mail_listener_loop():
+    """LISTEN 连接守护：断线自动重连（5s 退避）。"""
+    import asyncpg
+    while True:
+        conn = None
+        try:
+            conn = await asyncpg.connect(STORE.dsn)
+            await conn.add_listener(MAIL_NOTIFY_CHANNEL, _on_mail_notify)
+            log(f'[social] mail listener ready (channel={MAIL_NOTIFY_CHANNEL})')
+            # 挂住直到连接关闭（asyncpg Connection 无 await_closed，
+            # 用 is_closed 状态位守护；断网/服务端重启后此处退出 → 重连）
+            while not conn.is_closed():
+                await asyncio.sleep(5)
+            log('[social] mail listener connection lost, reconnecting')
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log(f'[social] mail listener died ({e}), retry in 5s')
+        finally:
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+        await asyncio.sleep(5)
+
+
+def start_mail_listener():
+    asyncio.ensure_future(_mail_listener_loop())
 
 
 async def handle_set_message_recipients_read(sess, writer, cmd_id, req_type,
@@ -727,6 +849,12 @@ async def handle_set_message_recipients_read(sess, writer, cmd_id, req_type,
         try:
             n = await STORE.set_mail_flag(int(pid), ids, 'is_read', is_read)
             log(f'      [DB] set_mail_read: {n} rows')
+            # 回推更新后的 MessageRecipient 行：客户端 onSetMessageRecipients
+            # ReadResponse 为空实现，未读角标只在 KVCS 行到达时才会递减，
+            # 不回推则已读状态要重登才生效
+            if n:
+                rows = await STORE.get_mail_rows(int(pid), ids)
+                await push_mail_recipient_rows(sess, writer, int(pid), rows)
         except Exception as e:
             log(f'      [DB] set_mail_read failed: {e}')
 
@@ -755,6 +883,11 @@ async def handle_set_message_recipients_deleted(sess, writer, cmd_id, req_type,
         try:
             n = await STORE.set_mail_flag(int(pid), ids, 'deleted', is_deleted)
             log(f'      [DB] set_mail_deleted: {n} rows')
+            # 回推更新后的行：客户端 onMessageRecipientUpdated 按 isDeleted
+            # 从邮箱列表移除线程，不回推则删除要重登才生效
+            if n:
+                rows = await STORE.get_mail_rows(int(pid), ids)
+                await push_mail_recipient_rows(sess, writer, int(pid), rows)
         except Exception as e:
             log(f'      [DB] set_mail_deleted failed: {e}')
 

@@ -41,4 +41,13 @@ async def send_mail(pool, *, player_id: int, subject: str, text: str) -> int:
                     rid, subject, text)
                 await conn.execute(
                     'UPDATE mail_messages SET thread_id = $1 WHERE id = $1', mid)
+            # 通知游戏服推送（LISTEN hng_new_mail，COMMIT 后送达）：
+            # payload=收件人 id 列表（单发定向推）；全服群发收件人可能
+            # 超过 NOTIFY payload 8000 字节上限，超长降级为空 payload
+            # （游戏服按"推所有在线会话差量"兜底）
+            payload = ','.join(str(r) for r in recipients)
+            if len(payload) > 8000:
+                payload = ''
+            await conn.execute('SELECT pg_notify($1, $2)',
+                               'hng_new_mail', payload)
     return len(recipients)

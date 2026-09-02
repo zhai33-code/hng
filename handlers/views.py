@@ -56,6 +56,7 @@ from .social import (
     notify_friends_of,
     push_friend_rows,
     push_ignored_rows,
+    push_new_mail_rows,
     )
 from .squad import push_squad_rows
 
@@ -208,6 +209,9 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
             # 好友界面数据源，不推则列表恒空。
             await push_friend_rows(sess, writer, int(pid))
             await push_ignored_rows(sess, writer, int(pid))
+            # 收件箱行（MessageRecipient 表）：邮箱 UI / 未读角标唯一数据源，
+            # 不推则客户端永不发 GetMailMessagesRequest（邮箱恒空）
+            await push_new_mail_rows(sess, writer)
             # 上线广播：在线好友的好友列表里把我的 onlinestatus 刷成 1，
             # 否则对方要重登才能看到我在线
             await notify_friends_of(int(pid))
