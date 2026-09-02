@@ -132,6 +132,8 @@ class _WearStore:
         self.vehicles = []
         self.vehicle_upgrades = []
         self.vehicle_ammo = []
+        self.balances = {}      # (pid, currency_key) -> 余额
+        self.spent = []         # [(pid, currency_key, cost), ...]
 
     # ---- 结算入库（D 部分用）----
     async def save_battle_report(self, report, players):
@@ -139,6 +141,14 @@ class _WearStore:
 
     async def add_currency(self, player_id, credits=0, warfunds=0):
         return {'credits': credits, 'warfunds': warfunds}
+
+    async def spend_currency(self, player_id, currency_key, cost, conn=None):
+        bal = self.balances.get((player_id, currency_key), 0)
+        if bal < cost:
+            return False, bal
+        self.balances[(player_id, currency_key)] = bal - cost
+        self.spent.append((player_id, currency_key, cost))
+        return True, bal - cost
 
     async def add_combat_xp(self, pid, cid, xp):
         return xp
@@ -346,6 +356,119 @@ def test_apply_equipment_wear_worn_not_negative():
     assert st.vehicles[0]['condition'] == 0.0
 
 
+# ---------- C2. 战后自动维修（autoRepair 扣费 + 修复满耐久）----------
+
+def _priced_weapon_template():
+    """找一个可磨损且有维修定价的武器模板。"""
+    for t, p in wardb._WEAPON_WEAR.items():
+        if (p[1] or p[2]) and wardb.repair_base_price(
+                'WeaponMaxConditionRepair', t, 'credits') > 0:
+            return t
+    raise AssertionError('wardb 中找不到带维修定价的可磨损武器模板')
+
+
+def test_autorepair_credits_charges_and_restores():
+    """autoRepair=1(Credits)：战后扣费修复到满耐久，费用与客户端
+    PriceObject.calculateFractionPrice 同式 max(1, int(基础价×损耗比例))；
+    同角色未开启自动维修的物品照常磨损。"""
+    st, _ = _build_loadout()
+    wt = _priced_weapon_template()
+    wp = wardb.weapon_wear_params(wt)
+    base = wardb.repair_base_price('WeaponMaxConditionRepair', wt, 'credits')
+    st.weapons[0]['template_id'] = wt     # wA 主武器 slot1
+    st.weapons[0]['auto_repair'] = 1
+    st.balances[(1, 'credits')] = 10 ** 9
+    old = combat_handlers.STORE
+    combat_handlers.STORE = st
+    try:
+        asyncio.run(combat_handlers._apply_equipment_wear({(1, 11): 900}))
+    finally:
+        combat_handlers.STORE = old
+    worn = 1.0 - wp[1] * 675
+    expect_cost = max(1, int(base * (1.0 - worn) / 1.0))
+    assert st.weapons[0]['condition'] == 1.0, '应修复到满耐久'
+    assert st.spent == [(1, 'credits', expect_cost)], st.spent
+    assert st.balances[(1, 'credits')] == 10 ** 9 - expect_cost
+    # 副武器（同模板 slot2）未开启自动维修 → 保持磨损
+    assert st.weapons[1]['condition'] == 1.0 - wp[1] * int(675 * 0.3)
+
+
+def test_autorepair_insufficient_funds_keeps_worn():
+    """autoRepair=2(Gold) 余额不足：不扣款、保持磨损。"""
+    st, _ = _build_loadout()
+    wt = _priced_weapon_template()
+    wp = wardb.weapon_wear_params(wt)
+    st.weapons[0]['template_id'] = wt
+    st.weapons[0]['auto_repair'] = 2
+    st.balances[(1, 'gold')] = 0
+    old = combat_handlers.STORE
+    combat_handlers.STORE = st
+    try:
+        asyncio.run(combat_handlers._apply_equipment_wear({(1, 11): 900}))
+    finally:
+        combat_handlers.STORE = old
+    assert st.weapons[0]['condition'] == 1.0 - wp[1] * 675, '应保持磨损'
+    assert st.spent == [], '不应扣款'
+
+
+def test_autorepair_missing_pricing_repairs_free():
+    """定价缺失（基础价 0）：免费修复（与手动维修定价缺失免费口径一致）。"""
+    st, _ = _build_loadout()
+    st.weapons[0]['auto_repair'] = 1
+    old_store = combat_handlers.STORE
+    old_price = combat_handlers.repair_base_price
+    combat_handlers.STORE = st
+    combat_handlers.repair_base_price = lambda *a: 0
+    try:
+        asyncio.run(combat_handlers._apply_equipment_wear({(1, 11): 900}))
+    finally:
+        combat_handlers.STORE = old_store
+        combat_handlers.repair_base_price = old_price
+    assert st.weapons[0]['condition'] == 1.0, '应免费修复到满耐久'
+    assert st.spent == []
+
+
+def test_autorepair_vehicle_gold():
+    """载具 autoRepair=2(Gold)：按 spawn 磨损比例扣 Gold 修复到满耐久。"""
+    st, _ = _build_loadout()
+    vt = st.vehicles[0]['vehicle_variant_template_id']
+    base = wardb.repair_base_price('VehicleMaxConditionRepair',
+                                   wardb.vehicle_parent_template_id(vt), 'gold')
+    assert base > 0, '测试前提：载具模板需有维修定价'
+    st.vehicles[0]['auto_repair'] = 2
+    st.balances[(1, 'gold')] = 10 ** 9
+    old = combat_handlers.STORE
+    combat_handlers.STORE = st
+    try:
+        asyncio.run(combat_handlers._apply_equipment_wear({(1, 11): 900}))
+    finally:
+        combat_handlers.STORE = old
+    expect_cost = max(1, int(base * 3 / 60))
+    assert st.vehicles[0]['condition'] == 60.0, '应修复到满耐久'
+    assert (1, 'gold', expect_cost) in st.spent, st.spent
+
+
+def test_autorepair_ammo_refill():
+    """弹药 autoRepair=1：按消耗发数比例扣费回满。"""
+    st, _ = _build_loadout()
+    at = st.weapon_ammo[0]['ammo_template_id']
+    amax = wardb.ammo_wear_params(at)[0]
+    base = wardb.repair_base_price('AmmoMaxConditionRepair', at, 'credits')
+    assert base > 0, '测试前提：弹药模板需有维修定价'
+    st.weapon_ammo[0]['condition'] = amax
+    st.weapon_ammo[0]['auto_repair'] = 1
+    st.balances[(1, 'credits')] = 10 ** 9
+    old = combat_handlers.STORE
+    combat_handlers.STORE = st
+    try:
+        asyncio.run(combat_handlers._apply_equipment_wear({(1, 11): 900}))
+    finally:
+        combat_handlers.STORE = old
+    expect_cost = max(1, int(base * 675 / amax))
+    assert st.weapon_ammo[0]['condition'] == amax, '应回满'
+    assert (1, 'credits', expect_cost) in st.spent, st.spent
+
+
 # ---------- D. 完整结算链路触达磨损 ----------
 
 class _MockWriter:
@@ -516,10 +639,12 @@ def test_db_normalize_create_and_wear():
                 'ORDER BY w.container_slot LIMIT 1', pid, cid)
             assert wrow is not None, '前置条件丢失（已装备武器）'
             await conn.execute(
-                'UPDATE weapons SET condition = 1.0 WHERE id = $1', wrow['id'])
+                'UPDATE weapons SET condition = 1.0, auto_repair = 0 '
+                'WHERE id = $1', wrow['id'])
             if vrow is not None:
                 await conn.execute(
-                    'UPDATE vehicles SET condition = $2 WHERE id = $1',
+                    'UPDATE vehicles SET condition = $2, auto_repair = 0 '
+                    'WHERE id = $1',
                     vrow['id'],
                     wardb.vehicle_full_condition(
                         vrow['vehicle_variant_template_id']))
@@ -564,6 +689,11 @@ if __name__ == '__main__':
         test_apply_equipment_wear_math_and_skips,
         test_apply_equipment_wear_zero_active_skipped,
         test_apply_equipment_wear_worn_not_negative,
+        test_autorepair_credits_charges_and_restores,
+        test_autorepair_insufficient_funds_keeps_worn,
+        test_autorepair_missing_pricing_repairs_free,
+        test_autorepair_vehicle_gold,
+        test_autorepair_ammo_refill,
         test_settlement_path_applies_wear,
         test_db_normalize_create_and_wear,
     ]

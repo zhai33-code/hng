@@ -27,6 +27,10 @@ import os
 import re
 import time
 
+# Windows 注册表里没有 .webp 的 MIME 映射，guess_type 会返回 None，
+# /icons/ 下的压缩 webp 会被当成 octet-stream 下发 → 手动注册
+mimetypes.add_type('image/webp', '.webp')
+
 from http.server import (
     SimpleHTTPRequestHandler,
     ThreadingHTTPServer,

@@ -1,4 +1,4 @@
-# HnG real-machine test launcher
+﻿# HnG real-machine test launcher
 # Requires: Administrator (for port 80) + hosts entries (managed manually)
 #   hosts需手动添加：
 #     127.0.0.1 game.hng-group.com

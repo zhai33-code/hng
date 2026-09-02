@@ -98,7 +98,7 @@ def ribbon_overlay_fallback(template_id: int) -> str:
     ov = RIBBON_SPECIALIST_OVERLAY.get(template_id)
     if not ov:
         return ''
-    return f'/icons/{_OVERLAY_DIR[ov[0]]}/{ov[1]}.png'
+    return f'/icons/{_OVERLAY_DIR[ov[0]]}/{ov[1]}.webp'
 
 
 def ribbon_overlay_style(template_id: int) -> dict:

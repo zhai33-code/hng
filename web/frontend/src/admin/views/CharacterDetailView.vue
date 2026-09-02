@@ -78,11 +78,11 @@ onMounted(load)
 
 /** 武器图标：客户端 images/Weapons/{weaponTemplate id}.png */
 function weaponIcon(w: WeaponItem): string {
-  return `/icons/Weapons/${w.template_id}.png`
+  return `/icons/Weapons/${w.template_id}.webp`
 }
 /** 载具图标：客户端 images/Vehicles/{vehicleTemplate id}.png（variant 级无图，用父模板图） */
 function vehicleIcon(v: VehicleItem): string {
-  return `/icons/Vehicles/${v.parent}.png`
+  return `/icons/Vehicles/${v.parent}.webp`
 }
 /** 勋带图标：后端拼好最终路径（专属图或类别底图），前端零试错 */
 /** 军衔徽章 */

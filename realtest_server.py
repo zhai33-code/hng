@@ -29,6 +29,7 @@ import time
 
 import game_server
 import handlers
+import login_queue
 import matchmaking
 import statistics_server
 import web_server
@@ -125,6 +126,13 @@ async def handle_tcp(reader, writer):
                 await notify_friends_of(int(sess.player_id))
             except Exception as e:
                 log(f'[social] offline notify failed: {type(e).__name__}: {e}')
+        # 登录排队：排队/已放行未注册的会话出队释放名额；随后跑一次
+        # pump（含 went_offline 释放 FLASH_SESSIONS 名额的情况）放行队首
+        login_queue.on_disconnect(sess)
+        try:
+            await login_queue.pump()
+        except Exception as e:
+            log(f'[queue] pump on disconnect failed: {type(e).__name__}: {e}')
         # 匹配排队清理：断线玩家出池（防幽灵条目虚增人数/被撮合成局；
         # 已成局的不动，战局照常进行）
         try:
@@ -263,6 +271,8 @@ async def start_ping_responder():
 async def main():
     # 匹配模块依赖注入（PostgreSQL 连接池 + 统一日志）
     matchmaking.configure(STORE, log)
+    # 登录排队（容量 HNG_MAX_ONLINE，事件驱动 + 1s 周期 pump 放行）
+    login_queue.start()
     # OpenID provider：audience = EOS client_id（私服抓包确认）
     # ★ 私服 JWT aud = "xyza7891uO05dmOamk2giEDkkLHD6Taj"，非 Epic Deployment ID
     try:

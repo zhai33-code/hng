@@ -62,6 +62,7 @@ from matchmaking import (
     _msg_solo_squad_session,
     _push_kvcs,
     _push_kvcs_delete,
+    _reset_auto_squad_rows,
     _zulu_activated,
     release_match,
     reset_real_squad_to_lobby,
@@ -347,6 +348,22 @@ async def handle_abandon_mission(sess, writer, cmd_id, req_type, proto):
             if solo is not None:
                 try:
                     solo['mission_id'] = 0
+                    # ★ 凑队小队行删除（先于 solo 行重推，同战斗结束路径）：
+                    #   被合并进 2 人以上凑队的玩家删合并队行后重推 solo 行
+                    #   ★★ 括号必须包住 `or {}`：裸写
+                    #   `PMS_TO_SESSION.get(p) or {}.get('auto_sq_id') or 0`
+                    #   时 .get 绑定的是字面量 {}（返回 None），整条 or 链
+                    #   求值成 sess_rec 整个 dict → 下面 int(dict) 抛
+                    #   TypeError，solo 重置整体被 except 吞掉 → 凑队行不
+                    #   删、solo 行不推，客户端带着凑队行回大厅（2026-09-02
+                    #   "解散后没有退出小队"第一案发现场）
+                    _mm_sess = PMS_TO_SESSION.get(pms_id) or {}
+                    _auto_sq = int(_mm_sess.get('auto_sq_id') or 0)
+                    if _auto_sq:
+                        _auto_rows = _mm_sess.get('auto_sq_rows') or []
+                        await _reset_auto_squad_rows(
+                            writer, sess.playerview_cmd,
+                            int(_auto_sq), _auto_rows)
                     await _push_kvcs(writer, sess.playerview_cmd, b'SquadSession',
                                      _msg_solo_squad_session(
                                          solo['squad_row'], int(pid),
@@ -380,20 +397,24 @@ async def handle_abandon_mission(sess, writer, cmd_id, req_type, proto):
         if pid is not None:
             _MM_QUEUES.pop(int(pid), None)
         # 多人局：从战局详情移除该玩家；全员离场 → 释放 combat server 实例
-        for mid, det in list(_MM_MISSION_DETAILS.items()):
-            players = det.get('players')
-            if players is not None:
-                det['players'] = [p for p in players
-                                  if int(p.get('player_id', 0)) != int(pid)]
-                if not det['players']:
+        # ★ pid 为 None（未登录会话/ensure_player 失败）时跳过清理：
+        #   int(None) 抛 TypeError 会中断本 handler（response 已发但
+        #   det['players'] 留下幽灵条目 → 玩家列表人数虚高）
+        if pid is not None:
+            for mid, det in list(_MM_MISSION_DETAILS.items()):
+                players = det.get('players')
+                if players is not None:
+                    det['players'] = [p for p in players
+                                      if int(p.get('player_id', 0)) != int(pid)]
+                    if not det['players']:
+                        _MM_MISSION_DETAILS.pop(mid, None)
+                        release_match(mid)
+                        log(f'      [mission] mission {mid} empty, combat '
+                            f'server released')
+                elif int(det.get('player_id', 0)) == int(pid):
+                    # 旧单人结构
                     _MM_MISSION_DETAILS.pop(mid, None)
                     release_match(mid)
-                    log(f'      [mission] mission {mid} empty, combat server '
-                        f'released')
-            elif int(det.get('player_id', 0)) == int(pid):
-                # 旧单人结构
-                _MM_MISSION_DETAILS.pop(mid, None)
-                release_match(mid)
 
 
 async def handle_end_mission(sess, writer, cmd_id, req_type, proto):

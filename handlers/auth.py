@@ -55,27 +55,13 @@ async def handle_querybannedmachinerequest(sess, writer, cmd_id, req_type, proto
 
 
 async def handle_startlogin(sess, writer, cmd_id, req_type, proto):
+    # 登录排队：容量未满立即 mayProceed=true（行为同旧版）；满员则入队，
+    # 由 login_queue（断线/登出事件 + 1s 周期 pump）用原 cmdId 持续推送
+    # LoginQueueUpdate，放行时发 mayProceed=true 解锁客户端请求队列。
     # LoginQueueUpdate.result 是 ResponseCodes 枚举：fail=0, ok=1
-    # 必须设 1(ok)，否则 queueCallback 直接 return，登录流程中断
-    resp_proto = (pb_int32(1, 0) +        # positionInQueue = 0
-                  pb_int32(2, 1) +        # mayProceed = true
-                  pb_int32(3, cmd_id) +   # originalId = cmd_id
-                  pb_int32(4, 1))         # result = 1 (ResponseCodes.ok)
-    resp = build_response(cmd_id, 'LoginQueueUpdate', resp_proto)
-    log(f'S->C cmd={cmd_id:<4} LoginQueueUpdate (mayProceed=true)')
-    log(f'      resp bytes ({len(resp)}B): {resp.hex()}')
-    log(f'      proto bytes ({len(resp_proto)}B): {resp_proto.hex()}')
-    # Re-parse our own response to verify it round-trips correctly.
-    try:
-        echo_chunk, _ = Chunk.parse(resp, 0)
-        echo_cmd = echo_chunk.as_int() if echo_chunk else None
-        echo_title = echo_chunk.subs[0].as_str() if echo_chunk and echo_chunk.subs else None
-        echo_proto = echo_chunk.subs[0].subs[0].data if echo_chunk and echo_chunk.subs and echo_chunk.subs[0].subs else None
-        log(f'      round-trip: cmd={echo_cmd} title={echo_title!r} proto={echo_proto.hex() if echo_proto else None}')
-    except Exception as e:
-        log(f'      round-trip FAILED: {e}')
-    writer.write(resp)
-    await writer.drain()
+    # （必须设 1(ok)，否则 queueCallback 直接 return，登录流程中断）。
+    import login_queue
+    await login_queue.enter(sess, writer, cmd_id)
 
 
 

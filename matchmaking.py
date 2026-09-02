@@ -42,6 +42,7 @@ from wardb import (
     battlefield_entity_for_gamemap, battlefield_pos,
     commandnode_template, is_general_character, preset_scene,
     squad_template_for_character, squad_template_name,
+    squad_template_slot_count,
 )
 import mm_config
 import mm_pool
@@ -737,6 +738,7 @@ _MM_SOLO_SMS_ID = [random.getrandbits(63)]           # 单人隐式小队 SquadM
 _MM_METRICS_SESSION_ID = [random.getrandbits(63)]    # metricsSessionId 自增
 _MM_BATTLE_SESSION_ID = [random.getrandbits(63)]     # battle session id 自增
 _MM_SQUAD_ID = [random.getrandbits(63)]              # squadId 自增
+_MM_SQUAD_MEMBER_ROW = [random.getrandbits(63)]      # 凑队成员行 id 自增
 
 # 局内小队分组登记：mission_id -> {squad_id: {
 #   name, leader_char_id, faction, squad_db_id(真小队=DB id / 单人凑队=0),
@@ -744,7 +746,11 @@ _MM_SQUAD_ID = [random.getrandbits(63)]              # squadId 自增
 # _start_match 成局时写入；game_server SquadResponse 按此构建局内小队定义
 # （队名/队长/每成员槽位）；release_match 清理。
 _MM_MISSION_SQUADS = {}
-_MM_SOLO_SQUAD_MAX = 6        # 单人匹配自动凑队的人数上限
+# 单人匹配自动凑队人数上限 = 小队模板玩家槽数（wardb
+# SquadPlayerSlotTemplate 表：Infantry/Paratrooper 4、Armor 3、
+# Fighter/Recon 2；客户端 SquadModel MAX_CHARACTERS_PER_SQUAD=4）。
+# 超过槽数的成员在战斗服里找不到槽（SquadResponse 按模板发全量槽），
+# 故凑队/late join 补队都按 wardb.squad_template_slot_count 封顶。
 
 
 def _next_match_id(seq):
@@ -852,6 +858,105 @@ async def _msg_solo_squad_member_session(row_id, squad_row_id, pid, gamertag,
     m += pb_int64(19, upt)                   # uniformPartTemplateId
     m += pb_int64(20, faction)               # characterFactionTemplateId
     return m
+
+
+def _msg_auto_squad_session(sq_id, info, mission_id, entered=1):
+    """散人凑成小队 SquadSession proto（字段结构与真实小队同构）。
+
+    f18 squadId=0（局内动态凑队，非 DB 真小队，不可定制）；f17 missionId
+    = 战局 id（StatusMediator 状态机按非零进 LOCKED_IN_COMBAT）。
+    """
+    members = info.get('members') or []
+    leader_pid = int(members[0]['player_id']) if members else 0
+    m = b''
+    m += pb_int64(1, sq_id)                  # id（=squadSessionId）
+    m += pb_int64(2, leader_pid)             # ownerPlayerId（slot 0 = 队长）
+    m += pb_int64(3, int(info.get('template', 1) or 1))  # characterTemplateId
+    m += pb_int64(4, int(info.get('faction', 0) or 0))  # factionTemplateId
+    m += pb_int64(5, 0)                      # supportSlotTemplateId1
+    m += pb_int64(6, 0)                      # supportSlotTemplateId2
+    m += pb_int64(7, 0)                      # supportSlotTemplateId3
+    m += pb_int32(8, 0)                      # totalCustomizationPoints
+    m += pb_int32(9, 0)                      # usedCustomizationPoints
+    m += pb_string(10, str(info.get('name') or ''))     # name
+    m += pb_bool(12, False)                  # matchMakeWarMissionFlag
+    m += pb_int64(17, int(mission_id or 0))  # missionId
+    m += pb_int64(18, 0)                     # squadId（凑队非真小队）
+    m += pb_int32(19, int(entered or 1))     # actionGamesEntered
+    m += pb_bool(20, False)                  # isLockedForMembers
+    m += pb_bool(21, False)                  # isLockedForCustomization
+    m += pb_bool(22, False)                  # forceReady
+    return m
+
+
+async def _msg_auto_squad_member(mem, sq_id, faction, status=4):
+    """散人凑成小队 SquadMemberSession proto（f3=slot+1 与 solo 行同规律）。"""
+    uvt, upt = 0, 0
+    try:
+        uvt, upt = await STORE.get_character_appearance(
+            int(mem['player_id']), int(mem['char_id']))
+    except Exception:
+        pass
+    m = b''
+    m += pb_int64(1, int(mem['row_id']))     # id（成员行 id）
+    m += pb_int64(2, int(sq_id))             # squadSessionId
+    # f3 槽模板 id = slot+1（solo 行官方 slot0→f3=1 同规律；客户端删行
+    # handleClearingSlot 按 f3 反查 SquadPlayerSlotTemplate.slotNumber-1
+    # 清槽，0 会 null 解引用）
+    m += pb_int64(3, int(mem.get('slot', 0) or 0) + 1)  # squadPlayerSlotTemplateId
+    m += pb_int64(4, int(mem['player_id']))  # playerId
+    m += pb_string(5, str(mem['gamertag']))  # gamerTag
+    m += pb_int64(6, 0)                      # playerFactionTemplateId
+    m += pb_int64(7, int(mem['char_id']))    # characterId
+    m += pb_int64(8, uvt)                    # uniformVariantTemplateId
+    m += pb_int64(9, 0)                      # weaponVariantTemplateId
+    m += pb_int32(10, int(mem.get('rank', 0) or 0))     # characterRank
+    m += pb_int64(11, 0)                     # shopMembershipItemId
+    m += pb_int32(12, int(status))           # squadMemberSessionStatus
+    m += pb_int64(13, 1)                     # verifiedSquadResourceTemplates
+    m += pb_int64(13, 2)
+    m += pb_string(14, str(mem['gamertag'])) # characterName
+    m += pb_int64(15, 0)                     # playerSessionId
+    m += pb_int32(16, 0)                     # playerTier
+    m += pb_int32(17, 0)                     # squadCustomizationPoints
+    m += pb_bool(18, False)                  # wasInvited
+    m += pb_int64(19, upt)                   # uniformPartTemplateId
+    m += pb_int64(20, int(faction))          # characterFactionTemplateId
+    return m
+
+
+async def _push_auto_squad_rows(w, vc, mission_id, sq_id, info, entered=1):
+    """凑队小队全量 KVCS 行推给单条连接（SquadSession + 全体成员行）。
+
+    客户端 SquadModel.handleSquadMemberSessionAdd：新增含本人 playerId 的
+    成员行（非邀请态）即切换当前小队 → 大厅小队面板从 solo 行切到合并队。
+    先推 SquadSession 行再推成员行（成员行 ADD 触发 getFromId 切换）。
+    """
+    await _push_kvcs(w, vc, b'SquadSession',
+                     _msg_auto_squad_session(sq_id, info, mission_id, entered))
+    faction = int(info.get('faction', 0) or 0)
+    for mem in info.get('members') or []:
+        await _push_kvcs(w, vc, b'SquadMemberSession',
+                         await _msg_auto_squad_member(mem, sq_id, faction))
+    _log(f'S->C cmd={vc:<4} KeyValueChangeSet (auto squad id={sq_id} + '
+         f'{len(info.get("members") or [])} members, mission={mission_id})')
+
+
+async def _reset_auto_squad_rows(w, vc, auto_sq_id, auto_sq_rows):
+    """战斗结束/放弃：删除凑队小队 KVCS 行（整队成员行 + SquadSession）。
+
+    逐行删除（成员行先删——客户端 handleClearingSlot 按 _currentSquadMember
+    -Session 清面板）；随后调用方重推 solo 行（ADD）恢复单人小队视图。
+    """
+    try:
+        for rid in auto_sq_rows or []:
+            await _push_kvcs_delete(w, vc, b'SquadMemberSession', int(rid))
+        if auto_sq_id:
+            await _push_kvcs_delete(w, vc, b'SquadSession', int(auto_sq_id))
+        _log(f'S->C cmd={vc:<4} KeyValueChangeSet delete (auto squad '
+             f'id={auto_sq_id} + {len(auto_sq_rows or [])} member rows)')
+    except Exception as e:
+        _log(f'      [WARN] auto squad reset push failed: {e}')
 PMS_TO_MISSION = {}         # pms_id -> mission_id（game_server 按启动参数 /M 反查）
 PMS_TO_SESSION = {}         # pms_id -> {player_id, char_id, gamertag, faction,
                             #            metrics_uid, metrics_session_id,
@@ -1619,8 +1724,8 @@ async def _start_match(match):
     # ★ 局内小队分组（覆盖上面每人一个 squad_id 的占位发号）：
     #   - 真实小队（ctx.squad_db_id 相同）共用 DB 小队 id，队名取库
     #     （大厅 SetSquadDetails 传入），队长取 DB leader_character_id
-    #   - 单人匹配玩家按阵营+兵种自动凑队（每队上限 _MM_SOLO_SQUAD_MAX，
-    #     rank 最高者任队长、占 slot 0），队名用兵种对应官方小队模板名
+    #   - 单人匹配玩家按阵营+兵种自动凑队（每队上限 = 该兵种小队
+    #     模板槽数，rank 最高者任队长、占 slot 0），队名用兵种对应官方小队模板名
     #     （Infantry/Fighter/Paratrooper/Armor/Recon Squad）+ 按本局
     #     (阵营, 兵种) 从 1 的编号（_auto_squad_numbered_name）
     # game_server SquadResponse 按登记表构建小队定义 → 同队成员进同一局内小队。
@@ -1632,11 +1737,15 @@ async def _start_match(match):
         for slot, s in enumerate(members):
             s['sess']['squad_id'] = sq_id
             s['sess']['squad_slot'] = slot
+            # 成员行 id：凑队小队 KVCS 行（SquadMemberSession.f1）——
+            # 合并小队推送/战斗结束重置按 id 删行，须与 solo/真实小队
+            # 成员行 id 不冲突（_MM_SQUAD_MEMBER_ROW 独立序列）
             rows.append({'player_id': int(s['entry'].player_id),
                          'char_id': int(s['entry'].char_id),
                          'gamertag': s['sess']['gamertag'],
                          'rank': int((s['ctx'] or {}).get('rank', 0) or 0),
-                         'slot': slot})
+                         'slot': slot,
+                         'row_id': _next_match_id(_MM_SQUAD_MEMBER_ROW)})
         _MM_MISSION_SQUADS.setdefault(mission_id, {})[sq_id] = {
             'name': name, 'leader_char_id': int(leader_char),
             'faction': int(fac), 'squad_db_id': int(db_id),
@@ -1675,8 +1784,10 @@ async def _start_match(match):
         for sq_tmpl, sub in sorted(by_branch.items()):
             sub.sort(key=lambda s: (-int((s['ctx'] or {}).get('rank', 0) or 0),
                                     int(s['entry'].player_id)))
-            for i in range(0, len(sub), _MM_SOLO_SQUAD_MAX):
-                chunk = sub[i:i + _MM_SOLO_SQUAD_MAX]
+            # 凑队上限 = 该兵种小队模板槽数（超编成员战斗服找不到槽）
+            _cap = squad_template_slot_count(sq_tmpl)
+            for i in range(0, len(sub), _cap):
+                chunk = sub[i:i + _cap]
                 leader = chunk[0]
                 _register_mission_squad(
                     _next_match_id(_MM_SQUAD_ID),
@@ -1711,10 +1822,15 @@ async def _start_match(match):
         # 本局天气/时段（成局时随机抽取一次，简报 MissionInfo f12/f13 与
         # 战斗服 BattleFieldSettings f9/f21/f22 同源取值）
         **roll_weather(),
-        'players': [{'player_id': int(e.player_id),
+        # ★必须取 s['sess']（每人各自的登记行）：此处在 for e in
+        #   match.players 循环之后，列表推导式里引用 e 会捕获循环残留
+        #   变量 = 最后一名玩家 → 多人局所有条目 faction/char_id/player_id
+        #   全被抹成最后一人的值（2026-09-02 双人局大厅玩家列表双方都
+        #   显示在最后一人阵营下的根因；单人局 e 恰为本人故未暴露）
+        'players': [{'player_id': int(s['sess']['player_id']),
                      'gamertag': s['sess']['gamertag'],
-                     'char_id': int(e.char_id),
-                     'faction': int(e.faction),
+                     'char_id': int(s['sess']['char_id']),
+                     'faction': int(s['sess']['faction']),
                      'pms_id': s['pms_id']} for s in sessions],
     }
     # 每局资源池：f5（匹配界面）/ f14（握手）/ f2（轮询）三处单一事实源，
@@ -1792,17 +1908,41 @@ async def _push_player_into_mission(e, ctx, sess_rec, pms_id, mission_id,
     elif solo:
         solo['mission_id'] = mission_id
         solo['entered'] = int(solo.get('entered', 0)) + 1
-        await _push_kvcs(w, vc, b'SquadSession',
-                         _msg_solo_squad_session(
-                             solo['squad_row'], pid,
-                             solo['template'], solo['faction'],
-                             mission_id, solo['entered']))
-        await _push_kvcs(w, vc, b'SquadMemberSession',
-                         await _msg_solo_squad_member_session(
-                             solo['member_row'], solo['squad_row'], pid,
-                             gamertag, char_id, char_name, rank, 4,
-                             solo.get('metrics_session_id', 0),
-                             solo['faction']))
+        # ★ 散人被编进 2 人以上凑队：推合并小队全量行（每人的连接都收到
+        #   全队成员行 → 大厅小队面板显示同队队友，2026-09-02"同阵营队友
+        #   没进我的队"根因：此前只推 solo 行，合并队仅存在于战斗内
+        #   SquadResponse）；并删 solo 行（客户端按"含本人 playerId 的
+        #   新成员行"自动切换当前小队）。单人凑队保持 solo 行推送。
+        auto_sq_id = int(sess_rec.get('squad_id', 0) or 0)
+        auto_info = ((_MM_MISSION_SQUADS.get(int(mission_id)) or {})
+                     .get(auto_sq_id))
+        if (auto_info is not None
+                and not int(auto_info.get('squad_db_id', 0) or 0)
+                and len(auto_info.get('members') or []) >= 2):
+            await _push_auto_squad_rows(w, vc, mission_id, auto_sq_id,
+                                        auto_info, solo['entered'])
+            # 记录全队行 id：战斗结束/放弃时按 id 删行（mm_sess 会话行）
+            sess_rec['auto_sq_id'] = auto_sq_id
+            sess_rec['auto_sq_rows'] = [int(m['row_id'])
+                                        for m in auto_info['members']]
+            await _push_kvcs_delete(w, vc, b'SquadMemberSession',
+                                    solo['member_row'])
+            await _push_kvcs_delete(w, vc, b'SquadSession',
+                                    solo['squad_row'])
+            _log(f'S->C cmd={vc:<4} KeyValueChangeSet delete (solo squad '
+                 f'id={solo["squad_row"]} → merged into {auto_sq_id})')
+        else:
+            await _push_kvcs(w, vc, b'SquadSession',
+                             _msg_solo_squad_session(
+                                 solo['squad_row'], pid,
+                                 solo['template'], solo['faction'],
+                                 mission_id, solo['entered']))
+            await _push_kvcs(w, vc, b'SquadMemberSession',
+                             await _msg_solo_squad_member_session(
+                                 solo['member_row'], solo['squad_row'], pid,
+                                 gamertag, char_id, char_name, rank, 4,
+                                 solo.get('metrics_session_id', 0),
+                                 solo['faction']))
     # PMM delete（退出匹配中界面）
     pmm_id = _MATCH_PMM_IDS.pop(pid, None)
     if pmm_id is not None:
@@ -1938,7 +2078,8 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
     join_tmpl = squad_template_for_character(ctx.get('char_template'))
     new_member = {'player_id': pid, 'char_id': int(e.char_id),
                   'gamertag': sess_rec['gamertag'], 'rank': join_rank,
-                  'slot': 0}
+                  'slot': 0,
+                  'row_id': _next_match_id(_MM_SQUAD_MEMBER_ROW)}
     picked = None
     squad_db_id = old_squad_db or int(ctx.get('squad_db_id', 0) or 0)
     if squad_db_id:
@@ -1955,13 +2096,23 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
                 continue
             if int(info.get('template', 1) or 1) != int(join_tmpl):
                 continue                  # 兵种不同则大厅默认名对不上
-            if len(info.get('members') or []) >= _MM_SOLO_SQUAD_MAX:
+            # 补队上限 = 小队模板槽数：战斗服开局已拉取全量槽定义，
+            # 超过槽数的 late join 会报 slot not found（2026-09-02）
+            if len(info.get('members') or []) >= squad_template_slot_count(
+                    info.get('template', 1) or 1):
                 continue
             picked = (sq_id, info)
             break
     if picked is not None:
         sq_id, info = picked
-        new_member['slot'] = len(info['members'])
+        # 取最小空闲槽位：成员掉线后列表收缩，len(members) 可能与在队
+        # 成员的槽位冲突 → 战斗服按槽位踢人（"Slot already occupied
+        # removing old player"），绝不能撞在队玩家的槽
+        used = {int(m.get('slot', 0) or 0) for m in info['members']}
+        slot = 0
+        while slot in used:
+            slot += 1
+        new_member['slot'] = slot
         info['members'].append(new_member)
         sess_rec['squad_id'] = sq_id
         sess_rec['squad_slot'] = new_member['slot']
@@ -2004,6 +2155,49 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
     except Exception as ex:
         _log(f'      late join push failed (player={pid}, mission='
              f'{mission_id}): {ex}')
+    # ★ 中途加入进了 2 人以上凑队：把凑队全量行（SquadSession + 全体
+    #   成员行，含新成员）推给已在队成员的 Flash 连接——他们的大厅小队
+    #   面板才能看到新队友。已在队成员若成局时是单人（后来才被凑成队），
+    #   还要删其 solo 行 + 登记 reset 信息（battle end 删凑队行用）。
+    #   新成员自己的行由上面 _push_player_into_mission 全量推送；
+    #   真实小队不在此处理（走 DB 成员行推送路径）。全量行按相同行 id
+    #   重复推送幂等（客户端表 upsert），已被推送过的成员无副作用。
+    try:
+        _sq_id = int(sess_rec.get('squad_id', 0) or 0)
+        _info = ((_MM_MISSION_SQUADS.get(int(mission_id)) or {}).get(_sq_id))
+        if (_info is not None and not int(_info.get('squad_db_id', 0) or 0)
+                and len(_info.get('members') or []) >= 2):
+            _row_ids = [int(mm['row_id']) for mm in _info['members']]
+            for m in _info['members']:
+                _mpid = int(m.get('player_id', 0) or 0)
+                if _mpid == int(pid):
+                    continue          # 本人已在上面收到全量行
+                flash = FLASH_SESSIONS.get(m.get('gamertag') or '')
+                if flash is None or flash.playerview_cmd is None:
+                    continue
+                await _push_auto_squad_rows(flash.writer,
+                                            flash.playerview_cmd, mission_id,
+                                            _sq_id, _info, 1)
+                _msolo = _SOLO_SQUADS.get(_mpid)
+                if _msolo is not None:
+                    await _push_kvcs_delete(flash.writer,
+                                            flash.playerview_cmd,
+                                            b'SquadMemberSession',
+                                            _msolo['member_row'])
+                    await _push_kvcs_delete(flash.writer,
+                                            flash.playerview_cmd,
+                                            b'SquadSession',
+                                            _msolo['squad_row'])
+                for _pms, _rec in PMS_TO_SESSION.items():
+                    if (int((_rec or {}).get('player_id', 0) or 0) == _mpid
+                            and int((_rec or {}).get('squad_id', 0) or 0)
+                            == _sq_id):
+                        _rec['auto_sq_id'] = _sq_id
+                        _rec['auto_sq_rows'] = _row_ids
+                        break
+    except Exception as ex:
+        _log(f'      [WARN] late join member row fanout failed '
+             f'(mission={mission_id}): {ex}')
     await _push_queue_counts()
 
 

@@ -86,7 +86,8 @@ from player_service import (
     )
 
 from messages import _push_kvcs
-from matchmaking import _SOLO_SQUADS, _push_kvcs_delete
+from matchmaking import (_MM_MISSION_SQUADS, _SOLO_SQUADS,
+                         _push_kvcs_delete)
 from wardb import _rank_from_combat_xp, squad_template_for_character
 
 RC_OK = 1
@@ -462,6 +463,60 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
       否则 get_squad_for_player 找不到 → 161 squad_not_found 弹"解散失败"。"""
     pid = await sess.ensure_player()
 
+    # ⓪ 匹配凑队（auto squad）：野队合组的临时小队行只在内存
+    #    （_MM_MISSION_SQUADS），不在 DB 也不在 solo 注册表——两者都查不到
+    #    时旧代码直接 161 "squad not found"，且客户端上的凑队行永远删不掉
+    #    （2026-09-02 "解散后没有退出小队/再次解散 squad not found" 根因）。
+    #    ★必须排在 solo 分支前：合并进凑队后 solo 注册表条目刻意保留
+    #    （战斗结束恢复 solo 视图用），先走 solo 分支会误删早已不存在的
+    #    旧 solo 行并消费掉该条目。
+    if pid is not None:
+        for _mid in list(_MM_MISSION_SQUADS.keys()):
+            for _sq_id, _info in list(_MM_MISSION_SQUADS[_mid].items()):
+                if int(_info.get('squad_db_id', 0) or 0):
+                    continue          # DB 真小队走下方 ② 分支
+                me = next((m for m in _info.get('members') or []
+                           if int(m.get('player_id', 0) or 0) == int(pid)),
+                          None)
+                if me is None:
+                    continue
+                my_row = int(me['row_id'])
+                all_rows = [int(m['row_id']) for m in _info['members']]
+                # 删本人连接上的凑队行（成员行先删，同 _reset_auto_squad_rows）
+                if sess.playerview_cmd is not None:
+                    for rid in all_rows:
+                        await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                                b'SquadMemberSession', rid)
+                    await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                            b'SquadSession', int(_sq_id))
+                    log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+                        f'delete (auto squad id={_sq_id} + '
+                        f'{len(all_rows)} member rows ★auto squad disband)')
+                # 其他在线成员：只删本人在队内的成员行（面板移除该玩家）
+                for m in _info['members']:
+                    if int(m.get('player_id', 0) or 0) == int(pid):
+                        continue
+                    flash = FLASH_SESSIONS.get(m.get('gamertag') or '')
+                    if flash is None or flash.playerview_cmd is None:
+                        continue
+                    await _push_kvcs_delete(flash.writer,
+                                            flash.playerview_cmd,
+                                            b'SquadMemberSession', my_row)
+                _info['members'] = [m for m in _info['members']
+                                    if int(m.get('player_id', 0) or 0)
+                                    != int(pid)]
+                if not _info['members']:    # 空壳凑队随手清（战局结束前）
+                    _MM_MISSION_SQUADS[_mid].pop(_sq_id, None)
+                    if not _MM_MISSION_SQUADS[_mid]:
+                        _MM_MISSION_SQUADS.pop(_mid, None)
+                resp = build_response(cmd_id, 'RemoveSquadResponse',
+                                      pb_int32(1, RC_OK))
+                writer.write(resp)
+                await writer.drain()
+                log(f'S->C cmd={cmd_id:<4} RemoveSquadResponse '
+                    f'(auto squad={_sq_id}, response=1)')
+                return
+
     # ① 单人隐式小队：KVCS 删成员行 + 小队行，清注册表（下次 join 重建）
     if pid is not None:
         solo = _SOLO_SQUADS.pop(int(pid), None)
@@ -545,6 +600,55 @@ async def handle_remove_squad_member(sess, writer, cmd_id, req_type, proto):
     pid = await sess.ensure_player()
     code = RC_OK
     removed_squad_id = 0
+
+    # ⓪ 匹配凑队（auto squad）成员行：只在内存（_MM_MISSION_SQUADS），
+    #    不在 DB——SquadService.deactivate 成员离队 / clearSlot 队长踢人
+    #    都带凑队成员行 id，走 DB 必查空 → 158 弹错且行删不掉（与
+    #    handle_remove_squad 凑队分支同族的补漏，2026-09-02）。
+    #    权限：请求者 = 该成员本人（离队）或同队成员（队长踢人）。
+    if pid is not None and member_row:
+        for _mid in list(_MM_MISSION_SQUADS.keys()):
+            for _sq_id, _info in list(
+                    (_MM_MISSION_SQUADS.get(_mid) or {}).items()):
+                if int(_info.get('squad_db_id', 0) or 0):
+                    continue          # DB 真小队走下方原分支
+                me = next((m for m in _info.get('members') or []
+                           if int(m.get('row_id', 0) or 0) == member_row),
+                          None)
+                if me is None:
+                    continue
+                if not any(int(m.get('player_id', 0) or 0) == int(pid)
+                           for m in _info.get('members') or []):
+                    break              # 请求者不在该凑队 → 交回原分支判错
+                # 删除该成员行：请求者本人 + 其他在线成员连接都推
+                if sess.playerview_cmd is not None:
+                    await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                            b'SquadMemberSession', member_row)
+                for m in _info.get('members') or []:
+                    if int(m.get('player_id', 0) or 0) == int(pid):
+                        continue
+                    flash = FLASH_SESSIONS.get(m.get('gamertag') or '')
+                    if flash is None or flash.playerview_cmd is None:
+                        continue
+                    await _push_kvcs_delete(flash.writer,
+                                            flash.playerview_cmd,
+                                            b'SquadMemberSession', member_row)
+                _info['members'] = [m for m in _info.get('members') or []
+                                    if int(m.get('row_id', 0) or 0)
+                                    != member_row]
+                if not _info['members']:    # 空壳凑队随手清（战局结束前）
+                    _MM_MISSION_SQUADS[_mid].pop(_sq_id, None)
+                    if not _MM_MISSION_SQUADS[_mid]:
+                        _MM_MISSION_SQUADS.pop(_mid, None)
+                resp = build_response(cmd_id, 'RemoveSquadMemberResponse',
+                                      pb_int32(1, RC_OK))
+                writer.write(resp)
+                await writer.drain()
+                log(f'S->C cmd={cmd_id:<4} RemoveSquadMemberResponse '
+                    f'(member={member_row}, response=1 '
+                    f'★auto squad id={_sq_id})')
+                return
+
     if pid is None or STORE is None or not member_row:
         code = RC_SQUAD_SLOT_NOT_FOUND
     else:
@@ -1029,7 +1133,22 @@ async def handle_set_squad_matchmaking_flag(sess, writer, cmd_id, req_type,
         log(f'      [squad] SetSquadMatchMakingFlag parse error: {e}')
 
     code = RC_OK
-    if STORE is None or not squad_session_id:
+    # 内存隐式小队（solo / 匹配凑队）：squadSessionId 是内存行 id（超
+    # int32），走 DB set_squad_flag 必炸（"value out of int32 range"）
+    # 且回 161 会触发客户端 sendFeedbackMessage 错误弹窗（2026-09-02
+    # 实测每次凑队成局客户端连发两条 161）。战争模式标记对隐式小队
+    # 无持久化意义 → 静默 OK。
+    in_memory = any(int(s.get('squad_row', 0) or 0) == squad_session_id
+                    for s in _SOLO_SQUADS.values())
+    if not in_memory:
+        for _mid in list(_MM_MISSION_SQUADS.keys()):
+            if squad_session_id in _MM_MISSION_SQUADS.get(_mid, {}):
+                in_memory = True
+                break
+    if in_memory:
+        log(f'      [squad] SetSquadMatchMakingFlag: in-memory squad '
+            f'{squad_session_id} → no-op OK')
+    elif STORE is None or not squad_session_id:
         code = RC_SQUAD_NOT_FOUND
     else:
         try:

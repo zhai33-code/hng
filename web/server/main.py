@@ -11,6 +11,7 @@
   python -m server.main set-password <用户名> <新密码>  改密（会使该管理员全部会话失效）
 """
 import asyncio
+import mimetypes
 import os
 import secrets
 import sys
@@ -20,6 +21,10 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
+
+# Windows 注册表里没有 .webp 的 MIME 映射，StaticFiles 会按 text/plain 下发；
+# 加上 nosniff 后浏览器拒绝渲染 /icons/ 下的压缩 webp → 手动注册
+mimetypes.add_type('image/webp', '.webp')
 
 # 兼容 python server/main.py 直接运行：无包上下文时把 web/ 注入 sys.path
 _WEB_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

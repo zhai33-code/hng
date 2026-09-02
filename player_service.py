@@ -391,6 +391,7 @@ async def _msg_player_for(sess, gamertag=None):
     tutorials_completed = 0
     faction = None
     total_score = 0
+    first_action_date = ''
     pid = await sess.ensure_player()
     if pid is not None:
         try:
@@ -405,6 +406,15 @@ async def _msg_player_for(sess, gamertag=None):
             faction = await STORE.get_player_faction(pid)
         except Exception as e:
             log(f'[DB] get_player_faction failed: {e}')
+        # ★ firstActionGameDate（player f19，YYYYMMDD）：签到窗口连续登录
+        # 天数计算的起点（客户端以 firstActionGameDate 与今天比对）。
+        # 恒发空串会让该计算退化；无首局回落注册日。
+        try:
+            metrics = await STORE.get_daily_metrics(pid)
+            if metrics:
+                first_action_date = metrics['fagd'] or ''
+        except Exception as e:
+            log(f'[DB] get_daily_metrics failed: {e}')
         # ★ totalScore（player f36）：统计界面"分数"显示值 = 全角色 score 汇总
         #   （type-6 上报的 PlayerScore 优先，legacy 结算键 score 回落，二者
         #   同源不叠加）。此前恒发 0 → 统计页分数为 0（2026-09-01）。
@@ -418,6 +428,7 @@ async def _msg_player_for(sess, gamertag=None):
     return msg_player(gamertag or sess.username or 'DemoPlayer',
                       tutorials_completed=tutorials_completed,
                       pid=pid or 1, faction=faction, total_score=total_score,
+                      first_action_date=first_action_date,
                       **cur)
 
 

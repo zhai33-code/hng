@@ -411,6 +411,28 @@ def _build_pricing_map():
 
 _PRICING_MAP = _build_pricing_map()
 
+# 维修定价索引：(type, objectId) -> Pricing 行。客户端 PriceModel.
+# createItemMaintenancePurchaseOptions 按 HnGGUIGamePrices.TYPE_*_REPAIR +
+# 模板 id 查价，维修价 = 基础价 x 损耗比例（PriceObject.calculateFractionPrice：
+# max(1, int(base * (max-cur)/max))）。objectId：武器/配件/弹药/升级 = 各自
+# 模板 id；载具 = 基础载具模板 id（变体的 parentVehicleTemplateId）。
+_REPAIR_PRICING = {}
+for _p in _PRICING_MAP.values():
+    if 'Repair' in _p['type']:
+        _REPAIR_PRICING[(_p['type'], _p['object_id'])] = _p
+
+
+def repair_base_price(price_type, template_id, currency_key):
+    """维修基础价（满耐久）：(定价类型, 模板 id) -> 该货币的基础价；缺失返回 0。"""
+    p = _REPAIR_PRICING.get((price_type, int(template_id or 0)))
+    return int(p[currency_key] or 0) if p else 0
+
+
+def vehicle_parent_template_id(variant_template_id):
+    """载具变体模板 -> 基础载具模板 id（无父或未知回退变体 id 自身）。"""
+    vid = int(variant_template_id or 0)
+    return _VEHICLE_VARIANT_PARENT.get(vid, 0) or vid
+
 # VirtualCurrencyType：1=Credits 2=Warfunds 3=Gold 4=Tickets
 _CUR_KEY = {1: 'credits', 2: 'warfunds', 3: 'gold'}
 _CUR_NAME = {1: 'Credits', 2: 'Warfunds', 3: 'Gold', 4: 'Tickets'}
@@ -608,6 +630,30 @@ def squad_template_for_character(character_template_id):
     """兵种模板 → 小队模板 id（1-5）；未知兵种回退 1（Infantry）。"""
     return _ACTIONID_SQUAD_TEMPLATE.get(
         charactertemplate_actionid(character_template_id), 1)
+
+
+# SquadPlayerSlotTemplate 表（15 行：f1 id / f2 squadTemplateId /
+# f3 defaultSlot / f4 slotNumber（1 基）/ f5 customizationCost）→
+# 每个小队模板的玩家槽位列表 [(slotTemplateId, slotNumber-1)]。
+# 战斗服 ActionGameSquadDefinition f5 playerSlots 必须发模板全量槽：
+# 战斗服对同一 squadId 只在首个成员加入时向 warserver 拉一次定义并缓存
+# （PhaseUpdatePlayerInit 反编译证实），按当前成员数发槽会让 late join
+# 补进小队的成员分到不存在的槽 → "#error3 specified squad character
+# slot not found"（2026-09-02 late join 小队名空白根因）。
+# 客户端 SquadModel MAX_CHARACTERS_PER_SQUAD=4，槽位 UI 同按此表渲染。
+SQUAD_TEMPLATE_SLOTS = {}
+for _f in _parse_wardb_table('SquadPlayerSlotTemplate'):
+    _st = int(_f.get(2, 0) or 0)
+    if _st:
+        SQUAD_TEMPLATE_SLOTS.setdefault(_st, []).append(
+            (int(_f.get(1, 0) or 0), int(_f.get(4, 0) or 0) - 1))
+for _v in SQUAD_TEMPLATE_SLOTS.values():
+    _v.sort(key=lambda r: r[1])
+
+
+def squad_template_slot_count(squad_template_id):
+    """小队模板玩家槽数（凑队/late join 人数上限）；未知模板回退 1。"""
+    return len(SQUAD_TEMPLATE_SLOTS.get(int(squad_template_id or 0), [])) or 1
 
 
 def squad_template_name(squad_template_id):

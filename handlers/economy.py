@@ -50,7 +50,10 @@
 """
 
 import calendar
+import os
+import random
 import time
+import xml.etree.ElementTree as ET
 
 from protocol import (
     build_response,
@@ -63,9 +66,9 @@ from protocol import (
     pb_uint32,
     )
 
-from state import STORE, log
+from state import GAME_DIR, STORE, log
 
-from wardb import MEMBERSHIP_DAYS_BY_ID
+from wardb import MEMBERSHIP_DAYS_BY_ID, _RIBBON_BOOSTERS
 
 from messages import _push_kvcs
 from player_service import _PaymentFailed, _charge_player, _push_player_refresh
@@ -84,8 +87,59 @@ _TICKET_HOURS = 72
 # 会员默认时长（天）：仅作 ShopMembershipItems 查表未命中时的兜底，
 # 实际时长按 membershipTemplateId 查客户端表（30/90/180/365 天等）
 _MEMBERSHIP_DAYS = 30
-# 每日登录奖励 credits
-_DAILY_REWARD_CREDITS = 2500
+
+# ---- 每日签到（Daily Rewards）----
+# 客户端 DailyRewardsWindowMediator 从文件服务器拉 dailyRewards.xml 渲染
+# 365 天循环表，服务器按同一文件发放当日奖励，保证 UI 与到账一致
+# （combat-server 副本优先，与 WARDDB_DIR 同源逻辑）。
+_DAILY_REWARDS = {}
+
+
+def _load_daily_rewards_xml():
+    global _DAILY_REWARDS
+    # 候选文件不存在时直接跳过（GAME_DIR 自身即 combat-server 的布局下，
+    # GAME_DIR\combat-server\... 不存在，避免误报一条 load failed 日志）
+    for cand in (os.path.join(GAME_DIR, 'combat-server', 'dailyRewards.xml'),
+                 os.path.join(GAME_DIR, 'dailyRewards.xml')):
+        if not os.path.isfile(cand):
+            continue
+        try:
+            with open(cand, 'r', encoding='utf-8-sig') as f:
+                root = ET.fromstring(f.read())
+            for r in root.iter('reward'):
+                day = int(r.get('day', 0) or 0)
+                if day:
+                    _DAILY_REWARDS[day] = str(r.get('type', '') or '')
+            return
+        except Exception as e:
+            log(f'[daily] load {cand} failed: {e}')
+
+
+_load_daily_rewards_xml()
+
+
+def _adjust_day(n):
+    """客户端 DailyRewardsWindowMediator.adjustDay：365 天循环折算。"""
+    return n if n < 365 else n % 365 + 1
+
+
+# 奖励类型 → 发放规格（数值与客户端 setRewardDescription 硬编码展示一致）
+_DAILY_REWARD_GRANTS = {
+    'currency1': ('gold', 10), 'currency2': ('gold', 20),
+    'currency3': ('credits', 1000), 'currency4': ('credits', 2000),
+    'currency5': ('credits', 3000), 'currency6': ('credits', 5000),
+    'currency7': ('credits', 100000), 'currency8': ('credits', 150000),
+    'currency9': ('warfunds', 100000), 'currency10': ('warfunds', 150000),
+    'ribbonbooster1': ('ribbon_booster', 3),
+    'ribbonbooster2': ('ribbon_booster', 5),
+    'ribbonbooster3': ('ribbon_booster', 10),
+    'veteranmembership1': ('membership', 11),   # ShopMembershipItems 11 = 1 天
+    'veteranmembership2': ('membership', 14),   # ShopMembershipItems 14 = 3 天
+}
+
+# 随机缎带加成模板池（可售区间 1..99，排除促销/特殊模板）
+_RIBBON_BOOSTER_POOL = sorted(
+    i for i in _RIBBON_BOOSTERS if 1 <= i <= 99)
 
 
 def _str(v):
@@ -229,11 +283,114 @@ async def push_economy_rows(sess, writer, pid):
 
 # ------------------------------------------------------------- 每日奖励
 
+async def push_player_offer_metrics_row(sess, writer, pid):
+    """推 PlayerOfferMetrics KVCS 行（每日签到窗口数据源）。
+
+    客户端 OpenDailyRewardWindowCommand（登录自动弹窗）/ HomeScreenMediator
+    （主界面签到 tile）/ DailyRewardsWindowMediator（窗口渲染）全部按
+    playerId 索引查本表行——行缺失时签到窗口永不自动弹出，手动点开时
+    取行得 null 直接空引用。
+    dailyRewardCount = 已领次数 +（今天可领 ? 1 : 0）：客户端弹窗条件
+    redeemedCount < dailyRewardCount，今天已领则两者相等不再弹。"""
+    if STORE is None or sess.playerview_cmd is None:
+        return
+    try:
+        metrics = await STORE.get_daily_metrics(pid)
+    except Exception as e:
+        log(f'      [DB] get_daily_metrics failed: {e}')
+        return
+    if metrics is None:
+        return
+    redeemed = int(metrics['n'])
+    count = redeemed + (1 if metrics['available'] else 0)
+    m = pb_int64(1, pid)                   # id（行 id=playerId，同 CareerOrder 约定）
+    m += pb_int64(2, pid)                  # playerId
+    m += pb_int32(3, 0)                    # matchesPlayed
+    m += pb_int32(4, 0)                    # goldOffersCount
+    m += pb_int32(5, count)                # dailyRewardCount
+    m += pb_int32(6, redeemed)             # dailyRewardRedeemedCount
+    m += pb_string(7, '')                  # unredeemedConsecutiveDayRewards
+    m += pb_int32(8, int(metrics['c']))    # consecutiveDayCount
+    m += pb_string(9, '')                  # lastFirstBattleDate
+    # f10 lastUpdatedConsecutiveDayCount optional，不发
+    await _push_kvcs(writer, sess.playerview_cmd, b'PlayerOfferMetrics', m)
+    log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+        f'(PlayerOfferMetrics id={pid}, day={count}, '
+        f'{"claimable" if metrics["available"] else "redeemed"}, '
+        f'consecutive={metrics["c"]})')
+
+
+def _msg_voucher_pack_item(object_type, object_id, info=''):
+    """VoucherPackItem {objectType=1 str, objectId=2 i64, info=3 str opt}。"""
+    m = pb_string(1, object_type)
+    m += pb_int64(2, int(object_id))
+    if info:
+        m += pb_string(3, info)
+    return m
+
+
+def _msg_voucher_pack_info(item_protos, identifier='daily_login_reward'):
+    """VoucherPackInfo {identifier=1, factionTemplateId=2, status=3,
+    names=4 repeated, items=5 repeated}。status=1 granted。
+
+    names/items 均为 repeated：零元素必须整体省略（客户端空 infos 走
+    checkFlow 不弹窗）。"""
+    m = pb_string(1, identifier)
+    m += pb_int64(2, 0)                    # factionTemplateId
+    m += pb_int32(3, 1)                    # status = granted
+    for it in item_protos:
+        m += pb_message(5, it)
+    return m
+
+
+async def _grant_daily_reward(pid, day):
+    """发放当日签到奖励（按 dailyRewards.xml day 条目）。
+
+    返回 {'items': [VoucherPackItem proto], 'push': set}：
+    push 标记需要重推的 KVCS 行（player 货币 / booster / membership）。
+    货币走 add_currency；缎带加成随机模板入 player_boosters（is_ribbon）；
+    会员按 ShopMembershipItems 时长入 player_memberships。"""
+    rtype = _DAILY_REWARDS.get(day, '')
+    spec = _DAILY_REWARD_GRANTS.get(rtype)
+    out = {'items': [], 'push': set()}
+    if STORE is None or spec is None:
+        return out
+    kind, val = spec
+    try:
+        if kind in ('gold', 'credits', 'warfunds'):
+            await STORE.add_currency(pid, **{kind: val})
+            out['items'].append(
+                _msg_voucher_pack_item(kind, val))
+            out['push'].add('player')
+        elif kind == 'ribbon_booster':
+            for _ in range(val):
+                tid = random.choice(_RIBBON_BOOSTER_POOL) \
+                    if _RIBBON_BOOSTER_POOL else 1
+                await STORE.add_booster(
+                    pid, tid, duration_minutes=_BOOSTER_MINUTES,
+                    is_ribbon=True)
+                out['items'].append(
+                    _msg_voucher_pack_item('ribbonboostertemplate', tid))
+            out['push'].add('booster')
+        elif kind == 'membership':
+            days = MEMBERSHIP_DAYS_BY_ID.get(val, _MEMBERSHIP_DAYS)
+            await STORE.add_membership(pid, val, duration_days=days)
+            out['items'].append(
+                _msg_voucher_pack_item('shopmembershipitems', val))
+            out['push'].add('membership')
+    except Exception as e:
+        log(f'      [DB] grant daily reward (day={day}, {rtype}) failed: {e}')
+    return out
+
+
 async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto):
     """RedeemDailyLoginRewardRequest {playerId=1}
-    → RedeemDailyLoginRewardResponse{response=1}。
+    → RedeemDailyLoginRewardResponse{response=1, infos=2 repeated VoucherPackInfo}。
 
-    当天首次领取发 credits（幂等）；infos 为空（无附赠券包，repeated 省略）。"""
+    当天首次领取：daily_reward_redeemed_count+1，按 dailyRewards.xml 当日
+    条目发放（货币/随机缎带加成/会员天数），响应带 VoucherPackInfo
+    （客户端 BundleWindow 显示获得内容），并重推 PlayerOfferMetrics /
+    货币 / 加成 / 会员 KVCS 行实时刷新。当天已领：幂等不发（infos 省略）。"""
     req_player_id = 0
     try:
         f = pb_parse(proto)
@@ -243,36 +400,48 @@ async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto
 
     pid = await sess.ensure_player()
     code = RC_OK
-    granted = 0
+    day = 0
     if pid is not None and STORE is not None:
         try:
-            ok, granted = await STORE.redeem_daily_reward(
-                int(pid), credits=_DAILY_REWARD_CREDITS)
+            ok, day, redeemed = await STORE.claim_daily_reward(int(pid))
             code = RC_OK if ok else 64            # player_not_found
-            log(f'      [DB] redeem_daily_reward player={pid}: '
-                f'granted={granted}')
+            log(f'      [DB] claim_daily_reward player={pid}: '
+                f'day={day}, redeemed={redeemed}')
         except Exception as e:
-            log(f'      [DB] redeem_daily_reward failed: {e}')
+            log(f'      [DB] claim_daily_reward failed: {e}')
             code = 64
-    if granted:
-        await _push_player_refresh(sess, writer)
+
+    infos = b''
+    if day:
+        granted = await _grant_daily_reward(int(pid), _adjust_day(day))
+        if granted['items']:
+            infos = pb_message(2, _msg_voucher_pack_info(granted['items']))
+        # KVCS 实时刷新：签到进度行 + 获得物品对应表
+        await push_player_offer_metrics_row(sess, writer, int(pid))
+        if 'booster' in granted['push']:
+            await push_booster_rows(sess, writer, int(pid))
+        if 'membership' in granted['push']:
+            await push_membership_rows(sess, writer, int(pid))
+        if 'player' in granted['push']:
+            await _push_player_refresh(sess, writer)
         # 生涯军令 12 eRedeemDailyReward（客户端无上报点）+ 推行实时刷新
         from handlers.career import complete_order_and_push
         await complete_order_and_push(sess, writer, pid, 12)
 
     resp = build_response(cmd_id, 'RedeemDailyLoginRewardResponse',
-                          pb_int32(1, code))
+                          pb_int32(1, code) + infos)
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RedeemDailyLoginRewardResponse '
-        f'(player={req_player_id or pid}, response={code}, granted={granted})')
+        f'(player={req_player_id or pid}, response={code}, '
+        f'day={day or "-"}, items={len(infos) and 1 or 0})')
 
 
 async def handle_set_daily_reward(sess, writer, cmd_id, req_type, proto):
     """SetDailyRewardRequest {rewardDay=1} → SetDailyRewardResponse{result=1}。
 
     客户端本地记录连续登录天数，服务器确认即可（领取幂等性由
-    redeem_daily_reward 的 last_daily_reward_at 保证）。"""
+    claim_daily_reward 的 last_daily_reward_at 保证）。"""
     reward_day = 0
     try:
         f = pb_parse(proto)

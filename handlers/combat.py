@@ -44,6 +44,8 @@ from wardb import (
     _rank_from_combat_xp,
     ammo_wear_params,
     commandnode_template,
+    repair_base_price,
+    vehicle_parent_template_id,
     vehicle_upgrade_wear_params,
     vehicle_wear_params_for_variant,
     weapon_modifier_wear_params,
@@ -770,6 +772,38 @@ def _est_spawns(time_active):
     return max(1, min(6, int(round(time_active / 300.0))))
 
 
+# autoRepair 三态（客户端 ItemMaintenanceComponent 勾选框）：0=关 1=Credits 2=Gold
+_AR_CURRENCY_KEY = {1: 'credits', 2: 'gold'}
+
+
+async def _auto_repair_after_wear(pid, auto_flag, params, worn_cond,
+                                  price_type, template_id):
+    """战后自动维修：autoRepair=1(Credits)/2(Gold) 的物品扣费修复到满耐久。
+
+    价格与客户端 PriceObject.calculateFractionPrice 同式：
+    max(1, int(基础价 × (max-cur)/max))；定价缺失（基础价 0）按免费修复；
+    余额不足时保持磨损（返回 worn_cond 不修复）。"""
+    cur_key = _AR_CURRENCY_KEY.get(int(auto_flag or 0))
+    if cur_key is None or not params:
+        return worn_cond
+    max_cond = params[0]
+    if max_cond <= 0 or worn_cond >= max_cond:
+        return worn_cond
+    base = repair_base_price(price_type, template_id, cur_key)
+    if base > 0:
+        cost = max(1, int(base * (max_cond - worn_cond) / max_cond))
+        ok, balance = await STORE.spend_currency(pid, cur_key, cost)
+        if not ok:
+            log(f'      [autorepair] player={pid} {price_type}/'
+                f'{template_id} skipped: not enough {cur_key} '
+                f'(need {cost}, balance {balance})')
+            return worn_cond
+        log(f'      [autorepair] player={pid} -{cost} {cur_key} '
+            f'({price_type} template={template_id} '
+            f'{worn_cond:.2f} -> {max_cond:.2f})')
+    return max_cond
+
+
 async def _apply_equipment_wear(char_times):
     """战后维护损耗：按 CharacterBattleResult f7 timeActive 估算，扣减参战
     角色已装备物品的 condition。
@@ -803,8 +837,13 @@ async def _apply_equipment_wear(char_times):
                     shots = est_shots if slot == 1 else int(est_shots * 0.3)
                     new_cond = max(0.0, cond - params[1] * shots - params[2])
                     if new_cond < cond:
-                        await STORE.update_weapon_condition(pid, wid, new_cond)
-                        worn += 1
+                        new_cond = await _auto_repair_after_wear(
+                            pid, w.get('auto_repair'), params, new_cond,
+                            'WeaponMaxConditionRepair', w['template_id'])
+                        if new_cond != cond:
+                            await STORE.update_weapon_condition(pid, wid,
+                                                                new_cond)
+                            worn += 1
 
             # ---- 配件/弹药（挂在已装备武器上；弹药须已装备到弹药槽）----
             if equipped_w:
@@ -818,9 +857,14 @@ async def _apply_equipment_wear(char_times):
                         shots = est_shots if slot == 1 else int(est_shots * 0.3)
                         new_cond = max(0.0, cond - params[1] * shots - params[2])
                         if new_cond < cond:
-                            await STORE.update_weapon_modifier_condition(
-                                pid, m['id'], new_cond)
-                            worn += 1
+                            new_cond = await _auto_repair_after_wear(
+                                pid, m.get('auto_repair'), params, new_cond,
+                                'WeaponModifierMaxConditionRepair',
+                                m['template_id'])
+                            if new_cond != cond:
+                                await STORE.update_weapon_modifier_condition(
+                                    pid, m['id'], new_cond)
+                                worn += 1
                 for a in await STORE.list_weapon_ammo(pid, char_id):
                     if int(a.get('weapon_id') or 0) not in equipped_w:
                         continue
@@ -833,9 +877,14 @@ async def _apply_equipment_wear(char_times):
                         shots = est_shots if slot == 1 else int(est_shots * 0.3)
                         new_cond = max(0.0, cond - params[1] * shots)
                         if new_cond < cond:
-                            await STORE.update_weapon_ammo_condition(
-                                pid, a['id'], new_cond)
-                            worn += 1
+                            new_cond = await _auto_repair_after_wear(
+                                pid, a.get('auto_repair'), params, new_cond,
+                                'AmmoMaxConditionRepair',
+                                a['ammo_template_id'])
+                            if new_cond != cond:
+                                await STORE.update_weapon_ammo_condition(
+                                    pid, a['id'], new_cond)
+                                worn += 1
 
             # ---- 载具（装备中：character_id==角色 && equipped_in_slot>0）----
             vehicles = await STORE.list_vehicles(pid, char_id)
@@ -849,8 +898,15 @@ async def _apply_equipment_wear(char_times):
                 if params and cond > 0 and (params[1] or params[2]):
                     new_cond = max(0.0, cond - params[1] * est_spawns - params[2])
                     if new_cond < cond:
-                        await STORE.update_vehicle_condition(pid, vid, new_cond)
-                        worn += 1
+                        new_cond = await _auto_repair_after_wear(
+                            pid, v.get('auto_repair'), params, new_cond,
+                            'VehicleMaxConditionRepair',
+                            vehicle_parent_template_id(
+                                v['vehicle_variant_template_id']))
+                        if new_cond != cond:
+                            await STORE.update_vehicle_condition(pid, vid,
+                                                                new_cond)
+                            worn += 1
 
             # ---- 载具升级/载具弹药（装在已装备载具上）----
             if equipped_v:
@@ -866,9 +922,14 @@ async def _apply_equipment_wear(char_times):
                         new_cond = max(0.0,
                                        cond - params[1] * est_spawns - params[2])
                         if new_cond < cond:
-                            await STORE.update_vehicle_upgrade_condition(
-                                pid, u['id'], new_cond)
-                            worn += 1
+                            new_cond = await _auto_repair_after_wear(
+                                pid, u.get('auto_repair'), params, new_cond,
+                                'VehicleUpgradeMaxConditionRepair',
+                                u['upgrade_template_id'])
+                            if new_cond != cond:
+                                await STORE.update_vehicle_upgrade_condition(
+                                    pid, u['id'], new_cond)
+                                worn += 1
                 for a in await STORE.list_vehicle_ammo(pid):
                     if int(a.get('vehicle_id') or 0) not in equipped_v:
                         continue
@@ -879,14 +940,19 @@ async def _apply_equipment_wear(char_times):
                     if params and cond > 0 and params[1]:
                         new_cond = max(0.0, cond - params[1] * est_shots)
                         if new_cond < cond:
-                            await STORE.update_vehicle_ammo_condition(
-                                pid, a['id'], new_cond)
-                            worn += 1
+                            new_cond = await _auto_repair_after_wear(
+                                pid, a.get('auto_repair'), params, new_cond,
+                                'AmmoMaxConditionRepair',
+                                a['ammo_template_id'])
+                            if new_cond != cond:
+                                await STORE.update_vehicle_ammo_condition(
+                                    pid, a['id'], new_cond)
+                                worn += 1
 
             if worn:
                 log(f'      [wear] player={pid} char={char_id} '
                     f'active={t_active}s shots~{est_shots} spawns~{est_spawns} '
-                    f'-> {worn} item(s) worn')
+                    f'-> {worn} item(s) worn/repaired')
         except Exception as e:
             log(f'      [wear] player={pid} char={char_id} failed: {e}')
 
@@ -1149,6 +1215,15 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 f'{len(br_players)} players)')
         except Exception as e:
             log(f'      [DB] save_battle_report failed: {e}')
+        # 首局日期（player f19 firstActionGameDate / 签到连续天数起点）：
+        # 幂等只写一次，bot/不可结算 pid 跳过
+        for p in br_players:
+            if not _is_settleable(p['player_id']):
+                continue
+            try:
+                await STORE.mark_first_action_game(p['player_id'])
+            except Exception as e:
+                log(f'      [DB] mark_first_action_game failed: {e}')
 
         for pid, credits, warfunds in currency_ops:
             if not (credits or warfunds) or not _is_settleable(pid):
@@ -1388,6 +1463,14 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None):
         try:
             if solo is not None and not squad_db_id:
                 solo['mission_id'] = 0
+                # ★ 凑队小队行删除（先于 solo 行重推）：进局时被合并进
+                #   2 人以上凑队的玩家，客户端表中的 SquadSession/成员行
+                #   是合并队行——删净后重推 solo 行（ADD）恢复单人小队视图
+                if mm_sess.get('auto_sq_id'):
+                    await matchmaking._reset_auto_squad_rows(
+                        flash.writer, flash.playerview_cmd,
+                        int(mm_sess.get('auto_sq_id') or 0),
+                        mm_sess.get('auto_sq_rows') or [])
                 await matchmaking._push_kvcs(
                     flash.writer, flash.playerview_cmd, b'SquadSession',
                     matchmaking._msg_solo_squad_session(

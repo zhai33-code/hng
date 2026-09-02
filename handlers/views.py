@@ -40,13 +40,18 @@ from matchmaking import (
     _msg_supreme_command_rows,
     )
 
+import login_queue
+
 from .career import (
     push_battle_pass_row,
     push_career_order_row,
     push_season_templates,
     )
 from .characters import push_tutorial_row
-from .economy import push_economy_rows
+from .economy import (
+    push_economy_rows,
+    push_player_offer_metrics_row,
+    )
 from .social import (
     notify_friends_of,
     push_friend_rows,
@@ -178,6 +183,8 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         # PMS Admitted KVCS 需推给该玩家的 Flash 连接
         if sess.username:
             FLASH_SESSIONS[sess.username] = sess
+            # 登录排队：PENDING 名额转由 FLASH_SESSIONS 计数（总在线数不变）
+            login_queue.on_logged_in(sess)
             log(f'      tracked PLAYER_VIEW cmd_id={cmd_id} (flash session registered)')
         else:
             log(f'      tracked PLAYER_VIEW cmd_id={cmd_id}')
@@ -217,6 +224,15 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
             # 经济道具行（PlayerMembershipItem / Booster / Ticket / TicketTimed）：
             # 会员/加成/修理票 UI 数据源，不推则购买记录重启后丢失。
             await push_economy_rows(sess, writer, int(pid))
+            # 每日签到（PlayerOfferMetrics 行）：客户端签到窗口/主界面 tile 的
+            # 唯一数据源，不推则窗口永不弹出；推前先记连续登录天数
+            # （同日幂等 / 昨日+1 / 断签重置 1）。
+            if STORE is not None:
+                try:
+                    await STORE.touch_daily_login(int(pid))
+                except Exception as e:
+                    log(f'      [DB] touch_daily_login failed: {e}')
+            await push_player_offer_metrics_row(sess, writer, int(pid))
 
     resp = build_response(cmd_id, 'subscriberesponse')
     writer.write(resp)

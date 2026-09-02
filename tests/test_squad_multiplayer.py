@@ -333,6 +333,91 @@ async def run():
     finally:
         combat_handlers.STORE = old_cstore
 
+    # --- 用例 8：SquadResponse 发模板全量槽（late join 根因回归） ---
+    # 战斗服对同一 squadId 只拉一次定义并缓存：按成员数发槽会让
+    # late join 补队的成员分到不存在的槽 → "specified squad character
+    # slot not found"（2026-09-02 hng_boot.log）。必须按
+    # SquadPlayerSlotTemplate 表发模板全量槽。
+    async def _squad_slots(mission_session_id, squad_id):
+        proto = pb_varint(1, mission_session_id) + pb_varint(2, squad_id)
+        w = FakeWriter()
+        await game_server.handle_request(None, w, 6, 'SquadRequest', proto)
+        main, _ = Chunk.parse(w.data, 0)
+        resp = _parse_varints(main.subs[0].subs[0].data)
+        squad_def = resp['_messages'][2]
+        # 逐字段扫 f2 定义消息里的 repeated f5 playerSlots
+        slots = []
+        i = 0
+        data = squad_def
+
+        def _rv(pos):
+            v = shift = 0
+            while True:
+                b = data[pos]
+                pos += 1
+                v |= (b & 0x7F) << shift
+                shift += 7
+                if not (b & 0x80):
+                    return v, pos
+
+        while i < len(data):
+            key, i = _rv(i)
+            fn, wt = key >> 3, key & 7
+            if wt != 2:
+                if wt == 0:
+                    _, i = _rv(i)
+                elif wt == 5:
+                    i += 4
+                elif wt == 1:
+                    i += 8
+                continue
+            ln, i = _rv(i)
+            body = data[i:i + ln]
+            i += ln
+            if fn == 5:
+                f = _parse_varints(body)
+                slots.append((f.get(1), f.get(2)))
+        return resp.get(1), _parse_varints(squad_def).get(2), slots
+
+    mission, sess_a, sess_b = _seed_two_player_match()
+    sid, tmpl, slots = await _squad_slots(sess_a['pms_id'],
+                                          sess_a['squad_id'])
+    check('步兵小队(1 成员)发模板全量 4 槽（late join slot 1-3 可命中）',
+          tmpl == 1 and slots == [(1, 0), (2, 1), (3, 2), (4, 3)],
+          f'got template={tmpl} slots={slots}')
+    # 侦察小队（template 5，表 2 槽）
+    recon_sq = 3721435839200754999
+    matchmaking._MM_MISSION_SQUADS[mission][recon_sq] = {
+        'name': 'Recon Squad', 'leader_char_id': 49, 'faction': 3,
+        'squad_db_id': 0, 'template': 5,
+        'members': [{'player_id': 11, 'char_id': 49, 'gamertag': 'x',
+                     'rank': 1, 'slot': 0}]}
+    sid, tmpl, slots = await _squad_slots(sess_b['pms_id'], recon_sq)
+    check('侦察小队发模板全量 2 槽且 squadTemplateId=5',
+          tmpl == 5 and slots == [(21, 0), (22, 1)],
+          f'got template={tmpl} slots={slots}')
+    # 装甲小队 4 成员超模板 3 槽 → 补第 4 槽（沿用最后一行槽模板）
+    armor_sq = 3721435839200754888
+    matchmaking._MM_MISSION_SQUADS[mission][armor_sq] = {
+        'name': 'Armor Squad', 'leader_char_id': 60, 'faction': 2,
+        'squad_db_id': 0, 'template': 4,
+        'members': [{'player_id': p, 'char_id': 60 + p, 'gamertag': 'a',
+                     'rank': 1, 'slot': p - 1} for p in (1, 2, 3, 4)]}
+    sid, tmpl, slots = await _squad_slots(sess_a['pms_id'], armor_sq)
+    check('装甲小队 4 成员超模板 3 槽 → 补第 4 槽',
+          tmpl == 4 and slots == [(17, 0), (18, 1), (19, 2), (19, 3)],
+          f'got template={tmpl} slots={slots}')
+    # 无登记表（兜底路径）→ 回归冒烟（响应可解析、字段齐全）
+    matchmaking.PMS_TO_SESSION.clear()
+    w = FakeWriter()
+    await game_server.handle_request(None, w, 6, 'SquadRequest',
+                                     pb_varint(1, 1) + pb_varint(2, 0))
+    main, _ = Chunk.parse(w.data, 0)
+    resp = _parse_varints(main.subs[0].subs[0].data)
+    check('无登记表兜底仍回有效 SquadResponse（动态 squadId 非零）',
+          int(resp.get(1) or 0) != 0 and '_messages' in resp
+          and 2 in resp.get('_messages', {}))
+
     # --- 清理 ---
     matchmaking.PMS_TO_SESSION.clear()
     matchmaking.PMS_TO_MISSION.clear()

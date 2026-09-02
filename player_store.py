@@ -519,6 +519,12 @@ ALTER TABLE players ADD COLUMN IF NOT EXISTS discord_id TEXT NOT NULL DEFAULT ''
 ALTER TABLE players ADD COLUMN IF NOT EXISTS steam_id   TEXT NOT NULL DEFAULT '';
 ALTER TABLE players ADD COLUMN IF NOT EXISTS last_daily_reward_at TIMESTAMPTZ;
 ALTER TABLE players ADD COLUMN IF NOT EXISTS first_gold_offer_shown BOOLEAN NOT NULL DEFAULT FALSE;
+-- 每日签到（PlayerOfferMetrics KVCS 行源）：已领次数 / 连续登录天数 /
+-- 最近登录日期（连续性判定）/ 首局日期（player f19 firstActionGameDate）
+ALTER TABLE players ADD COLUMN IF NOT EXISTS daily_reward_redeemed_count INT NOT NULL DEFAULT 0;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS consecutive_day_count INT NOT NULL DEFAULT 0;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS last_login_date DATE;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS first_action_game_date DATE;
 
 -- characters：改名/换模板/激活状态/tier/软删
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS active_status INT NOT NULL DEFAULT 1;
@@ -2320,30 +2326,72 @@ class PlayerStore:
 
     # ------------------------------------------------------------- 经济道具（U5）
 
-    async def redeem_daily_reward(self, player_id, credits=2500):
-        """每日登录奖励：当天首次领取发放 credits 并记录时间戳。
-        返回 (ok, granted)：当天已领则 granted=0（幂等，不重复发）。
+    async def claim_daily_reward(self, player_id):
+        """每日签到领取（RedeemDailyLoginRewardRequest）。
 
-        标记时间戳与发钱在同一事务内（FOR UPDATE 锁行防并发双领）。"""
+        当天首次领取 → daily_reward_redeemed_count+1、last_daily_reward_at=now()
+        返回 (True, day, redeemed_count)；当天已领 → (True, 0, n) 幂等不发；
+        账号不存在 → (False, 0, 0)。day 即客户端 dailyRewards.xml 的奖励日
+        （连续计数，handler 侧做 365 天循环折算）。发放内容（货币/加成/会员）
+        由 handler 按当日 day 执行——标记与计数在同一事务内（FOR UPDATE
+        锁行防并发双领），发放失败不回滚（已计入的 day 只少发一次奖励，
+        不会重复发）。"""
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    'SELECT last_daily_reward_at::date AS d FROM players '
+                    'SELECT last_daily_reward_at::date AS d, '
+                    'daily_reward_redeemed_count AS n FROM players '
                     'WHERE id = $1 FOR UPDATE', int(player_id))
                 if row is None:
-                    return False, 0
+                    return False, 0, 0
                 if row['d'] is not None:
                     today = await conn.fetchval('SELECT now()::date')
                     if row['d'] == today:
-                        return True, 0
+                        return True, 0, int(row['n'])
+                n = int(row['n']) + 1
                 await conn.execute(
-                    'UPDATE players SET last_daily_reward_at = now() WHERE id = $1',
-                    int(player_id))
-                if credits:
-                    await conn.execute(
-                        'UPDATE players SET credits = credits + $2 WHERE id = $1',
-                        int(player_id), int(credits))
-        return True, int(credits)
+                    'UPDATE players SET last_daily_reward_at = now(), '
+                    'daily_reward_redeemed_count = $2 WHERE id = $1',
+                    int(player_id), n)
+        return True, n, n
+
+    async def touch_daily_login(self, player_id):
+        """登录即记连续天数（subscribeplayerview 推签到行前调用）：
+        同日幂等；昨日已登录 → +1；断签 → 重置 1。返回连续天数。"""
+        async with self.pool.acquire() as conn:
+            return int(await conn.fetchval(
+                'UPDATE players SET consecutive_day_count = CASE '
+                'WHEN last_login_date = CURRENT_DATE '
+                '  THEN consecutive_day_count '
+                'WHEN last_login_date = CURRENT_DATE - 1 '
+                '  THEN consecutive_day_count + 1 '
+                'ELSE 1 END, last_login_date = CURRENT_DATE '
+                'WHERE id = $1 RETURNING consecutive_day_count',
+                int(player_id)) or 1)
+
+    async def get_daily_metrics(self, player_id):
+        """PlayerOfferMetrics KVCS 行源（签到窗口数据）。
+
+        available=今天可领（last_daily_reward_at 非今天）；
+        fagd=firstActionGameDate（YYYYMMDD，无首局回落注册日）。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT daily_reward_redeemed_count AS n, '
+                'consecutive_day_count AS c, '
+                "COALESCE(last_daily_reward_at::date <> now()::date, "
+                "TRUE) AS available, "
+                "to_char(COALESCE(first_action_game_date, created_at::date), "
+                "'YYYYMMDD') AS fagd "
+                'FROM players WHERE id = $1', int(player_id))
+        return dict(row) if row else None
+
+    async def mark_first_action_game(self, player_id):
+        """首局日期（player f19 firstActionGameDate）：结算时调用，幂等只写一次。"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE players SET first_action_game_date = '
+                'COALESCE(first_action_game_date, now()::date) '
+                'WHERE id = $1', int(player_id))
 
     async def redeem_voucher(self, player_id, key):
         """兑换码 v2（RedeemVoucherRequest）：校验 + 记 pending 流水，不立即发放。

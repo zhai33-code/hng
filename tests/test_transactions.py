@@ -138,25 +138,23 @@ async def main():
               f'n_wb={n_wb} gold={await bal("gold")}')
 
         # ---------------------------------------------------------------- 3
-        print('== 3. redeem_daily_reward 幂等 + 防双领 ==')
-        await st.set_currency(pid, credits=0)
-        ok1, g1 = await st.redeem_daily_reward(pid, credits=2500)
-        ok2, g2 = await st.redeem_daily_reward(pid, credits=2500)
-        check('当天首次领取发放 2500', ok1 and g1 == 2500, f'ok={ok1} g={g1}')
-        check('当天重复领取 granted=0', ok2 and g2 == 0, f'ok={ok2} g={g2}')
-        check('重复领取不重复发钱', await bal('credits') == 2500,
-              f'credits={await bal("credits")}')
+        # 2026-09-02 每日签到改造：redeem_daily_reward 拆为 claim_daily_reward
+        # （标记/计数）+ handler 侧发放（货币/加成/会员按 dailyRewards.xml）
+        print('== 3. claim_daily_reward 幂等 + 防双领 ==')
+        ok1, day1, n1 = await st.claim_daily_reward(pid)
+        ok2, day2, n2 = await st.claim_daily_reward(pid)
+        check('当天首次领取 day=1', ok1 and day1 == 1 and n1 == 1,
+              f'ok={ok1} day={day1} n={n1}')
+        check('当天重复领取 day=0（幂等）', ok2 and day2 == 0 and n2 == 1,
+              f'ok={ok2} day={day2} n={n2}')
 
-        # 并发双领：fresh 玩家（新建号 credits 列默认 100000，先清零再断言）
+        # 并发双领：fresh 玩家
         pid2 = await st.create_player(f'{uname}_b', 'txn-test')
-        await st.set_currency(pid2, credits=0)
-        await asyncio.gather(
-            st.redeem_daily_reward(pid2, credits=2500),
-            st.redeem_daily_reward(pid2, credits=2500))
-        async with st.pool.acquire() as c:
-            cr2 = int(await c.fetchval(
-                'SELECT credits FROM players WHERE id = $1', pid2))
-        check('并发双领只发一次（FOR UPDATE）', cr2 == 2500, f'credits={cr2}')
+        res = await asyncio.gather(st.claim_daily_reward(pid2),
+                                   st.claim_daily_reward(pid2))
+        granted_days = sum(1 for ok, d, n in res if d)
+        check('并发双领只发一次（FOR UPDATE）', granted_days == 1,
+              f'res={res}')
 
         # ---------------------------------------------------------------- 4
         print('== 4. redeem_voucher v2（pending 流水 + 时效/限量/无限）==')

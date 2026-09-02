@@ -35,6 +35,7 @@ from protocol import (
 from state import STORE, log
 
 from player_service import _load_db_loadout
+from wardb import SQUAD_TEMPLATE_SLOTS
 from warserver_messages import (
     BF_DEFENDER_FACTION_ID,
     MISSION_PRESET_ID,
@@ -509,17 +510,32 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             squad_leader_char_id = int(sq_info.get('leader_char_id', 0) or 0) \
                 or (int(members[0]['char_id']) if members else sess_char_id)
             owner_char_id = squad_leader_char_id
+            # ★ f2 squadTemplateId 取成局登记的兵种小队模板（回退 1）
+            squad_template_id = int(sq_info.get('template', 1) or 1)
             # ★ faction 以成局登记表为准（matchmaking 按 entry.faction 分组
             #   写入）：会话回退值在两人局可能是另一名玩家的 faction。
             if int(sq_info.get('faction', 0) or 0):
                 team_runtime_faction_id = int(sq_info['faction'])
                 faction_template_id = int(sq_info['faction'])
-            # playerSlots：每名成员一个槽（slotTemplateId=1 突击步兵位，
-            # 与 SquadPlayerSlotTemplate 对齐；index=成员在队内槽位）
+            # ★ f5 playerSlots：发小队模板全量槽（SquadPlayerSlotTemplate
+            #   表行：f1 slotTemplateId、f2 index=slotNumber-1）。绝不能按
+            #   当前成员数发槽——战斗服对同一 squadId 只在首个成员加入时
+            #   拉一次本定义并缓存（PhaseUpdatePlayerInit 反编译证实），
+            #   late join 补进小队时分到的 slot 不在首次定义里 →
+            #   "#error3 specified squad character slot not found" →
+            #   客户端小队名空白/无军衔、无法部署（2026-09-02）。
+            slot_rows = list(SQUAD_TEMPLATE_SLOTS.get(squad_template_id)
+                             or [(1, 0)])
+            # 成员数超模板槽（理论不可达，如超编 DB 小队）→ 沿用最后一行
+            # 槽模板补槽，保证每个成员 slot 都能命中
+            if len(members) > len(slot_rows):
+                last_tid = slot_rows[-1][0]
+                slot_rows += [(last_tid, i) for i in
+                              range(len(slot_rows), len(members))]
             slots = b''.join(
-                pb_message(5, pb_int64(1, 1) + pb_int32(2, int(m['slot'])))
-                for m in members)
-            slot_count = len(members)
+                pb_message(5, pb_int64(1, int(tid)) + pb_int32(2, int(idx)))
+                for tid, idx in slot_rows)
+            slot_count = len(slot_rows)
         else:
             squad_name = 'PlayerSquad'
             owner_char_id = sess_char_id
