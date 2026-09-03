@@ -230,7 +230,7 @@ def _msg_character_entry(ch, loadout=None):
     if loadout is None:
         loadout = {'weapons': {}, 'w_ammo': {}, 'w_mods': {}, 'vehicles': {},
                    'v_ups': {}, 'v_ammo': {}, 'vv_tmpl': {},
-                   'wv_tmpl': {}, 'wv_owned': {},
+                   'wv_tmpl': {}, 'wv_owned': {}, 'tr_tmpl': {},
                    'uv_tmpl': {}, 'u_parts': {}, 'up_tmpl': {},
                    'rboosters': {}}
     xp = int(ch.get('combat_xp', 0) or 0)
@@ -252,7 +252,8 @@ def _msg_character_entry(ch, loadout=None):
         out += _msg_weapon_setting(
             w, loadout['w_ammo'].get(int(w['id']), []),
             loadout['w_mods'].get(int(w['id']), []), slot,
-            loadout.get('wv_tmpl'), loadout.get('wv_owned'))
+            loadout.get('wv_tmpl'), loadout.get('wv_owned'),
+            loadout.get('tr_tmpl'))
 
     # f4 载具：仅下发已装备载具（equipped_in_slot>0，与 f3 武器同原则）。
     # 未装备载具只在车库（Vehicle KVCS）显示，不进战斗配装
@@ -308,9 +309,10 @@ def _msg_character_entry(ch, loadout=None):
     return pb_message(12, out)
 
 
-def _msg_weapon_setting(w, ammos, mods, slot, wv_tmpl=None, wv_owned=None):
+def _msg_weapon_setting(w, ammos, mods, slot, wv_tmpl=None, wv_owned=None,
+                        tr_tmpl=None):
     """charactersetting.f3 WeaponSetting（§7.2，wire 格式按回放实测）：
-    f1 id / f2 template / f3 弹药(含耐久 fixed32) / f4 配件 / f5 tracer(恒0) /
+    f1 id / f2 template / f3 弹药(含耐久 fixed32) / f4 配件 / f5 tracer /
     f6 decals(官方服恒发空消息，按回放字节镜像) / f7 spawnClips /
     f8 equipmentSlot / f9 condition(fixed32) / f10 皮肤模板 / f11 name。
 
@@ -320,6 +322,9 @@ def _msg_weapon_setting(w, ammos, mods, slot, wv_tmpl=None, wv_owned=None):
     皮肤后装备）战斗内皮肤不生效。variant_id=0（已卸下）时仅当该武器没有
     任何皮肤实例行（旧库从未持久化 variant_id）才回退反规范化列；
     有实例行而未装备 = 卸下 → 默认涂装（与 f3 弹药只发已装备同原则）。
+
+    f5 tracer：weapon_id → 已装备曳光弹模板（tr_tmpl 映射，来源
+    tracer_effects 行 is_equipped）；无装备行发 0（默认曳光弹）。
     """
     vid = int(w.get('variant_id', 0) or 0)
     vtmpl = int((wv_tmpl or {}).get(vid, 0) or 0) if vid else 0
@@ -347,8 +352,9 @@ def _msg_weapon_setting(w, ammos, mods, slot, wv_tmpl=None, wv_owned=None):
         mm += pb_int64(2, int(md['template_id']))
         mm += pb_float(3, float(md.get('condition', 1.0) or 1.0))
         m += pb_message(4, mm)
-    # f5/f6：官方服恒发默认值（tracer_effect_template=0 / decals 空消息）
-    m += pb_varint(5, 0)
+    # f5 tracer：已装备曳光弹模板（tracer_effects 行 is_equipped → tr_tmpl；
+    # 无装备行发 0=默认曳光弹）；f6 decals 官方服恒发空消息（按回放字节镜像）
+    m += pb_varint(5, int((tr_tmpl or {}).get(int(w['id']), 0) or 0))
     m += pb_message(6, b'')
     m += pb_int32(7, spawn_clips_for(
         int(w.get('clip_count', 0) or 0), int(w['template_id'])))

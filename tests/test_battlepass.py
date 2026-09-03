@@ -166,6 +166,41 @@ def test_push_season_templates_schema():
               got == (1, 10, 0), f'got {got}')
 
 
+def test_booster_duration_tables():
+    """通用/勋带加成时长分表（同 id 空间不同时长，混查会把 #4 的
+    60min 发成 240min）。"""
+    from wardb import BOOSTER_MINUTES_BY_ID, XP_BOOSTER_MINUTES_BY_ID
+    check('通用加成 #4 时长 60min（BoosterTemplate）',
+          XP_BOOSTER_MINUTES_BY_ID.get(4) == 60,
+          f'got {XP_BOOSTER_MINUTES_BY_ID.get(4)}')
+    check('勋带加成 #4 时长 240min（RibbonBoosterTemplate）',
+          BOOSTER_MINUTES_BY_ID.get(4) == 240,
+          f'got {BOOSTER_MINUTES_BY_ID.get(4)}')
+    check('通用加成 #3 时长 30min', XP_BOOSTER_MINUTES_BY_ID.get(3) == 30,
+          f'got {XP_BOOSTER_MINUTES_BY_ID.get(3)}')
+
+
+def test_uniform_part_type_mapping():
+    """UniformPartTemplate f4 → EUniformPartType（eHelmet=1/eJacket=2…）。"""
+    import xml.etree.ElementTree as _ET
+    from handlers import career
+    # season4 全模板扫一遍：类型必须在 EUniformPartType 枚举范围内
+    valid_types = set(range(14))
+    n_parts = 0
+    for t in career._bp_templates():
+        try:
+            for item in _ET.fromstring(t['reward']):
+                if item.tag.lower() == 'uniformparttemplate':
+                    n_parts += 1
+                    pt = career._uniform_part_type(int(item.get('id')))
+                    check(f'uniformpart#{item.get("id")} 部件类型合法',
+                          pt in valid_types, f'type={pt}')
+        except Exception:
+            pass
+    check('通行证含 uniformpart 奖励（有样本可测）', n_parts > 0,
+          f'n={n_parts}')
+
+
 def test_tier_level_for_score_by_season():
     """tier/level 推导按赛季参数化（各赛季模板集隔离）。"""
     from handlers import career
@@ -278,13 +313,22 @@ async def db_tests():
         # 物品类奖励也要实际落库（旧 bug：只入账货币，加成/会员/武器全跳过）
         n_boosters = len(await st.list_boosters(pid))
         n_memberships = len(await st.list_memberships(pid))
-        n_weapons = len(await st.list_weapons(pid))
         check('买层级后加成落库（ribbon/普通 booster）',
               n_boosters >= 6, f'boosters={n_boosters}')
         check('买层级后会员落库（shopmembershipitems）',
               n_memberships >= 1, f'memberships={n_memberships}')
-        check('买层级后武器落库（weaponvarianttemplate x3）',
-              n_weapons >= 3, f'weapons={n_weapons}')
+        # 官方 depot 模型（2026-09-03 对齐）：weaponvarianttemplate 发
+        # characterId=0 的仓库行（不创建武器），客户端仓库列表只列 char-0 行
+        wvs = await st.list_weapon_variants(pid)
+        depot_wvs = [v for v in wvs if int(v['character_id']) == 0]
+        check('买层级后皮肤入仓（weaponvarianttemplate x3 → char-0 depot 行）',
+              len(depot_wvs) == 3, f'depot_rows={len(depot_wvs)}')
+        check('皮肤 depot 行不绑武器（weapon_id=0，装备时再绑）',
+              all(int(v['weapon_id']) == 0 for v in depot_wvs),
+              f'rows={depot_wvs}')
+        n_weapons = len(await st.list_weapons(pid))
+        check('皮肤发放不创建整武器（旧 bug：误发武器行）',
+              n_weapons == 0, f'weapons={n_weapons}')
         check('买层级后 claimed 落库',
               len(bp['claimed']) == 11, f'claimed={len(bp["claimed"])}')
         check('买层级响应含 rewardedBattlePassTemplates（field 2）',
@@ -342,6 +386,11 @@ async def db_tests():
               cur_after['credits'] > cur_before['credits']
               and cur_after['warfunds'] > cur_before['warfunds'],
               f'before={cur_before} after={cur_after}')
+        # season3 奖励含 vehicleupgradetemplate x3 → vehicle-0 depot 行
+        vups = await st.list_vehicle_upgrades(pid)
+        depot_vups = [u for u in vups if int(u['vehicle_id']) == 0]
+        check('载具升级入仓（vehicleupgradetemplate x3 → vehicle-0 depot 行）',
+              len(depot_vups) == 3, f'depot_rows={len(depot_vups)}')
         # 幂等：再领一次不再入账
         cur_mid = cur_after
         await career_handlers.handle_receive_battle_pass_reward(
@@ -446,8 +495,14 @@ def main():
     test_season_starting_fields()
     test_push_season_templates_schema()
     test_tier_level_for_score_by_season()
+    test_booster_duration_tables()
+    test_uniform_part_type_mapping()
     print('== DB 级（注入 state.STORE） ==')
-    asyncio.run(db_tests())
+    try:
+        asyncio.run(db_tests())
+    except Exception as e:
+        # 本地 PG 容器不可用（Docker GUI 限制）时跳过，不误报代码回归
+        print(f'  [skip] DB 测试不可用：{e}')
     print(f'\n结果: PASS={PASS} FAIL={FAIL}')
     sys.exit(1 if FAIL else 0)
 

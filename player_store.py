@@ -55,6 +55,7 @@ CREATE SEQUENCE IF NOT EXISTS uniform_variant_id_seq START 700;
 CREATE SEQUENCE IF NOT EXISTS weapon_variant_id_seq START 800;
 CREATE SEQUENCE IF NOT EXISTS uniform_part_id_seq START 900;
 CREATE SEQUENCE IF NOT EXISTS vehicle_variant_id_seq START 1000;
+CREATE SEQUENCE IF NOT EXISTS tracer_effect_id_seq START 1100;
 -- 玩家 id 从 1e6 起步：避开战斗服 bot 缺省 playerId（= u16 clientId ≤65535）
 -- 的命名空间，防止击杀归属/实体顶替撞号（playerid-bot-collision-2026-08-31.md）
 CREATE SEQUENCE IF NOT EXISTS players_id_seq START 1000000;
@@ -290,6 +291,21 @@ CREATE INDEX IF NOT EXISTS idx_uniform_variants_player ON uniform_variants(playe
 CREATE INDEX IF NOT EXISTS idx_weapon_variants_player ON weapon_variants(player_id);
 CREATE INDEX IF NOT EXISTS idx_uniform_parts_player ON uniform_parts(player_id);
 CREATE INDEX IF NOT EXISTS idx_vehicle_variants_player ON vehicle_variants(player_id);
+
+-- 玩家曳光弹效果实例（通行证奖励 target='depot' 发放；SetTracerEffectRequest 装备）。
+-- 官方模型 = KVCS 'TracerEffect' 行 {tracerEffectTemplateId, playerId, characterId,
+-- weaponId, isEquipped}：characterId=0 即仓库在库（客户端 TracerEffectUtilities
+-- .getTracerEffectsInDepot），装备=行绑定 weaponId + isEquipped 置位。
+CREATE TABLE IF NOT EXISTS tracer_effects (
+    id                 BIGINT PRIMARY KEY DEFAULT nextval('tracer_effect_id_seq'),
+    player_id          BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    tracer_template_id BIGINT NOT NULL,
+    character_id       BIGINT NOT NULL DEFAULT 0,
+    weapon_id          BIGINT NOT NULL DEFAULT 0,
+    is_equipped        BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tracer_effects_player ON tracer_effects(player_id);
 
 -- ===== SWF 前端未响应请求全面补全（2026-08-21 计划 U1）=====
 -- 全部 CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS，启动自动迁移，不动旧数据
@@ -1504,6 +1520,51 @@ class PlayerStore:
                 'RETURNING id, weapon_id, character_id, weapon_variant_template_id',
                 player_id, weapon_id, character_id, weapon_variant_template_id)
             return dict(row)
+
+    async def bind_weapon_variant(self, player_id, variant_id, weapon_id, character_id):
+        """绑定武器皮肤 depot 行到武器（SetWeaponVariantRequest 装备仓库皮肤）。
+        行必须属于该玩家且 weapon_id=0（仓库行）；绑定后 character_id 跟随武器，
+        客户端 isWeaponVariantOwned 要求 characterId==选中角色。返回更新后行或 None。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'UPDATE weapon_variants SET weapon_id = $3, character_id = $4 '
+                'WHERE id = $1 AND player_id = $2 AND weapon_id = 0 '
+                'RETURNING id, weapon_id, character_id, weapon_variant_template_id',
+                int(variant_id), int(player_id), int(weapon_id), int(character_id))
+            return dict(row) if row else None
+
+    # ---- tracer effects（曳光弹）----
+
+    async def list_tracer_effects(self, player_id):
+        """返回 [{id, tracer_template_id, character_id, weapon_id, is_equipped}]，按 id 顺序。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT id, tracer_template_id, character_id, weapon_id, is_equipped '
+                'FROM tracer_effects WHERE player_id = $1 ORDER BY id', player_id)
+            return [dict(r) for r in rows]
+
+    async def create_tracer_effect(self, player_id, tracer_template_id,
+                                   character_id=0, weapon_id=0):
+        """创建曳光弹效果实例（通行证奖励发放），返回含新 id 的 dict。
+        官方发放 target='depot'：character_id=0 的仓库行，装备时才绑定武器。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'INSERT INTO tracer_effects '
+                '(player_id, tracer_template_id, character_id, weapon_id) '
+                'VALUES ($1, $2, $3, $4) '
+                'RETURNING id, tracer_template_id, character_id, weapon_id, is_equipped',
+                int(player_id), int(tracer_template_id),
+                int(character_id), int(weapon_id))
+            return dict(row)
+
+    async def get_tracer_effect(self, player_id, tracer_id):
+        """按 id 查询单个曳光弹实例，未找到返回 None。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT id, tracer_template_id, character_id, weapon_id, is_equipped '
+                'FROM tracer_effects WHERE id = $1 AND player_id = $2',
+                int(tracer_id), int(player_id))
+            return dict(row) if row else None
 
     async def get_weapon(self, player_id, weapon_id):
         """按 id 查询单个武器，未找到返回 None。"""
@@ -3329,14 +3390,56 @@ class PlayerStore:
                 int(weapon_id), int(player_id), str(new_name or ''))
         return _rowcount(n) > 0
 
-    async def set_weapon_tracer_effect(self, player_id, weapon_id, tracer_effect_id):
-        """武器曳光弹效果（SetTracerEffectRequest）。返回是否更新。"""
+    async def set_weapon_tracer_effect(self, player_id, weapon_id, tracer_effect_id,
+                                       character_id=0):
+        """武器曳光弹效果（SetTracerEffectRequest，官方行模型）。
+        tracer_effect_id=0：卸下该武器全部曳光弹行；非 0：绑定该行到武器
+        （character_id 跟随武器）并置 is_equipped，同时清该武器其他行的装备位。
+        weapons.tracer_effect_id 反规范化列同步维护（战斗配装兜底）。
+        返回受影响行 [{id, tracer_template_id, character_id, weapon_id, is_equipped}]。"""
         async with self.pool.acquire() as conn:
-            n = await conn.execute(
-                'UPDATE weapons SET tracer_effect_id = $3 WHERE id = $1 '
-                'AND player_id = $2',
-                int(weapon_id), int(player_id), int(tracer_effect_id))
-        return _rowcount(n) > 0
+            async with conn.transaction():
+                affected = []
+                if int(tracer_effect_id) == 0:
+                    rows = await conn.fetch(
+                        'UPDATE tracer_effects SET is_equipped = FALSE '
+                        'WHERE weapon_id = $1 AND player_id = $2 AND is_equipped '
+                        'RETURNING id, tracer_template_id, character_id, weapon_id, is_equipped',
+                        int(weapon_id), int(player_id))
+                    affected = [dict(r) for r in rows]
+                    await conn.execute(
+                        'UPDATE weapons SET tracer_effect_id = 0 '
+                        'WHERE id = $1 AND player_id = $2',
+                        int(weapon_id), int(player_id))
+                    return affected
+                # 目标行必须属于该玩家
+                row = await conn.fetchrow(
+                    'SELECT id, tracer_template_id, character_id, weapon_id, is_equipped '
+                    'FROM tracer_effects WHERE id = $1 AND player_id = $2',
+                    int(tracer_effect_id), int(player_id))
+                if row is None:
+                    return None
+                # 清同武器其他行的装备位（武器同一时间只有一个曳光弹）
+                others = await conn.fetch(
+                    'UPDATE tracer_effects SET is_equipped = FALSE '
+                    'WHERE weapon_id = $1 AND player_id = $2 AND is_equipped AND id <> $3 '
+                    'RETURNING id, tracer_template_id, character_id, weapon_id, is_equipped',
+                    int(weapon_id), int(player_id), int(tracer_effect_id))
+                affected = [dict(r) for r in others]
+                # 绑定目标行：weapon_id + character_id 跟随武器
+                bound = await conn.fetchrow(
+                    'UPDATE tracer_effects SET weapon_id = $3, character_id = $4, '
+                    'is_equipped = TRUE WHERE id = $1 AND player_id = $2 '
+                    'RETURNING id, tracer_template_id, character_id, weapon_id, is_equipped',
+                    int(tracer_effect_id), int(player_id),
+                    int(weapon_id), int(character_id))
+                if bound is not None:
+                    affected.append(dict(bound))
+                await conn.execute(
+                    'UPDATE weapons SET tracer_effect_id = $3 '
+                    'WHERE id = $1 AND player_id = $2',
+                    int(weapon_id), int(player_id), int(tracer_effect_id))
+        return affected
 
     async def update_weapon_condition(self, player_id, weapon_id, condition):
         """修复武器耐久（RepairWeaponRequest）。返回是否更新。"""

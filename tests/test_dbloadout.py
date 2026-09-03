@@ -159,8 +159,12 @@ def main():
     check('载具 f3 耐久 wiretype=5 值=100.0',
           f3wt == 5 and abs(v[3][0] - 100.0) < 1e-3)
     vu = fields(v[5][0])
-    check('载具升级 f5 只含已安装的 501/11（slot=0 的 502 不下发）',
-          len(v[5]) == 1 and vu[1][0] == 501 and vu[2][0] == 11)
+    # f2 是 VehicleUpgradeSlot 表 id（equipped_slot_id）而非升级模板 id
+    # （2026-08-31 hng_boot.log 实证：客户端按 f2 查槽位表反解模板，
+    # 误发模板 id 会撞同 id 行解析错模板且挂载失败）
+    check('载具升级 f5 只含已安装的 501（slot=0 的 502 不下发），'
+          'f2=槽位表 id=1',
+          len(v[5]) == 1 and vu[1][0] == 501 and vu[2][0] == 1)
     va = fields(v[6][0])
     check('载具弹药 f2仓=71 f3槽=1 f4模板=93 f6出生弹夹=3(VehicleAmmoStorage.f2)',
           va[2][0] == 71 and va[3][0] == 1 and va[4][0] == 93

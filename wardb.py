@@ -154,6 +154,15 @@ BOOSTER_MINUTES_BY_ID = {
     for f in _parse_wardb_table('RibbonBoosterTemplate') if int(f.get(1, 0))
 }
 
+# BoosterTemplate { id=1, ?, minutes=3, multiplier=4(fixed32) }（通用 XP 加成）
+# 与 RibbonBoosterTemplate 分表同 id 空间但时长不同（实锤：#1 240/240 碰巧一致，
+# #4 官方 60min、勋带表同 id 为 240min）——两类发放必须各查各表，
+# 混用会把通用加成 #4 发成 4 倍时长。
+XP_BOOSTER_MINUTES_BY_ID = {
+    int(f.get(1, 0)): int(f.get(3, 0))
+    for f in _parse_wardb_table('BoosterTemplate') if int(f.get(1, 0))
+}
+
 # 可购买物品类 unlockItemType 的全量解锁 uid 集合（白名单式统一剔除）。
 # CharacterUnlockTemplate.unlockSequence 实际是该角色类型「全部勋带路径条目」
 # 的清单——物品类 uid 一律不能随默认序列授予。历史四轮同根因泄漏：
@@ -501,6 +510,21 @@ def _build_rank_meta_level():
 
 
 _RANK_META_LEVEL = _build_rank_meta_level()
+
+# eCommandPoints（progressionUnlock unlockItemType=11）uid → 指挥点数
+# （unlockItemId.low = 点数）。官服 AT 购买/部署 gate = 角色指挥点 > 0
+# （客户端 HandleAssaultShopCommand.as 实锤，无 isGeneral 检查）：
+# - uid 342/344/346（勋带 3000 的 4/8/12 级，各 +1 点）：仅在将军模板
+#   (7, faction) 的 CharacterUnlockTemplate 默认序列 → 将军默认 3 点；
+# - uid 280-289（军衔 rank 12/15-22，各 +1 点）：全职业，军衔 12 级起
+#   累计最高 10 点（CharacterSchema.commandPointsUnlocked 按 unlockBits 求和）。
+# AT 点数成本 = commandnodetemplate f9 size（infantry/mechanized/fighter=2 等），
+# 装备/部署受 size ≤ commandPointsUnlocked - commandPointsUsed 约束。
+COMMAND_POINT_UIDS = {
+    int(f.get(1, 0)): int(f.get(8, 0))
+    for f in _parse_wardb_table('progressionUnlock')
+    if int(f.get(7, 0)) == 11
+}
 
 
 # ---- 玩家等级（进展 tab：PlayerLevel / PlayerLevelUnlock）----

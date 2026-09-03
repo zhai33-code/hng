@@ -46,6 +46,7 @@ from starting_gear import STARTING_GEAR
 from messages import (
     _msg_character,
     _msg_depot_new_item,
+    _msg_tracer_effect,
     _msg_uniform_part,
     _msg_uniform_variant,
     _msg_vehicle,
@@ -450,6 +451,7 @@ async def _push_stored_soldier_data(sess, writer):
         weapon_variants = await STORE.list_weapon_variants(pid)
         uniform_parts = await STORE.list_uniform_parts(pid)
         vehicle_variants = await STORE.list_vehicle_variants(pid)
+        tracer_effects = await STORE.list_tracer_effects(pid)
         depot_new = await STORE.list_depot_new_items(pid)
     except Exception as e:
         log(f'[DB] load soldier data failed: {e}')
@@ -480,7 +482,8 @@ async def _push_stored_soldier_data(sess, writer):
                 await STORE.delete_weapon(pid, fw['id'])
             except Exception as e:
                 log(f'[DB] delete fake weapon failed: {e}')
-    if not chars and not weapons and not modifiers and not ammo_list and not vehicles and not v_upgrades:
+    if not chars and not weapons and not modifiers and not ammo_list \
+            and not vehicles and not v_upgrades and not tracer_effects:
         return
     cmd = sess.soldier_view_cmd
     # UniformVariant/UniformPart 必须先于 character 推送：客户端 changeset 串行队列
@@ -675,10 +678,17 @@ async def _push_stored_soldier_data(sess, writer):
                                            a['equipped_storage_id'], a['slot_index'],
                                            a['character_id'], a.get('condition', 100.0),
                                            a.get('auto_repair', 0)))
+    # 曳光弹行（weaponId 引用已推送的 weapon 行，置于 weapon/弹药之后）
+    for t in tracer_effects:
+        await _push_kvcs(writer, cmd, b'TracerEffect',
+                         _msg_tracer_effect(t['id'], t['tracer_template_id'],
+                                            t['character_id'], t['weapon_id'],
+                                            t['is_equipped']))
     # UniformVariant/UniformPart 已在 character 循环之前推送（见上）
     log(f'S->C cmd={cmd:<4} KeyValueChangeSet (stored data: {len(chars)} chars, '
         f'{len(weapons)} weapons, {len(modifiers)} modifiers, {len(ammo_list)} ammo, '
         f'{len(vehicles)} vehicles, {len(v_upgrades)} vehicle upgrades, '
+        f'{len(tracer_effects)} tracers, '
         f'{len(v_ammo_list)} vehicle ammo, {len(uniform_variants)} uniform variants, '
         f'{len(uniform_parts)} uniform parts)')
 
@@ -699,13 +709,14 @@ async def _load_db_loadout(player_id):
         v_ammo = await STORE.list_vehicle_ammo(player_id)
         u_vars = await STORE.list_uniform_variants(player_id)
         u_parts = await STORE.list_uniform_parts(player_id)
+        tracers = await STORE.list_tracer_effects(player_id)
         boosters = await STORE.list_active_boosters(player_id, ribbon_only=True)
     except Exception as e:
         log(f'[DB] load loadout failed: {e}')
         return None
     loadout = {'weapons': {}, 'w_ammo': {}, 'w_mods': {}, 'vehicles': {},
                'v_ups': {}, 'v_ammo': {}, 'vv_tmpl': {},
-               'wv_tmpl': {}, 'wv_owned': {},
+               'wv_tmpl': {}, 'wv_owned': {}, 'tr_tmpl': {},
                'uv_tmpl': {}, 'u_parts': {}, 'up_tmpl': {},
                'rboosters': {}}
     for w in weapons:
@@ -737,6 +748,11 @@ async def _load_db_loadout(player_id):
         tmpl = int(wv['weapon_variant_template_id'])
         loadout['wv_tmpl'][int(wv['id'])] = tmpl
         loadout['wv_owned'].setdefault(int(wv['weapon_id'] or 0), []).append(tmpl)
+    # tr_tmpl：weapon_id → 已装备曳光弹模板（WeaponSetting f5 用；
+    # 仅 is_equipped 行，未装备不发 = 战斗内默认曳光弹）
+    for t in tracers:
+        if t['is_equipped'] and int(t['weapon_id'] or 0):
+            loadout['tr_tmpl'][int(t['weapon_id'])] = int(t['tracer_template_id'])
     # rboosters：激活中的勋带加成 → {勋带模板 id: 乘数}（账号级，所有角色条目
     # 同发；同一勋带多个加成取最大乘数，不叠乘）。模板不在
     # RibbonBoosterTemplate 表 / 乘数<=1 的行跳过

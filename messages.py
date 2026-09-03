@@ -302,6 +302,21 @@ def _msg_uniform_part(pid2, char_id, template_id, part_type):
     return m
 
 
+def _msg_tracer_effect(tid, template_id, char_id, weapon_id, is_equipped=False):
+    """构建 HnG_States.TracerEffect proto（曳光弹效果实例），用于 SOLDIER_VIEW 推送。
+    表名注册为 'TracerEffect'（TracerEffectTable.xmlTag）。
+    官方模型：characterId=0 即仓库在库（TracerEffectUtilities.getTracerEffectsInDepot），
+    装备=行绑定 weaponId 且 isEquipped 置位。"""
+    m = b''
+    m += pb_int64(1, tid)                  # id
+    m += pb_int64(2, template_id)          # tracerEffectTemplateId
+    m += pb_int64(3, _cur_pid())           # playerId
+    m += pb_int64(4, char_id)              # characterId
+    m += pb_int64(5, weapon_id)            # weaponId
+    m += pb_bool(6, bool(is_equipped))     # isEquipped
+    return m
+
+
 def _msg_depot_new_item(row_id, player_id, new_item_str):
     """构建 HnG_States.DepotNewItem proto（仓库"新物品"通知行）。
 

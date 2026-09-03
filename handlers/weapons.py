@@ -38,6 +38,7 @@ from messages import (
     _msg_weapon_ammo,
     _msg_weapon_modifier,
     _msg_weapon_variant,
+    _msg_tracer_effect,
     _push_kvcs,
     )
 
@@ -353,29 +354,71 @@ async def handle_setweaponvariantrequest(sess, writer, cmd_id, req_type, proto):
     except Exception as e:
         log(f'      SetWeaponVariant parse error: {e}')
 
-    # 装备校验：非卸下时变体实例必须属于该玩家且指向该武器
+    # 装备校验：非卸下时变体实例必须属于该玩家，且满足其一：
+    #   a) 已绑定到该武器（旧购买路径：皮肤随武器发放/单买后绑定）
+    #   b) weapon_id=0 的仓库行（官方通行证/奖励发放模型，target='depot'）
+    #      且变体模板兼容该武器（客户端 ModifyWeaponMediator 同样按
+    #      weaponId==0||weaponId==当前武器 列出可选皮肤）
     valid = False
+    depot_row = None
     pid = await sess.ensure_player()
+    w = None
+    if pid is not None:
+        try:
+            w = await STORE.get_weapon(pid, int(sw_weapon_id))
+        except Exception as e:
+            log(f'[DB] get_weapon failed: {e}')
+    if w is None:
+        w = sess.weapons.get(int(sw_weapon_id)) if getattr(sess, 'weapons', None) else None
     if pid is not None:
         try:
             if int(sw_variant_id) == 0:
                 valid = True
             else:
                 for vv in await STORE.list_weapon_variants(pid):
-                    if (int(vv['id']) == int(sw_variant_id)
-                            and int(vv['weapon_id']) == int(sw_weapon_id)):
+                    if int(vv['id']) != int(sw_variant_id):
+                        continue
+                    if int(vv['weapon_id']) == int(sw_weapon_id):
                         valid = True
-                        break
+                    elif int(vv['weapon_id']) == 0 and w is not None:
+                        # 仓库行：校验变体模板与武器模板兼容
+                        from handlers.shop import _WEAPON_VARIANT_META
+                        meta = _WEAPON_VARIANT_META.get(
+                            int(vv['weapon_variant_template_id']))
+                        if meta is not None \
+                                and int(meta[1]) == int(w['template_id']):
+                            valid = True
+                            depot_row = vv
+                    break
         except Exception as e:
             log(f'[DB] weapon variant ownership check failed: {e}')
     if not valid:
-        resp_proto = pb_int32(2, 0)  # fail（皮肤不存在或不属于该武器）
+        resp_proto = pb_int32(2, 0)  # fail（皮肤不存在或不适用于该武器）
         resp = build_response(cmd_id, 'SetWeaponVariantResponse', resp_proto)
         writer.write(resp)
         await writer.drain()
         log(f'S->C cmd={cmd_id:<4} SetWeaponVariantResponse (rejected: '
             f'variant={sw_variant_id} weapon={sw_weapon_id} not owned)')
         return
+
+    # 官方装备语义：仓库皮肤行绑定到该武器（weaponId + characterId 跟随
+    # 武器），客户端 isWeaponVariantOwned 要求 characterId==选中角色
+    if depot_row is not None and pid is not None:
+        try:
+            bound = await STORE.bind_weapon_variant(
+                pid, int(sw_variant_id), int(sw_weapon_id),
+                int((w or {}).get('character_id') or 0))
+            if bound is not None and sess.soldier_view_cmd is not None:
+                await _push_kvcs(
+                    writer, sess.soldier_view_cmd, b'WeaponVariant',
+                    _msg_weapon_variant(bound['id'], bound['character_id'],
+                                        bound['weapon_id'],
+                                        bound['weapon_variant_template_id']))
+                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                    f'(WeaponVariant id={bound["id"]} bound to weapon '
+                    f'{sw_weapon_id}, char={bound["character_id"]})')
+        except Exception as e:
+            log(f'[DB] bind_weapon_variant failed: {e}')
 
     # 持久化到 weapons.variant_id 列（0 = 卸下）
     if pid is not None:
@@ -1332,8 +1375,25 @@ async def handle_settracereffectrequest(sess, writer, cmd_id, req_type, proto):
     pid = await sess.ensure_player()
     if pid is not None and te_weapon_id:
         try:
-            await STORE.set_weapon_tracer_effect(pid, int(te_weapon_id),
-                                                 int(te_tracer_id))
+            # character_id 跟随武器（行模型：characterId=0 为仓库在库，
+            # 装备后绑定 weaponId 并置 isEquipped）
+            tw = await STORE.get_weapon(pid, int(te_weapon_id))
+            affected = await STORE.set_weapon_tracer_effect(
+                pid, int(te_weapon_id), int(te_tracer_id),
+                character_id=int((tw or {}).get('character_id') or 0))
+            if affected is None:
+                log(f'[DB] set_weapon_tracer_effect: tracer row '
+                    f'{te_tracer_id} not owned, ignored')
+            elif sess.soldier_view_cmd is not None:
+                for t in affected:
+                    await _push_kvcs(
+                        writer, sess.soldier_view_cmd, b'TracerEffect',
+                        _msg_tracer_effect(t['id'], t['tracer_template_id'],
+                                           t['character_id'], t['weapon_id'],
+                                           t['is_equipped']))
+                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                    f'(TracerEffect rows re-pushed: {len(affected)}, '
+                    f'weapon={te_weapon_id}, tracerId={te_tracer_id})')
         except Exception as e:
             log(f'[DB] set_weapon_tracer_effect failed: {e}')
 

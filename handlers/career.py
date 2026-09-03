@@ -53,7 +53,14 @@ from protocol import (
     )
 from state import STORE, log
 
-from messages import _push_kvcs, _msg_uniform_part, _msg_uniform_variant
+from messages import (
+    _push_kvcs,
+    _msg_tracer_effect,
+    _msg_uniform_part,
+    _msg_uniform_variant,
+    _msg_vehicle_upgrade,
+    _msg_weapon_variant,
+    )
 from player_service import _push_player_refresh
 from handlers.economy import (
     _BOOSTER_MINUTES,
@@ -64,9 +71,11 @@ from handlers.economy import (
 from wardb import (
     BOOSTER_MINUTES_BY_ID,
     MEMBERSHIP_DAYS_BY_ID,
+    XP_BOOSTER_MINUTES_BY_ID,
     _parse_wardb_table,
     _rank_from_combat_xp,
     _ribbon_level_from_xp,
+    _VEHICLE_UPGRADE_MAXCOND,
     charactertemplate_actionid,
     is_general_character,
     weapon_template_category,
@@ -155,19 +164,41 @@ def _career_templates():
 
 # ------------------------------------------------------------- 奖励入账
 
+_UNIFORM_PART_TYPE = None
+
+
+def _uniform_part_type(template_id):
+    """UniformPartTemplate f4 → EUniformPartType（部件类型，eHelmet=1）。
+    缓存全表；模板缺失回退 1（通行证奖励全为头盔/面罩类）。"""
+    global _UNIFORM_PART_TYPE
+    if _UNIFORM_PART_TYPE is None:
+        _UNIFORM_PART_TYPE = {
+            int(f.get(1, 0)): int(f.get(4, 1) or 1)
+            for f in _parse_wardb_table('UniformPartTemplate')
+        }
+    return _UNIFORM_PART_TYPE.get(int(template_id), 1)
+
+
 async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
     """解析奖励 XML（<items target='player|depot'>…</items>）并入账。
 
-    支持 battle_pass_template / CareerOrderTemplate 奖励全集：
-    - 货币：credits / warfunds / gold
-    - 加成：ribbonboostertemplate / boostertemplate（Booster KVCS 推送）
-    - 会员：shopmembershipitems（Membership KVCS 推送）
-    - 门票：tickettemplate / tickettimedtemplate（Ticket KVCS 推送）
-    - 武器/载具变体：发到当前选中角色（复用商店礼包发货，含默认弹药）
-    - 军服：uniformvarianttemplate / uniformparttemplate
-    暂不支持（需载具/武器/进度绑定，官服为 depot 账户级库存）：
-    vehicleupgradetemplate / tracereffecttemplate / progressionunlock，
-    命中时记日志跳过。返回入账摘要列表。
+    官方语义（2026-09-03 对齐，奖励 XML + 客户端反编译实锤）：
+    - target='player'：货币/加成/会员/门票直接入账。加成时长按模板表查：
+      boostertemplate（通用 XP）与 ribbonboostertemplate（勋带）分表
+      同 id 空间但时长不同（#4 官方 60min vs 勋带表 240min），各查各表。
+    - target='depot'：一律插 characterId=0 的账户级仓库行 + KVCS 推送，
+      不创建整机/整武器、不绑角色（客户端仓库列表只列 char-0 行：
+      WeaponDepotViewMediator.getDepotSkins / UniformVariantUtilities
+      .getUniformObjectsInDepot / VehicleDepotViewMediator.setupVehiclesInDepot
+      / TracerEffectUtilities.getTracerEffectsInDepot）：
+      · weaponvarianttemplate  → WeaponVariant depot 行（weaponId=0）
+      · vehiclevarianttemplate → Vehicle 整车入仓 + 默认载具弹药
+      · uniformvarianttemplate → UniformVariant depot 行
+      · uniformparttemplate    → UniformPart depot 行（类型取模板 f4）
+      · tracereffecttemplate   → TracerEffect depot 行（weaponId=0）
+      · vehicleupgradetemplate → VehicleUpgrade depot 行（vehicleId=0）
+      · progressionunlock      → 全角色 add_extra_unlock_uids（幂等登记）
+    返回入账摘要列表。
     """
     granted = []
     try:
@@ -177,20 +208,6 @@ async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
         return granted
     if STORE is None:
         return granted
-
-    # 武器/载具/军服需要挂角色：优先当前选中角色，回落首个角色
-    need_char = any(el.tag.lower() in (
-        'weaponvarianttemplate', 'vehiclevarianttemplate',
-        'uniformvarianttemplate', 'uniformparttemplate') for el in root)
-    char_id = None
-    if need_char:
-        try:
-            char_id = await STORE.get_player_selected_char(int(pid))
-            if not char_id:
-                chars = await STORE.list_characters(int(pid))
-                char_id = int(chars[0]['id']) if chars else None
-        except Exception as e:
-            log(f'      [career] reward char resolve failed ({tag}): {e}')
 
     delta = {}
     n_boosters = n_memberships = n_tickets = n_timed = 0
@@ -203,10 +220,13 @@ async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
                 delta[obj] = delta.get(obj, 0) + amount
                 granted.append(f'{obj}+{amount}')
             elif obj in ('ribbonboostertemplate', 'boostertemplate'):
+                # 时长分表：通用加成查 BoosterTemplate，勋带加成查
+                # RibbonBoosterTemplate（同 id 不同时长，混查会把 #4 的
+                # 60min 发成 240min）
+                minutes = (XP_BOOSTER_MINUTES_BY_ID if obj == 'boostertemplate'
+                           else BOOSTER_MINUTES_BY_ID).get(tid, _BOOSTER_MINUTES)
                 await STORE.add_booster(
-                    pid, tid,
-                    duration_minutes=BOOSTER_MINUTES_BY_ID.get(
-                        tid, _BOOSTER_MINUTES),
+                    pid, tid, duration_minutes=minutes,
                     activate_now=False,
                     is_ribbon=(obj == 'ribbonboostertemplate'))
                 n_boosters += 1
@@ -226,34 +246,59 @@ async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
                 n_timed += 1
                 granted.append(f'tickettimed#{tid}')
             elif obj == 'weaponvarianttemplate':
-                if char_id:
-                    from handlers.shop import _bundle_deliver_weapon
-                    await _bundle_deliver_weapon(
-                        sess, writer, pid, char_id, tid, [],
-                        equip_slot1=False)
-                    granted.append(f'weapon#{tid}')
+                # 皮肤本体入仓（不创建武器/弹药）；装备时客户端发
+                # SetWeaponVariantRequest 绑定到具体武器
+                vv = await STORE.create_weapon_variant(pid, 0, 0, tid)
+                if sess.soldier_view_cmd is not None:
+                    await _push_kvcs(
+                        writer, sess.soldier_view_cmd, b'WeaponVariant',
+                        _msg_weapon_variant(vv['id'], 0, 0, tid))
+                granted.append(f'weaponvariant#{tid}')
             elif obj == 'vehiclevarianttemplate':
-                if char_id:
-                    from handlers.shop import _bundle_deliver_vehicle
-                    await _bundle_deliver_vehicle(
-                        sess, writer, pid, char_id, tid, equip_slot1=False)
-                    granted.append(f'vehicle#{tid}')
+                # 官方语义：载具奖励=整车入仓（Vehicle 行 char=0）
+                from handlers.shop import _bundle_deliver_vehicle
+                await _bundle_deliver_vehicle(
+                    sess, writer, pid, 0, tid, equip_slot1=False)
+                granted.append(f'vehicle#{tid}')
             elif obj == 'uniformvarianttemplate':
-                if char_id:
-                    uv = await STORE.create_uniform_variant(pid, tid, char_id)
-                    if sess.soldier_view_cmd is not None:
-                        await _push_kvcs(
-                            writer, sess.soldier_view_cmd, b'UniformVariant',
-                            _msg_uniform_variant(uv['id'], tid, char_id))
-                    granted.append(f'uniformvariant#{tid}')
+                uv = await STORE.create_uniform_variant(pid, tid, 0)
+                if sess.soldier_view_cmd is not None:
+                    await _push_kvcs(
+                        writer, sess.soldier_view_cmd, b'UniformVariant',
+                        _msg_uniform_variant(uv['id'], tid, 0))
+                granted.append(f'uniformvariant#{tid}')
             elif obj == 'uniformparttemplate':
-                if char_id:
-                    part = await STORE.create_uniform_part(pid, char_id, tid, 1)
-                    if sess.soldier_view_cmd is not None:
-                        await _push_kvcs(
-                            writer, sess.soldier_view_cmd, b'UniformPart',
-                            _msg_uniform_part(part['id'], char_id, tid, 1))
-                    granted.append(f'uniformpart#{tid}')
+                ptype = _uniform_part_type(tid)
+                part = await STORE.create_uniform_part(pid, 0, tid, ptype)
+                if sess.soldier_view_cmd is not None:
+                    await _push_kvcs(
+                        writer, sess.soldier_view_cmd, b'UniformPart',
+                        _msg_uniform_part(part['id'], 0, tid, ptype))
+                granted.append(f'uniformpart#{tid}')
+            elif obj == 'tracereffecttemplate':
+                t = await STORE.create_tracer_effect(pid, tid)
+                if sess.soldier_view_cmd is not None:
+                    await _push_kvcs(
+                        writer, sess.soldier_view_cmd, b'TracerEffect',
+                        _msg_tracer_effect(t['id'], tid, 0, 0, False))
+                granted.append(f'tracereffect#{tid}')
+            elif obj == 'vehicleupgradetemplate':
+                u = await STORE.create_vehicle_upgrade(
+                    pid, tid, 0, 0,
+                    _VEHICLE_UPGRADE_MAXCOND.get(int(tid), 100.0))
+                if sess.soldier_view_cmd is not None:
+                    await _push_kvcs(
+                        writer, sess.soldier_view_cmd, b'VehicleUpgrade',
+                        _msg_vehicle_upgrade(u['id'], tid, 0, 0, 0,
+                                             u.get('condition', 100.0)))
+                granted.append(f'vehicleupgrade#{tid}')
+            elif obj == 'progressionunlock':
+                # 角色解锁（如三阵营头部外观）：全角色幂等登记
+                # （当前奖励 uid 已被 level0/rank 默认路径授予，此处
+                # 防御未来 metaLevel>0 条目漏发）
+                for ch in await STORE.list_characters(pid):
+                    await STORE.add_extra_unlock_uids(pid, ch['id'], [tid])
+                granted.append(f'progressionunlock#{tid}')
             else:
                 log(f'      [career] reward item skipped ({tag}): '
                     f'<{item.tag} id={tid}>')
