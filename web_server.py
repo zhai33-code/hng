@@ -6,6 +6,8 @@
 职责：
   /register /account  注册页（Vite/Vue SPA，web/dist，HnG 官方风格）
   /api/register       账号注册 JSON API（经主 loop 投递 STORE.create_player）
+  /api/captcha/get    滑动验证码出题（register_captcha.py，pi-captcha 出图）
+  /api/captcha/check  验证码校验 → 签发一次性注册令牌
   /settings.js        客户端入口配置（warserver 地址 / 静态资源地址 / statserver 等）
   /hng_unique_v173293 静态数据文件清单 XML
   /wardb_unique       WarDatabase 表清单（表名,sha256-size）
@@ -30,6 +32,8 @@ import time
 # Windows 注册表里没有 .webp 的 MIME 映射，guess_type 会返回 None，
 # /icons/ 下的压缩 webp 会被当成 octet-stream 下发 → 手动注册
 mimetypes.add_type('image/webp', '.webp')
+
+import register_captcha
 
 from http.server import (
     SimpleHTTPRequestHandler,
@@ -419,8 +423,53 @@ def _json_reply(handler, obj, status=200):
     handler.wfile.write(body)
 
 
+def _client_ip(handler):
+    """客户端真实 IP（IP 直连，client_address 可信；XFF 可伪造一律不信任）。"""
+    try:
+        return handler.client_address[0] if handler.client_address else None
+    except Exception:
+        return None
+
+
+def _handle_captcha_get(handler):
+    """GET /api/captcha/get：出题（服务端出题，前端 go-captcha-vue 展示）。"""
+    data = register_captcha.issue_captcha(_client_ip(handler))
+    if data is None:
+        # 区分两种不可用：缺 pi-captcha 库 / captcha_assets 素材 vs 限速命中
+        if not register_captcha.is_available():
+            log('[captcha] 503: pi-captcha lib or captcha_assets/ missing')
+        else:
+            log('[captcha] 503: rate-limited or empty resources')
+        _json_reply(handler, {'error': '验证码服务不可用，请稍后再试'}, 503)
+        return
+    log('[captcha] issued challenge')
+    _json_reply(handler, data)
+
+
+def _handle_captcha_check(handler):
+    """POST /api/captcha/check：校验滑动坐标，签发一次性注册令牌。"""
+    try:
+        length = int(handler.headers.get('Content-Length') or 0)
+        if length > 4096:
+            _json_reply(handler, {'error': '请求过大'}, 413)
+            return
+        raw = handler.rfile.read(length) if length > 0 else b''
+        data = json.loads(raw or b'{}')
+    except Exception:
+        _json_reply(handler, {'error': '请求格式错误'}, 400)
+        return
+    token = register_captcha.check_captcha(
+        data.get('captcha_id'), data.get('x'), data.get('y'),
+        ip=_client_ip(handler))
+    if token is None:
+        log(f'[captcha] check failed ip={_client_ip(handler)} (wrong/expired/rate-limited)')
+        _json_reply(handler, {'error': '验证失败，请重试'}, 401)
+        return
+    _json_reply(handler, {'ok': True, 'token': token})
+
+
 def _handle_register_api(handler):
-    """POST /api/register：JSON -> 校验 -> 投递 create_player 到主 loop。"""
+    """POST /api/register：JSON -> 蜜罐/令牌/限速 -> 投递 create_player。"""
     try:
         length = int(handler.headers.get('Content-Length') or 0)
         if length > 65536:            # 上限防内存 DoS
@@ -433,6 +482,21 @@ def _handle_register_api(handler):
     except Exception as e:
         _json_reply(handler, {'error': '请求格式错误'}, 400)
         log(f'[register] json parse failed: {e}')
+        return
+
+    # 蜜罐：隐藏字段被填 = 脚本，静默拒绝（对外报通用错误）
+    if register_captcha.honeypot_hit(data):
+        log(f'[register] BLOCKED honeypot (username={username!r})')
+        _json_reply(handler, {'error': '无法注册，请稍后重试'}, 400)
+        return
+    # 人机验证令牌：一次性消费（fail-closed——无令牌一律拒绝）
+    if not register_captcha.consume_token(data.get('token')):
+        _json_reply(handler, {'error': '请先完成人机验证'}, 403)
+        return
+    # 限速兜底：单 IP 为主 + 全局兜底（令牌校验之后、DB 写入之前）
+    if not register_captcha.allow_register(_client_ip(handler)):
+        log(f'[register] rate-limited ip={_client_ip(handler)} username={username!r}')
+        _json_reply(handler, {'error': '注册过于频繁，请稍后再试'}, 429)
         return
 
     if not username or not password:
@@ -449,8 +513,10 @@ def _handle_register_api(handler):
         log(f'[register] BLOCKED reserved-prefix username {username!r}')
         _json_reply(handler, {'error': '无法注册，请稍后重试'}, 400)
         return
-    if not (4 <= len(password) <= 64):
-        _json_reply(handler, {'error': '密码长度需为 4-64 位'}, 400)
+    # 客户端登录界面 LoginModel.checkPassword 要求密码 >=6 位（SWF 实锤），
+    # 服务端必须同口径，否则 4/5 位密码注册成功却登不进游戏。
+    if not (6 <= len(password) <= 64):
+        _json_reply(handler, {'error': '密码长度需为 6-64 位'}, 400)
         return
     if _MAIN_LOOP is None or STORE.pool is None:
         _json_reply(handler, {'error': '数据库未连接，暂时无法注册'}, 503)
@@ -612,6 +678,9 @@ class HttpHandler(SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'OK' if ok else b'Not Found')
+            return
+        if path == '/api/captcha/get' or path == '//api/captcha/get':
+            _handle_captcha_get(self)
             return
         if path == '/online.json' or path == '//online.json':
             _handle_online_api(self)
@@ -788,6 +857,13 @@ class HttpHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split('?')[0]
         self._log_client_request('POST')
+        if path == '/api/captcha/check' or path == '//api/captcha/check':
+            # CSRF 双保险之一：自定义头（跨站表单无法携带；SameSite 由 Cookie 侧管）
+            if self.headers.get('X-Requested-With') != 'XMLHttpRequest':
+                _json_reply(self, {'error': '非法请求'}, 403)
+                return
+            _handle_captcha_check(self)
+            return
         if path == '/api/register' or path == '//api/register':
             # CSRF 双保险之一：自定义头（跨站表单无法携带；SameSite 由 Cookie 侧管）
             if self.headers.get('X-Requested-With') != 'XMLHttpRequest':

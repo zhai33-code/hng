@@ -4,6 +4,32 @@ export interface ApiError {
   message: string
 }
 
+export async function apiGet<T = unknown>(url: string, timeoutMs = 10000): Promise<T> {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const res = await fetch(url, { signal: ctrl.signal })
+    let data: any = null
+    try {
+      data = await res.json()
+    } catch {
+      /* 非 JSON 响应 */
+    }
+    if (!res.ok) {
+      const err: ApiError = { status: res.status, message: data?.error || `请求失败 (${res.status})` }
+      throw err
+    }
+    return data as T
+  } catch (e: any) {
+    if (e?.name === 'AbortError') {
+      throw { status: 0, message: '请求超时，请检查网络后重试' } satisfies ApiError
+    }
+    throw e
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export async function apiPost<T = unknown>(url: string, body: unknown, timeoutMs = 10000): Promise<T> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)

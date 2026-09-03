@@ -234,8 +234,8 @@ async def character_detail(pool, player_id: int, character_id: int) -> dict:
 
 async def reset_password(pool, player_id: int, new_password: str) -> str:
     """重置密码，返回用户名（供审计）。"""
-    if not (4 <= len(new_password) <= 64):
-        raise ValueError('密码长度需为 4-64 位')
+    if not (6 <= len(new_password) <= 64):
+        raise ValueError('密码长度需为 6-64 位')
     assert pool is not None
     async with pool.acquire() as conn:
         row = await conn.fetchrow(

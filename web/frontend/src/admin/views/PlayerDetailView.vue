@@ -102,9 +102,9 @@ async function onResetPassword() {
   let pw: string
   try {
     const r = await ElMessageBox.prompt(
-      '输入新密码（4-64 位，明文写入数据库，与游戏服存储方式一致）',
-      '重置玩家密码', { inputType: 'password', inputPattern: /^.{4,64}$/,
-        inputErrorMessage: '密码长度需为 4-64 位' })
+      '输入新密码（6-64 位，明文写入数据库，与游戏服存储方式一致）',
+      '重置玩家密码', { inputType: 'password', inputPattern: /^.{6,64}$/,
+        inputErrorMessage: '密码长度需为 6-64 位' })
     pw = r.value
   } catch {
     return

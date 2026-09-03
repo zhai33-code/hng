@@ -11,6 +11,9 @@ importers:
       element-plus:
         specifier: ~2.9.11
         version: 2.9.11(vue@3.5.41(typescript@5.7.3))
+      go-captcha-vue:
+        specifier: ^2.0.7
+        version: 2.0.7(vue@3.5.41(typescript@5.7.3))
       pinia:
         specifier: ~3.0.2
         version: 3.0.4(typescript@5.7.3)(vue@3.5.41(typescript@5.7.3))
@@ -611,6 +614,11 @@ packages:
   glob-parent@5.1.2:
     resolution: {integrity: sha512-AOIgSQCepiJYwP3ARnGx+5VnTu2HBYdzbGP45eLw1vr3zB3vZLeyed1sC9hnbcOc9/SrMyM5RPQrkGz4aS9Zow==}
     engines: {node: '>= 6'}
+
+  go-captcha-vue@2.0.7:
+    resolution: {integrity: sha512-ynlb/6CJiMdsqKe+79lIVpTsNXQTgOHDJ7BH+Gx6EZQZyHSwuyLZvQwjz9vQOYhyHpREW9tapBo8ZOTyVzIQew==}
+    peerDependencies:
+      vue: '>=3'
 
   has-flag@4.0.0:
     resolution: {integrity: sha512-EykJT/Q1KjTWctppgIAgfSO0tKVuZUjhgMr17kqTumMl6Afv3EISleU7qZUzoXDFTAHTDC4NOoG/ZxU3EvlMPQ==}
@@ -1530,6 +1538,10 @@ snapshots:
   glob-parent@5.1.2:
     dependencies:
       is-glob: 4.0.3
+
+  go-captcha-vue@2.0.7(vue@3.5.41(typescript@5.7.3)):
+    dependencies:
+      vue: 3.5.41(typescript@5.7.3)
 
   has-flag@4.0.0: {}
 
