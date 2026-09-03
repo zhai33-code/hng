@@ -32,15 +32,12 @@ _DELEGATED = {
 
 # 白名单：明确不实现（回 HandlerErrorResponse 解锁队列，无功能影响）
 _WHITELIST = {
-    # --- U6 战争地图/统计（用户指示跳过；warmap.py/stats.py 暂缓）---
-    'CreateCommandNodeRequest', 'DeployCommandNodeRequest',
-    'RetreatCommandNodeRequest', 'RenameCommandnodeRequest',
-    'UpgradeCommandNodeRequest', 'SetCommandNodeEquipmentRequest',
+    # --- 战争地图/统计族（暂缓；AT 五请求已实装 war_at.HANDLERS，已摘除）---
     'ReorderSupplyQueueRequest', 'LeaveSupplyQueueRequest',
     'QueryFactionsOnBattlefieldRequest', 'MonitorLoadRequest',
     'CompleteAssaultTeamRankRequest', 'GetAssaultTeamStatsRequest',
     'AddCharacterStatisticsRequest', 'AddAssaultTeamStatisticsRequest',
-    'resupply_request', 'war_create_request',
+    'war_create_request',
     # stats 族（RequestReadRibbonValue/RequestXPs 等命名不含 Request 结尾的
     # 由类清单 Request 结尾过滤自然排除，此处为结尾匹配到的）
     # --- 无响应 proto 定义（ZServer 未注册，回 HandlerErrorResponse）---

@@ -36,6 +36,7 @@ from player_service import (
     )
 
 from matchmaking import (
+    _msg_faction_queue_rows,
     _msg_faction_resource_rows,
     _msg_faction_rows,
     _msg_supreme_command_rows,
@@ -166,17 +167,39 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         # resourceViewSubscribedSignal → setupProductionOverview 重查。
         # ⚠ 2026-09-02 登录卡死排查：此推送启用后客户端停在"设置最终细节"，
         # cmd=22 QueryShopWarBondItemsRequest 不再发出。待逐表定位后恢复。
+        # （已修：CommandNodeWarInstance.mapEntityTypeId=0 NPE，见上
+        # _RESOURCE_FILL_ENABLED 注释）
+        sess.resource_view_cmd = cmd_id    # 生产 tick 周期重推行用（war_campaign）
         defs, instances = _msg_supreme_command_rows()
         for row in defs:
             await _push_kvcs(writer, cmd_id, b'CommandNodeDefinition', row)
         for row in instances:
             await _push_kvcs(writer, cmd_id, b'CommandNodeWarInstance', row)
-        # 资源总览窗口的产量/消耗行（三阵营 × 全部分类）
-        prods, cons = _msg_faction_resource_rows()
+        # 资源总览窗口的产量/消耗行（三阵营 × 全部分类）+ 增援队列窗口
+        # （§3.12：消耗行 f8/f9 与 FactionResourceQueue 行同源）
+        windows = await war_campaign.supply_windows(STORE)
+        prods, cons = _msg_faction_resource_rows(windows)
         for row in prods:
             await _push_kvcs(writer, cmd_id, b'FactionResourceProduction', row)
         for row in cons:
             await _push_kvcs(writer, cmd_id, b'FactionResourceConsumption', row)
+        for row in _msg_faction_queue_rows(windows):
+            await _push_kvcs(writer, cmd_id, b'FactionResourceQueue', row)
+        # AT 级补给队列行（§10.2 #3）：CommandNodeSupplyQueueItem 驱动
+        # AssaultTeamModel.queueItems/isQueuedForResources，Ticket 驱动
+        # 增援队列窗口"排队第 N 位"显示（onTicketUpdated 用
+        # queueNumber - supplyQueueHead；窗口打开时会先发本订阅）
+        q_items, q_tickets = await war_campaign.supply_queue_table_rows(STORE)
+        for row in q_items:
+            await _push_kvcs(writer, cmd_id, b'CommandNodeSupplyQueueItem',
+                             row)
+        for row in q_tickets:
+            await _push_kvcs(writer, cmd_id,
+                             b'CommandNodeSupplyQueueItemTicket', row)
+        # 阵营库存行（armyresource 挂最高司令部，§3.12.1 库存列数据源；
+        # 无战争/DB 不可用时静默为空）
+        for row in await war_campaign.hq_stock_rows(STORE):
+            await _push_kvcs(writer, cmd_id, b'armyresource', row)
         log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (supreme command ×3 factions, '
             f'resource production/consumption ×{len(prods)}) ★CommandnodeTable fill')
 

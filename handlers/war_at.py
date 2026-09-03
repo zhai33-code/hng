@@ -4,6 +4,7 @@
 处理 HnG_States 请求族：
   CreateCommandNodeRequest / UpgradeCommandNodeRequest /
   DeployCommandNodeRequest / RetreatCommandNodeRequest /
+  SetCommandNodeEquipmentRequest / resupply_request /
   RenameCommandnodeRequest / dissolve_commandnode /
   query_commandnode_owner / LeaveSupplyQueueRequest / ReorderSupplyQueueRequest
 
@@ -18,12 +19,19 @@ from protocol import (
     pb_int32,
     pb_int64,
     pb_parse,
+    pb_parse_multi,
     pb_string,
     )
 from state import STORE, log
 
 from messages import _push_kvcs, _push_kvcs_delete
-from wardb import COMMAND_POINT_UIDS, commandnode_templates
+from wardb import (
+    _CUR_KEY,
+    _PRICING_MAP,
+    COMMAND_POINT_UIDS,
+    commandnode_templates,
+    is_general_character,
+    )
 
 from player_service import (
     _charge_player,
@@ -122,6 +130,61 @@ def _currency_ok(currency):
     return _i(currency) in (1, 2, 3)
 
 
+def _unit_price(pricing_id, currency_key):
+    """Pricing 行单价（缺行/币种无价按 0，与 _charge_player 免单口径一致）。"""
+    return int((_PRICING_MAP.get(_i(pricing_id)) or {}).get(currency_key) or 0)
+
+
+def _at_missing_resources(at, tpl):
+    """AT 缺编 {cat: missing}（模板编制 - 现有资源，负值截 0）。"""
+    cur = war_campaign._as_resources(at.get('resources'))
+    missing = {}
+    for cat, full in war_campaign.template_resources(tpl).items():
+        gap = int(full) - _i(cur.get(str(cat), cur.get(cat, 0)))
+        if gap > 0:
+            missing[int(cat)] = gap
+    return missing
+
+
+# --------------------------------------------------------- 装备 / 指挥点
+
+def _template_matches_character(tpl, char_template):
+    """官服 checkIfTeamAndCharacterIsMatching（AssaultTeamResources.as:519）：
+    将军角色恒真 / 模板未限定兵种（f16 generalCharacterTemplateId=0）恒真 /
+    否则须与角色兵种模板相等。"""
+    if is_general_character(char_template):
+        return True
+    gct = _i((tpl or {}).get('general_character_template_id'))
+    return gct == 0 or gct == _i(char_template)
+
+
+async def _char_command_points(sess, ch):
+    """角色指挥点上限 = Σ unlockBits[uid] × COMMAND_POINT_UIDS[uid]
+    （与客户端 CharacterSchema.getUnlockedUnlocksForCharacter 同构）。"""
+    from player_service import _char_unlock_bits_for
+    bits = await _char_unlock_bits_for(
+        sess, ch.get('template'), ch.get('faction'), ch.get('id'))
+    return sum(int(val) for uid, val in COMMAND_POINT_UIDS.items()
+               if uid < len(bits) and bits[uid])
+
+
+async def _command_points_used(war_id, char_id, exclude_node=0):
+    """角色已装备 AT 的指挥点消耗 = Σ 模板 size（与客户端
+    AssaultTeamModel._characterCommandPointsUsed 同构）。"""
+    used = 0
+    try:
+        for o in await STORE.list_war_command_nodes(war_id):
+            if o['id'] == exclude_node:
+                continue
+            if _i(o.get('general_character_id')) != int(char_id):
+                continue
+            tpl = commandnode_templates().get(_i(o.get('template_id'))) or {}
+            used += _i(tpl.get('size'))
+    except Exception as e:
+        log(f'      [war_at] command points used lookup failed: {e}')
+    return used
+
+
 # ------------------------------------------------------------- 购买 / 升级
 
 async def handle_create_command_node_request(sess, writer, cmd_id, req_type,
@@ -164,11 +227,12 @@ async def handle_create_command_node_request(sess, writer, cmd_id, req_type,
                 if not ok:
                     code = war_campaign.RC_NOT_ENOUGH_WARFUNDS
                 else:
+                    # 官服买壳口径（§10.2 #4）：购买得空编 AT（generalCharacterId=0），
+                    # 兵员经增援（resupply_request）首次免费/后续付费补齐
                     try:
                         at = await STORE.create_command_node(
                             war['id'], template_id, pid, faction, name,
-                            resources={str(k): v for k, v in
-                                       war_campaign.template_resources(tpl).items()},
+                            resources={},
                             abbreviation=abbr,
                             rank=war_campaign.template_rank(tpl))
                     except Exception as e:
@@ -225,10 +289,10 @@ async def handle_upgrade_command_node_request(sess, writer, cmd_id, req_type,
                         code = war_campaign.RC_NOT_ENOUGH_WARFUNDS
                     else:
                         try:
+                            # 买壳口径：升级只换模板不补编，缺编走 resupply
+                            # 付费补齐（与 create resources={} 一致）
                             await STORE.update_command_node(
-                                at['id'], template_id=target_tpl,
-                                resources={str(k): v for k, v in
-                                           war_campaign.template_resources(tgt).items()})
+                                at['id'], template_id=target_tpl)
                             at = await STORE.get_command_node(at['id'])
                         except Exception as e:
                             log(f'      [war_at] upgrade failed: {e}')
@@ -251,7 +315,15 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
                                               proto):
     """DeployCommandNodeRequest {f1 instance, f2 soldierPricingId,
     f3 vehiclePricingId, f4 nearCapitalBattlefieldId?, f5/f6 discounts,
-    f7 paymentCurrency} → DeployCommandNodeResponse{f1 msg}。"""
+    f7 paymentCurrency} → DeployCommandNodeResponse{f1 msg}。
+
+    官服口径（§10.2 #4/#5，2026-09-03 客户端实锤）：部署即补编——
+    Deploy All 批量部署窗口响应后绝不发 resupply_request，缺编必须
+    由部署请求内的计价 id 在服务端落地（单 AT 部署窗口的自动 resupply
+    链仅在窗口开着 + UPDATE 非移动 + 缺编价 > 0 时触发，补满后价格归零
+    自然关窗）。补编走 _apply_resupply：新 AT 首次免费（置位
+    hasGotten*ForFree），阵营库存不足入队回 226（官服"入队成功"提示）；
+    补编失败（余额不足等）不回滚部署——部署动作本身免费。"""
     node_id = soldier_pricing = vehicle_pricing = near_capital = currency = 0
     try:
         f = pb_parse(proto)
@@ -285,26 +357,29 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
                 if at.get('is_deployed'):
                     code = war_campaign.RC_COMMANDNODE_ALREADY_DEPLOYED
                 else:
-                    pricings = [p for p in (soldier_pricing, vehicle_pricing) if p]
-                    if pricings:
-                        cost, ok = await _charge_player_multi(
-                            sess, pricings, currency)
-                    else:
-                        cost, ok = 0, True
-                    if not ok:
-                        code = war_campaign.RC_NOT_ENOUGH_WARFUNDS
-                    else:
-                        bf = war_campaign.deploy_battlefield(
-                            at, at.get('faction'), near_capital)
-                        try:
-                            await STORE.update_command_node(
-                                at['id'], is_deployed=True, map_entity_id=bf)
-                            at = await STORE.get_command_node(at['id'])
-                            log(f'      [war] AT 部署 node={node_id} -> bf={bf}')
-                        except Exception as e:
-                            log(f'      [war_at] deploy failed: {e}')
-                            code = war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
-    if at is not None and not code:
+                    bf = war_campaign.deploy_battlefield(
+                        at, at.get('faction'), near_capital)
+                    try:
+                        await STORE.update_command_node(
+                            at['id'], is_deployed=True, map_entity_id=bf)
+                        at = await STORE.get_command_node(at['id'])
+                        log(f'      [war] AT 部署 node={node_id} -> bf={bf}')
+                    except Exception as e:
+                        log(f'      [war_at] deploy failed: {e}')
+                        code = war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
+                    if not code:
+                        # 部署即补编（§10.2 #4/#5）：请求内计价 id 在此
+                        # 消费——Deploy All 路径客户端绝不发 resupply
+                        rcode, at = await _apply_resupply(
+                            at, pid, war, currency,
+                            soldier_pricing, vehicle_pricing)
+                        if rcode == war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES:
+                            code = rcode    # 226：入队提示（官服语义）
+                        elif rcode:
+                            log(f'      [war_at] deploy resupply '
+                                f'skipped: {rcode}')
+    if at is not None and code in (
+            0, war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES):
         await _push_at_rows(sess, writer, at, at['war_id'])
         await _push_player_refresh(sess, writer)
     code = code or war_campaign.RC_OK   # 内部 0=通过 → 协议 ok=1
@@ -357,6 +432,255 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RetreatCommandNodeResponse (msg={code})')
+
+
+# ------------------------------------------------------------- 增援（#2）
+
+async def _apply_resupply(at, pid, war, currency,
+                          soldier_pricing, vehicle_pricing):
+    """缺编补编公共链（deploy/resupply 共用，§10.2 #4/#5）：
+    每侧首次免费（has_gotten_*_free 置位后转付费）→ 按模板 Pricing 计价
+    扣款 → 阵营库存（war_faction_resources）即时交付 → 缺口入
+    war_supply_queue（supply_queue_tick 周期 FIFO 交付）。
+
+    返回 (code, at)：0=已处理（全额即时交付/已满），
+    RC_COMMANDNODE_QUEUED_FOR_RESOURCES=有缺口入队（客户端特判 226），
+    其他=失败码（余额不足 153 等，AT 未变更）。状态校验（101/116）由
+    调用方自理。"""
+    tpl = commandnode_templates().get(_i(at.get('template_id'))) or {}
+    missing = _at_missing_resources(at, tpl)
+    if not missing:
+        return war_campaign.RC_NO_RESUPPLY_ALREADY_FULL, at
+    veh_cats = tpl.get('vehicle_cats') or set()
+    m_sold = sum(n for c, n in missing.items() if c not in veh_cats)
+    m_veh = sum(n for c, n in missing.items() if c in veh_cats)
+    key = _CUR_KEY.get(currency)
+    s_free = (m_sold > 0 and not
+              bool(at.get('has_gotten_soldier_free')))
+    v_free = (m_veh > 0 and not
+              bool(at.get('has_gotten_vehicle_free')))
+    total = 0
+    if m_sold and not s_free:
+        total += _unit_price(soldier_pricing, key) * m_sold
+    if m_veh and not v_free:
+        total += _unit_price(vehicle_pricing, key) * m_veh
+    if total > 0:
+        ok, _bal = await STORE.spend_currency(int(pid), key, total)
+        if not ok:
+            return war_campaign.RC_NOT_ENOUGH_WARFUNDS, at
+    # ---- M3-2 库存核算：即时交付 + 缺口入队 ----
+    fac = int(at.get('faction') or 0)
+    give, queued = {}, {}
+    try:
+        stock = {int(r['category_id']):
+                 int(r['count']) for r in
+                 await STORE.list_war_faction_resources(
+                     war['id'], fac)}
+    except Exception as e:
+        log(f'      [war_at] stock read failed: {e}')
+        stock = None    # 库存未知 → 全额即时交付（保守）
+    for cat, need in missing.items():
+        if stock is None:
+            continue    # 无库存数据 → 全部即时
+        have = stock.get(cat, 0)
+        if mm_config.WAR_SUPPLY_INSTANT_PARTIAL:
+            g = min(need, have)
+        else:
+            g = need if have >= need else 0
+        if g > 0:
+            give[cat] = g
+        if need - g > 0:
+            queued[cat] = need - g
+    res = {str(k): int(v) for k, v in
+           war_campaign._as_resources(
+               at.get('resources')).items()}
+    for c, n in give.items():
+        res[str(c)] = int(res.get(str(c), 0)) + n
+    upd = {'resources': res}
+    if s_free:
+        upd['has_gotten_soldier_free'] = True
+    if v_free:
+        upd['has_gotten_vehicle_free'] = True
+    try:
+        if give:
+            await STORE.adjust_war_faction_resources(
+                war['id'], fac,
+                {c: -n for c, n in give.items()})
+        await STORE.update_command_node(at['id'], **upd)
+        if queued:
+            await STORE.enqueue_war_supply(
+                war['id'], fac, at['id'], queued)
+            # AT 级队列行重推（§10.2 #3）：AssaultTeamModel.onQueueUpdates
+            # 消费 CommandNodeSupplyQueueItem；226 触发的 RESOURCE_VIEW
+            # 订阅在响应后，新订阅者由 views 快照覆盖
+            try:
+                await war_campaign.push_supply_queue_rows(STORE, war)
+            except Exception as e:
+                log(f'      [war_at] queue row push failed: {e}')
+        at = await STORE.get_command_node(at['id'])
+        log(f'      [war] AT 补编 node={at["id"]} '
+            f'infantry={m_sold} vehicles={m_veh} '
+            f'free={int(s_free) + int(v_free)} '
+            f'cost={total} given={give} '
+            f'queued={queued}')
+    except Exception as e:
+        log(f'      [war_at] resupply failed: {e}')
+        return war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND, at
+    code = (war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES
+            if queued else 0)
+    return code, at
+
+
+async def handle_resupply_request(sess, writer, cmd_id, req_type, proto):
+    """resupply_request {f1 instance, f2 soldierPricingId, f3 soldierDiscountId,
+    f4 vehiclePricingId, f5 vehicleDiscountId, f6 nearCapitalBattlefieldId?,
+    f7 path(忽略), f8 paymentCurrency} → resupply_request_response{f2 response}。
+
+    增援链（§10.2 #2）：状态校验（101/116）后走 _apply_resupply 公共
+    补编链（首次免费/计价扣款/阵营库存交付/缺口入队 226）。客户端
+    ReinforcementWindowMediator.issueSupplyRequest 发送，response=ok 关窗，
+    否则错误反馈。"""
+    node_id = soldier_pricing = vehicle_pricing = currency = 0
+    try:
+        f = pb_parse(proto)
+        node_id = _i(f.get(1))
+        soldier_pricing = _i(f.get(2))
+        vehicle_pricing = _i(f.get(4))
+        currency = _i(f.get(8))
+    except Exception as e:
+        log(f'      [war_at] resupply_request parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = war_campaign.RC_OK
+    at = None
+    if pid is None or STORE is None:
+        code = war_campaign.RC_CHARACTER_NOT_FOUND
+    else:
+        war = await war_campaign.ensure_war(STORE)
+        if war is None:
+            code = war_campaign.RC_WAR_NOT_FOUND
+        elif not _currency_ok(currency):
+            code = war_campaign.RC_INVALID_CURRENCY
+        else:
+            at, code = await _load_at(pid, node_id, war)
+            if not code:
+                st = int(at.get('state') or 0)
+                if st == 2:
+                    code = war_campaign.RC_NO_RESUPPLY_IN_BATTLE
+                elif st == 1:
+                    code = war_campaign.RC_NO_RESUPPLY_IN_TRANSPORT
+                else:
+                    code, at = await _apply_resupply(
+                        at, pid, war, currency,
+                        soldier_pricing, vehicle_pricing)
+    if at is not None and code in (
+            0, war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES):
+        await _push_at_rows(sess, writer, at, at['war_id'])
+    code = code or war_campaign.RC_OK   # _load_at 成功返回 0 → 协议 ok=1
+    resp = build_response(cmd_id, 'resupply_request_response',
+                          pb_int32(2, code))          # 响应 f2=response（AS3 实锤）
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} resupply_request_response (response={code})')
+
+
+# ------------------------------------------------------------- 装备（#1）
+
+async def handle_set_command_node_equipment_request(sess, writer, cmd_id,
+                                                    req_type, proto):
+    """SetCommandNodeEquipmentRequest {f1 equipmentItems REPEATED
+    SetCommandNodeEquipmentItem{f1 characterId, f2 commandNodeWarInstanceId,
+    f3 doEquip, f4 leaveSupplyQueue}} → SetCommandNodeEquipmentResponse{f1 msg}。
+
+    官服 AT-角色绑定模型（§5.2）：装备 = 指挥点消耗的权威落点——
+    general_character_id 0→charId，校验 模板 size ≤ commandPointsUnlocked -
+    used（与客户端同构复算，超出 → equipment_not_allowed 219）；
+    幂等回 217/218；客户端按 Definition 增量推送对称增减 used
+    （AssaultTeamModel:447-462）。f4 leaveSupplyQueue 属阵营资源队列
+    （M3）语义，M1 无队列忽略。客户端每请求恒发单条 item
+    （AssaultTeamService.resetCommandNode），REPEATED 兼容批量。"""
+    items = []
+    try:
+        f = pb_parse_multi(proto)
+        for raw in f.get(1) or []:
+            it = pb_parse(raw) if isinstance(raw, (bytes, bytearray)) else raw
+            items.append((_i(it.get(1)), _i(it.get(2)), bool(it.get(3))))
+    except Exception as e:
+        log(f'      [war_at] SetCommandNodeEquipment parse error: {e}')
+
+    pid = await sess.ensure_player()
+    code = war_campaign.RC_OK
+    changed = []                                   # [(at, war_id), ...]
+    if pid is None or STORE is None:
+        code = war_campaign.RC_CHARACTER_NOT_FOUND
+    elif not items:
+        code = war_campaign.RC_FAIL
+    else:
+        war = await war_campaign.ensure_war(STORE)
+        if war is None:
+            code = war_campaign.RC_WAR_NOT_FOUND
+        else:
+            chars = None
+            for char_id, node_id, do_equip in items:
+                at, ec = await _load_at(pid, node_id, war)
+                if ec:
+                    code = ec
+                    break
+                tpl = commandnode_templates().get(
+                    _i(at.get('template_id'))) or {}
+                cur = _i(at.get('general_character_id'))
+                if do_equip:
+                    if cur == int(char_id):
+                        code = war_campaign.RC_COMMANDNODE_ALREADY_EQUIPPED
+                        break
+                    # 角色归属 + 阵营一致 + 模板-兵种匹配
+                    if chars is None:
+                        try:
+                            chars = {int(c.get('id') or 0): c for c in
+                                     await STORE.list_characters(pid)}
+                        except Exception:
+                            chars = {}
+                    ch = chars.get(int(char_id))
+                    if ch is None:
+                        code = war_campaign.RC_CHARACTER_NOT_FOUND
+                        break
+                    if (int(ch.get('faction') or 0)
+                            != int(at.get('faction') or 0)
+                            or not _template_matches_character(
+                                tpl, ch.get('template'))):
+                        code = war_campaign.RC_EQUIPMENT_NOT_ALLOWED
+                        break
+                    if mm_config.WAR_AT_REQUIRE_COMMAND_POINTS:
+                        unlocked = await _char_command_points(sess, ch)
+                        used = await _command_points_used(
+                            war['id'], char_id, exclude_node=at['id'])
+                        if _i(tpl.get('size')) > unlocked - used:
+                            code = war_campaign.RC_EQUIPMENT_NOT_ALLOWED
+                            break
+                elif not cur or cur != int(char_id):
+                    code = war_campaign.RC_COMMANDNODE_ALREADY_UNEQUIPPED
+                    break
+                try:
+                    await STORE.update_command_node(
+                        at['id'],
+                        general_character_id=(int(char_id) if do_equip else 0))
+                    at = await STORE.get_command_node(at['id'])
+                    changed.append((at, at['war_id']))
+                    log(f'      [war] AT 装备 node={node_id} char={char_id} '
+                        f'equip={do_equip}')
+                except Exception as e:
+                    log(f'      [war_at] equipment update failed: {e}')
+                    code = war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
+                    break
+    for at, war_id in changed:
+        await _push_at_rows(sess, writer, at, war_id)
+    # 注意：此处无 0→1 重映射——本 handler code 恒为 RC_OK(1) 或协议错误码，
+    # 空 items 的 RC_FAIL(0) 必须原样回传（重映射会翻成假成功）。
+    resp = build_response(cmd_id, 'SetCommandNodeEquipmentResponse',
+                          pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} SetCommandNodeEquipmentResponse (msg={code})')
 
 
 # ------------------------------------------------------------- 改名 / 解散 / 查询
@@ -575,7 +899,34 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                         mv, mcode = await war_campaign.start_movement(
                             STORE, at, dest_bf, override_ap=override_ap,
                             override_move=override_move)
-                        if mcode:
+                        if mcode == war_campaign.RC_CANNOT_FIND_COMMANDNODE:
+                            # 地面不可达 → 空运回退（M3 §9.4）：携运输机
+                            # （cat10≥1）消耗 1 架直达目标城市，响应 21
+                            amv, acode = await war_campaign.start_air_transport(
+                                STORE, at, dest_bf)
+                            if acode:
+                                code = acode
+                            else:
+                                at = await STORE.get_command_node(at['id'])
+                                segs = war_campaign.movement_segments(amv)
+                                caps = war_campaign._faction_capital_bf()
+                                events = [
+                                    ('set', b'air_transport',
+                                     war_campaign.msg_air_transport_row(
+                                         at, war['id'], amv, segs[0])),
+                                    ('set', b'CommandNodeWarInstance',
+                                     war_campaign.msg_commandnode_instance_row(
+                                         at, war['id'], caps))]
+                                for p in war_campaign.msg_armyresource_rows(
+                                        at, war['id']):
+                                    events.append(('set', b'armyresource', p))
+                                await war_campaign.broadcast_war_events(events)
+                                log(f'      [war] AT 空运 node={node_id} '
+                                    f'-> bf={dest_bf} '
+                                    f'({mm_config.WAR_AIR_TRANSIT_SECONDS}s)')
+                                code = (
+                                    war_campaign.RC_RELOCATING_TO_NEW_AIRBASE)
+                        elif mcode:
                             code = mcode
                         elif mv is not None:
                             at = await STORE.get_command_node(at['id'])
@@ -647,6 +998,8 @@ HANDLERS = {
     'UpgradeCommandNodeRequest': handle_upgrade_command_node_request,
     'DeployCommandNodeRequest': handle_deploy_command_node_request,
     'RetreatCommandNodeRequest': handle_retreat_command_node_request,
+    'SetCommandNodeEquipmentRequest': handle_set_command_node_equipment_request,
+    'resupply_request': handle_resupply_request,
     'RenameCommandnodeRequest': handle_rename_commandnode_request,
     'dissolve_commandnode': handle_dissolve_commandnode,
     'query_commandnode_owner': handle_query_commandnode_owner,

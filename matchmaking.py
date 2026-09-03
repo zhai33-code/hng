@@ -561,7 +561,7 @@ def _msg_supreme_command_rows():
     return defs, instances
 
 
-def _msg_faction_resource_rows():
+def _msg_faction_resource_rows(queue_windows=None):
     """KVS 'FactionResourceProduction' + 'FactionResourceConsumption' 行
     （三阵营 × 全部 armyresourcecategory 分类）：阵营资源总览窗口数据源，
     缺 FactionResourceProduction 行时客户端每分类 dd.error 并留空。
@@ -571,7 +571,9 @@ def _msg_faction_resource_rows():
     相同：步兵 900/85 万、重坦 2/225、战斗机 3/1800……），间隔全表恒 600s。
     此前误用 armyresourcecategory f6（speed）×10 当产量、间隔取 1h，已废弃。
     时间戳为 Zulu 'YYYYMMDDHHmmss'（TimeUtilities.convertZuluTimeToMilliseconds），
-    nextRunTimeStamp = 当前时间 + 模板间隔（客户端倒计时展示值）。"""
+    nextRunTimeStamp = 当前时间 + 模板间隔（客户端倒计时展示值）。
+    queue_windows={faction: (head, tail)}：消耗行 f8/f9 队列窗口
+    （M3-2 队列化，war_campaign.supply_windows 提供；空=0）。"""
     prods, cons = [], []
     templates = {(t['faction'], t['category_id']): t
                  for t in armyresource_production()}
@@ -579,6 +581,7 @@ def _msg_faction_resource_rows():
     prev_ts = time.strftime('%Y%m%d%H%M%S', time.gmtime(now))
     for tmpl, fid in FACTION_ROW_IDS.items():
         hq = FACTION_SUPREME_COMMANDS[tmpl]
+        win = (queue_windows or {}).get(tmpl, (0, 0))
         for cat, _name in army_resource_categories():
             t = templates.get((tmpl, cat))
             interval = t['run_every_seconds'] if t else 600
@@ -602,10 +605,27 @@ def _msg_faction_resource_rows():
             c += pb_int64(5, cat)                              # armyResourceCategoryId
             c += pb_string(6, prev_ts)                         # previousConsumptionTimeStamp
             c += pb_int32(7, 0)                                # previousConsumptionValue
-            c += pb_int32(8, 0)                                # supplyQueueHead
-            c += pb_int32(9, 0)                                # supplyQueueTail
+            c += pb_int32(8, win[0])                           # supplyQueueHead（阵营窗口）
+            c += pb_int32(9, win[1])                           # supplyQueueTail
             cons.append(c)
     return prods, cons
+
+
+def _msg_faction_queue_rows(queue_windows):
+    """KVS 'FactionResourceQueue' 行（每阵营 1 行，§3.12 schema）：
+    f1 id / f2 factionId / f3 warId / f4 supplyQueueHead(I32) /
+    f5 supplyQueueTail(I32)。窗口语义：head=MIN(queue_number)、
+    tail=MAX+1、空队 (0,0)。queue_windows={faction: (head, tail)}。"""
+    rows = []
+    for tmpl, fid in FACTION_ROW_IDS.items():
+        head, tail = (queue_windows or {}).get(tmpl, (0, 0))
+        r = pb_int64(1, fid)                               # id（=factionId）
+        r += pb_int64(2, fid)                              # factionId
+        r += pb_int64(3, _WAR_ID)                          # warId
+        r += pb_int32(4, head)                             # supplyQueueHead
+        r += pb_int32(5, tail)                             # supplyQueueTail
+        rows.append(r)
+    return rows
 
 AI_MISSIONPRESET = 10                   # mission_info f3（AI 模式=10；多人模式=29）
 AI_PLAYER_COUNT = 2                     # mission_info f9（他服单人AI局实测=2）
@@ -660,9 +680,13 @@ ASSAULT_TEAM_NODE_NAMES = ('infantry', 'motorized_infantry', 'motorized_guard')
 
 
 def _assault_team_nodes(faction, mission_id=None):
-    """阵营突击队 commandNode 模板 id 序列（本局 AT 抽取名单跨阵营翻译）。"""
-    names = force_pool.assault_team_names(mission_id) or \
-        list(ASSAULT_TEAM_NODE_NAMES) * 2
+    """阵营突击队 commandNode 模板 id 序列（本局 AT 抽取名单跨阵营翻译）。
+
+    war 会战局（M2）攻守名单独立 → 按 faction 取（init_mission_war 的
+    names_by_faction）；staged 局回退镜像名单。"""
+    names = (force_pool.assault_team_names(mission_id, faction)
+             or force_pool.assault_team_names(mission_id)
+             or list(ASSAULT_TEAM_NODE_NAMES) * 2)
     faction = int(faction) if int(faction) in (1, 2, 3) else 3
     return [commandnode_template(faction, n) for n in names]
 
@@ -695,6 +719,46 @@ def _mission_capturepoints(gamemap_id):
 def _init_mission_resources(mission_id, gamemode_id, attacker, defender):
     """成局时建立资源池（按模式抽 AT，攻防双方镜像同编制）。"""
     force_pool.init_mission(mission_id, gamemode_id, attacker, defender)
+
+
+async def _init_war_mission_resources(mission_id, battle_id, attacker,
+                                      defender):
+    """war 会战资源池（M2-3）：兵力 = 双方实际参战 AT 编制之和。
+
+    AT 名单 = war_battles.factions_json（会战登记的双方 AT 实例 id）；
+    编制 = AT template_id → commandnodetemplate 兵种名 → 编制表原值。
+    任一侧无有效 AT（DB 异常/实例已解散）→ 整局回退镜像随机抽取，
+    保证会战可玩（宁要可打的局，不要空池死局）。"""
+    comps = {int(attacker): [], int(defender): []}
+    names = {int(attacker): [], int(defender): []}
+    try:
+        wb = await STORE.get_war_battle(int(battle_id))
+        roster = (wb or {}).get('factions') or []
+        nodes = {}
+        at_ids = [int(f.get('at_id', 0) or 0) for f in roster]
+        if at_ids:
+            nodes = {int(n['id']): n
+                     for n in await STORE.get_command_nodes_by_ids(at_ids)}
+        for f in roster:
+            fac = int(f.get('faction', 0) or 0)
+            node = nodes.get(int(f.get('at_id', 0) or 0))
+            if fac not in comps or node is None:
+                continue
+            tid = int(node.get('template_id', 0) or 0)
+            comp = force_pool.composition_for_template(tid)
+            if comp is None:
+                continue
+            comps[fac].append(comp)
+            names[fac].append(force_pool.template_name(tid) or f'at{tid}')
+    except Exception as ex:
+        _log(f'[war] battle {battle_id} AT roster load failed: {ex}')
+    if not comps[int(attacker)] or not comps[int(defender)]:
+        _log(f'[war] battle {battle_id} AT roster incomplete '
+             f'(atk={len(comps[int(attacker)])}, '
+             f'dfd={len(comps[int(defender)])}) -> fallback mirror draw')
+        _init_mission_resources(mission_id, 10, attacker, defender)
+        return
+    force_pool.init_mission_war(mission_id, attacker, defender, comps, names)
 
 
 def mission_resource_pool(mission_id):
@@ -1343,6 +1407,12 @@ async def _try_form_all():
         if match is None:
             break
         _dispatch_match(match)
+    # war 会战撮合（M2）：battle 桶内攻守双方各≥1 真人即成局
+    while True:
+        wmatch = POOL.try_form_war()
+        if wmatch is None:
+            break
+        _dispatch_match(wmatch)
     await _push_queue_counts()
 
 
@@ -1644,12 +1714,52 @@ async def _start_match(match):
     - mission_id 全局唯一（/M、GetMissionDetails、release_match 键）
     - 每名玩家独立 pms_id / metrics ids（game_server 按 pms 查会话）
     - game_connect = 127.0.0.1:{port}（客户端 hng.exe 连此 UDP 打战斗）
+
+    war 会战局（match.battle_id>0，M2）：mission_id = mission_records 行 id
+    （成局时已落库），地图/攻防阵营从 record 读取（不随机、不掷硬币）。
     """
-    mission_id = _next_match_id(_MM_MISSION_ID)
+    battle_id = int(getattr(match, 'battle_id', 0) or 0)
+    war_rec = None
+    if battle_id:
+        try:
+            war_rec = await STORE.get_mission_by_battle(battle_id)
+        except Exception as ex:
+            _log(f'[war] get_mission_by_battle({battle_id}) failed: {ex}')
+        if war_rec is None:
+            # record 已清（automission 结算过）：全员回池无意义（battle 已
+            # 结束）——直接退排队玩家回大厅（清 PMM 行）。
+            _log(f'[war] battle {battle_id} has no live mission record, '
+                 f'dropping {len(match.players)} queued players')
+            for e in match.players:
+                pid = int(e.player_id)
+                _cleanup_queued_player(pid)
+                _MATCH_PMM_IDS.pop(pid, None)
+            await _push_queue_counts()
+            return
+    if battle_id:
+        mission_id = int(war_rec['id'])
+    else:
+        mission_id = _next_match_id(_MM_MISSION_ID)
     match.mission_id = mission_id
-    preset = int(match.preset_id)
+    if battle_id:
+        preset = int(war_rec['preset'] or 0) or AI_MISSIONPRESET
+    else:
+        preset = int(match.preset_id)
     gamemode_id = int(match.players[0].gamemode_id) if match.players else 0
-    attacker, defender, one_sided = _split_factions(match.players)
+    if battle_id:
+        # war 局攻防固定（record 成局时按 AT 阵营写入），不随机掷硬币
+        attacker = int(war_rec['attacker_faction'] or 0)
+        defender = int(war_rec['defender_faction'] or 0)
+        one_sided = False
+        if not (attacker in (1, 2, 3) and defender in (1, 2, 3)
+                and attacker != defender):
+            _log(f'ERROR: war battle {battle_id} record factions invalid '
+                 f'({attacker}/{defender}), aborting match')
+            for e in match.players:
+                _cleanup_queued_player(int(e.player_id))
+            return
+    else:
+        attacker, defender, one_sided = _split_factions(match.players)
     # ★ AI 策略（2026-09-01 按官方实现复刻 killfeed 阵营默认名）：官方两套
     #   bot 系统按模式互斥（战斗服 player.dll 逆向实锤）：
     #   - 训练模式（gamemode 1）f20 enableBots=True：战斗服本地 bot
@@ -1681,7 +1791,12 @@ async def _start_match(match):
 
     preset_row = _load_preset(preset)
     gamemap_id = int(preset_row.get(3, 0) or 0) or 13
-    map_entity_id = battlefield_entity_for_gamemap(gamemap_id)
+    if battle_id:
+        # war 局：简报落点 = 会战城市（record.map_entity_id，成局时写）
+        map_entity_id = int(war_rec['map_entity_id'] or 0) \
+            or battlefield_entity_for_gamemap(gamemap_id)
+    else:
+        map_entity_id = battlefield_entity_for_gamemap(gamemap_id)
     combat_map = preset_scene(preset)
 
     port = _alloc_combat_port()
@@ -1827,6 +1942,9 @@ async def _start_match(match):
         'ai_fill': bool(match.ai_fill), 'map_entity_id': map_entity_id,
         'attacker_faction': attacker, 'defender_faction': defender,
         'enable_bots': enable_bots, 'enable_sa_bots': enable_sa_bots,
+        # war 会战局（M2）：battle_id>0 → MissionInfo f2=真实 battleId、
+        # f7 isAutogenerated=0；结算钩子按 battle_id 回写战争状态
+        'battle_id': battle_id,
         # 成局时刻（monotonic）：等待期中途加入窗口（mm_config.JOIN_WINDOW）
         # 从此起算；release_match 随详情一并清理
         'formed_at': time.monotonic(),
@@ -1846,7 +1964,12 @@ async def _start_match(match):
     }
     # 每局资源池：f5（匹配界面）/ f14（握手）/ f2（轮询）三处单一事实源，
     # 出生消耗（ReportMissionStatusRequest f2）扣减（与详情同生命周期）
-    _init_mission_resources(mission_id, gamemode_id, attacker, defender)
+    # war 会战局：池 = 双方实际参战 AT 编制之和（init_mission_war）
+    if battle_id:
+        await _init_war_mission_resources(mission_id, battle_id, attacker,
+                                          defender)
+    else:
+        _init_mission_resources(mission_id, gamemode_id, attacker, defender)
     _log(f'match formed: mission={mission_id}, preset={preset}, map='
          f'{combat_map}, players={len(match.players)}, ai_fill={match.ai_fill}, '
          f'bots={enable_bots}, sa_bots={enable_sa_bots}, '
@@ -1859,6 +1982,12 @@ async def _start_match(match):
     first_pms = sessions[0]['pms_id'] if sessions else 0
     await _ensure_combat_server(mission_id, port, first_pms, combat_map)
     game_connect = f'{PUBLIC_HOST}:{port}'   # 客户端 hng.exe 连战斗服的地址
+    if battle_id:
+        # war 局：record state 0(组队中) → 1(运行中)（GetMissionList status）
+        try:
+            await STORE.set_mission_state(mission_id, 1)
+        except Exception as ex:
+            _log(f'[war] set_mission_state({mission_id}, 1) failed: {ex}')
     # 战局位置：mapEntityId 对应 battlefield 行坐标（简报战场名与地图标记一致；
     # battlefield_entity_for_gamemap 对无行图恒返回有效行 id，无需回退）
     pos = battlefield_pos(map_entity_id)
@@ -2450,6 +2579,57 @@ async def _handle_join(sess, writer, cmd_id, proto):
              f'(SquadSession id={solo["squad_row"]} + SquadMemberSession '
              f'id={solo["member_row"]} status=3 Ready ★solo squad)')
 
+    # 1b-1. ★ war 会战路由（M2）：指定战局（战争地图点进行中战斗/任务
+    #        列表 war 行）且该局是 war 会战 record（battle_id>0）→ 不走
+    #        普通撮合/rejoin 搜索：
+    #        - state 2/3（已结算）或玩家阵营非交战双方 → 忽略（JoinMM
+    #          已回 ok；战报行删除后任务列表自然消失。绝不能入普通池：
+    #          war 桶无 battle_id 永不成局，普通撮合还会凑出同阵营局）
+    #        - 局内会话存活（_MM_MISSION_DETAILS + COMBAT_INSTANCES）→
+    #          同阵营 late join 直接回局（绕 JOIN_WINDOW：官服 war 会战
+    #          开打后随时可加入）
+    #        - state 0（成局待开局）→ 带 battle_id 入 war 桶（try_form_war
+    #          按 battle_id 分桶，攻守双方阵营各 ≥1 即成局）
+    if req_mission_id:
+        wrec = None
+        try:
+            wrec = await STORE.get_mission_record(int(req_mission_id))
+        except Exception as e:
+            _log(f'[DB] get_mission_record({req_mission_id}) failed: {e}')
+        if wrec is not None and int(wrec.get('battle_id') or 0):
+            w_mid = int(req_mission_id)
+            w_state = int(wrec.get('state', 0) or 0)
+            w_atk = int(wrec.get('attacker_faction', 0) or 0)
+            w_dfd = int(wrec.get('defender_faction', 0) or 0)
+            w_bid = int(wrec['battle_id'])
+            if w_state in (2, 3) or faction not in (w_atk, w_dfd):
+                _log(f'[war] JoinMM mission={w_mid} not joinable: '
+                     f'state={w_state}, faction={faction} '
+                     f'(battle={w_bid}, atk={w_atk}, dfd={w_dfd})')
+                return
+            if _MM_MISSION_DETAILS.get(w_mid) and w_mid in COMBAT_INSTANCES:
+                _log(f'[war] JoinMM mission={w_mid} live -> late join '
+                     f'(faction={faction}, battle={w_bid})')
+                entry = mm_pool.QueueEntry(
+                    player_id=pid, char_id=int(char_id), faction=faction,
+                    gamemode_id=10, presets=staged_presets)
+                await _join_existing_mission(pid, w_mid, entry, ctx)
+                return
+            if w_state == 0:
+                _log(f'[war] JoinMM mission={w_mid} -> war queue '
+                     f'(battle={w_bid}, faction={faction})')
+                _MM_QUEUES[pid]['gamemode'] = 10
+                entry = mm_pool.QueueEntry(
+                    player_id=pid, char_id=int(char_id), faction=faction,
+                    gamemode_id=10, presets=staged_presets, battle_id=w_bid)
+                POOL.enqueue(entry)
+                await _try_form_all()
+                return
+            # state=1 但局内会话已清（战斗服收尾中）：不可加入，忽略
+            _log(f'[war] JoinMM mission={w_mid} state={w_state} no live '
+                 f'session -> ignored')
+            return
+
     # 1c. 等待期中途加入：已有同模式、选图兼容、未满员的战局仍处于开局
     #     等待窗口内（mm_config.JOIN_WINDOW）→ 直接进该局（不另开新局）；
     #     玩家指定了战局（f2 missionId，战争地图点进行中战斗）则只考虑该局。
@@ -2551,13 +2731,15 @@ def _msg_mission_info_multi(mission_id, details, zulu):
     players = details.get('players') or []
     creator = int(players[0]['player_id']) if players else 0
     pcount = len(players) + (1 if details.get('ai_fill') else 0)
+    # war 会战局（M2）：f2=真实 battleId、f7 isAutogenerated=0（官服口径）
+    w_battle = int(details.get('battle_id') or 0)
     m = b''
     m += pb_int64(1, int(mission_id))              # missionId
-    m += pb_int64(2, 0)                            # battleId
+    m += pb_int64(2, w_battle)                     # battleId
     m += pb_int64(3, int(details.get('preset') or AI_MISSIONPRESET))
     m += pb_int64(5, int(details.get('map_entity_id') or MISSION_MAP_ENTITY_ID))
     m += pb_int64(6, 1)                            # mapEntityTypeId
-    m += pb_int32(7, 1)                            # isAutogenerated
+    m += pb_int32(7, 0 if w_battle else 1)         # isAutogenerated
     # f8 defenderFactionId：客户端 UI 攻防判定（factionIdToUse ==
     # defenderFactionId → 显示 defend）。★曾误填 creator playerId（巨大
     # id 恒不等于玩家阵营）→ 简报恒显示进攻方，与 BattleFieldSettings f3
@@ -2704,6 +2886,25 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
     f = pb_parse(proto)
     mid = int(f.get(1, 0))
     details = _MM_MISSION_DETAILS.get(mid)
+    if details is None:
+        # war 会战局回退（M2）：局尚未成（无人加入，_MM_MISSION_DETAILS
+        # 未登记）但任务列表已展示 record 行 → 客户端点行拉详情。按 DB
+        # record 构造无 'players' 键的最小 det（走 multi 渲染 = 双方空
+        # 名单，官服成局前观感）；非 war record（battle_id=0）维持 43。
+        wrec = None
+        try:
+            wrec = await STORE.get_mission_record(mid)
+        except Exception as e:
+            _log(f'[DB] get_mission_record({mid}) failed: {e}')
+        if wrec is not None and int(wrec.get('battle_id') or 0):
+            details = {'battle_id': int(wrec['battle_id']),
+                       'preset': int(wrec.get('preset', 0) or 0),
+                       'map_entity_id': int(wrec.get('map_entity_id', 0) or 0),
+                       'attacker_faction':
+                           int(wrec.get('attacker_faction', 0) or 0),
+                       'defender_faction':
+                           int(wrec.get('defender_faction', 0) or 0),
+                       'war_pending': True}
     if details is None:
         resp = build_response(cmd_id, 'GetMissionDetailsResponse', pb_int32(1, 43))
         writer.write(resp)

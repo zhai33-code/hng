@@ -14,6 +14,7 @@ faction id 空间 = factiontemplateid 恒等映射 1/2/3（project_rules 硬约�
 import datetime
 import json
 import math
+import random
 import time
 
 from protocol import (
@@ -108,11 +109,22 @@ def _war_config(morale=None):
     }
 
 
+async def _next_war_name(store):
+    """递进战争名：'<base> #N'（N=历史战争轮次，wars 只增不删 count+1）。
+    统计不可用（FakeStore/DB 异常）回退 base 无后缀。"""
+    base = mm_config.WAR_NAME
+    try:
+        n = int(await store.war_count()) + 1
+        return f'{base} #{n}'
+    except Exception:
+        return base
+
+
 async def ensure_war(store):
     """取当前 running 战争；无且 MM_WAR_AUTO_CREATE=1 时自动开战。
 
-    开战流程：create_war（config 快照）→ init_war_cities（capital 表初始
-    归属）。返回 war dict 或 None（store 不可用 / 不自动开战）。"""
+    开战流程：create_war（递进名 + config 快照）→ init_war_cities（capital
+    表初始归属）。返回 war dict 或 None（store 不可用 / 不自动开战）。"""
     if store is None or getattr(store, 'pool', None) is None:
         return None
     try:
@@ -121,14 +133,26 @@ async def ensure_war(store):
             return war
         if not mm_config.WAR_AUTO_CREATE:
             return None
+        war_name = await _next_war_name(store)
         war = await store.create_war(
-            mm_config.WAR_NAME,
+            war_name,
             points_needed_for_victory=mm_config.WAR_POINTS_VICTORY,
             config=_war_config())
         await store.init_war_cities(war['id'], initial_city_owners())
-        log(f'[war] 新战争开打 id={war["id"]} name={mm_config.WAR_NAME!r} '
+        # 阵营种子库存 = ArmyResourceProductionTemplate warStartValue
+        # （§3.12.1：步兵 85 万 / 重坦 225……幂等，已有行不覆盖）
+        initial = {}
+        for t in wardb.armyresource_production():
+            v = int(t.get('war_start_value') or 0)
+            if v > 0:
+                initial.setdefault(int(t.get('faction') or 0), {})[
+                    int(t.get('category_id') or 0)] = v
+        if initial:
+            await store.init_war_faction_resources(war['id'], initial)
+        log(f'[war] 新战争开打 id={war["id"]} name={war_name!r} '
             f'points={mm_config.WAR_POINTS_VICTORY} '
-            f'cities={len(initial_city_owners())}')
+            f'cities={len(initial_city_owners())} '
+            f'stock_rows={sum(len(c) for c in initial.values())}')
         return war
     except Exception as e:
         log(f'[war] ensure_war failed: {e}')
@@ -151,9 +175,9 @@ def build_war_proto(war):
     m += pb_int64(7, war.get('winning_faction_id') or 0)          # winningfactionid
     m += pb_int32(8, war.get('points_needed_for_victory')
                   or mm_config.WAR_POINTS_VICTORY)                # pointsNeededForVictory
-    m += pb_uint32(9, 0)                                          # automissionnormal（M3）
-    m += pb_uint32(10, 0)                                         # automissionskirmish（M3）
-    m += pb_uint32(11, 0)                                         # automissionsupply（M3）
+    m += pb_uint32(9, mm_config.WAR_AUTOMISSION_NORMAL)      # automissionnormal
+    m += pb_uint32(10, mm_config.WAR_AUTOMISSION_SKIRMISH)   # automissionskirmish
+    m += pb_uint32(11, mm_config.WAR_AUTOMISSION_SUPPLY)     # automissionsupply
     m += pb_float(12, float(cfg.get('strategytimescale',
                                     mm_config.WAR_TIMESCALE)))     # strategytimescale
     m += pb_float(13, float(cfg.get('daycycletimescale',
@@ -164,9 +188,11 @@ def build_war_proto(war):
     m += pb_int64(16, war.get('sequel_war_id') or 0)              # sequelwarid
     m += pb_int64(17, war.get('mapid') or 1)                      # mapid
     m += pb_int32(18, 0)                                          # cleanupStatus
-    m += pb_int32(19, 0)                                          # fowGridSize（M1 全图可见）
-    m += pb_int32(20, 0)                                          # fowGridOriginX
-    m += pb_int32(21, 0)                                          # fowGridOriginY
+    # fow 网格参数（M3 §9.3）：非 0 即激活客户端 FogOfWarLayer，
+    # 可见性判定在客户端本地；默认 0=全图可见
+    m += pb_int32(19, mm_config.WAR_FOW_GRID_SIZE)                # fowGridSize
+    m += pb_int32(20, mm_config.WAR_FOW_GRID_ORIGIN_X)            # fowGridOriginX
+    m += pb_int32(21, mm_config.WAR_FOW_GRID_ORIGIN_Y)            # fowGridOriginY
     m += pb_int32(22, 0)                                          # queueReinforcements（M2）
     m += pb_int32(23, 0)                                          # firstResourceFree
     m += pb_uint32(24, int(morale['min']))                        # moraleMinValue
@@ -484,6 +510,7 @@ def msg_commandnode_definition_row(at):
     m += pb_int32(7, at.get('rank') or 1)            # rank
     m += pb_int64(9, at.get('general_character_id') or 0)  # generalCharacterId
     m += pb_int64(10, _ts_ms(at.get('created_at')))  # statUpdateTimeStamp
+    # suppliedOnCreation：官服买壳口径恒 False（购买即满编已废弃，见 §10.2 #4）
     m += pb_bool(11, False)                          # suppliedOnCreation
     return m
 
@@ -502,8 +529,8 @@ def msg_commandnode_instance_row(at, war_id, faction_capitals):
     m += pb_uint32(8, at.get('morale') or 0)         # morale
     m += pb_int64(9, _ts_ms(at.get('created_at')))   # lastReset
     m += pb_uint32(10, 1 if at.get('is_deployed') else 0)  # isDeployed
-    m += pb_bool(11, False)                          # hasGottenSoldierResourcesForFree
-    m += pb_bool(12, False)                          # hasGottenVehicleResourcesForFree
+    m += pb_bool(11, bool(at.get('has_gotten_soldier_free')))  # hasGottenSoldierResourcesForFree
+    m += pb_bool(12, bool(at.get('has_gotten_vehicle_free')))  # hasGottenVehicleResourcesForFree
     m += pb_uint32(13, at.get('max_morale') or 100)  # maxMorale
     m += pb_float(14, 1.0)                           # moraleGainModifier
     return m
@@ -527,6 +554,57 @@ def msg_armyresource_rows(at, war_id):
         m += pb_int64(5, war_id)                     # warid
         out.append(m)
     return out
+
+
+def msg_hq_resource_rows(war_id, hq_id, stock):
+    """阵营最高司令部 armyresource 行（阵营库存本体，§3.12.1：
+    FactionResourceOverviewMediator 库存列数据源）。
+
+    stock={category_id: count}。id = (hq_id & ~0xFF) | cat：HQ id 是 63 位
+    随机数（matchmaking.FACTION_SUPREME_COMMANDS），*1000 惯例会溢出 int64；
+    低 8 位塞 cat（1-21 < 255）保证 (hq,cat) 唯一且不越界。"""
+    out = []
+    base = int(hq_id) & ~0xFF
+    for cat, cnt in sorted((stock or {}).items()):
+        try:
+            cat, cnt = int(cat), int(cnt)
+        except (TypeError, ValueError):
+            continue
+        if cnt <= 0:
+            continue
+        m = b''
+        m += pb_int64(1, base | cat)                 # id
+        m += pb_int64(2, int(hq_id))                 # commandNodeWarInstanceId（=faction.supremecommand）
+        m += pb_int64(3, cat)                        # armyResourceCategoryId
+        m += pb_uint32(4, cnt)                       # count
+        m += pb_int64(5, war_id)                     # warid
+        out.append(m)
+    return out
+
+
+async def hq_stock_rows(store, war=None):
+    """全阵营最高司令部 armyresource 行列表（库存本体）。
+
+    production_tick 周期重推与 views subscriberesourceview 订阅首推共用；
+    store 不可用 / 无战争 / 库存读失败回 []。"""
+    try:
+        war = war or await ensure_war(store)
+        if war is None:
+            return []
+        stock = {}
+        for r in await store.list_war_faction_resources(war['id']):
+            stock.setdefault(int(r['faction']), {})[
+                int(r['category_id'])] = int(r['count'])
+        import matchmaking          # 延迟 import（防循环依赖）
+        rows = []
+        for fid, cats in stock.items():
+            hq = matchmaking.FACTION_SUPREME_COMMANDS.get(fid)
+            if hq:
+                rows.extend(msg_hq_resource_rows(war['id'], hq, cats))
+        return rows
+    except Exception as e:
+        log(f'[war] hq_stock_rows failed: {e}')
+        return []
 
 
 def msg_commandnode_morale_row(at, war_id):
@@ -579,6 +657,15 @@ async def build_warmap_snapshot(store, war=None):
         for at in ats:
             for p in msg_armyresource_rows(at, war_id):
                 rows.append((b'armyresource', p))
+        # 在途空运行（订阅时已起飞的 AT；§3.14 air_transport）
+        for mv in await store.list_active_movements(war_id):
+            segs = movement_segments(mv)
+            if segs and segs[0].get('air'):
+                mvat = await store.get_command_node(mv['commandnode_id'])
+                if mvat:
+                    rows.append((b'air_transport',
+                                 msg_air_transport_row(mvat, war_id, mv,
+                                                       segs[0])))
         return rows
     except Exception as e:
         log(f'[war] build_warmap_snapshot failed: {e}')
@@ -601,6 +688,16 @@ RC_COMMANDNODE_ALREADY_DEPLOYED = 150
 RC_NOT_ENOUGH_WARFUNDS = 153
 RC_INVALID_OWNER = 189
 RC_INVALID_CURRENCY = 240
+# SetCommandNodeEquipment（ResponseCodes.as 实锤）
+RC_COMMANDNODE_ALREADY_EQUIPPED = 217
+RC_COMMANDNODE_ALREADY_UNEQUIPPED = 218
+RC_EQUIPMENT_NOT_ALLOWED = 219
+RC_COMMANDNODE_QUEUED_FOR_RESOURCES = 226
+# resupply_request（no_resupply_* 族）
+RC_NO_RESUPPLY_IN_BATTLE = 101
+RC_NO_RESUPPLY_INSUFFICIENT_RESOURCES = 102
+RC_NO_RESUPPLY_ALREADY_FULL = 103
+RC_NO_RESUPPLY_IN_TRANSPORT = 116
 
 # AT 名/缩写长度上限（官服 UI 语义：min 3 校验在客户端，服务端同口径拦截）
 AT_NAME_MAX_LENGTH = 20
@@ -688,6 +785,8 @@ def deploy_battlefield(at, faction, near_capital_bf=0):
 
 # ---- AT 移动（Phase 6，docs/hng-rts-protocol.md §5.3）----
 
+# 0=fail 语义族的通用失败码（SetCommandNodeEquipmentResponse 实锤 0=fail）；
+# transport 族响应 0=ok，禁用本码表达失败（用 7/33/109/152 等非 0 实码）
 RC_FAIL = 0
 RC_CANNOT_FIND_COMMANDNODE = 7
 RC_ALREADY_IN_TRANSPORT = 33
@@ -846,12 +945,12 @@ async def start_movement(store, at, target_bf, override_ap=0,
     cur_bf = at_current_battlefield(at)
     target_bf = int(target_bf or 0)
     if not cur_bf or not target_bf:
-        return None, RC_FAIL
+        return None, RC_CANNOT_FIND_COMMANDNODE
     if cur_bf == target_bf and not override_ap:
         return None, RC_OK
     path = find_supplyline_path(cur_bf, target_bf)
     if path is None:
-        return None, RC_FAIL
+        return None, RC_CANNOT_FIND_COMMANDNODE
     speed = at_speed(at)
     now = now or datetime.datetime.now(datetime.timezone.utc)
     for seg in path:
@@ -874,6 +973,38 @@ async def start_movement(store, at, target_bf, override_ap=0,
             await store.update_command_node(
                 at['id'], map_entity_id=int(override_ap),
                 map_entity_type=MAP_ENTITY_ACCESSPOINT)
+    return mv, RC_OK
+
+
+async def start_air_transport(store, at, target_bf, now=None):
+    """空运（M3 §9.4）：地面 BFS 不可达时，携运输机（resources cat 10 ≥1）
+    的 AT 可空运直达目标城市：消耗 1 架运输机 + 单段 air 移动
+    （时长 mm_config.WAR_AIR_TRANSIT_SECONDS）。
+
+    返回 (movement, error_code)。movement 非 None 时段带 air=True：
+    AT state=1 在途但 map_entity 保持出发城市（instance 行不变位，
+    在途动画由 air_transport 行驱动）；到达走 advance_movements 通用
+    落位/会战成局逻辑。"""
+    cur_bf = at_current_battlefield(at)
+    target_bf = int(target_bf or 0)
+    if not cur_bf or not target_bf or cur_bf == target_bf:
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    res = dict(_as_resources(at.get('resources')))
+    try:
+        planes = int(res.get('10') or res.get(10) or 0)
+    except (TypeError, ValueError):
+        planes = 0
+    if planes < 1:
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    res['10'] = planes - 1
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    seconds = max(1, int(mm_config.WAR_AIR_TRANSIT_SECONDS or 600))
+    seg = {'from_bf': cur_bf, 'to_bf': target_bf, 'sl_id': 0,
+           'from_ap': 0, 'to_ap': 0, 'seconds': seconds, 'air': True}
+    mv = await store.create_movement(
+        at['id'], at['war_id'], [seg], started_at=now,
+        arrive_at=now + datetime.timedelta(seconds=seconds))
+    await store.update_command_node(at['id'], state=1, resources=res)
     return mv, RC_OK
 
 
@@ -911,6 +1042,21 @@ def msg_transport_destination_row(at, war_id, mv, segs, now_ms=None):
     m += pb_bool(7, False)                             # retreatFlag
     m += pb_float(8, total)                             # timeEstimate（秒）
     m += pb_float(9, 0.0)                              # beginPosition
+    return m
+
+
+def msg_air_transport_row(at, war_id, mv, seg):
+    """air_transport 行（§3.14）：f3/f4 from + f5/f6 to（type1=battlefield）
+    + f7/f8 起止毫秒。空运在途动画由本行驱动（instance 行保持出发城市）。"""
+    m = pb_int64(1, mv['id'])                          # id（movement id）
+    m += pb_int64(2, at['id'])                         # commandNodeWarInstanceId
+    m += pb_int64(3, seg['from_bf'])                   # fromentityid
+    m += pb_int32(4, MAP_ENTITY_BATTLEFIELD)           # fromentitytype
+    m += pb_int64(5, seg['to_bf'])                     # toentityid
+    m += pb_int32(6, MAP_ENTITY_BATTLEFIELD)           # toentitytype
+    m += pb_int64(7, int(seg['begin_ms']))             # begintime（ms）
+    m += pb_int64(8, int(seg['end_ms']))               # endtime（ms）
+    m += pb_int64(9, war_id)                           # warid
     return m
 
 
@@ -953,6 +1099,7 @@ async def advance_movements(store, war=None, now=None):
             if not segs:
                 await store.finish_movement(mv['id'], 1)
                 continue
+            is_air = bool(segs[0].get('air'))
             if now_ms >= segs[-1]['end_ms']:
                 # ---- 到达：终段 to_bf（或 dest_ap 出兵点）落位 ----
                 await store.finish_movement(mv['id'], 1)
@@ -967,7 +1114,8 @@ async def advance_movements(store, war=None, now=None):
                 at = await store.get_command_node(at['id'])
                 events.append(('del', b'transport_commandnode_segment',
                                mv['id']))
-                events.append(('del', b'transport_commandnode_destination',
+                events.append(('del', b'air_transport' if is_air else
+                               b'transport_commandnode_destination',
                                mv['id']))
                 events.append(('set', b'CommandNodeWarInstance',
                                msg_commandnode_instance_row(at, war_id, caps)))
@@ -976,6 +1124,9 @@ async def advance_movements(store, war=None, now=None):
                            else _ap_battlefield(dest_ap))
                 events.extend(await _check_battle_formation(
                     store, war_id, at, dest_bf))
+                continue
+            if is_air:
+                # 空运单段在途：无换段（instance 行保持出发城市）
                 continue
             # ---- 换段：AT map_entity 同步当前段补给线 ----
             idx = current_segment_index(segs, now_ms)
@@ -997,7 +1148,8 @@ async def advance_movements(store, war=None, now=None):
 
 
 async def _check_battle_formation(store, war_id, at, dest_bf):
-    """到达敌情检查（M1 会战桩）：目标城市驻有敌对 AT → war_battles 登记。
+    """到达敌情检查（M1 会战桩 → M2 成局）：目标城市驻有敌对 AT →
+    war_battles 登记 + war mission record 落库（任务列表可见）。
 
     已有同城市进行中会战 → 本 AT 标记入战（state=2）不重复建战。
     返回追加推送事件。"""
@@ -1025,6 +1177,24 @@ async def _check_battle_formation(store, war_id, at, dest_bf):
         await store.update_command_node(e['id'], state=2)
     if wb:
         events.append(('set', b'battle', msg_battle_row(wb)))
+        # M2：会战 → war mission record（GetMissionList 展示，玩家加入成
+        # 真人局；mission_id = mission_records serial id，battle_id 关联）。
+        # 攻方=到达的 AT 阵营，守方=首个敌 AT 阵营（M1 桩既有简化）。
+        try:
+            preset_pool = (mm_config.gamemode_cfg(10).get('fallback_presets')
+                           or [])
+            mid = await store.create_mission_record(
+                random.choice(preset_pool) if preset_pool else 0,
+                attacker_faction=int(at.get('faction') or 0),
+                defender_faction=int(enemies[0].get('faction') or 0),
+                name=f'war battle {wb["id"]} battlefield {dest_bf}',
+                map_entity_id=int(dest_bf),
+                battle_id=int(wb['id']))
+            log(f'[war] battle {wb["id"]} formed → mission record id={mid} '
+                f'bf={dest_bf} atk={at.get("faction")} '
+                f'def={enemies[0].get("faction")}')
+        except Exception as e:
+            log(f'[war] create war mission record failed: {e}')
     return events
 
 
@@ -1050,7 +1220,541 @@ async def broadcast_war_events(events):
 
 
 async def war_tick(store):
-    """战争推进 tick（realtest_server 周期挂载）：移动推进 + 事件广播。"""
+    """战争推进 tick（realtest_server 周期挂载）：移动推进 + automission
+    超时结算 + 阵营资源生产 + 增援队列交付 + 事件广播。"""
     events = await advance_movements(store)
+    await automission_tick(store)
+    await production_tick(store)
+    await supply_queue_tick(store)
     if events:
         await broadcast_war_events(events)
+
+
+# ---- M2-4 会战结算回写（docs/hng-rts-protocol.md §8.3-§8.4）----
+
+def _scale_resources(res, ratio):
+    """按比例扣减 AT 编制 {cat: count}（向下取整，保零）。"""
+    out = {}
+    for cat, cnt in (res or {}).items():
+        try:
+            cnt = int(cnt)
+        except (TypeError, ValueError):
+            continue
+        if cnt <= 0:
+            continue
+        out[int(cat)] = int(cnt * (1.0 - ratio))
+    return out
+
+
+async def settle_war_battle(store, mission_id, battle_id, winner_faction,
+                            loss_ratios=None):
+    """FPS 会战结算回写（BattleReport 之后、release_match 之前调用）。
+
+    loss_ratios：可选 (胜方损耗比, 败方损耗比) 覆盖（automission 用
+    WAR_AUTOMISSION_* 系数）；缺省用 WAR_BATTLE_*_LOSS。
+
+    流程（协议 §8.3-4）：
+      ① AT 损耗：胜方轻损 / 败方重损（mm_config.WAR_BATTLE_*_LOSS 比例），
+         编制扣空 = 歼灭（state=3 软删，将军损失投资）；
+      ② 士气：败 -moraleLostPerBattle / 胜 +moraleGainedPerWin，低于
+         surrenderLimit → 投降撤回首都（is_deployed=0，需重建再战）；
+      ③ 城市易主：攻方（mission record attacker_faction）胜 → war_cities
+         UPDATE + battlefieldstatus 行推送；
+      ④ war_battles state=1 + winning_faction；mission record 置 2（任务
+         列表移除）；battle 行删除（战争图交战标记消失）；
+      ⑤ warfunds：参战 AT 主人每局 +WAR_WARFUNDS_PER_BATTLE，胜方再
+         +WIN_BONUS（占点英雄收益已在 PlayerBattleResult f3 入账）；
+      ⑥ check_victory（首都数判据）。
+
+    返回推送事件列表（调用方 broadcast_war_events）。
+    """
+    if store is None or getattr(store, 'pool', None) is None:
+        return []
+    try:
+        wb = await store.get_war_battle(int(battle_id))
+        if wb is None or int(wb.get('state') or 0) != 0:
+            return []
+        war_id = int(wb['war_id'])
+        winner = int(winner_faction or 0)
+        win_loss, lose_loss = loss_ratios or (
+            mm_config.WAR_BATTLE_WINNER_LOSS,
+            mm_config.WAR_BATTLE_LOSER_LOSS)
+        events = []
+        caps = _faction_capital_bf()
+        morale_cfg = morale_defaults()
+        surrender = int(morale_cfg.get('surrender_limit', 25))
+
+        for entry in (wb.get('factions') or []):
+            at = await store.get_command_node(int(entry.get('at_id') or 0))
+            if not at or int(at.get('state') or 0) != 2:
+                continue                      # 已解散/不在战中
+            won = bool(winner) and int(at.get('faction') or 0) == winner
+            ratio = win_loss if won else lose_loss
+            new_res = _scale_resources(
+                _as_resources(at.get('resources')), ratio)
+            morale = int(at.get('morale') or 0)
+            morale += (mm_config.WAR_MORALE_GAINED_PER_WIN if won
+                       else -mm_config.WAR_MORALE_LOST_PER_BATTLE)
+            morale = max(0, min(int(at.get('max_morale') or 100), morale))
+            # ⑤ warfunds（先行：与状态回写解耦，玩家不存在不阻断结算）
+            owner = int(at.get('owner_player_id') or 0)
+            if owner and mm_config.WAR_WARFUNDS_PER_BATTLE:
+                try:
+                    await store.add_war_funds(
+                        owner, mm_config.WAR_WARFUNDS_PER_BATTLE,
+                        f'war_battle {battle_id}')
+                    if won and mm_config.WAR_WARFUNDS_WIN_BONUS:
+                        await store.add_war_funds(
+                            owner, mm_config.WAR_WARFUNDS_WIN_BONUS,
+                            f'war_battle {battle_id} win')
+                except ValueError:
+                    pass                      # 玩家已删除，跳过
+
+            if not any(v > 0 for v in new_res.values()):
+                # ---- 歼灭：编制扣空（state=3 软删，地图行删除）----
+                await store.update_command_node(
+                    at['id'], state=3, resources={}, morale=morale)
+                events.append(('del', b'CommandNodeWarInstance', at['id']))
+                for cat in _as_resources(at.get('resources')):
+                    events.append(('del', b'armyresource',
+                                   at['id'] * 1000 + int(cat)))
+                log(f'[war] battle {battle_id}: AT {at["id"]} '
+                    f'{at.get("name")!r} (faction {at.get("faction")}) '
+                    f'wiped out')
+                continue
+            # ---- 存活：编制/士气回写 + 投降判定 ----
+            fields = {'resources': new_res, 'morale': morale}
+            if morale <= surrender and at.get('is_deployed'):
+                cap_bf = caps.get(int(at.get('faction') or 0))
+                if cap_bf:
+                    fields.update(state=0, is_deployed=False,
+                                  map_entity_id=cap_bf,
+                                  map_entity_type=MAP_ENTITY_BATTLEFIELD)
+                    log(f'[war] battle {battle_id}: AT {at["id"]} morale '
+                        f'{morale} <= surrender {surrender}, retreated to '
+                        f'capital {cap_bf}')
+            await store.update_command_node(at['id'], **fields)
+            at = await store.get_command_node(at['id'])
+            events.append(('set', b'CommandNodeWarInstance',
+                           msg_commandnode_instance_row(at, war_id, caps)))
+            for cat, cnt in sorted(new_res.items()):
+                if cnt:
+                    events.append(
+                        ('set', b'armyresource',
+                         msg_armyresource_rows(
+                             {'id': at['id'], 'resources': {cat: cnt}},
+                             war_id)[0]))
+                else:
+                    events.append(('del', b'armyresource',
+                                   at['id'] * 1000 + cat))
+
+        # ③ 城市易主：攻方胜 → 占领（守方胜城市不变）
+        attacker = 0
+        try:
+            mrec = await store.get_mission_record(int(mission_id))
+            attacker = int((mrec or {}).get('attacker_faction') or 0)
+        except Exception:
+            pass
+        dest_bf = int(wb.get('battlefield_id') or 0)
+        if winner and attacker and winner == attacker and dest_bf:
+            await store.set_city_owner(war_id, dest_bf, winner)
+            events.append(('set', b'battlefieldstatus',
+                           msg_battlefieldstatus_row(war_id, dest_bf, winner)))
+            log(f'[war] battle {battle_id}: attacker faction {winner} '
+                f'captured battlefield {dest_bf}')
+
+        # ④ 会战终态 + 任务列表移除 + 战争图交战标记删除
+        await store.end_war_battle(int(battle_id), winner)
+        try:
+            await store.set_mission_state(int(mission_id), 2)
+        except Exception as e:
+            log(f'[war] set_mission_state({mission_id}, 2) failed: {e}')
+        events.append(('del', b'battle', int(battle_id)))
+        log(f'[war] battle {battle_id} settled: winner={winner or "defender"}')
+
+        # ⑥ 首都数判据（占领可能触发战争结束）
+        victory = await check_victory(store)
+        if victory:
+            log(f'[war] war ended by battle {battle_id}: '
+                f'faction {victory} victorious')
+        return events
+    except Exception as e:
+        log(f'[war] settle_war_battle({battle_id}) failed: {e}')
+        return []
+
+
+async def automission_tick(store):
+    """M2-5 automission（协议 §8.4）：war battle 无人加入超时自动结算。
+
+    每 active battle（state=0）按 mission record 判定：
+      - record 缺失 / state==0（撮合未满，无人加入）：started_at 超过
+        WAR_AUTOMISSION_NORMAL 秒 → 结算；
+      - state==1 且战斗会话已不存在（全员中途退出，release_match 不回写
+        record）：同样按超时结算；
+      - state==1 且会话存活（COMBAT_INSTANCES 有实例）：live，跳过。
+    胜负：双方参战 AT 剩余资源总量多者胜（持平/双方皆空 = 攻方不胜，守方
+    守住）。损耗按 WAR_AUTOMISSION_WINNER_LOSS / LOSER_LOSS。
+    由 realtest_server war_tick 周期调用；返回无值（事件已广播）。
+    """
+    if store is None or getattr(store, 'pool', None) is None:
+        return
+    try:
+        war = await ensure_war(store)
+        if war is None:
+            return
+        import matchmaking            # 延迟 import（防未来循环依赖）
+        now_s = time.time()
+        timeout = max(60, mm_config.WAR_AUTOMISSION_NORMAL)
+        for wb in await store.list_active_war_battles(war['id']):
+            try:
+                mrec = await store.get_mission_by_battle(int(wb['id']))
+            except Exception:
+                mrec = None
+            r_state = int((mrec or {}).get('state', 0) or 0)
+            if r_state == 1 and mrec is not None:
+                if int(mrec['id']) in matchmaking.COMBAT_INSTANCES:
+                    continue          # 成局且战斗会话存活
+            started = _ts_ms(wb.get('started_at')) / 1000.0
+            if started <= 0 or now_s - started < timeout:
+                continue
+            # ---- 超时：按 AT 剩余资源判胜负 ----
+            power = {}
+            for entry in (wb.get('factions') or []):
+                at = await store.get_command_node(
+                    int(entry.get('at_id') or 0))
+                if not at or int(at.get('state') or 0) != 2:
+                    continue
+                fac = int(at.get('faction') or 0)
+                power[fac] = power.get(fac, 0) + sum(
+                    v for v in _as_resources(at.get('resources')).values()
+                    if isinstance(v, (int, float)))
+            winner = 0
+            if power:
+                best = max(power.values())
+                tops = [f for f, p in power.items() if p == best]
+                if best > 0 and len(tops) == 1:
+                    winner = tops[0]
+            log(f'[war] automission: battle {wb["id"]} idle '
+                f'{int(now_s - started)}s, settling (winner={winner})')
+            events = await settle_war_battle(
+                store, int((mrec or {}).get('id') or 0), int(wb['id']),
+                winner,
+                loss_ratios=(mm_config.WAR_AUTOMISSION_WINNER_LOSS,
+                             mm_config.WAR_AUTOMISSION_LOSER_LOSS))
+            await broadcast_war_events(events)
+    except Exception as e:
+        log(f'[war] automission_tick failed: {e}')
+
+
+# ---- M3-1 阵营资源生产（docs/hng-rts-protocol.md §9.1 / §3.12.1）----
+
+_PROD_INTERVAL_MS = 600_000        # ArmyResourceProductionTemplate 全表恒 600s
+_PROD_LAST_RUN = 0.0               # WAR_PRODUCTION_MIN_TICK 节流游标
+
+
+async def production_tick(store):
+    """阵营资源生产推进：wars.production_ms 游标按 600s/run 结算 runs，
+    把模板产量累加进 war_faction_resources，并对 resourceview 订阅会话
+    重推 FactionResourceProduction/Consumption 行 + 最高司令部 armyresource
+    行（客户端不做本地生产模拟，不推则资源总览数值停滞）。
+
+    游标语义：0 = 首跑只初始化游标（不补发开战前历史产量）；
+    runs>0 时游标推进 cursor + runs*interval。war_tick 5s 周期调用，
+    WAR_PRODUCTION_MIN_TICK 节流整函数。"""
+    global _PROD_LAST_RUN
+    if store is None or getattr(store, 'pool', None) is None:
+        return
+    now_s = time.time()
+    if now_s - _PROD_LAST_RUN < max(5, mm_config.WAR_PRODUCTION_MIN_TICK):
+        return
+    _PROD_LAST_RUN = now_s
+    try:
+        war = await ensure_war(store)
+        if war is None:
+            return
+        now_ms = int(now_s * 1000)
+        cursor = int(war.get('production_ms') or 0)
+        if cursor <= 0:
+            await store.update_war_production(war['id'], now_ms)
+            return
+        runs = int((now_ms - cursor) // _PROD_INTERVAL_MS)
+        if runs <= 0:
+            return
+        deltas = {}
+        for t in wardb.armyresource_production():
+            per = int(t.get('produce_per_run') or 0)
+            if per <= 0:
+                continue            # 死行 cat 13 等
+            fac = int(t.get('faction') or 0)
+            cat = int(t.get('category_id') or 0)
+            d = deltas.setdefault(fac, {})
+            d[cat] = d.get(cat, 0) + per * runs
+        for fac, d in deltas.items():
+            await store.adjust_war_faction_resources(war['id'], fac, d)
+        await store.update_war_production(
+            war['id'], cursor + runs * _PROD_INTERVAL_MS)
+        log(f'[war] production: war={war["id"]} runs={runs} '
+            f'factions={sorted(deltas)}')
+        # ---- 行重推（resourceview 订阅会话，与订阅时同函数同 warId 源）----
+        import matchmaking          # 延迟 import（防循环依赖）
+        from state import FLASH_SESSIONS
+        from messages import _push_kvcs
+        windows = await supply_windows(store, war)
+        prods, cons = matchmaking._msg_faction_resource_rows(windows)
+        queue_rows = matchmaking._msg_faction_queue_rows(windows)
+        hq_rows = await hq_stock_rows(store, war)
+        for sess in list(FLASH_SESSIONS.values()):
+            cmd = getattr(sess, 'resource_view_cmd', None)
+            w = getattr(sess, 'writer', None)
+            if not cmd or not w:
+                continue
+            try:
+                for row in prods:
+                    await _push_kvcs(w, cmd, b'FactionResourceProduction', row)
+                for row in hq_rows:
+                    await _push_kvcs(w, cmd, b'armyresource', row)
+                for row in cons:
+                    await _push_kvcs(w, cmd, b'FactionResourceConsumption', row)
+                for row in queue_rows:
+                    await _push_kvcs(w, cmd, b'FactionResourceQueue', row)
+            except Exception:
+                pass                # 单会话故障不影响其他订阅者
+    except Exception as e:
+        log(f'[war] production_tick failed: {e}')
+
+
+# ---- M3-2 阵营资源增援队列（docs/hng-rts-protocol.md §3.12 / §10.2 #3/#5）----
+
+def _qn_window(rows):
+    """队列行 → 窗口 (head, tail)：head=MIN(queue_number)、tail=MAX+1、
+    空队 (0,0)（客户端 AssaultTeamModel 对称语义）。"""
+    if not rows:
+        return (0, 0)
+    qns = [int(r.get('queue_number') or 0) for r in rows]
+    return (min(qns), max(qns) + 1)
+
+
+async def supply_windows(store, war=None):
+    """{faction: (head, tail)} 队列窗口（resourceview 订阅/重推共用）。
+    DB 不可用/无战争时回 {}（全部按 (0,0)）。"""
+    try:
+        if store is None or getattr(store, 'pool', None) is None:
+            return {}
+        if war is None:
+            war = await ensure_war(store)
+        if war is None:
+            return {}
+        by_fac = {}
+        for r in await store.list_war_supply_queue(war['id']):
+            by_fac.setdefault(int(r.get('faction') or 0), []).append(r)
+        return {fac: _qn_window(rs) for fac, rs in by_fac.items()}
+    except Exception as e:
+        log(f'[war] supply_windows failed: {e}')
+        return {}
+
+
+async def supply_queue_tick(store):
+    """增援队列推进（每阵营 FIFO，队头阻塞）：war_supply_queue 队头行
+    库存足够 → 库存转移（HQ → AT 补编）+ 出队；不足 → 整个阵营本 tick
+    阻塞（不跳行，保官方队列语义）。
+
+    - AT 歼灭/解散（state>=3 或缺失）→ 出队不退款（warfunds 入队时已扣，
+      简化口径）。
+    - 交付后重推 AT 行（warmap 广播）+ 库存/队列/production 行
+      （resourceview 订阅会话）。"""
+    if store is None or getattr(store, 'pool', None) is None:
+        return
+    try:
+        war = await ensure_war(store)
+        if war is None:
+            return
+        import matchmaking          # 延迟 import（防循环依赖）
+        from state import FLASH_SESSIONS
+        from messages import _push_kvcs
+        delivered = []              # 交付过的 AT（重取后供推送）
+        dequeued_ids = []           # 出队行 id（交付/清理），供 DELETE 行推送
+        for fid in (1, 2, 3):
+            q = await store.list_war_supply_queue(war['id'], fid)
+            if not q:
+                continue
+            stock = {int(r['category_id']): int(r['count'])
+                     for r in await store.list_war_faction_resources(
+                         war['id'], fid)}
+            for row in q:           # 队头起逐行判定
+                need = int(row['count'])
+                cat = int(row['category_id'])
+                if need <= 0 or stock.get(cat, 0) < need:
+                    break           # 队头不足：本阵营阻塞
+                at = await store.get_command_node(
+                    int(row['command_node_id'] or 0))
+                if not at or int(at.get('state') or 0) >= 3:
+                    await store.dequeue_war_supply([row['id']])
+                    dequeued_ids.append(int(row['id']))
+                    continue        # AT 没了：出队不退款，继续清理下一行
+                await store.adjust_war_faction_resources(
+                    war['id'], fid, {cat: -need})
+                await store.update_command_node(
+                    at['id'], resources=_at_add_resources(at, cat, need))
+                await store.dequeue_war_supply([row['id']])
+                dequeued_ids.append(int(row['id']))
+                at = await store.get_command_node(at['id'])
+                delivered.append(at)
+                log(f'[war] supply queue: at={at["id"]} faction={fid} '
+                    f'cat={cat} x{need} delivered from stock')
+                break               # 队头已推进，本阵营下 tick 再看下一行
+        if not delivered:
+            return
+        # ---- 推送：touched AT 重取后推 armyresource/Instance 行 ----
+        events = []
+        for at in delivered:
+            caps = _faction_capital_bf()
+            events.append(('set', b'CommandNodeWarInstance',
+                           msg_commandnode_instance_row(at, war['id'], caps)))
+            for p in msg_armyresource_rows(at, war['id']):
+                events.append(('set', b'armyresource', p))
+        await broadcast_war_events(events)
+        windows = await supply_windows(store, war)
+        queue_rows = matchmaking._msg_faction_queue_rows(windows)
+        cons = matchmaking._msg_faction_resource_rows(windows)[1]
+        hq_rows = await hq_stock_rows(store, war)
+        from messages import _push_kvcs_delete
+        for sess in list(FLASH_SESSIONS.values()):
+            cmd = getattr(sess, 'resource_view_cmd', None)
+            w = getattr(sess, 'writer', None)
+            if not cmd or not w:
+                continue
+            try:
+                for row in queue_rows:
+                    await _push_kvcs(w, cmd, b'FactionResourceQueue', row)
+                for row in hq_rows:
+                    await _push_kvcs(w, cmd, b'armyresource', row)
+                for row in cons:
+                    await _push_kvcs(w, cmd, b'FactionResourceConsumption', row)
+                # AT 级队列行 DELETE（交付/清理；客户端 onQueueUpdates
+                # 移除 queueItems 并重算 isQueuedForResources；
+                # ticket DELETE → 增援队列窗口关闭——官服语义）
+                for rid in dequeued_ids:
+                    await _push_kvcs_delete(
+                        w, cmd, b'CommandNodeSupplyQueueItem', rid)
+                    await _push_kvcs_delete(
+                        w, cmd, b'CommandNodeSupplyQueueItemTicket', rid)
+            except Exception:
+                pass
+    except Exception as e:
+        log(f'[war] supply_queue_tick failed: {e}')
+
+
+def msg_supply_queue_item_row(qrow, at, war_id=None):
+    """CommandNodeSupplyQueueItem 行（AT 级补给队列，客户端 xmlTag 同名，
+    Database._warTables 注册；AssaultTeamModel.onQueueUpdates 按 AT 归属
+    过滤消费 → queueItems/isQueuedForResources；增援队列窗口按 factionId
+    聚合显示排队位次，§10.2 #3）。
+
+    REQUIRED f1-14 + 可选 f17 resourcesNeeded（客户端实锤 schema：
+    id/playerId/commandNodeWarInstanceId/armyResourceCategoryId/warId/
+    factionId/timestamp/pricingId/paymentCurrency/queueNumber/
+    nearCapitalBattlefieldId/playerSessionId/deviceId/metricsUid）。
+    f8 pricingId / f9 paymentCurrency 入队时未持久化、客户端展示不读 →
+    填 0；f11-f14 官服遥测字段填空值。queueNumber>10000000 客户端显示
+    "unassigned"（我们 plentiful 合成值不入 war_supply_queue，不受影响）。"""
+    ts = int(qrow.get('created_at') or 0) or int(time.time() * 1000)
+    m = b''
+    m += pb_int64(1, int(qrow['id']))                       # id
+    m += pb_int64(2, int(at.get('owner_player_id') or 0))   # playerId
+    m += pb_int64(3, int(qrow['command_node_id']))          # commandNodeWarInstanceId
+    m += pb_int64(4, int(qrow['category_id']))              # armyResourceCategoryId
+    m += pb_int64(5, int(qrow.get('war_id') or war_id or 0))
+    m += pb_int64(6, int(qrow['faction']))                  # factionId
+    m += pb_int64(7, ts)                                    # timestamp
+    m += pb_int64(8, 0)                                     # pricingId
+    m += pb_int32(9, 0)                                     # paymentCurrency (enum)
+    m += pb_int32(10, int(qrow['queue_number']))            # queueNumber
+    m += pb_int64(11, 0)                                    # nearCapitalBattlefieldId
+    m += pb_int64(12, 0)                                    # playerSessionId
+    m += pb_string(13, '')                                  # deviceId
+    m += pb_string(14, '')                                  # metricsUid
+    m += pb_int32(17, int(qrow.get('count') or 0))          # resourcesNeeded
+    return m
+
+
+def msg_supply_queue_ticket_row(qrow, at, place):
+    """CommandNodeSupplyQueueItemTicket 行（队列位次凭证；增援队列窗口
+    onTicketUpdated/updateQueueData 用 queueNumber - supplyQueueHead 显示
+    "排队第 N 位"，DELETE → 关窗；§10.2 #3 lnTicket）。
+
+    REQUIRED f1 id / f2 playerId / f3 warId / f4 factionId / f7 timestamp /
+    f8 queueNumber / f9 queuePlace（f5/f6 无 descriptor 跳过，实锤 schema）。
+    ticket id 复用队列行 id（两表键空间独立，出队 DELETE 同 id 推两张表）。"""
+    ts = int(qrow.get('created_at') or 0) or int(time.time() * 1000)
+    m = b''
+    m += pb_int64(1, int(qrow['id']))
+    m += pb_int64(2, int(at.get('owner_player_id') or 0))
+    m += pb_int64(3, int(qrow.get('war_id') or 0))
+    m += pb_int64(4, int(qrow['faction']))
+    m += pb_int64(7, ts)
+    m += pb_int32(8, int(qrow['queue_number']))
+    m += pb_int32(9, int(place))                            # queuePlace（1 起）
+    return m
+
+
+async def supply_queue_table_rows(store, war=None):
+    """AT 级补给队列全量行 (item_rows, ticket_rows)：subscriberesourceview
+    订阅快照 / 入队重推共用。queuePlace=阵营 FIFO 位次（1 起）。
+    DB 不可用/无战争回 ([], [])。"""
+    try:
+        if store is None or getattr(store, 'pool', None) is None:
+            return [], []
+        if war is None:
+            war = await ensure_war(store)
+        if war is None:
+            return [], []
+        rows = await store.list_war_supply_queue(war['id'])
+        items, tickets = [], []
+        at_cache = {}
+        places = {}                     # faction → 已序位次
+        for q in rows:                  # list 按 faction, queue_number FIFO 序
+            nid = int(q['command_node_id'])
+            at = at_cache.get(nid)
+            if at is None:
+                at = await store.get_command_node(nid) or {}
+                at_cache[nid] = at
+            fac = int(q['faction'])
+            places[fac] = places.get(fac, 0) + 1
+            items.append(msg_supply_queue_item_row(q, at, war['id']))
+            tickets.append(msg_supply_queue_ticket_row(q, at, places[fac]))
+        return items, tickets
+    except Exception as e:
+        log(f'[war] supply_queue_table_rows failed: {e}')
+        return [], []
+
+
+async def push_supply_queue_rows(store, war=None):
+    """AT 级补给队列行重推到 resourceview 订阅会话（item+ticket 全量 set）。
+    入队后调用（226 触发的 RESOURCE_VIEW 订阅在响应之后才发生，新订阅者
+    由 views.handle_subscribe 快照覆盖；此处覆盖已订阅会话）。"""
+    from state import FLASH_SESSIONS
+    from messages import _push_kvcs
+    items, tickets = await supply_queue_table_rows(store, war)
+    if not items:
+        return
+    for sess in list(FLASH_SESSIONS.values()):
+        cmd = getattr(sess, 'resource_view_cmd', None)
+        w = getattr(sess, 'writer', None)
+        if not cmd or not w:
+            continue
+        try:
+            for row in items:
+                await _push_kvcs(w, cmd, b'CommandNodeSupplyQueueItem', row)
+            for row in tickets:
+                await _push_kvcs(w, cmd,
+                                 b'CommandNodeSupplyQueueItemTicket', row)
+        except Exception:
+            pass                # 单会话故障不影响其他订阅者
+
+
+def _at_add_resources(at, cat, need):
+    """AT 现有 resources（str 键）+ 交付补编 → 新 resources dict（str 键，
+    update_command_node JSON 序列化用）。"""
+    res = {str(k): int(v) for k, v in _as_resources(at.get('resources')).items()}
+    res[str(cat)] = int(res.get(str(cat), 0)) + int(need)
+    return res

@@ -79,6 +79,13 @@ class FakeStore:
     async def init_war_cities(self, war_id, owner_map):
         self.city_owners[war_id] = dict(owner_map)
 
+    async def init_war_faction_resources(self, war_id, initial):
+        self.stock = getattr(self, 'stock', {})
+        self.stock.setdefault(int(war_id), {})
+
+    async def list_active_movements(self, war_id):
+        return []
+
     async def get_war_cities(self, war_id):
         return sorted(self.city_owners.get(war_id, {}).items())
 

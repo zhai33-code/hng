@@ -28,6 +28,7 @@ import time
 import zlib
 
 import matchmaking
+import war_campaign
 from protocol import (
     build_response,
     pb_bool,
@@ -1372,7 +1373,30 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
             await _finish_mission_sessions(mission_id, report_id, earned_chars)
         except Exception as e:
             log(f'      [combat] finish mission sessions failed: {e}')
+        await _settle_war_mission(mission_id, report)
         matchmaking.release_match(mission_id)
+
+
+async def _settle_war_mission(mission_id, report):
+    """war 会战局（det.battle_id>0）结算回写（M2-4，协议 §8.3-4）。
+
+    非 war 局无操作。胜负取 BattleReport f3 winnerFactionId（0 = 守方
+    守住：攻方未能占领）。必须在 release_match 之前（det 尚未清理）。
+    """
+    det = matchmaking._MM_MISSION_DETAILS.get(int(mission_id)) or {}
+    battle_id = int(det.get('battle_id') or 0)
+    if not battle_id:
+        return
+    winner = int((report or {}).get('winner_faction_id') or 0)
+    if not winner:
+        winner = int(det.get('defender_faction') or 0)
+    try:
+        events = await war_campaign.settle_war_battle(
+            STORE, int(mission_id), battle_id, winner)
+        await war_campaign.broadcast_war_events(events)
+    except Exception as e:
+        log(f'      [war] settle battle {battle_id} (mission={mission_id}) '
+            f'failed: {e}')
 
 
 # ---------------------------------------------------------------- 战局结束收尾

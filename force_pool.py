@@ -126,6 +126,10 @@ _FALLBACK_COMP = {
 }
 
 
+# commandnodetemplate 模板 id → AT 名（war 会战按 AT 实例 template_id 查编制）
+_TEMPLATE_NAMES = {}
+
+
 def _load_at_compositions():
     """解析 AT 编制表 → {AT 名: {资源类别id: count}}（取单一阵营，编制同构）。
 
@@ -145,6 +149,7 @@ def _load_at_compositions():
     except Exception as e:
         log(f'[force_pool] commandnodetemplate parse failed: {e}')
         return {}
+    _TEMPLATE_NAMES.update({nid: nm for nid, (nm, _fac) in names.items()})
     by_name = {}   # name -> {faction: {cat: count}}
     try:
         for r in _parse_wardb_table(
@@ -169,6 +174,19 @@ _AT_COMP = _load_at_compositions() or dict(_FALLBACK_COMP)
 _missing = [n for fam in AT_FAMILIES.values() for n in fam if n not in _AT_COMP]
 if _missing:
     log(f'[force_pool] WARNING: AT missing in WarDatabase: {_missing}')
+
+
+def template_name(template_id):
+    """commandnodetemplate 模板 id → AT 兵种名（未知返回 None）。"""
+    return _TEMPLATE_NAMES.get(int(template_id or 0))
+
+
+def composition_for_template(template_id):
+    """commandnodetemplate 模板 id → 编制 {资源类别id: count}（未知返回 None）。"""
+    nm = _TEMPLATE_NAMES.get(int(template_id or 0))
+    if nm is None or nm not in _AT_COMP:
+        return None
+    return dict(_AT_COMP[nm])
 
 
 # ---------------------------------------------------------------- 抽取
@@ -236,6 +254,42 @@ def init_mission(mission_id, gamemode_id, attacker, defender):
     }
     log(f'[force_pool] mission={mission_id} mode={mode_name} '
         f'ATs[{len(names)}]={",".join(names)} pool={counts}')
+    return True
+
+
+def init_mission_war(mission_id, attacker, defender, comps_by_faction,
+                     names_by_faction):
+    """war 会战建池（M2）：兵力 = 双方实际参战 AT 编制之和（官方口径：
+    战争局兵力 = 将军部署的 AT 之和，攻守各自独立、不镜像）。
+
+    comps_by_faction: {faction: [{资源类别id: count}, ...]} 每 AT 一份编制
+    names_by_faction: {faction: [AT 兵种名, ...]}（f4 渲染按阵营翻译）
+    'names' 存攻方名单（assign_lines 攻方分线兼容：分线池合计=攻方主池）。
+    """
+    pools = {}
+    for fac, comps in (comps_by_faction or {}).items():
+        counts = {}
+        for comp in (comps or []):
+            for cat, cnt in comp.items():
+                counts[int(cat)] = counts.get(int(cat), 0) + int(cnt)
+        pools[int(fac)] = counts
+    names_by_faction = {int(f): [str(n) for n in (v or [])]
+                        for f, v in (names_by_faction or {}).items()}
+    _MISSIONS[int(mission_id)] = {
+        'mode': 'war',
+        'names': list(names_by_faction.get(int(attacker)) or []),
+        'names_by_faction': names_by_faction,
+        'attacker': int(attacker), 'defender': int(defender),
+        'pool': pools,
+        'lines': None, 'line_pool': None, 'ap_line': {},
+    }
+    log(f'[force_pool] mission={mission_id} mode=war (battle ATs) '
+        f'atk ATs[{len(names_by_faction.get(int(attacker)) or [])}]='
+        f'{",".join(names_by_faction.get(int(attacker)) or [])} '
+        f'pool={pools.get(int(attacker))} | dfd ATs['
+        f'{len(names_by_faction.get(int(defender)) or [])}]='
+        f'{",".join(names_by_faction.get(int(defender)) or [])} '
+        f'pool={pools.get(int(defender))}')
     return True
 
 
@@ -348,7 +402,14 @@ def release(mission_id):
     _MISSIONS.pop(int(mission_id or 0), None)
 
 
-def assault_team_names(mission_id):
-    """本局抽中的 AT 名单（f4 渲染按阵营查 commandnodetemplate 翻译）。"""
+def assault_team_names(mission_id, faction=None):
+    """本局 AT 名单（f4 渲染按阵营查 commandnodetemplate 翻译）。
+
+    faction 给定且为 war 局（names_by_faction）→ 该阵营名单（攻守独立）；
+    否则镜像名单（staged 双侧同编制）。"""
     rec = _MISSIONS.get(int(mission_id or 0))
-    return list(rec['names']) if rec else None
+    if rec is None:
+        return None
+    if faction is not None and rec.get('names_by_faction'):
+        return list(rec['names_by_faction'].get(int(faction)) or [])
+    return list(rec['names']) if rec.get('names') else None

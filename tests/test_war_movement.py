@@ -11,6 +11,8 @@
      到达落位（城市 type1 / 出兵点 type2）、会战成局（新建 + 加入既有）
   E. transport_commandnode_segment / destination 行字段
   F. war_tick 冒烟（advance + broadcast 接线）
+  G. M3-3：fow 网格参数（war f19-21 ← mm_config）+ 空运
+     （start_air_transport 消耗 cat10 / air 段 / 到达落位成局 / 快照行）
 
 合成拓扑（monkeypatch wardb 三表 + 重置 war_campaign 缓存）：
   城市 10(0,0) --sl101-- 城市 20(300,400) --sl102-- 城市 30(600,800)
@@ -69,6 +71,7 @@ wardb.battlefields = lambda: list(_SYN_BFS)
 wardb.capitals = lambda: []
 wardb.commandnode_templates = lambda: {}
 wardb.morale_template = lambda: None
+wardb.armyresource_production = lambda: []   # 禁用 M3 种子库存（合成环境）
 war_campaign._ADJACENCY_CACHE = None
 war_campaign._BF_POS_CACHE = None
 
@@ -113,6 +116,28 @@ class FakeStore:
 
     async def init_war_cities(self, war_id, owner_map):
         self.city_owners[war_id] = dict(owner_map)
+
+    async def init_war_faction_resources(self, war_id, initial):
+        # M3 种子库存（armyresource_production 已 patch 为 [] → no-op）
+        self.stock = getattr(self, 'stock', {})
+        self.stock.setdefault(int(war_id), {})
+
+    async def get_war_cities(self, war_id):
+        return dict(self.city_owners.get(int(war_id), {}))
+
+    async def create_mission_record(self, preset, **kw):
+        self.next_mission_id = getattr(self, 'next_mission_id', 500) + 1
+        return self.next_mission_id
+
+    async def update_war_production(self, war_id, production_ms):
+        return True
+
+    async def list_war_supply_queue(self, war_id, faction=None,
+                                    command_node_id=None):
+        return []
+
+    async def dequeue_war_supply(self, row_ids):
+        return True
 
     async def list_wars(self, limit=20):
         return [dict(w) for w in
@@ -255,10 +280,10 @@ async def main():
     check('同地目标 (None, RC_OK)', mv3 is None
           and code3 == war_campaign.RC_OK)
 
-    # 不可达 → RC_FAIL
+    # 不可达 → 7（transport 族 0=ok，失败禁回 0）
     mv4, code4 = await war_campaign.start_movement(store, b, 40, now=NOW)
-    check('不可达目标 RC_FAIL', mv4 is None
-          and code4 == war_campaign.RC_FAIL)
+    check('不可达目标 7', mv4 is None
+          and code4 == war_campaign.RC_CANNOT_FIND_COMMANDNODE)
 
     # override_move → 全 0 时长
     mv5, code5 = await war_campaign.start_movement(
@@ -426,6 +451,117 @@ async def main():
               f'{len(broadcast_calls)} calls')
     finally:
         war_campaign.broadcast_war_events = _orig_bcast
+
+    # ---- G. M3-3：fow 参数 + 空运 ----
+    # G1 fow 网格参数：war f19-21 ← mm_config（非 0 激活客户端 FogOfWarLayer）
+    _fow_bak = (mm_config.WAR_FOW_GRID_SIZE, mm_config.WAR_FOW_GRID_ORIGIN_X,
+                mm_config.WAR_FOW_GRID_ORIGIN_Y)
+    try:
+        mm_config.WAR_FOW_GRID_SIZE = 512
+        mm_config.WAR_FOW_GRID_ORIGIN_X = 2048
+        mm_config.WAR_FOW_GRID_ORIGIN_Y = 1024
+        war_row = pb_parse(war_campaign.build_war_proto(war))
+        check('war f19-21 ← mm_config fow 参数',
+              int(war_row[19]) == 512 and int(war_row[20]) == 2048
+              and int(war_row[21]) == 1024,
+              f'{int(war_row[19])},{int(war_row[20])},{int(war_row[21])}')
+    finally:
+        (mm_config.WAR_FOW_GRID_SIZE, mm_config.WAR_FOW_GRID_ORIGIN_X,
+         mm_config.WAR_FOW_GRID_ORIGIN_Y) = _fow_bak
+    war_row0 = pb_parse(war_campaign.build_war_proto(war))
+    check('war f19-21 还原后回默认',
+          int(war_row0[19]) == _fow_bak[0] and int(war_row0[20]) == _fow_bak[1]
+          and int(war_row0[21]) == _fow_bak[2])
+
+    store6 = FakeStore()
+    war6 = await war_campaign.ensure_war(store6)
+    plane = _mk_at(store6, war6['id'], 61, 1, 10)
+    plane['resources'] = {'10': 2}                 # 2 架运输机
+    enemy = _mk_at(store6, war6['id'], 62, 2, 40)  # 敌 AT 驻孤城 40（空运目标）
+
+    # G2 无运输机 → 拒绝（7）
+    noplane = _mk_at(store6, war6['id'], 63, 1, 20)
+    amv, acode = await war_campaign.start_air_transport(store6, noplane, 40,
+                                                        now=NOW)
+    check('空运 无运输机 → 7', amv is None
+          and acode == war_campaign.RC_CANNOT_FIND_COMMANDNODE)
+
+    # G4 同城/无效目标 → 7
+    amv4, acode4 = await war_campaign.start_air_transport(store6, plane, 10,
+                                                          now=NOW)
+    amv0, acode0 = await war_campaign.start_air_transport(store6, plane, 0,
+                                                          now=NOW)
+    check('空运 同城/无效目标 → 7', amv4 is None and acode4 == 7
+          and amv0 is None and acode0 == 7)
+
+    # G3 携运输机 → 单段 air 移动（消耗 1 架 + state=1 + map_entity 不变）
+    amv3, acode3 = await war_campaign.start_air_transport(store6, plane, 40,
+                                                          now=NOW)
+    seg0 = amv3['path'][0] if amv3 else {}
+    air_sec = max(1, int(mm_config.WAR_AIR_TRANSIT_SECONDS or 600))
+    check('空运 成功 RC_OK + 单段 air',
+          acode3 == war_campaign.RC_OK and amv3
+          and len(amv3['path']) == 1 and seg0.get('air') is True
+          and seg0['from_bf'] == 10 and seg0['to_bf'] == 40
+          and seg0['sl_id'] == 0,
+          f"path={amv3['path'] if amv3 else None}")
+    check('空运 段时长 = WAR_AIR_TRANSIT_SECONDS',
+          abs(float(seg0.get('seconds') or 0) - air_sec) < 1e-6
+          and abs((amv3['arrive_at'] - NOW).total_seconds() - air_sec) < 1e-6)
+    p61 = store6.ats[61]
+    check('空运 消耗 1 架运输机 + state=1 + 出发城市不变',
+          p61['resources'] == {'10': 1} and p61['state'] == 1
+          and p61['map_entity_id'] == 10
+          and p61['map_entity_type']
+          == war_campaign.MAP_ENTITY_BATTLEFIELD)
+
+    # G5 air_transport 行字段（§3.14）
+    aseg = war_campaign.movement_segments(amv3)[0]
+    arow = pb_parse(war_campaign.msg_air_transport_row(
+        p61, war6['id'], amv3, aseg))
+    check('air_transport 行 f1-f9',
+          int(arow[1]) == amv3['id'] and int(arow[2]) == 61
+          and int(arow[3]) == 10 and int(arow[4]) == 1
+          and int(arow[5]) == 40 and int(arow[6]) == 1
+          and int(arow[9]) == war6['id'],
+          f'{dict(sorted(arow.items()))}')
+
+    # G7 在途未到 → 无事件（不换段）
+    ev_air_mid = await war_campaign.advance_movements(
+        store6, war6, now=NOW + datetime.timedelta(seconds=air_sec / 2))
+    check('空运在途 无换段事件', ev_air_mid == [])
+
+    # G6 到达 → 落位孤城 40 + del air_transport + 会战成局（敌 AT 驻 40）
+    ev_air = await war_campaign.advance_movements(
+        store6, war6,
+        now=NOW + datetime.timedelta(seconds=air_sec + 5))
+    tags_air = {(k, tag) for k, tag, _ in ev_air}
+    check('空运到达 del segment/air_transport + instance + battle',
+          ('del', b'transport_commandnode_segment') in tags_air
+          and ('del', b'air_transport') in tags_air
+          and ('set', b'CommandNodeWarInstance') in tags_air
+          and ('set', b'battle') in tags_air,
+          f'{sorted(tags_air)}')
+    check('空运落位城市 40 type=1 + 会战双方 state=2',
+          p61['map_entity_id'] == 40 and p61['state'] == 2
+          and store6.ats[62]['state'] == 2
+          and store6.movements[amv3['id']]['state'] == 1)
+
+    # G8 快照：无在途空运时无 air_transport 行
+    store7 = FakeStore()
+    war7 = await war_campaign.ensure_war(store7)
+    snap = await war_campaign.build_warmap_snapshot(store7, war7)
+    check('快照 无在途空运 → 无 air_transport 行',
+          all(tag != b'air_transport' for tag, _ in snap))
+    flier = _mk_at(store7, war7['id'], 71, 1, 20)
+    flier['resources'] = {'10': 1}
+    _famv, facode = await war_campaign.start_air_transport(store7, flier, 10,
+                                                           now=NOW)
+    snap2 = await war_campaign.build_warmap_snapshot(store7, war7)
+    frow = pb_parse(next(p for tag, p in snap2 if tag == b'air_transport'))
+    check('快照 在途空运 → air_transport 行（f2 instance/f5 to）',
+          facode == war_campaign.RC_OK
+          and int(frow[2]) == 71 and int(frow[5]) == 10)
 
     fails = [l for l, ok in RESULTS if not ok]
     print(f'\n{"="*50}\nwar_movement 回归：{len(RESULTS)-len(fails)}/{len(RESULTS)} PASS')

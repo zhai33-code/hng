@@ -61,6 +61,7 @@
 import asyncio
 import time
 
+import mm_config
 from protocol import (
     build_response,
     pb_bool,
@@ -92,7 +93,18 @@ IGN_ALREADY = 1
 IGN_NOT_CURRENTLY = 2
 IGN_FAIL = 3
 
-_WAR_NAME = 'Demo War'
+async def _current_war_name():
+    """当前战争名：wars 表动态名优先（与战争目录/登录 war KVCS 同源），
+    DB 不可用/无战争回退 mm_config.WAR_NAME。
+    （此前硬编码 'Demo War'，好友列表/玩家搜索 warName 与实际战争名不一致。）"""
+    if STORE is not None:
+        try:
+            war = await STORE.get_active_war()
+            if war is not None and war.get('name'):
+                return war['name']
+        except Exception as e:
+            log(f'      [DB] get_active_war failed: {e}')
+    return mm_config.WAR_NAME
 
 
 def _str(v):
@@ -115,6 +127,7 @@ async def push_friend_rows(sess, writer, pid):
     except Exception as e:
         log(f'      [DB] list_friend_rows failed: {e}')
         return
+    war_name = await _current_war_name()
     for r in rows:
         online = FLASH_SESSIONS.get(r['gamertag']) is not None
         m = pb_int64(1, r['id'])                     # id
@@ -128,7 +141,7 @@ async def push_friend_rows(sess, writer, pid):
         # 客户端邀请好友（小队/战斗）前本地校验 friend.warId == currentWar.id，
         # 不一致直接提示"不在同一服务器"（此前用 matchmaking._WAR_ID 随机大数）
         m += pb_int64(8, 1)                          # warId
-        m += pb_string(9, _WAR_NAME)                 # warName
+        m += pb_string(9, war_name)                  # warName
         m += pb_bool(10, r['also_friend'])           # otherPlayerAlsoFriend
         m += pb_bool(11, r['initiated_by_me'])       # friendshipInitiatedByMe
         m += pb_int64(12, 0)                         # squadSessionId
@@ -254,7 +267,7 @@ async def handle_search_player_detail(sess, writer, cmd_id, req_type, proto):
         resp_proto += pb_int64(2, target['id'])
         resp_proto += pb_string(3, target['username'])
         resp_proto += pb_int64(4, faction)
-        resp_proto += pb_string(5, _WAR_NAME)
+        resp_proto += pb_string(5, await _current_war_name())
     else:
         # 未找到：response=64；required 字段仍需给出（客户端先判 response）
         resp_proto = pb_int32(1, RC_PLAYER_NOT_FOUND)

@@ -613,6 +613,7 @@ ALTER TABLE mission_records ADD COLUMN IF NOT EXISTS attacker_faction BIGINT NOT
 ALTER TABLE mission_records ADD COLUMN IF NOT EXISTS defender_faction BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE mission_records ADD COLUMN IF NOT EXISTS owner_player_id BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE mission_records ADD COLUMN IF NOT EXISTS map_entity_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE mission_records ADD COLUMN IF NOT EXISTS battle_id BIGINT NOT NULL DEFAULT 0;
 
 -- ===== U5 迁移（经济/小队/军团域）=====
 -- 会员（AddMembershipRequest 购买，PlayerMembershipItem 源）
@@ -723,6 +724,9 @@ ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS map_entity_id BIGINT NOT NULL
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS map_entity_type INT NOT NULL DEFAULT 0;
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS general_character_id BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS is_deployed BOOLEAN NOT NULL DEFAULT FALSE;
+-- 官服 suppliedOnCreation / hasGotten*ForFree：买壳为空编，首次增援免费补齐
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS has_gotten_soldier_free BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS has_gotten_vehicle_free BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 CREATE INDEX IF NOT EXISTS idx_command_nodes_war ON command_nodes(war_id);
 
@@ -748,8 +752,10 @@ CREATE TABLE IF NOT EXISTS war_battles (
     factions_json JSONB NOT NULL DEFAULT '[]',      -- [{at_id, faction}]
     state INT NOT NULL DEFAULT 0,                   -- 0=active 1=ended
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    ended_at TIMESTAMPTZ
+    ended_at TIMESTAMPTZ,
+    winning_faction INT NOT NULL DEFAULT 0
 );
+ALTER TABLE wars ADD COLUMN IF NOT EXISTS production_ms BIGINT NOT NULL DEFAULT 0;
 
 -- warfunds 流水（余额仍在 players.warfunds）
 CREATE TABLE IF NOT EXISTS war_funds_ledger (
@@ -761,6 +767,29 @@ CREATE TABLE IF NOT EXISTS war_funds_ledger (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_war_funds_player ON war_funds_ledger(player_id);
+
+-- 阵营资源库存（M3 生产 tick：按 ArmyResourceProductionTemplate 初始值
+-- 开战初始化，之后周期累加；增援/部署从这里扣）
+CREATE TABLE IF NOT EXISTS war_faction_resources (
+    war_id BIGINT NOT NULL,
+    faction INT NOT NULL,                          -- 1/2/3
+    category_id INT NOT NULL,                      -- armyresourcecategory id
+    count BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (war_id, faction, category_id)
+);
+
+-- 阵营补给队列（M3 #3/#5：增援/部署库存不足入队；queue_number 单调递增，
+-- 推进到队头且库存足够时资源从阵营库存转移到 AT）
+CREATE TABLE IF NOT EXISTS war_supply_queue (
+    id BIGSERIAL PRIMARY KEY,
+    war_id BIGINT NOT NULL,
+    faction INT NOT NULL,
+    command_node_id BIGINT NOT NULL,
+    category_id INT NOT NULL,
+    count INT NOT NULL DEFAULT 0,
+    queue_number BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -2481,17 +2510,18 @@ class PlayerStore:
 
     async def create_mission_record(self, preset, attacker_faction=0,
                                     defender_faction=0, owner_player_id=0,
-                                    name='', map_entity_id=0):
-        """CreateMissionRequest 落库（state=0 组队中）。返回 mission_id。"""
+                                    name='', map_entity_id=0, battle_id=0):
+        """CreateMissionRequest / war 会战成局落库（state=0 组队中）。
+        battle_id>0 = war 会战局（M2）。返回 mission_id。"""
         async with self.pool.acquire() as conn:
             mid = await conn.fetchval(
                 'INSERT INTO mission_records (name, preset, state, '
                 'attacker_faction, defender_faction, owner_player_id, '
-                'map_entity_id) VALUES ($1, $2, 0, $3, $4, $5, $6) '
-                'RETURNING id',
+                'map_entity_id, battle_id) VALUES ($1, $2, 0, $3, $4, $5, '
+                '$6, $7) RETURNING id',
                 str(name or ''), int(preset or 0), int(attacker_faction or 0),
                 int(defender_faction or 0), int(owner_player_id or 0),
-                int(map_entity_id or 0))
+                int(map_entity_id or 0), int(battle_id or 0))
         return int(mid)
 
     async def set_mission_state(self, mission_id, state):
@@ -2520,7 +2550,7 @@ class PlayerStore:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 'SELECT id, name, preset, state, attacker_faction, '
-                'defender_faction, owner_player_id, map_entity_id '
+                'defender_faction, owner_player_id, map_entity_id, battle_id '
                 'FROM mission_records WHERE state = ANY($1::int[]) '
                 'ORDER BY id DESC LIMIT $2', [int(s) for s in states],
                 int(limit))
@@ -2531,8 +2561,21 @@ class PlayerStore:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 'SELECT id, name, preset, state, attacker_faction, '
-                'defender_faction, owner_player_id, map_entity_id '
+                'defender_faction, owner_player_id, map_entity_id, battle_id '
                 'FROM mission_records WHERE id = $1', int(mission_id))
+        return dict(row) if row else None
+
+    async def get_mission_by_battle(self, battle_id, states=(0, 1)):
+        """按 war battle 查活任务记录（M2：撮合/automission 判定）。
+
+        返回最新一条或 None。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT id, name, preset, state, attacker_faction, '
+                'defender_faction, owner_player_id, map_entity_id, battle_id '
+                'FROM mission_records WHERE battle_id = $1 '
+                'AND state = ANY($2::int[]) ORDER BY id DESC LIMIT 1',
+                int(battle_id), [int(s) for s in states])
         return dict(row) if row else None
 
     # ------------------------------------------------------------- 经济道具（U5）
@@ -3843,15 +3886,28 @@ class PlayerStore:
 
     _WAR_COLUMNS = ('id, name, begintime, endtime, winning_faction_id, '
                     'points_needed_for_victory, sequel_war_id, mapid, state, '
-                    'config_json')
+                    'config_json, production_ms')
 
     @staticmethod
     def _war_row(row):
         if row is None:
             return None
         d = dict(row)
-        d['config'] = d.pop('config_json') or {}
+        cfg = d.pop('config_json')
+        if isinstance(cfg, (str, bytes)):
+            # asyncpg 无 codec 时 JSONB 返回 str（2026-09-03 VPS 实锤：
+            # build_war_proto 拿到 str 直接 AttributeError，登录卡死）
+            try:
+                cfg = json.loads(cfg) if cfg else {}
+            except ValueError:
+                cfg = {}
+        d['config'] = cfg or {}
         return d
+
+    async def war_count(self):
+        """历史战争总数（wars 只增不删，count 即战争轮次；_next_war_name 用）。"""
+        async with self.pool.acquire() as conn:
+            return int(await conn.fetchval('SELECT count(*) FROM wars'))
 
     async def create_war(self, name, points_needed_for_victory=15, mapid=1,
                          config=None):
@@ -3992,13 +4048,25 @@ class PlayerStore:
                 'ORDER BY id', int(war_id))
         return [dict(r) for r in rows]
 
+    async def get_command_nodes_by_ids(self, node_ids):
+        """按 id 集合查 AT（M2 会战兵力聚合：war_battles.factions_json）。"""
+        ids = [int(i) for i in (node_ids or []) if int(i)]
+        if not ids:
+            return []
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT * FROM command_nodes WHERE id = ANY($1::bigint[]) '
+                'ORDER BY id', ids)
+        return [dict(r) for r in rows]
+
     async def update_command_node(self, node_id, **fields):
         """AT 字段更新（name/rank/xp/resources/morale/state/map_entity_id/
         map_entity_type/general_character_id/is_deployed/abbreviation）。返回是否更新。"""
         allowed = {'name', 'abbreviation', 'rank', 'xp', 'resources', 'morale',
                    'max_morale', 'state', 'map_entity_id', 'map_entity_type',
                    'general_character_id', 'is_deployed', 'upgrade_level',
-                   'owner_player_id', 'faction', 'template_id'}
+                   'owner_player_id', 'faction', 'template_id',
+                   'has_gotten_soldier_free', 'has_gotten_vehicle_free'}
         import json as _json
         sets, args = [], []
         for k, v in fields.items():
@@ -4094,7 +4162,7 @@ class PlayerStore:
             row = await conn.fetchrow(
                 'INSERT INTO war_battles (war_id, battlefield_id, factions_json) '
                 'VALUES ($1, $2, $3) RETURNING id, war_id, battlefield_id, '
-                'factions_json, state, started_at, ended_at',
+                'factions_json, state, winning_faction, started_at, ended_at',
                 int(war_id), int(battlefield_id),
                 _json.dumps(list(factions or [])))
         if not row:
@@ -4108,8 +4176,8 @@ class PlayerStore:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 'SELECT id, war_id, battlefield_id, factions_json, state, '
-                'started_at, ended_at FROM war_battles WHERE war_id = $1 '
-                'AND state = 0 ORDER BY id', int(war_id))
+                'winning_faction, started_at, ended_at FROM war_battles '
+                'WHERE war_id = $1 AND state = 0 ORDER BY id', int(war_id))
         out = []
         for r in rows:
             d = dict(r)
@@ -4117,11 +4185,27 @@ class PlayerStore:
             out.append(d)
         return out
 
+    async def get_war_battle(self, battle_id):
+        """单查会战（含已结束）；无则 None。"""
+        import json as _j
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT id, war_id, battlefield_id, factions_json, state, '
+                'winning_faction, started_at, ended_at FROM war_battles '
+                'WHERE id = $1', int(battle_id))
+        if not row:
+            return None
+        d = dict(row)
+        d['factions'] = _j.loads(d.pop('factions_json') or '[]')
+        return d
+
     async def end_war_battle(self, battle_id, winning_faction=0):
+        """会战结束（state=1，M2：写入胜方阵营）。"""
         async with self.pool.acquire() as conn:
             n = await conn.execute(
-                'UPDATE war_battles SET state = 1, ended_at = now() '
-                'WHERE id = $1 AND state = 0', int(battle_id))
+                'UPDATE war_battles SET state = 1, ended_at = now(), '
+                'winning_faction = $2 WHERE id = $1 AND state = 0',
+                int(battle_id), int(winning_faction))
         return _rowcount(n) > 0
 
     # ---- warfunds 流水 ----
@@ -4143,3 +4227,117 @@ class PlayerStore:
                     int(player_id), int(amount), str(reason or ''),
                     int(balance))
         return balance
+
+    # ---- war_faction_resources（M3 阵营资源库存）----
+
+    async def init_war_faction_resources(self, war_id, initial):
+        """幂等初始化阵营库存。initial={faction: {category_id: count}}；
+        已有行不覆盖（ON CONFLICT DO NOTHING）。"""
+        rows = []
+        for fid, cats in (initial or {}).items():
+            for cat, cnt in cats.items():
+                if cnt:
+                    rows.append((int(war_id), int(fid), int(cat), int(cnt)))
+        if not rows:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.executemany(
+                'INSERT INTO war_faction_resources '
+                '(war_id, faction, category_id, count) '
+                'VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING', rows)
+
+    async def list_war_faction_resources(self, war_id, faction=None):
+        """阵营库存行。faction=None 时全阵营。"""
+        sql = ('SELECT war_id, faction, category_id, count '
+               'FROM war_faction_resources WHERE war_id = $1')
+        args = [int(war_id)]
+        if faction is not None:
+            sql += ' AND faction = $2'
+            args.append(int(faction))
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql + ' ORDER BY faction, category_id', *args)
+        return [dict(r) for r in rows]
+
+    async def adjust_war_faction_resources(self, war_id, faction, deltas):
+        """按类别批量增减库存（delta 可负，clamp 到 0）。返回更新后行。"""
+        if not deltas:
+            return []
+        sets = sorted((int(cat), int(d)) for cat, d in deltas.items() if d)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                for cat, d in sets:
+                    await conn.execute(
+                        'INSERT INTO war_faction_resources '
+                        '(war_id, faction, category_id, count) '
+                        'VALUES ($1, $2, $3, GREATEST($4, 0)) '
+                        'ON CONFLICT (war_id, faction, category_id) DO UPDATE '
+                        'SET count = GREATEST(war_faction_resources.count + $4, 0)',
+                        int(war_id), int(faction), cat, d)
+            rows = await conn.fetch(
+                'SELECT war_id, faction, category_id, count '
+                'FROM war_faction_resources WHERE war_id = $1 AND faction = $2 '
+                'ORDER BY category_id', int(war_id), int(faction))
+        return [dict(r) for r in rows]
+
+    async def update_war_production(self, war_id, production_ms):
+        """推进生产游标（M3 tick）。"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE wars SET production_ms = $2 WHERE id = $1',
+                int(war_id), int(production_ms))
+
+    # ---- war_supply_queue（M3-2 阵营资源增援队列）----
+
+    async def enqueue_war_supply(self, war_id, faction, command_node_id,
+                                 items):
+        """AT 增援缺口入队（FIFO）：items={category_id: count}，逐行写
+        queue_number = 阵营内 COALESCE(MAX,0)+1 单调分配。返回入队行数。"""
+        rows = [(int(war_id), int(faction), int(command_node_id),
+                 int(cat), int(cnt)) for cat, cnt in (items or {}).items()
+                if int(cnt) > 0]
+        if not rows:
+            return 0
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                for wid, fac, cnid, cat, cnt in rows:
+                    await conn.execute(
+                        'INSERT INTO war_supply_queue '
+                        '(war_id, faction, command_node_id, category_id, '
+                        'count, queue_number) VALUES '
+                        '($1, $2, $3, $4, $5, COALESCE('
+                        '(SELECT MAX(queue_number) FROM war_supply_queue '
+                        ' WHERE war_id = $1 AND faction = $2), 0) + 1)',
+                        wid, fac, cnid, cat, cnt)
+        return len(rows)
+
+    async def list_war_supply_queue(self, war_id, faction=None,
+                                    command_node_id=None):
+        """队列行（FIFO 序：faction, queue_number）。可按阵营/AT 过滤。"""
+        sql = ('SELECT id, war_id, faction, command_node_id, category_id, '
+               'count, queue_number, created_at '
+               'FROM war_supply_queue WHERE war_id = $1')
+        args = [int(war_id)]
+        if faction is not None:
+            sql += ' AND faction = $2'
+            args.append(int(faction))
+        if command_node_id is not None:
+            sql += f' AND command_node_id = ${len(args) + 1}'
+            args.append(int(command_node_id))
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql + ' ORDER BY faction, queue_number',
+                                    *args)
+        return [dict(r) for r in rows]
+
+    async def dequeue_war_supply(self, row_ids):
+        """按行 id 批量出队（交付/AT 歼灭解散清理）。返回删除行数。"""
+        ids = [int(i) for i in (row_ids or [])]
+        if not ids:
+            return 0
+        async with self.pool.acquire() as conn:
+            res = await conn.execute(
+                'DELETE FROM war_supply_queue WHERE id = ANY($1::bigint[])',
+                ids)
+        try:
+            return int(res.split()[-1])
+        except (ValueError, IndexError):
+            return len(ids)

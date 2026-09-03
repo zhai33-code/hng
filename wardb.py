@@ -1527,6 +1527,7 @@ def commandnode_templates():
                     'view_range': int(r.get(15, 0) or 0),
                     'general_character_template_id': int(r.get(16, 0) or 0),
                     'resources': {},
+                    'vehicle_cats': set(),
                     'characters': [],
                 }
             for r in _parse_wardb_table(
@@ -1535,6 +1536,16 @@ def commandnode_templates():
                 if tid in out:
                     cat = int(r.get(2, 0) or 0)
                     out[tid]['resources'][cat] = int(r.get(4, 0) or 0)
+                    # f5 hasVehicleData（官服实锤：客户端
+                    # AssaultTeamResources.getTemplateCounts 以此判别
+                    # 载具侧资源类别，增援缺编分侧计费依赖）
+                    hv = r.get(5, 0)
+                    if isinstance(hv, (bytes, bytearray)):
+                        is_veh = _wardb_str(hv).strip().lower() in ('true', '1')
+                    else:
+                        is_veh = bool(hv)
+                    if is_veh:
+                        out[tid]['vehicle_cats'].add(cat)
             for r in _parse_wardb_table(
                     'commandnodetemplatecharactertemplaterelation'):
                 tid = int(r.get(2, 0) or 0)

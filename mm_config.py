@@ -150,7 +150,7 @@ SIMULATE_COMBAT = bool(_int_env('MM_SIMULATE_COMBAT'))
 # /R seasonal.forceSnowEvent=1 强制开启引擎季节雪事件（渲染层功能，不走
 # 游戏协议；选项表见 docs/hng-combat-protocol.md §B.13 ZOption_Seasonal）。
 # 0=永不下雪，1=每局都下。MM_SNOW_CHANCE 环境变量覆盖，非法值回退 0.3。
-SNOW_CHANCE = _float_env('MM_SNOW_CHANCE', 1)
+SNOW_CHANCE = _float_env('MM_SNOW_CHANCE', 0.3)
 if SNOW_CHANCE is None or not 0.0 <= SNOW_CHANCE <= 1.0:
     print(f'[mm_config] WARNING: MM_SNOW_CHANCE={os.environ.get("MM_SNOW_CHANCE")!r} '
           f'not in [0,1], using 0.3')
@@ -180,3 +180,41 @@ WAR_AT_REQUIRE_COMMAND_POINTS = bool(
 WAR_AT_MOVE_SCALE = _float_env('MM_WAR_AT_MOVE_SCALE', 1.0)
 # 战争推进 tick 间隔秒（移动换段/到达判定/会战成局桩；realtest_server 挂载）
 WAR_TICK_SECONDS = _int_env('MM_WAR_TICK_SECONDS', 5)
+
+# ---- M2 战斗接入（docs/hng-rts-protocol.md §8）----
+# war 行 automission 三档（f9-f11，纯服务端参数，按秒取值）：war battle
+# 成局后无人加入超过该时长 → 服务器按双方 AT 剩余资源自动结算（§8.4）。
+WAR_AUTOMISSION_NORMAL = _int_env('MM_WAR_AUTOMISSION_NORMAL', 3600)
+WAR_AUTOMISSION_SKIRMISH = _int_env('MM_WAR_AUTOMISSION_SKIRMISH', 1800)
+WAR_AUTOMISSION_SUPPLY = _int_env('MM_WAR_AUTOMISSION_SUPPLY', 1800)
+# automission 结算损耗系数（占各 AT 当前 resources 比例；胜方轻损/负方重损）
+WAR_AUTOMISSION_WINNER_LOSS = _float_env('MM_WAR_AUTOMISSION_WINNER_LOSS', 0.25)
+WAR_AUTOMISSION_LOSER_LOSS = _float_env('MM_WAR_AUTOMISSION_LOSER_LOSS', 0.6)
+# FPS 结算士气变化（官服 moraleLostPerBattle=20 / moraleGainedPerWin=10，
+# 默认取 build_war_proto 同源 morale config 的官方值）
+WAR_MORALE_LOST_PER_BATTLE = _int_env('MM_WAR_MORALE_LOST', 20)
+WAR_MORALE_GAINED_PER_WIN = _int_env('MM_WAR_MORALE_GAINED', 10)
+# FPS 真人会战结算损耗系数（占参战 AT 当前 resources 比例；官服按局内
+# 死亡逐兵扣减，逐兵数据不可得，退化为按胜负比例扣，可校准）
+WAR_BATTLE_WINNER_LOSS = _float_env('MM_WAR_BATTLE_WINNER_LOSS', 0.15)
+WAR_BATTLE_LOSER_LOSS = _float_env('MM_WAR_BATTLE_LOSER_LOSS', 0.6)
+# 会战 warfunds（官服：AT 每参战一局发放 + 胜方加成；占点英雄收益已由
+# PlayerBattleResult f3 结算路径入账）
+WAR_WARFUNDS_PER_BATTLE = _int_env('MM_WAR_WARFUNDS_PER_BATTLE', 100)
+WAR_WARFUNDS_WIN_BONUS = _int_env('MM_WAR_WARFUNDS_WIN_BONUS', 200)
+# fow 战争迷雾网格参数（war f19-f21；发非 0 即激活客户端 FogOfWarLayer，
+# 可见性判定在客户端本地。默认 0=全图可见；官服数值失传，启用后可校准）
+WAR_FOW_GRID_SIZE = _int_env('MM_WAR_FOW_GRID_SIZE', 0)
+WAR_FOW_GRID_ORIGIN_X = _int_env('MM_WAR_FOW_GRID_ORIGIN_X', 0)
+WAR_FOW_GRID_ORIGIN_Y = _int_env('MM_WAR_FOW_GRID_ORIGIN_Y', 0)
+# 空运（§9.4）：BFS 不可达且 AT 编制含 transport_plane（cat 10）→ 空运，
+# 直达时长固定秒（官服耗时失传，可校准）
+WAR_AIR_TRANSIT_SECONDS = _int_env('MM_WAR_AIR_TRANSIT_SECONDS', 600)
+
+# ---- M3 战争经济（docs/hng-rts-protocol.md §9 / §3.12.1）----
+# 阵营资源生产推进最小间隔秒（war_tick 内检查；产量节奏由模板 600s 决定，
+# 此游标只限制 DB 写频率与行重推频率）
+WAR_PRODUCTION_MIN_TICK = _int_env('MM_WAR_PRODUCTION_MIN_TICK', 60)
+# 增援/部署受阵营库存约束时，库存可交付比例下限（0=有多少给多少，缺口入队）
+WAR_SUPPLY_INSTANT_PARTIAL = bool(
+    _int_env('MM_WAR_SUPPLY_INSTANT_PARTIAL', 1))

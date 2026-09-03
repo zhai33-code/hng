@@ -29,6 +29,7 @@ class QueueEntry:
     presets: tuple = ()          # 玩家选图（int preset id），空 = 不限
     enqueued_at: float = field(default_factory=time.monotonic)
     group_key: int = 0           # 整队入池键（=squad_id）；0 = 单人
+    battle_id: int = 0           # war 会战局 id（M2）；0 = 普通撮合
 
 
 @dataclass
@@ -37,6 +38,7 @@ class Match:
     preset_id: int
     ai_fill: bool = False        # True = 超时强制成组（AI 补位）
     mission_id: int = 0          # matchmaking 发号后回填
+    battle_id: int = 0           # war 会战局（M2）：mission_id = record id
 
 
 class MatchPool:
@@ -108,6 +110,33 @@ class MatchPool:
         for e in group:
             self.remove(e.player_id)
         return Match(players=group, preset_id=preset, ai_fill=True)
+
+    def try_form_war(self):
+        """war 会战撮合（M2，gamemode 10）：按 battle_id 分桶，桶内攻守
+        双方阵营各≥1 即成局（官服口径：交战双方都有真人排队才开局）。
+
+        入池侧（matchmaking._handle_join war 路由）已保证只有该会战
+        攻/守两阵营的玩家能入桶，桶内凑齐两阵营即可。war 局无 AI 补位
+        （gamemode 10 ai_fill_after=0，凑不齐继续等）。
+        Match.preset_id 恒 0：地图/阵营来自 mission_records 行，
+        _start_match war 分支按 battle_id 反查。
+        """
+        entries = self._by_mode.get(10, [])
+        if not entries:
+            return None
+        buckets = {}
+        for e in entries:
+            if e.battle_id:
+                buckets.setdefault(int(e.battle_id), []).append(e)
+        for battle_id, group in buckets.items():
+            factions = {int(e.faction) for e in group}
+            if len(factions) < 2:
+                continue
+            for e in group:
+                self.remove(e.player_id)
+            return Match(players=group, preset_id=0, ai_fill=False,
+                         battle_id=battle_id)
+        return None
 
     # ---- 内部 ----
     def _collect_group(self, entries, min_p, max_p):
