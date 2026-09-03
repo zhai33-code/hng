@@ -324,7 +324,7 @@ def msg_login2_challenge(salt_b64, temp_sid_b64, enc_key_b64):
 
 def msg_player(gamertag, credits=None, warfunds=None, gold=None,
                tutorials_completed=0, pid=1, faction=None, total_score=0,
-               first_action_date='', level=None):
+               first_action_date='', level=None, war=None):
     m = b''
     # 货币默认与数据库新账号默认值一致（新账号给默认货币）
     if credits is None:
@@ -347,10 +347,14 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     m += pb_uint32(7, 0)                # mousecontrolledcars
     m += pb_uint32(8, 1)                # showcrosshair
     m += pb_uint32(9, 1)                # showcrosshairVehicles
-    m += pb_int64(10, 1)                # war
+    # war（f10）：加入的战争 id。None → 1（旧 mock 回退）；0 = 无战争
+    # （客户端 PlayerModel war==0 直接 return，不进战争逻辑）
+    m += pb_int64(10, int(war) if war is not None else 1)
     # factionid：客户端阵营颜色/战场部署过滤/资源总览都读 currentPlayer.factionid，
-    # 恒发 1(US) 会让 GE/SU 玩家界面按美国阵营展示。None 时回退 1（老行为）
-    m += pb_int64(11, int(faction) if faction else 1)  # factionid (1=US 2=GE 3=USSR)
+    # None 时回退 1（老行为）；0 = 本场战争未选阵营（官服 join_war 口径）——
+    # 客户端 factionTemplateId==0 → 首页 warUpdateGreetingCallToAction CTA
+    # / 进战争图弹 FactionSelectionWindow → join_war_request 落库后重推本行
+    m += pb_int64(11, int(faction) if faction is not None else 1)  # factionid (1=US 2=GE 3=USSR)
     m += pb_string(12, '')              # subscribedupto
     # 货币：Bought/Earned/Used 三段式，余额 = Bought + Earned - Used
     m += pb_int64(13, 0)                # goldBought
@@ -400,11 +404,12 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     return m
 
 
-def msg_login2_result(username, code, pid=1, faction=None):
+def msg_login2_result(username, code, pid=1, faction=None, war=None):
     m = b''
     m += pb_string(1, username)
     m += pb_string(2, time.strftime('%Y-%m-%d %H:%M:%S'))
     m += pb_int32(3, code)
     if code == RC['login_success']:
-        m += pb_message(6, msg_player(username, pid=pid, faction=faction))
+        m += pb_message(6, msg_player(username, pid=pid, faction=faction,
+                                      war=war))
     return m

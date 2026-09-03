@@ -209,6 +209,15 @@ async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
     if STORE is None:
         return granted
 
+    # 仓库行 KVCS 推送用视图：优先 SOLDIER_VIEW；该会话尚未进过兵种
+    # 界面时（如一直在战争地图/通行证窗口买层级）为 None，回退
+    # PLAYER_VIEW（登录即订阅）。客户端 ServiceHandler.receiveChunk 对
+    # KeyValueChangeSet 一律 queueChangeset 入表，不区分到达视图，
+    # 回退推送可让奖励当场可见，而非等下次进兵种界面的全量回放
+    # （2026-09-04 tier300 手榴弹补给箱买了不显示事故）。
+    depot_view_cmd = (getattr(sess, 'soldier_view_cmd', None)
+                      or getattr(sess, 'playerview_cmd', None))
+
     delta = {}
     n_boosters = n_memberships = n_tickets = n_timed = 0
     for item in root:
@@ -277,18 +286,18 @@ async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
                 granted.append(f'uniformpart#{tid}')
             elif obj == 'tracereffecttemplate':
                 t = await STORE.create_tracer_effect(pid, tid)
-                if sess.soldier_view_cmd is not None:
+                if depot_view_cmd is not None:
                     await _push_kvcs(
-                        writer, sess.soldier_view_cmd, b'TracerEffect',
+                        writer, depot_view_cmd, b'TracerEffect',
                         _msg_tracer_effect(t['id'], tid, 0, 0, False))
                 granted.append(f'tracereffect#{tid}')
             elif obj == 'vehicleupgradetemplate':
                 u = await STORE.create_vehicle_upgrade(
                     pid, tid, 0, 0,
                     _VEHICLE_UPGRADE_MAXCOND.get(int(tid), 100.0))
-                if sess.soldier_view_cmd is not None:
+                if depot_view_cmd is not None:
                     await _push_kvcs(
-                        writer, sess.soldier_view_cmd, b'VehicleUpgrade',
+                        writer, depot_view_cmd, b'VehicleUpgrade',
                         _msg_vehicle_upgrade(u['id'], tid, 0, 0, 0,
                                              u.get('condition', 100.0)))
                 granted.append(f'vehicleupgrade#{tid}')

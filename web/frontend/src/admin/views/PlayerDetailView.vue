@@ -28,6 +28,8 @@ interface PlayerDetail {
     credits: number
     warfunds: number
     gold: number
+    total_score: number
+    level: number
     banned: boolean
     created_at: string
   }
@@ -145,6 +147,32 @@ async function onAdjustCurrency() {
   }
 }
 
+// ---- 经验调整（账号经验 totalScore → 进展 tab 等级）----
+const scoreForm = reactive({ delta: 1000 })
+
+async function onAdjustScore() {
+  const delta = Number(scoreForm.delta)
+  const cur = data.value?.player
+  try {
+    await ElMessageBox.confirm(
+      `确认对玩家 ${cur?.username} ${delta >= 0 ? '增加' : '扣减'} ` +
+      `${Math.abs(delta)} 经验？（当前 ${fmtNum(cur?.total_score ?? 0)} 分，` +
+      `等级 Lv.${cur?.level ?? 0}；奖励弹窗将在玩家下次登录/战局结算时补发）`,
+      '调整经验', { type: 'warning' })
+  } catch {
+    return
+  }
+  try {
+    const r = await post<{ ok: boolean; total_score: number; level: number }>(
+      `/players/${playerId.value}/score`, { delta },
+    )
+    ElMessage.success(`已调整，当前经验 ${fmtNum(r.total_score)}，等级 Lv.${r.level}`)
+    load()
+  } catch (e: unknown) {
+    ElMessage.error((e as Error).message || '操作失败')
+  }
+}
+
 // ---- 封禁 ----
 async function onToggleBan() {
   const banned = !data.value?.player.banned
@@ -186,6 +214,14 @@ async function onToggleBan() {
           <div class="value num" :class="{ long: data.player.gold >= 10_000_000 }">{{ fmtNum(data.player.gold) }}</div>
         </div>
         <div class="stat">
+          <div class="label">账号等级</div>
+          <div class="value num">Lv.{{ data.player.level }}</div>
+        </div>
+        <div class="stat">
+          <div class="label">账号经验</div>
+          <div class="value num" :class="{ long: data.player.total_score >= 10_000_000 }">{{ fmtNum(data.player.total_score) }}</div>
+        </div>
+        <div class="stat">
           <div class="label">账号状态</div>
           <div class="value" style="font-size: 19px">
             <el-tag :type="data.player.banned ? 'danger' : 'success'">
@@ -210,6 +246,8 @@ async function onToggleBan() {
           </el-select>
           <el-input-number v-model="currencyForm.delta" :step="100" />
           <el-button type="primary" @click="onAdjustCurrency">调整货币</el-button>
+          <el-input-number v-model="scoreForm.delta" :step="100" />
+          <el-button type="primary" @click="onAdjustScore">调整经验</el-button>
           <el-button :type="data.player.banned ? 'success' : 'danger'" @click="onToggleBan">
             {{ data.player.banned ? '解除封禁' : '封禁账号' }}
           </el-button>

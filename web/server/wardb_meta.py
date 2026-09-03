@@ -13,6 +13,7 @@ from .templates_data import (
     MISSION_MODE_NAMES,
     MISSION_PRESETS,
     MODIFIERS,
+    PLAYER_LEVELS,
     RANK_THRESHOLDS,
     RIBBONS,
     RIBBON_KIND,
@@ -39,6 +40,16 @@ def rank_from_xp(xp: int) -> int:
         else:
             break
     return rank
+
+
+def player_level_from_score(score: int) -> int:
+    """账号等级（进展 tab）= totalScore 经 PlayerLevel 阈值取最大等级
+    （与游戏服 wardb.player_level_from_score / 客户端 PlayerSchema 同款算法）。"""
+    lvl = 0
+    for lv, threshold in PLAYER_LEVELS:
+        if int(score) >= threshold and lv > lvl:
+            lvl = lv
+    return lvl
 
 
 def weapon_name(template_id: int) -> str:

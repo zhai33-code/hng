@@ -11,7 +11,7 @@ from protocol import (
     Chunk,
     pb_string, pb_int32, pb_int64, pb_uint32, pb_float, pb_message, pb_packed_bool,
 )
-from state import CURRENT_PID
+from state import CURRENT_PID, log
 from wardb import _prog_max, _AMMO_MAXCOND, _RIBBON_LEVEL_XP, _ribbon_level_from_xp
 
 
@@ -175,6 +175,8 @@ async def _push_kvcs(writer, view_cmd, table_name, proto_data):
     main = Chunk(struct.pack('<i', view_cmd), [title_chunk])
     writer.write(main.write(b''))
     await writer.drain()
+    log(f'      [kvcs] set {table_name.decode()} via cmd={view_cmd} '
+        f'{len(proto_data)}B')
 
 
 async def _push_kvcs_delete(writer, view_cmd, table_name, row_id):
@@ -187,6 +189,8 @@ async def _push_kvcs_delete(writer, view_cmd, table_name, row_id):
     main = Chunk(struct.pack('<i', view_cmd), [title_chunk])
     writer.write(main.write(b''))
     await writer.drain()
+    log(f'      [kvcs] del {table_name.decode()} row={int(row_id)} '
+        f'via cmd={view_cmd}')
 
 
 def _msg_store_campaign(campaign_id, ctype):

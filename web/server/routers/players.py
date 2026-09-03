@@ -93,6 +93,26 @@ async def adjust_currency(player_id: int, body: CurrencyBody,
     return {'ok': True, 'balance': result['balance']}
 
 
+class ScoreBody(BaseModel):
+    delta: int             # 正加/负减（账号经验 totalScore）
+
+
+@router.post('/{player_id}/score', dependencies=[Depends(auth.write_guard)])
+@api_errors
+async def adjust_score(player_id: int, body: ScoreBody,
+                       request: Request,
+                       admin: auth.AdminUser = Depends(auth.current_admin)):
+    """账号经验（totalScore，进展 tab 等级来源）加/减。
+
+    升级奖励由游戏服在玩家下次登录/战局结算时按 level_granted 补发。"""
+    result = await players_svc.adjust_score(db.pool, player_id, body.delta)
+    await audit.record(admin, request, 'adjust_score', result['username'],
+                       {'delta': body.delta, 'after': result['total_score'],
+                        'level': result['level']})
+    return {'ok': True, 'total_score': result['total_score'],
+            'level': result['level']}
+
+
 class BanBody(BaseModel):
     banned: bool
 

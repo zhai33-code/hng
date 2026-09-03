@@ -14,6 +14,7 @@ from protocol import (
     pb_int32,
     pb_int64,
     pb_message,
+    pb_parse,
     pb_string,
     )
 
@@ -328,15 +329,79 @@ async def handle_query_war_catalogue_request(sess, writer, cmd_id, req_type, pro
 
 
 async def handle_join_war_request(sess, writer, cmd_id, req_type, proto):
-    # 加入战争请求：确保战争存在（自动开战）后返回 msg=1 (ResponseCodes.ok)
-    # war 数据已通过 subscribeplayerview 的 KeyValueChangeSet 推送，currentWar 已设置
-    # 客户端应直接走 onCurrentWarDataReceived → startPostLoginSignal
-    await war_campaign.ensure_war(STORE)
-    resp_proto = pb_int32(1, 1)  # msg = 1 (ok)
+    """join_war_request {f1 warid, f2 factionid, f3 playedFirstBlood}
+    → join_war_response {f1 msg}。
+
+    官服口径——每场战争玩家显式选阵营（FactionSelectionWindow → 本请求）：
+    factionid∈1/2/3 落库 player_war_factions(player, war, faction)，
+    新战争（sequel 新 war_id）无行 → 登录 player f11=0 → 客户端重弹选择窗。
+    成功后必须重推 player 行（f11 带已选 faction）：客户端
+    join_war_response 的 onJoinWarRequestResponse 只处理错误码，成功态
+    靠 PlayerModel 收到新 player KVCS（factionTemplateId!=0）驱动
+    JoinWarFactionSuccessSignal 关窗继续。
+
+    错误码（ResponseCodes）：77 war_not_found / 79 战争进行中不可换阵营 /
+    48 moving_to_same_war（无 factionid 且已有选择：客户端 resetWarData）。"""
+    factionid = 0
+    try:
+        f = pb_parse(proto)
+        factionid = int(f.get(2) or 0)
+    except Exception as e:
+        log(f'      [views] join_war parse error: {e}')
+
+    war = await war_campaign.ensure_war(STORE)
+    pid = await sess.ensure_player() if STORE is not None else None
+    code = 1                                     # ResponseCodes.ok
+    stored = False
+    if war is None:
+        code = 77                                # war_not_found
+    elif pid is None:
+        code = 15                                # 玩家不存在
+    elif factionid not in (1, 2, 3):
+        # 无/非法 factionid：视为"只加入战争不选阵营"（重定向流程）。
+        # 已有选择回 48：客户端 _isJoiningFaction=false 分支 resetWarData
+        try:
+            if await STORE.get_player_war_faction(pid, war['id']) is not None:
+                code = 48                        # moving_to_same_war
+        except Exception as e:
+            log(f'      [views] get_player_war_faction failed: {e}')
+    else:
+        try:
+            cur = await STORE.get_player_war_faction(pid, war['id'])
+        except Exception as e:
+            log(f'      [views] get_player_war_faction failed: {e}')
+            cur = None
+        if cur is not None and int(cur) != factionid:
+            code = 79                            # cannot switch while running
+            log(f'      [views] join_war blocked: player {pid} '
+                f'faction {cur} -> {factionid} (war {war["id"]} running)')
+        elif cur is None:
+            try:
+                await STORE.set_player_war_faction(pid, war['id'], factionid)
+                stored = True
+                log(f'[war] player {pid} joined war {war["id"]} '
+                    f'faction={factionid} ★faction selection stored')
+            except Exception as e:
+                code = 0
+                log(f'      [views] set_player_war_faction failed: {e}')
+        # cur == factionid：幂等重选，直接 ok
+
+    resp_proto = pb_int32(1, code)
     resp = build_response(cmd_id, 'join_war_response', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} join_war_response (msg=1 ok)')
+    log(f'S->C cmd={cmd_id:<4} join_war_response (msg={code})')
+
+    # 落库成功 → 重推 player 行（f11=已选 faction）驱动客户端关窗继续
+    if stored:
+        push_cmd = sess.playerview_cmd or cmd_id
+        try:
+            player_proto = await _msg_player_for(sess)
+            await _push_kvcs(writer, push_cmd, b'player', player_proto)
+            log(f'S->C cmd={push_cmd:<4} KeyValueChangeSet '
+                f'(player refreshed, faction selected ★join_war)')
+        except Exception as e:
+            log(f'      [views] player refresh after join_war failed: {e}')
 
 
 HANDLERS = {

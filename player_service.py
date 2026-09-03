@@ -387,10 +387,15 @@ async def _unlock_need_for_char(sess, char_id, req_uids):
 
 # ---- war_catalogue 构建（用于 query_war_catalogue_response）----
 async def _msg_player_for(sess, gamertag=None):
-    """从数据库读取货币/教程完成态并构建 player proto；DB 不可用时回退默认值。"""
+    """从数据库读取货币/教程完成态并构建 player proto；DB 不可用时回退默认值。
+
+    f10/f11 官服口径：f10 = 当前战争 id；f11 = 本场战争的阵营选择
+    （player_war_factions，无行 = 未选择 → 发 0，客户端弹
+    FactionSelectionWindow / 首页 CTA，join_war_request 落库后重推本行）。"""
     cur = {'credits': 100000, 'warfunds': 100000, 'gold': 100000}
     tutorials_completed = 0
     faction = None
+    war = None
     total_score = 0
     first_action_date = ''
     pid = await sess.ensure_player()
@@ -403,10 +408,16 @@ async def _msg_player_for(sess, gamertag=None):
             tutorials_completed = await STORE.get_tutorials_completed(pid)
         except Exception as e:
             log(f'[DB] get_tutorials_completed failed: {e}')
+        # ★ f10/f11：本场战争 id + 玩家的阵营选择（未选择 = 0 → 选阵营窗）
         try:
-            faction = await STORE.get_player_faction(pid)
+            import war_campaign
+            war = await war_campaign.ensure_war(STORE)
+            if war is not None:
+                sel = await STORE.get_player_war_faction(pid, war['id'])
+                faction = int(sel) if sel is not None else 0
         except Exception as e:
-            log(f'[DB] get_player_faction failed: {e}')
+            log(f'[DB] player war faction failed: {e}')
+            faction = None
         # ★ firstActionGameDate（player f19，YYYYMMDD）：签到窗口连续登录
         # 天数计算的起点（客户端以 firstActionGameDate 与今天比对）。
         # 恒发空串会让该计算退化；无首局回落注册日。
@@ -430,6 +441,7 @@ async def _msg_player_for(sess, gamertag=None):
                       tutorials_completed=tutorials_completed,
                       pid=pid or 1, faction=faction, total_score=total_score,
                       first_action_date=first_action_date,
+                      war=war['id'] if war is not None else 0,
                       **cur)
 
 

@@ -94,8 +94,30 @@ def character_dict(c) -> dict:
     }
 
 
+async def _char_score_rows(conn, player_id: int) -> list[tuple]:
+    """账号经验（totalScore）明细：全角色 character_stats 的
+    PlayerScore/score 生效值（PlayerScore 键优先、legacy score 回落，
+    与游戏服 player_service._msg_player_for / progression._total_score
+    同源）。返回 [(character_id, 生效键, 值), ...] 按 character_id 升序。"""
+    rows = await conn.fetch(
+        'SELECT cs.character_id, cs.stat_key, cs.value '
+        'FROM character_stats cs '
+        'JOIN characters c ON c.id = cs.character_id '
+        "WHERE c.player_id = $1 AND cs.stat_key IN ('PlayerScore', 'score')",
+        player_id)
+    by_char: dict[int, tuple] = {}
+    for r in rows:
+        cid = int(r['character_id'])
+        key = r['stat_key']
+        # PlayerScore 优先：覆盖 legacy score（二者同源不叠加）
+        if cid not in by_char or key == 'PlayerScore':
+            by_char[cid] = (key, float(r['value']))
+    return [(cid, kv[0], kv[1]) for cid, kv in sorted(by_char.items())]
+
+
 async def player_detail(pool, player_id: int) -> dict:
-    """玩家账号级详情：账号信息 + 三货币 + 角色概览 + 该玩家最近参战记录。"""
+    """玩家账号级详情：账号信息 + 三货币 + 账号经验/等级 + 角色概览 +
+    该玩家最近参战记录。"""
     assert pool is not None
     async with pool.acquire() as conn:
         p = await conn.fetchrow(
@@ -103,6 +125,8 @@ async def player_detail(pool, player_id: int) -> dict:
             'FROM players WHERE id = $1', player_id)
         if p is None:
             raise LookupError('玩家不存在')
+        total_score = int(sum(v for _, _, v in
+                              await _char_score_rows(conn, player_id)))
         chars = await conn.fetch(
             'SELECT id, name, faction, template, combat_xp, '
             'combat_badge_0, combat_badge_1, created_at '
@@ -124,8 +148,12 @@ async def player_detail(pool, player_id: int) -> dict:
         d['own'] = {'score': b['score'], 'kills': b['kills'],
                     'deaths': b['deaths'], 'captures': b['captures']}
         recent.append(d)
+    player = dict(p)
+    # 账号等级（进展 tab）：totalScore 经 PlayerLevel 阈值推导（12 级封顶）
+    player['total_score'] = total_score
+    player['level'] = wardb_meta.player_level_from_score(total_score)
     return {
-        'player': dict(p),
+        'player': player,
         'characters': [character_dict(c) for c in chars],
         'recent_battles': recent,
     }
@@ -265,6 +293,65 @@ async def adjust_currency(pool, player_id: int, currency: str,
             if int(row[currency]) < 0:
                 raise ValueError('扣减后余额不能为负')
     return {'username': row['username'], 'balance': int(row[currency])}
+
+
+async def adjust_score(pool, player_id: int, delta: int) -> dict:
+    """账号经验（totalScore，进展 tab 等级来源）加/减。
+
+    正数：计入当前经验贡献最高的角色（全 0 / 无统计时计入最早角色，
+    无键则新建 PlayerScore）；负数：按各角色贡献从高到低扣减（每角色
+    扣到 0 为止）。扣减后总额不能为负。
+
+    升级奖励不在此处发放：玩家下次登录（views.subscribeplayerview
+    check_player_level notify=False）或战局结算时由游戏服按
+    players.level_granted 补账并弹升级弹窗，与正常对战升级同链路。
+    返回用户名、新 totalScore 与新等级（供审计与回显）。"""
+    if delta == 0 or abs(delta) > 10 ** 9:
+        raise ValueError('变动值非法')
+    assert pool is not None
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                'SELECT username FROM players WHERE id = $1', player_id)
+            if row is None:
+                raise LookupError('玩家不存在')
+            chars = await conn.fetch(
+                'SELECT id FROM characters WHERE player_id = $1 ORDER BY id',
+                player_id)
+            if not chars:
+                raise ValueError('该玩家暂无角色，无法调整经验')
+            entries = await _char_score_rows(conn, player_id)
+            total = sum(v for _, _, v in entries)
+            if total + delta < 0:
+                raise ValueError('扣减后经验不能为负')
+            if delta > 0:
+                # 目标：贡献最高角色（并列取 id 最小）；全 0 / 无统计取最早角色
+                if entries:
+                    cid, key, val = max(entries, key=lambda e: (e[2], -e[0]))
+                else:
+                    cid, key, val = int(chars[0]['id']), 'PlayerScore', 0.0
+                # 相对增量（与游戏服 add_stat 同款 upsert，并发战局结算不丢账）
+                await conn.execute(
+                    'INSERT INTO character_stats (character_id, stat_key, value) '
+                    'VALUES ($1, $2, $3) '
+                    'ON CONFLICT (character_id, stat_key) '
+                    'DO UPDATE SET value = character_stats.value + EXCLUDED.value',
+                    cid, key, float(delta))
+            else:
+                # 从贡献最高到低逐角色扣减，各扣到 0 为止（相对减法）
+                remaining = float(-delta)
+                for cid, key, val in sorted(entries, key=lambda e: (-e[2], e[0])):
+                    take = min(val, remaining)
+                    if take <= 0:
+                        break
+                    await conn.execute(
+                        'UPDATE character_stats SET value = value - $1 '
+                        'WHERE character_id = $2 AND stat_key = $3',
+                        take, cid, key)
+                    remaining -= take
+    new_total = int(total + delta)
+    return {'username': row['username'], 'total_score': new_total,
+            'level': wardb_meta.player_level_from_score(new_total)}
 
 
 async def set_ban(pool, player_id: int, banned: bool) -> dict:

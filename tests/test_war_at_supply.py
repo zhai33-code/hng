@@ -171,6 +171,9 @@ class FakeStore:
     async def init_war_cities(self, war_id, owner_map):
         self.city_owners[war_id] = dict(owner_map)
 
+    async def get_war_cities(self, war_id):
+        return dict(self.city_owners.get(int(war_id), {}))
+
     async def init_war_faction_resources(self, war_id, initial):
         """幂等种子（对齐 ON CONFLICT DO NOTHING：已有不覆盖）。"""
         for fac, cats in (initial or {}).items():
@@ -963,8 +966,10 @@ async def section_e():
           and st.ats[600]['state'] == 0, str(f))
 
     # E3 升级不补编：模板换 503，resources 保持 {'1': 6}（买壳口径）
+    # （503 level=2 → 2026-09-03 升级 rank 门槛后需 AT rank>=2）
     st = _setup()
     _mk_at(st, 600, template=501, resources={'1': 6})
+    st.ats[600]['rank'] = 2
     w, f = await _upgrade(600)
     check('E3 升级换模板不补编（resources 不动/扣款照常）',
           f.get(1) == 1 and st.ats[600]['template_id'] == 503

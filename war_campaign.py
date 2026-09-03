@@ -9,7 +9,9 @@
   - war catalogue 数据聚合（views.handle_query_war_catalogue_request 用）。
 
 faction id 空间 = factiontemplateid 恒等映射 1/2/3（project_rules 硬约束）。
-时间戳 STR 格式 'YYYY-MM-DD HH:MM:SS'（协议 §3.1 begintime/endtime）。
+时间戳 STR 格式 'YYYYMMDDHHMMSSZ'（紧凑 Zulu，客户端统一用
+TimeUtilities.convertZuluTimeToMilliseconds 按位截取解析——带 '-'/' '/':' 的
+ISO 风格串会截出乱码 → Date.parse NaN → getMorale 士气恒 0）。
 """
 import datetime
 import json
@@ -76,14 +78,18 @@ def initial_city_owners():
 
 
 def _fmt_ts(dt):
-    """DB TIMESTAMPTZ → 协议 STR 时间戳（UTC，无时区后缀）。"""
+    """DB TIMESTAMPTZ → 协议 STR 时间戳（紧凑 Zulu 'YYYYMMDDHHMMSSZ'，UTC）。
+
+    客户端 TimeUtilities.convertZuluTimeToMilliseconds 按位 substr(0,4)/(4,2)/
+    ... 截取组 'YYYY/MM/DD HH:mm:ss GMT-0000' 再 Date.parse；ISO 分隔符串
+    会解析成 NaN（uint(NaN)=0 → 0 士气 bug）。"""
     if not dt:
         return ''
     if isinstance(dt, str):
         return dt
     if dt.tzinfo is None:            # naive（FakeStore/无时区来源）按 UTC
         dt = dt.replace(tzinfo=datetime.timezone.utc)
-    return dt.astimezone(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    return dt.astimezone(datetime.timezone.utc).strftime('%Y%m%d%H%M%SZ')
 
 
 def _as_resources(raw):
@@ -507,21 +513,27 @@ def msg_commandnode_definition_row(at):
     m += pb_int64(4, at.get('owner_player_id') or 0)  # ownerPlayerId
     m += pb_int64(5, at.get('faction') or 0)        # factionTemplateId（1/2/3）
     m += pb_int64(6, at.get('template_id') or 0)    # commandNodeTemplateId
-    m += pb_int32(7, at.get('rank') or 1)            # rank
+    m += pb_int32(7, int(at.get('rank') or 0))          # rank（0 起，客户端升级门槛）
     m += pb_int64(9, at.get('general_character_id') or 0)  # generalCharacterId
-    m += pb_int64(10, _ts_ms(at.get('created_at')))  # statUpdateTimeStamp
+    # statUpdateTimeStamp：stats_updated_at 随 rank/xp/battles 变化刷新 →
+    # 客户端 statsHaveChanged 重拉 GetAssaultTeamStats（无值回退 created_at）
+    m += pb_int64(10, _ts_ms(at.get('stats_updated_at')
+                             or at.get('created_at')))
     # suppliedOnCreation：官服买壳口径恒 False（购买即满编已废弃，见 §10.2 #4）
     m += pb_bool(11, False)                          # suppliedOnCreation
     return m
 
 
 def msg_commandnode_instance_row(at, war_id, faction_capitals):
-    """CommandNodeWarInstance 行（地图上的 AT 实例）。"""
+    """CommandNodeWarInstance 行（地图上的 AT 实例）。
+    f3 parentCommandNodeInstanceId：补给队（Reserve）指向被补给的父 AT
+    （客户端 AssaultTeamModel.updateArmyResources 按此把补给队载量汇总
+    进父 AT 的 resourceOne/TwoOnTheWay，官服汇合链）。"""
     ent, ent_type = _at_map_entity(at, faction_capitals)
     m = b''
     m += pb_int64(1, at['id'])                       # id
     m += pb_int64(2, at['id'])                       # commandNodeDefinitionId（M1 同 id）
-    m += pb_int64(3, 0)                              # parentCommandNodeInstanceId
+    m += pb_int64(3, at.get('parent_command_node_id') or 0)  # parentCommandNodeInstanceId
     m += pb_int64(4, at.get('faction') or 0)         # factionId
     m += pb_int64(5, ent)                            # mapEntityId
     m += pb_int64(6, ent_type)                      # mapEntityTypeId（1/2/3 硬约束）
@@ -753,8 +765,30 @@ def template_resources(tpl):
 
 
 def template_rank(tpl):
-    """新 AT 初始 rank（commandnodetemplate f10 level，缺省 1）。"""
-    return int(tpl.get('level') or 1)
+    """新 AT 初始 rank（commandnodetemplate f10 level：基础模板 guard/
+    light_armor 为 0，升级链目标 1/2——客户端升级门槛 rank >= level）。"""
+    return int(tpl.get('level') or 0)
+
+
+def rank_from_xp(xp):
+    """AT XP → 等级（AssaultTeamLevel 阈值：level N 需 xp>=阈值[N]，
+    0 XP = rank 0；与客户端 ExperienceCalculation 区间算法同构）。
+    缺表回退 350/3450/9200 三档。"""
+    thresholds = wardb.at_levels() or [(1, 350), (2, 3450), (3, 9200)]
+    rank = 0
+    for level, need in thresholds:
+        if int(xp) >= int(need):
+            rank = int(level)
+    return rank
+
+
+def next_level_xp(rank):
+    """下一等级 XP 阈值（rank 已满级返回 0）。GetAssaultTeamStatsRecord f4。"""
+    thresholds = wardb.at_levels() or [(1, 350), (2, 3450), (3, 9200)]
+    for level, need in thresholds:
+        if int(level) > int(rank):
+            return int(need)
+    return 0
 
 
 def dissolve_refund(tpl):
@@ -764,16 +798,26 @@ def dissolve_refund(tpl):
 
 
 def upgrade_allowed(cur_tpl, target_tpl):
-    """升级链校验：目标模板 parent_template_id == 当前模板 id
-    （或当前模板 convert_to == 目标 id，两方向任一命中即官服升级关系）。"""
+    """升级链校验（对齐客户端 AssaultTeamUpgradeOptions.getUpgradeOption）：
+    同阵营，且目标模板 parent_template_id == 当前模板 id（或当前模板
+    convert_to == 目标 id，两方向任一命中即官服升级关系）。
+
+    特例：motorized_guard → motorized_infantry 无 parent 链也合法
+    （客户端 HnGGUIGameVariables 模板特例；wardb 三阵营同名，
+    316→320 / 116→120 / 216→220）。"""
     if not cur_tpl or not target_tpl:
         return False
     cur_id, tgt = int(cur_tpl['id']), int(target_tpl['id'])
     if tgt == cur_id:
         return False
+    if int(cur_tpl.get('faction') or 0) != int(target_tpl.get('faction') or 0):
+        return False
     if int(target_tpl.get('parent_template_id') or 0) == cur_id:
         return True
-    return int(cur_tpl.get('convert_to') or 0) == tgt
+    if int(cur_tpl.get('convert_to') or 0) == tgt:
+        return True
+    return (str(cur_tpl.get('name') or '') == 'motorized_guard'
+            and str(target_tpl.get('name') or '') == 'motorized_infantry')
 
 
 def deploy_battlefield(at, faction, near_capital_bf=0):
@@ -1008,6 +1052,288 @@ async def start_air_transport(store, at, target_bf, now=None):
     return mv, RC_OK
 
 
+# ---- 补给队（Reserve，官服 §10.2 #6）----
+
+RESERVE_TEMPLATE_OFFSET = 4       # template_id = faction*100 + 4（104/204/304）
+
+
+def is_reserve(at):
+    """补给队（Reserve）判定：template_id % 100 == 4
+    （客户端 locTemplateId = templateId - faction*100 → 4 = AT_TEMPLATE_RESERVE）。"""
+    return int(at.get('template_id') or 0) % 100 == RESERVE_TEMPLATE_OFFSET
+
+
+def reserve_template_id(faction):
+    """阵营补给队模板 id（faction*100+4；wardb commandnodetemplate 104/
+    204/304 'reserve'，speed=1.0）。"""
+    return int(faction or 0) * 100 + RESERVE_TEMPLATE_OFFSET
+
+
+def bf_in_faction_supply(city_owners, faction, bf_id):
+    """AT 所在城市是否在己方补给网络内（可就地即时增援）。
+
+    官服口径：城市归本方，且沿补给线只经本方城市连通到本方首都
+    （补给自首都沿网络流动；孤悬敌后/链路被断的己方孤城不在网 →
+    需补给队机动）。无归属数据（owners 空，如 DB 异常）保守视为在网
+    （维持旧行为即时增援）。"""
+    if not city_owners:
+        return True
+    try:
+        fac = int(faction or 0)
+        bf = int(bf_id or 0)
+        if int(city_owners.get(bf, 0) or 0) != fac:
+            return False
+    except (TypeError, ValueError):
+        return True
+    cap = _faction_capital_bf().get(fac, 0)
+    if not cap or cap == bf:
+        return True
+    adj = supplyline_adjacency()
+    seen = {bf}
+    queue = [bf]
+    while queue:
+        cur = queue.pop(0)
+        for edge in adj.get(cur, ()):
+            nb = edge[3]
+            if nb == cap:
+                return True
+            if nb in seen:
+                continue
+            try:
+                if int(city_owners.get(nb, 0) or 0) != fac:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            seen.add(nb)
+            queue.append(nb)
+    return False
+
+
+def _column_delete_events(col):
+    """补给队删除推送事件（与 _push_at_delete 同表集合：客户端
+    CommandnodeTable DELETE 分支按 schema 移除 + OnTheWay 扣减）。"""
+    events = [('del', b'CommandNodeWarInstance', col['id']),
+              ('del', b'CommandNodeDefinition', col['id']),
+              ('del', b'CommandNodeMorale', col['id'])]
+    for cat in _as_resources(col.get('resources')):
+        try:
+            events.append(('del', b'armyresource',
+                           int(col['id']) * 1000 + int(cat)))
+        except (TypeError, ValueError):
+            continue
+    return events
+
+
+async def _merge_column_events(store, war_id, col, parent, caps):
+    """补给队与父 AT 汇合：资源并入父 AT（按模板编制封顶，超编丢弃）+
+    补给队软删（state=3）。返回追加推送事件。"""
+    parent = await store.get_command_node(parent['id']) or parent
+    res = {str(k): int(v) for k, v in
+           _as_resources(parent.get('resources')).items()}
+    tpl = wardb.commandnode_templates().get(
+        int(parent.get('template_id') or 0)) or {}
+    full = template_resources(tpl)
+    merged = {}
+    for cat, n in _as_resources(col.get('resources')).items():
+        try:
+            cat, n = int(cat), int(n)
+        except (TypeError, ValueError):
+            continue
+        cur = int(res.get(str(cat), 0) or 0)
+        cap = int(full.get(cat, 0) or 0)
+        add = n if not cap else max(0, min(n, cap - cur))
+        if add > 0:
+            res[str(cat)] = cur + add
+            merged[cat] = add
+    await store.update_command_node(parent['id'], resources=res)
+    await store.update_command_node(col['id'], state=3)
+    parent = await store.get_command_node(parent['id'])
+    events = [('set', b'CommandNodeWarInstance',
+               msg_commandnode_instance_row(parent, war_id, caps))]
+    if parent:
+        for p in msg_armyresource_rows(parent, war_id):
+            events.append(('set', b'armyresource', p))
+    events.extend(_column_delete_events(col))
+    log(f'[war] supply column {col["id"]} merged into AT {parent["id"] if parent else "?"} '
+        f'resources={merged}')
+    return events
+
+
+async def _arrive_supply_column(store, war_id, col, mv, dest_bf, caps,
+                                now=None):
+    """补给队到达处置（advance_movements 到达分支，替 AT 的落位/占城/
+    会战逻辑）：父 AT 在同城 → 汇合并删队；父 AT 挪窝 → 落位后重新寻路
+    追击；父 AT 没了 → 就地解散（资源损失，官服口径）。"""
+    events = [('del', b'transport_commandnode_segment', mv['id']),
+              ('del', b'transport_commandnode_destination', mv['id'])]
+    parent = await store.get_command_node(
+        int(col.get('parent_command_node_id') or 0))
+    # 落位（城市本体）
+    await store.update_command_node(
+        col['id'], state=0, map_entity_id=int(dest_bf or 0),
+        map_entity_type=MAP_ENTITY_BATTLEFIELD)
+    col = await store.get_command_node(col['id'])
+    if not parent or int(parent.get('state') or 0) >= 3:
+        await store.update_command_node(col['id'], state=3)
+        events.extend(_column_delete_events(col))
+        log(f'[war] supply column {col["id"]} dissolved '
+            f'(parent AT gone)')
+        return events
+    parent_bf = at_current_battlefield(parent)
+    if parent_bf and int(parent_bf) != int(dest_bf or 0):
+        # 父 AT 已机动 → 追击（拓扑静态，寻路失败则原地待命，由
+        # _cleanup_supply_columns 兜底清理）
+        mv2, code = await start_movement(store, col, parent_bf, now=now)
+        if mv2 is not None:
+            col = await store.get_command_node(col['id'])
+            events.append(('set', b'CommandNodeWarInstance',
+                           msg_commandnode_instance_row(col, war_id, caps)))
+            segs = movement_segments(mv2)
+            if segs:
+                events.append(('set', b'transport_commandnode_segment',
+                               msg_transport_segment_row(col, war_id, mv2,
+                                                         segs[0])))
+                events.append(('set', b'transport_commandnode_destination',
+                               msg_transport_destination_row(col, war_id,
+                                                             mv2, segs)))
+            log(f'[war] supply column {col["id"]} retargeting '
+                f'-> bf={parent_bf}')
+            return events
+        events.append(('set', b'CommandNodeWarInstance',
+                       msg_commandnode_instance_row(col, war_id, caps)))
+        return events
+    # 汇合（父 AT 在同城 / 父 AT 位置未知（待命回首都）落位失败兜底同此）
+    return events + await _merge_column_events(store, war_id, col, parent,
+                                               caps)
+
+
+async def column_route(store, war, parent_at, near_capital_bf=0):
+    """补给队路线预检（纯读，不落库不扣款，购买侧拒单用）：确定出生点
+    （f6 己方在网城 → 阵营首都）并按全图补给线拓扑验证可达性。
+
+    返回 (spawn_bf, parent_bf, ok)：ok=False 表示无出生点/无父位置/
+    地面不可达（真·孤岛：整张补给线拓扑无路，官服地图连通理论不达）。"""
+    fac = int(parent_at.get('faction') or 0)
+    try:
+        owners = dict(await store.get_war_cities(war['id']))
+    except Exception as e:
+        log(f'[war] supply column owners read failed: {e}')
+        owners = {}
+    parent_bf = at_current_battlefield(parent_at)
+    spawn_bf = int(near_capital_bf or 0)
+    if spawn_bf and not bf_in_faction_supply(owners, fac, spawn_bf):
+        spawn_bf = 0                    # 非己方在网（敌城/孤城）→ 自选
+    if not spawn_bf:
+        spawn_bf = _faction_capital_bf().get(fac, 0)
+    if not spawn_bf or not parent_bf:
+        return 0, parent_bf, False
+    if spawn_bf == parent_bf:
+        return spawn_bf, parent_bf, True
+    return spawn_bf, parent_bf, \
+        find_supplyline_path(spawn_bf, parent_bf) is not None
+
+
+async def spawn_supply_column(store, war, parent_at, resources,
+                              near_capital_bf=0, now=None):
+    """生成补给队并寻路：阵营首都出生（官服口径：补给自首都出发；
+    near_capital_bf=f6 玩家指定出发城，须己方在网否则忽略），载
+    resources（{cat: n}），沿补给线机动到父 AT 所在城市。
+
+    返回 (column, events, error_code)：column=None 且 error_code≠0 为失败
+    （RC_CANNOT_FIND_COMMANDNODE=无出生点或地面不可达（真·孤岛），购买侧
+    column_route 预检已挡、未扣款，理论不达；软删的父 AT 不会到这）。
+    同城（出生点=父 AT 位置）直接汇合不出队。"""
+    war_id = war['id']
+    fac = int(parent_at.get('faction') or 0)
+    caps = _faction_capital_bf()
+    spawn_bf, parent_bf, ok = await column_route(
+        store, war, parent_at, near_capital_bf=near_capital_bf)
+    if not ok:
+        log(f'[war] supply column for AT {parent_at["id"]} unreachable '
+            f'(spawn={spawn_bf} parent={parent_bf}), rejected')
+        return None, [], RC_CANNOT_FIND_COMMANDNODE
+    try:
+        col = await store.create_command_node(
+            war_id, reserve_template_id(fac),
+            int(parent_at.get('owner_player_id') or 0), fac,
+            parent_at.get('name') or '',
+            resources={str(k): int(v) for k, v in (resources or {}).items()},
+            abbreviation=parent_at.get('abbreviation') or '',
+            parent_command_node_id=parent_at['id'])
+    except Exception as e:
+        log(f'[war] supply column create failed: {e}')
+        return None, [], RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
+    if col is None:
+        return None, [], RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
+    events = [
+        ('set', b'CommandNodeDefinition',
+         msg_commandnode_definition_row(col)),
+        ('set', b'CommandNodeWarInstance',
+         msg_commandnode_instance_row(col, war_id, caps)),
+        ('set', b'CommandNodeMorale', msg_commandnode_morale_row(col, war_id)),
+    ]
+    for p in msg_armyresource_rows(col, war_id):
+        events.append(('set', b'armyresource', p))
+    # 出生城市落位（start_movement 以此为寻路起点）
+    await store.update_command_node(
+        col['id'], is_deployed=True, map_entity_id=spawn_bf,
+        map_entity_type=MAP_ENTITY_BATTLEFIELD)
+    col = await store.get_command_node(col['id'])
+    if spawn_bf == parent_bf:
+        events.extend(await _merge_column_events(store, war_id, col,
+                                                 parent_at, caps))
+        return col, events, 0
+    mv, code = await start_movement(store, col, parent_bf, now=now)
+    if mv is None and code != RC_OK:
+        # column_route 预检已过仍失败（状态异常等）→ 软删拒单，不留滞留行
+        log(f'[war] supply column {col["id"]} start_movement failed '
+            f'({code}), dissolved')
+        await store.update_command_node(col['id'], state=3)
+        return None, [], code
+    col = await store.get_command_node(col['id'])
+    events.append(('set', b'CommandNodeWarInstance',
+                   msg_commandnode_instance_row(col, war_id, caps)))
+    if mv is not None:
+        segs = movement_segments(mv)
+        if segs:
+            events.append(('set', b'transport_commandnode_segment',
+                           msg_transport_segment_row(col, war_id, mv,
+                                                     segs[0])))
+        events.append(('set', b'transport_commandnode_destination',
+                       msg_transport_destination_row(col, war_id, mv, segs)))
+    log(f'[war] supply column {col["id"]} spawned for AT '
+        f'{parent_at["id"]} at bf={spawn_bf} -> bf={parent_bf} '
+        f'resources={dict(resources or {})}')
+    return col, events, 0
+
+
+async def _cleanup_supply_columns(store, war=None):
+    """滞留补给队清理（war_tick 兜底）：父 AT 已亡（state>=3/缺失）的
+    空闲补给队就地解散；返回推送事件。"""
+    if store is None or getattr(store, 'pool', None) is None:
+        return []
+    try:
+        if war is None:
+            war = await ensure_war(store)
+        if war is None:
+            return []
+        events = []
+        for at in await store.list_war_command_nodes(war['id']):
+            if not is_reserve(at) or int(at.get('state') or 0) >= 3:
+                continue
+            parent = await store.get_command_node(
+                int(at.get('parent_command_node_id') or 0))
+            if parent and int(parent.get('state') or 0) < 3:
+                continue
+            await store.update_command_node(at['id'], state=3)
+            events.extend(_column_delete_events(at))
+            log(f'[war] supply column {at["id"]} dissolved in cleanup')
+        return events
+    except Exception as e:
+        log(f'[war] cleanup supply columns failed: {e}')
+        return []
+
+
 def msg_transport_segment_row(at, war_id, mv, seg):
     """transport_commandnode_segment 行（f6/f7 为毫秒数字符串，
     客户端 Number(begintime) 直接与 serverTimeAsNumber 比较）。"""
@@ -1103,6 +1429,12 @@ async def advance_movements(store, war=None, now=None):
             if now_ms >= segs[-1]['end_ms']:
                 # ---- 到达：终段 to_bf（或 dest_ap 出兵点）落位 ----
                 await store.finish_movement(mv['id'], 1)
+                if is_reserve(at):
+                    # 补给队到达：汇合/追击/解散（不占城、不成战）
+                    dest_bf = segs[-1]['to_bf']
+                    events.extend(await _arrive_supply_column(
+                        store, war_id, at, mv, dest_bf, caps, now=now))
+                    continue
                 dest_ap = int(mv.get('dest_ap') or 0)
                 if dest_ap:
                     ent, ent_type = dest_ap, MAP_ENTITY_ACCESSPOINT
@@ -1122,6 +1454,10 @@ async def advance_movements(store, war=None, now=None):
                 # ---- 会战成局桩：目标城市有敌对 AT 驻扎 ----
                 dest_bf = (segs[-1]['to_bf'] if not dest_ap
                            else _ap_battlefield(dest_ap))
+                # 到达占城：无敌驻军/无进行中会战 → 城市易主（敌驻军
+                # → 会战成局，归属由结算决定）
+                events.extend(await _capture_city_events(
+                    store, war_id, at.get('faction'), dest_bf))
                 events.extend(await _check_battle_formation(
                     store, war_id, at, dest_bf))
                 continue
@@ -1141,6 +1477,12 @@ async def advance_movements(store, war=None, now=None):
                                                          segs[idx])))
                 events.append(('set', b'CommandNodeWarInstance',
                                msg_commandnode_instance_row(at, war_id, caps)))
+                if is_reserve(at):
+                    continue        # 补给队途经不占城（补给线两端本方领地）
+                # 换段占城：AT 已抵达新段起点城市（=上一段终点），无敌
+                # 驻军/无进行中会战则易主（途经城市陆续占领）
+                events.extend(await _capture_city_events(
+                    store, war_id, at.get('faction'), segs[idx]['from_bf']))
         return events
     except Exception as e:
         log(f'[war] advance_movements failed: {e}')
@@ -1198,6 +1540,65 @@ async def _check_battle_formation(store, war_id, at, dest_bf):
     return events
 
 
+async def _capture_city_events(store, war_id, faction, bf_id,
+                               ignore_battle_id=0, force=False):
+    """城市易主：war_cities UPDATE + battlefieldstatus / supplylinestatus /
+    accesspointstatus 行事件（受影响补给线按新归属重推或删陈旧行）。
+
+    force=False 时守方检查：目标城市有进行中会战（battle id !=
+    ignore_battle_id）或敌对 AT 驻扎 → 放弃占领（归属由会战结算/对峙
+    决定），返回 []。force=True（会战结算胜方占领）跳过检查。
+    归属未变 → 返回 []（无事件）。"""
+    bf_id = int(bf_id or 0)
+    faction = int(faction or 0)
+    if not bf_id or not faction:
+        return []
+    try:
+        if not force:
+            for wb in await store.list_active_war_battles(war_id):
+                if (int(wb.get('battlefield_id') or 0) == bf_id
+                        and int(wb['id']) != int(ignore_battle_id or 0)):
+                    return []
+            for o in await store.list_war_command_nodes(war_id):
+                if (o.get('is_deployed')
+                        and int(o.get('faction') or 0) != faction
+                        and at_current_battlefield(o) == bf_id):
+                    return []
+        owners = dict(await store.get_war_cities(war_id))
+        if owners.get(bf_id) == faction:
+            return []
+        await store.set_city_owner(war_id, bf_id, faction)
+        events = [('set', b'battlefieldstatus',
+                   msg_battlefieldstatus_row(war_id, bf_id, faction))]
+        owners[bf_id] = faction
+        for sl in wardb.supplylines():
+            b1 = _ap_battlefield(sl.get('ap1'))
+            b2 = _ap_battlefield(sl.get('ap2'))
+            if bf_id not in (b1, b2):
+                continue
+            o = owners.get(b1)
+            if o and o == owners.get(b2):
+                events.append(('set', b'supplylinestatus',
+                               pb_sfixed64(1, sl['id'])
+                               + pb_int64(2, war_id)
+                               + pb_int64(3, o)
+                               + pb_int64(4, sl['id'])))
+            else:
+                events.append(('del', b'supplylinestatus', sl['id']))
+        for ap in wardb.accesspoints():
+            if ap.get('battlefield') == bf_id:
+                events.append(('set', b'accesspointstatus',
+                               pb_sfixed64(1, ap['id'])
+                               + pb_int64(2, war_id)
+                               + pb_int64(3, ap['id'])
+                               + pb_int64(4, faction)))
+        log(f'[war] battlefield {bf_id} owner -> faction {faction}')
+        return events
+    except Exception as e:
+        log(f'[war] capture city bf={bf_id} failed: {e}')
+        return []
+
+
 async def broadcast_war_events(events):
     """战争事件广播：全部 warmapview 订阅会话（含敌我视角）。"""
     if not events:
@@ -1221,8 +1622,9 @@ async def broadcast_war_events(events):
 
 async def war_tick(store):
     """战争推进 tick（realtest_server 周期挂载）：移动推进 + automission
-    超时结算 + 阵营资源生产 + 增援队列交付 + 事件广播。"""
+    超时结算 + 阵营资源生产 + 增援队列交付 + 补给队滞留清理 + 事件广播。"""
     events = await advance_movements(store)
+    events.extend(await _cleanup_supply_columns(store))
     await automission_tick(store)
     await production_tick(store)
     await supply_queue_tick(store)
@@ -1247,11 +1649,13 @@ def _scale_resources(res, ratio):
 
 
 async def settle_war_battle(store, mission_id, battle_id, winner_faction,
-                            loss_ratios=None):
+                            loss_ratios=None, captured=None):
     """FPS 会战结算回写（BattleReport 之后、release_match 之前调用）。
 
     loss_ratios：可选 (胜方损耗比, 败方损耗比) 覆盖（automission 用
     WAR_AUTOMISSION_* 系数）；缺省用 WAR_BATTLE_*_LOSS。
+    captured：可选 {category_id: count} 战场缴获（败方 AT 未投入的池剩余，
+    combat.py 从 force_pool 快照），入账胜方阵营库存并推送 armyresource 行。
 
     流程（协议 §8.3-4）：
       ① AT 损耗：胜方轻损 / 败方重损（mm_config.WAR_BATTLE_*_LOSS 比例），
@@ -1264,6 +1668,8 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
          列表移除）；battle 行删除（战争图交战标记消失）；
       ⑤ warfunds：参战 AT 主人每局 +WAR_WARFUNDS_PER_BATTLE，胜方再
          +WIN_BONUS（占点英雄收益已在 PlayerBattleResult f3 入账）；
+      ⑤b 缴获入账：captured 加进胜方 war_faction_resources 库存 + 推送
+         HQ armyresource 行（客户端资源视图实时上涨）；
       ⑥ check_victory（首都数判据）。
 
     返回推送事件列表（调用方 broadcast_war_events）。
@@ -1322,8 +1728,22 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                     f'{at.get("name")!r} (faction {at.get("faction")}) '
                     f'wiped out')
                 continue
-            # ---- 存活：编制/士气回写 + 投降判定 ----
-            fields = {'resources': new_res, 'morale': morale}
+            # ---- 存活：编制/士气回写 + XP/等级 + 投降判定 ----
+            # ②b AT XP（客户端 ExperienceCalculation.createATXpList 口径：
+            #     battles×5 + battlesWon×25）→ rank 按阈值自动晋升；
+            #     买等级注入的 XP（阈值+5）取 max 保护，不被公式重算冲掉
+            battles = int(at.get('battles') or 0) + 1
+            battles_won = int(at.get('battles_won') or 0) + (1 if won else 0)
+            xp = max(battles * 5 + battles_won * 25,
+                     int(at.get('xp') or 0) + 5 + (25 if won else 0))
+            rank = max(int(at.get('rank') or 0), rank_from_xp(xp))
+            fields = {'resources': new_res, 'morale': morale,
+                      'battles': battles, 'battles_won': battles_won,
+                      'xp': xp, 'rank': rank}
+            rank_up = rank > int(at.get('rank') or 0)
+            if rank_up:
+                log(f'[war] battle {battle_id}: AT {at["id"]} '
+                    f'{at.get("name")!r} rank up -> {rank} (xp={xp})')
             if morale <= surrender and at.get('is_deployed'):
                 cap_bf = caps.get(int(at.get('faction') or 0))
                 if cap_bf:
@@ -1335,6 +1755,10 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                         f'capital {cap_bf}')
             await store.update_command_node(at['id'], **fields)
             at = await store.get_command_node(at['id'])
+            if rank_up:
+                # rank 变化须重推 Definition 行（f7），客户端才会刷新升级选项
+                events.append(('set', b'CommandNodeDefinition',
+                               msg_commandnode_definition_row(at)))
             events.append(('set', b'CommandNodeWarInstance',
                            msg_commandnode_instance_row(at, war_id, caps)))
             for cat, cnt in sorted(new_res.items()):
@@ -1357,11 +1781,30 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
             pass
         dest_bf = int(wb.get('battlefield_id') or 0)
         if winner and attacker and winner == attacker and dest_bf:
-            await store.set_city_owner(war_id, dest_bf, winner)
-            events.append(('set', b'battlefieldstatus',
-                           msg_battlefieldstatus_row(war_id, dest_bf, winner)))
-            log(f'[war] battle {battle_id}: attacker faction {winner} '
-                f'captured battlefield {dest_bf}')
+            # force：会战胜方占领（结算语义，跳过敌驻军检查）；
+            # 复用助手补推 supplylinestatus/accesspointstatus 关联行
+            city_events = await _capture_city_events(
+                store, war_id, winner, dest_bf, force=True)
+            if city_events:
+                events.extend(city_events)
+                log(f'[war] battle {battle_id}: attacker faction {winner} '
+                    f'captured battlefield {dest_bf}')
+
+        # ⑤b 缴获入账（war 局）：败方 AT 未投入的池剩余 → 胜方阵营库存，
+        #     推送 HQ armyresource 行（在线客户端资源视图实时上涨）
+        if winner and captured:
+            try:
+                await store.adjust_war_faction_resources(
+                    war_id, winner, captured)
+                import matchmaking      # 延迟 import（防循环依赖）
+                hq = matchmaking.FACTION_SUPREME_COMMANDS.get(winner)
+                if hq:
+                    for row in msg_hq_resource_rows(war_id, hq, captured):
+                        events.append(('set', b'armyresource', row))
+                log(f'[war] battle {battle_id}: faction {winner} captured '
+                    f'{dict(sorted((int(c), int(n)) for c, n in captured.items()))}')
+            except Exception as e:
+                log(f'[war] battle {battle_id}: capture credit failed: {e}')
 
         # ④ 会战终态 + 任务列表移除 + 战争图交战标记删除
         await store.end_war_battle(int(battle_id), winner)

@@ -69,16 +69,24 @@ class _MockSess:
     game_mission = 100003
 
 
-def _build_earnings_request():
+def _build_earnings_request(mission_id=100003):
     """合成 AnnounceBattleFieldEarningsRequest（结构同远端抓包）。"""
     # BattleReportEarnings：f1 valueEarned
     earn_warfund = pb_varint(1, 5678)
     # BattleReportCharacter：f1 charId, f2 startXp, f3 endXp,
-    # f10/f11 嵌套 earnings（事故点），f13 ribbons{f1 id, f2 start, f3 end}
+    # f10/f11 嵌套 earnings（事故点），f13 ribbons{f1 id, f2 start, f3 end,
+    # f4-f8 加成, f9 ribbonStatValues{f1 id, f2 value, f3 xp}}
+    ribbon = (pb_varint(1, 13) + pb_varint(2, 3) + pb_varint(3, 8)
+              + pb_varint(4, 25) + pb_varint(5, 0) + pb_varint(6, 0)
+              + pb_varint(7, 0) + pb_varint(8, 5)
+              + pb_msg(9, pb_varint(1, 5001) + pb_varint(2, 7)
+                       + pb_varint(3, 12))
+              + pb_msg(9, pb_varint(1, 5002) + pb_varint(2, 2)
+                       + pb_varint(3, 4)))
     char = (pb_varint(1, 4) + pb_varint(2, 1000) + pb_varint(3, 2500)
             + pb_msg(10, CRASH_EARNINGS_F10)      # 事故现场字节（嵌套消息）
             + pb_msg(11, earn_warfund)
-            + pb_msg(13, pb_varint(1, 13) + pb_varint(2, 3) + pb_varint(3, 8)))
+            + pb_msg(13, ribbon))
     # BattleReportPlayer：f1 playerId, f4 score, f6 kills, f7 deaths,
     # f9 gamertag, f10 isBot, f11 repeated character
     player = (pb_varint(1, 1) + pb_varint(4, 500) + pb_varint(6, 3)
@@ -97,7 +105,7 @@ def _build_earnings_request():
     pbr = (pb_varint(1, 1) + pb_varint(2, 120) + pb_varint(3, 340)
            + pb_msg(6, char_result))
     # 顶层：f1 missionId, f2 msid, f3 preset, f4 report, f5 repeated pbr
-    return (pb_varint(1, 100003) + pb_varint(2, 730433917100003)
+    return (pb_varint(1, mission_id) + pb_varint(2, 730433917100003)
             + pb_varint(3, 10) + pb_msg(4, report) + pb_msg(5, pbr))
 
 
@@ -177,8 +185,14 @@ def test_ribbon_start_end_and_vet_bonus_persisted():
     assert fake.saved, '战报未入库'
     _, players = fake.saved
     ch = players[0]['characters'][0]
-    # f13 PlayerBattleReportRibbon：f1 id=13, f2 start=3, f3 end=8
-    assert ch['ribbons'] == [{'id': 13, 'start': 3, 'end': 8}], ch['ribbons']
+    # f13 PlayerBattleReportRibbon 全量：f1 id=13, f2 start=3, f3 end=8,
+    # f4/f8 加成 + f9 明细（f5-f7 为 0 也原样保留）
+    assert ch['ribbons'] == [{
+        'id': 13, 'start': 3, 'end': 8, 'xpVet': 25, 'xpBooster': 0,
+        'xpCampaign': 0, 'xpUnderdog': 0, 'xpSquadVet': 5,
+        'stats': [{'id': 5001, 'value': 7, 'xp': 12.0},
+                  {'id': 5002, 'value': 2, 'xp': 4.0}],
+    }], ch['ribbons']
     # f10 嵌套 valueEarned=2101 / f11=5678 → 老兵 +25%
     assert ch['creditEarned'] == 2101 and ch['creditVetBonus'] == 525
     assert ch['warfundEarned'] == 5678 and ch['warfundVetBonus'] == 1419
@@ -280,22 +294,31 @@ def test_msid_synthesized_when_missing():
 
 
 def test_battlereport_ribbon_and_vet_encoding():
-    """战报响应：勋带 f2/f3 与 earnings f2 veteranBonus 编码正确。"""
+    """战报响应：勋带 f2/f3/f4-f8/f9 与 earnings f2 veteranBonus 编码正确。"""
     from handlers import battlereport as br
     m = br._msg_report_character({
         'characterId': 4, 'startXp': 1000, 'endXp': 2500,
         'creditEarned': 2101, 'creditVetBonus': 525,
         'warfundEarned': 5678, 'warfundVetBonus': 1419,
         'xpDailyBonus': 750,
-        'ribbons': [{'id': 13, 'start': 3, 'end': 8}],
+        'ribbons': [{'id': 13, 'start': 3, 'end': 8, 'xpVet': 25,
+                      'xpBooster': 0, 'xpCampaign': 0, 'xpUnderdog': 0,
+                      'xpSquadVet': 5,
+                      'stats': [{'id': 5001, 'value': 7, 'xp': 12.0}]}],
     })
     # f9 xpDailyBonus（每日首战 +50%）编码
     assert pb_varint(9, 750) in m
+    # f13 勋带：f1/f2/f3 + f4 xpVet + f8 squadVet + f9 明细
+    # （S→C 侧 f3 xpValue 是 fixed32 float）
     assert pb_msg(13, pb_varint(1, 13) + pb_varint(2, 3)
-                  + pb_varint(3, 8)) in m
+                  + pb_varint(3, 8) + pb_varint(4, 25)
+                  + pb_varint(5, 0) + pb_varint(6, 0) + pb_varint(7, 0)
+                  + pb_varint(8, 5)
+                  + pb_msg(9, pb_varint(1, 5001) + pb_varint(2, 7)
+                           + _pb_fixed32(3, 12.0))) in m
     assert pb_msg(10, pb_varint(1, 2101) + pb_varint(2, 525)) in m
     assert pb_msg(11, pb_varint(1, 5678) + pb_varint(2, 1419)) in m
-    # 旧格式（纯 id 列表）不崩，回退 0→1
+    # 旧格式（纯 id 列表）不崩，回退 0→1，无 f4-f9
     m2 = br._msg_report_character({'characterId': 4, 'ribbons': [13]})
     assert pb_msg(13, pb_varint(1, 13) + pb_varint(2, 0)
                   + pb_varint(3, 1)) in m2
@@ -411,6 +434,160 @@ def test_battlereport_response_encodes_capturepoints_and_stats():
     assert pb_msg(12, pb_varint(1, 101)) not in m_old
 
 
+def test_factions_extra_snapshotted_from_force_pool():
+    """结算时从 force_pool 快照 f11.f3/f4/f5 数据（AT/战损/缴获）。"""
+    import force_pool
+    fake = _FakeStore()
+    old = combat_handlers.STORE
+    combat_handlers.STORE = fake
+    cat1 = None
+    initial_cat1 = 0
+    try:
+        force_pool.init_mission(100003, 0, 2, 3)   # attacker=2, defender=3
+        pool2 = force_pool.pool(100003)[2]
+        cat1 = next(iter(pool2))
+        initial_cat1 = pool2[cat1]
+        force_pool.consume(100003, 2, cat1, 5)     # 攻方消耗 5
+        force_pool.consume(100003, 3, cat1, 2)     # 守方消耗 2
+        asyncio.run(combat_handlers.handle_announce_battlefield_earnings(
+            _MockSess(), _MockWriter(), 200,
+            'AnnounceBattleFieldEarningsRequest', _build_earnings_request()))
+    finally:
+        combat_handlers.STORE = old
+        force_pool.release(100003)
+    rep, _ = fake.saved
+    fx = rep['factions_extra']
+    assert set(fx) == {2, 3}, fx
+    # f3 AT 名单：每方 >=1 条，tmpl 为阵营相关 commandnode 模板 id
+    for fac in (2, 3):
+        assert fx[fac]['ats'], fx
+        assert all(a['tmpl'] and a['name'] for a in fx[fac]['ats'])
+    # f4 战损：攻方消耗 5，守方消耗 2
+    assert fx[2]['destroyed'].get(cat1) == 5, fx[2]['destroyed']
+    assert fx[3]['destroyed'].get(cat1) == 2, fx[3]['destroyed']
+    # f5 缴获：winner=3 → 缴获败方（2）的剩余 cat1（初始-5）
+    assert fx[3]['captured'].get(cat1) == initial_cat1 - 5, \
+        fx[3]['captured']
+    assert 'captured' not in fx[2], '败方无缴获'
+
+
+def test_battlereport_response_encodes_faction_extras():
+    """GetBattleReportResponse f11.f3/f4/f5：参战 AT / 损失 / 缴获编码。"""
+    import json as _json
+    from protocol import pb_parse_multi
+    from handlers import battlereport as br
+    rep = {'id': 123, 'mission_preset_id': 10, 'defender_faction_id': 2,
+           'winner_faction_id': 3, 'mission_time_seconds': 900,
+           'battle_start_time': 1787750000, 'capturepoints_json': '[]',
+           'factions_json': _json.dumps({
+               '2': {'ats': [{'name': 'infantry', 'tmpl': 203}],
+                     'destroyed': {'1': 10}},
+               '3': {'ats': [{'name': 'guard', 'tmpl': 303}],
+                     'destroyed': {'1': 7}, 'captured': {'1': 100, '5': 4}},
+           })}
+    players = [{'player_id': 1, 'gamertag': 'T', 'score': 500, 'captures': 0,
+                'kills': 3, 'deaths': 1, 'squad_name': '',
+                'characters_json': '[{"characterId": 4, "factionId": 3}]'}]
+    m = br._msg_client_battle_report(rep, players)
+    fac_by_id = {}
+    for fac_raw in pb_parse_multi(m).get(11, []):
+        fac_by_id[int(pb_parse_multi(fac_raw).get(1, [0])[0])] = fac_raw
+    assert set(fac_by_id) == {2, 3}, fac_by_id   # 无玩家行的 faction 2 也发
+    for fac, exp_ats, exp_des, exp_cap in (
+            (2, [('infantry', 203)], {1: 10}, {}),
+            (3, [('guard', 303)], {1: 7}, {1: 100, 5: 4})):
+        ff = pb_parse_multi(fac_by_id[fac])
+        # f3 AT：{f1 name, f2 tmpl, f3 owner='', f4 ownerPlayerId=0}
+        ats = [(pb_parse_multi(a).get(1, [b''])[0].decode(),
+                int(pb_parse_multi(a).get(2, [0])[0]))
+               for a in ff.get(3, [])]
+        assert ats == exp_ats, (fac, ats)
+        for a_raw in ff.get(3, []):
+            a = pb_parse_multi(a_raw)
+            assert a.get(4, [0])[0] == 0 and a.get(3, [b''])[0] == b''
+        # f4 损失 / f5 缴获：{f1 cat, f2 n}
+        des = {int(pb_parse_multi(d).get(1, [0])[0]):
+               int(pb_parse_multi(d).get(2, [0])[0]) for d in ff.get(4, [])}
+        cap = {int(pb_parse_multi(c).get(1, [0])[0]):
+               int(pb_parse_multi(c).get(2, [0])[0]) for c in ff.get(5, [])}
+        assert des == exp_des, (fac, des)
+        assert cap == exp_cap, (fac, cap)
+    # 旧战报（无 factions_json）不崩、不误发 f3/f4/f5
+    rep_old = dict(rep)
+    rep_old['factions_json'] = None
+    m_old = br._msg_client_battle_report(rep_old, players)
+    for fac_raw in pb_parse_multi(m_old).get(11, []):
+        ff = pb_parse_multi(fac_raw)
+        assert not ff.get(3) and not ff.get(4) and not ff.get(5), ff
+
+
+def test_factions_extra_war_at_ownership():
+    """war 局 AT 实例归属：factions_extra.ats 带真实 owner + gamertag。
+
+    owner 在本局玩家表（BattleReport f9 gamertag）→ tag 直取；
+    owner 不在局（部署 AT 的将军未参战）→ tag=''（_FakeStore 无 pool，
+    DB 查询分支被吞，线上走 players 表反查）。"""
+    import force_pool
+    fake = _FakeStore()
+    old = combat_handlers.STORE
+    combat_handlers.STORE = fake
+    try:
+        comp = force_pool.composition_for_template(203) or {1: 90}
+        force_pool.init_mission_war(
+            100005, 2, 3,
+            {2: [comp], 3: [comp]},
+            {2: ['infantry'], 3: ['guard']},
+            {2: [{'id': 11, 'name': '第7装甲营', 'owner_player_id': 1,
+                  'template_id': 203}],
+             3: [{'id': 12, 'name': 'Guard Alpha', 'owner_player_id': 999,
+                  'template_id': 303}]})
+        asyncio.run(combat_handlers.handle_announce_battlefield_earnings(
+            _MockSess(), _MockWriter(), 200,
+            'AnnounceBattleFieldEarningsRequest',
+            _build_earnings_request(100005)))
+    finally:
+        combat_handlers.STORE = old
+        force_pool.release(100005)
+    rep, _ = fake.saved
+    fx = rep['factions_extra']
+    at2 = fx[2]['ats'][0]
+    assert at2['name'] == '第7装甲营', at2          # AT 实例名（非兵种名）
+    assert at2['owner'] == 1 and at2['tag'] == 'TestGuy', at2
+    at3 = fx[3]['ats'][0]
+    assert at3['owner'] == 999 and at3['tag'] == '', at3
+
+
+def test_battlereport_response_encodes_at_owner():
+    """GetBattleReportResponse f11.f3：AT 归属 ownerGamerTag/ownerPlayerId
+    编码（客户端显示属主与加好友按钮的数据源）。"""
+    import json as _json
+    from protocol import pb_parse_multi
+    from handlers import battlereport as br
+    rep = {'id': 321, 'mission_preset_id': 10, 'defender_faction_id': 2,
+           'winner_faction_id': 2, 'mission_time_seconds': 900,
+           'battle_start_time': 1787750000, 'capturepoints_json': '[]',
+           'factions_json': _json.dumps({
+               '2': {'ats': [{'name': '第7装甲营', 'tmpl': 203,
+                              'owner': 1, 'tag': 'TestGuy'}],
+                     'destroyed': {'1': 10}}})}
+    players = [{'player_id': 1, 'gamertag': 'TestGuy', 'score': 500,
+                'captures': 0, 'kills': 3, 'deaths': 1, 'squad_name': '',
+                'characters_json': '[{"characterId": 4, "factionId": 2}]'}]
+    m = br._msg_client_battle_report(rep, players)
+    fac_raw = pb_parse_multi(m).get(11, [])[0]
+    at_raw = pb_parse_multi(fac_raw).get(3, [])[0]
+    a = pb_parse_multi(at_raw)
+    assert a.get(1, [b''])[0].decode() == '第7装甲营'
+    assert int(a.get(2, [0])[0]) == 203
+    assert a.get(3, [b''])[0].decode() == 'TestGuy'   # ownerGamerTag
+    assert int(a.get(4, [0])[0]) == 1                  # ownerPlayerId
+    # 角色 f14/f15/f16（proto2 required）显式补 0
+    pm = pb_parse_multi(pb_parse_multi(fac_raw).get(2, [])[0])
+    ch = pb_parse_multi(pm.get(9, [])[0])
+    for f in (14, 15, 16):
+        assert int(ch.get(f, [0])[0]) == 0, f
+
+
 if __name__ == '__main__':
     test_earnings_value_crash_bytes()
     test_handle_earnings_no_crash_and_response_first()
@@ -420,4 +597,8 @@ if __name__ == '__main__':
     test_capturepoints_and_xpstats_parse_and_persist()
     test_capturepoints_fallback_from_status_overlay()
     test_battlereport_response_encodes_capturepoints_and_stats()
-    print('test_settlement_parse: 8 项全部通过')
+    test_factions_extra_snapshotted_from_force_pool()
+    test_battlereport_response_encodes_faction_extras()
+    test_factions_extra_war_at_ownership()
+    test_battlereport_response_encodes_at_owner()
+    print('test_settlement_parse: 12 项全部通过')

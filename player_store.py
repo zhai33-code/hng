@@ -315,16 +315,19 @@ CREATE TABLE IF NOT EXISTS battle_reports (
     id                  SERIAL PRIMARY KEY,
     mission_session_id  BIGINT UNIQUE NOT NULL,
     mission_id          BIGINT NOT NULL,
-    mission_preset_id   BIGINT NOT NULL,
+    mission_preset_id  BIGINT NOT NULL,
     winner_faction_id   BIGINT NOT NULL,
     defender_faction_id BIGINT NOT NULL,
     mission_time_seconds INT NOT NULL DEFAULT 0,
     battle_start_time   INT NOT NULL DEFAULT 0,
     capturepoints_json  JSONB NOT NULL DEFAULT '[]',
+    factions_json       JSONB NOT NULL DEFAULT '{}',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE battle_reports ADD COLUMN IF NOT EXISTS
     capturepoints_json JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE battle_reports ADD COLUMN IF NOT EXISTS
+    factions_json JSONB NOT NULL DEFAULT '{}';
 CREATE TABLE IF NOT EXISTS battle_report_players (
     id          SERIAL PRIMARY KEY,
     report_id   INT NOT NULL REFERENCES battle_reports(id) ON DELETE CASCADE,
@@ -708,11 +711,23 @@ CREATE TABLE IF NOT EXISTS war_cities (
     PRIMARY KEY (war_id, battlefield_id)
 );
 
+-- 每场战争的阵营选择（官服 join_war_request 落库）：FactionSelectionWindow
+-- 选定后存 (player, war, faction)；新战争（sequel 新 war_id）无行 → player
+-- f11=0 → 客户端重弹选阵营窗（"每场战争重新选阵营"官服语义）
+CREATE TABLE IF NOT EXISTS player_war_factions (
+    player_id  BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    war_id     BIGINT NOT NULL REFERENCES wars(id) ON DELETE CASCADE,
+    faction    INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (player_id, war_id)
+);
+
+
 -- AT 实例：扩展既有 command_nodes（原表零使用，纯 schema 占位）
 -- state：0=首都待命 1=移动中 2=会战中 3=已解散；morale/maxMorale 按
 -- CommandNodeMoraleTemplate 官服实值（100）由 war_campaign 层维护
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS abbreviation TEXT NOT NULL DEFAULT '';
-ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS rank INT NOT NULL DEFAULT 1;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS rank INT NOT NULL DEFAULT 0;
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS xp BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS resources JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS morale INT NOT NULL DEFAULT 100;
@@ -728,7 +743,19 @@ ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS is_deployed BOOLEAN NOT NULL 
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS has_gotten_soldier_free BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS has_gotten_vehicle_free BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- AT 战绩（GetAssaultTeamStatsRecord f5/f6；XP 口径 battles×5+battlesWon×25）
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS battles INT NOT NULL DEFAULT 0;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS battles_won INT NOT NULL DEFAULT 0;
+-- AT 战绩刷新时间戳（CommandNodeDefinition f10 statUpdateTimeStamp：rank/xp/
+-- battles 变化时刷新 → 客户端 statsHaveChanged 重拉 GetAssaultTeamStats）
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS stats_updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- 补给队（Reserve）父链：template_id=faction*100+4 时指向被补给的 AT
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS parent_command_node_id BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_command_nodes_war ON command_nodes(war_id);
+
+-- 旧库修正：rank 默认曾是 1（0 XP 新 AT 可直接升级的根因），存量行按
+-- xp 归零重算（0 XP → rank 0；有 xp 的行由结算 rank_from_xp 口径重推）
+UPDATE command_nodes SET rank = 0 WHERE xp = 0 AND rank > 0;
 
 -- AT 移动（transport_commandnode 路径；path_json=段列表
 -- [{sl_id,from_ap,to_ap,from_bf,to_bf,seconds}]）
@@ -1878,7 +1905,9 @@ class PlayerStore:
         report: {mission_session_id, mission_id, mission_preset_id,
                  winner_faction_id, defender_faction_id,
                  mission_time_seconds, battle_start_time,
-                 capturepoints: [{id, owner}]（结算时据点终态，可缺省）}
+                 capturepoints: [{id, owner}]（结算时据点终态，可缺省）,
+                 factions_extra: {faction: {ats: [{name, tmpl}],
+                                   destroyed: {cat: n}, captured: {cat: n}}}
         players: [{player_id, gamertag, squad_name, score, captures, kills,
                    deaths, is_bot, characters: [dict 任意结构存 JSONB]}]
         按 mission_session_id 幂等：同一局重复结算先删旧 players 再重建。
@@ -1895,13 +1924,15 @@ class PlayerStore:
                             'mission_time_seconds = EXCLUDED.mission_time_seconds, '
                             'battle_start_time = EXCLUDED.battle_start_time, '
                             'capturepoints_json = EXCLUDED.capturepoints_json, '
+                            'factions_json = EXCLUDED.factions_json, '
                             'created_at = now() ') if players else \
                            'ON CONFLICT (mission_session_id) DO NOTHING '
                 rid = await conn.fetchval(
                     'INSERT INTO battle_reports (mission_session_id, mission_id, '
                     'mission_preset_id, winner_faction_id, defender_faction_id, '
-                    'mission_time_seconds, battle_start_time, capturepoints_json) '
-                    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) '
+                    'mission_time_seconds, battle_start_time, capturepoints_json, '
+                    'factions_json) '
+                    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb) '
                     + conflict +
                     'RETURNING id',
                     int(report['mission_session_id']), int(report.get('mission_id', 0)),
@@ -1911,6 +1942,8 @@ class PlayerStore:
                     int(report.get('mission_time_seconds', 0)),
                     int(report.get('battle_start_time', 0)),
                     json.dumps(report.get('capturepoints') or [],
+                               ensure_ascii=False),
+                    json.dumps(report.get('factions_extra') or {},
                                ensure_ascii=False))
                 if rid is None:
                     # DO NOTHING 命中冲突：回查已存战报 id（供通知引用）
@@ -1942,7 +1975,8 @@ class PlayerStore:
             rep = await conn.fetchrow(
                 'SELECT id, mission_session_id, mission_id, mission_preset_id, '
                 'winner_faction_id, defender_faction_id, mission_time_seconds, '
-                'battle_start_time, capturepoints_json, created_at '
+                'battle_start_time, capturepoints_json, factions_json, '
+                'created_at '
                 'FROM battle_reports WHERE id = $1',
                 report_id)
             if rep is None:
@@ -2196,12 +2230,56 @@ class PlayerStore:
         return val
 
     async def get_player_faction(self, player_id):
-        """玩家阵营（最新角色 faction），无角色返回 0。"""
+        """玩家阵营：本场战争显式选择（player_war_factions）优先 → 名下 AT
+        faction → 最新角色（AT/购买链路用；player f11 用
+        get_player_war_faction 严格口径，未选择发 0）。
+
+        战争模式阵营以 AT 阵营为准——玩家用其他阵营士兵打普通模式
+        （characters 表 faction 变化）不应导致战争模式阵营漂移。
+        2026-09-03 官服口径：本场战争的显式选择（player_war_factions，
+        join_war_request 落库）最优先；未选择回落 AT/角色派生。"""
+        pid = int(player_id)
+        async with self.pool.acquire() as conn:
+            war_id = await conn.fetchval(
+                'SELECT id FROM wars WHERE state = 1 '
+                'ORDER BY id DESC LIMIT 1')
+            if war_id is not None:
+                sel = await conn.fetchval(
+                    'SELECT faction FROM player_war_factions '
+                    'WHERE player_id = $1 AND war_id = $2', pid, int(war_id))
+                if sel is not None:
+                    return int(sel)
+            val = await conn.fetchval(
+                'SELECT faction FROM command_nodes '
+                'WHERE owner_player_id = $1 AND state < 3 '
+                'ORDER BY id DESC LIMIT 1', pid)
+            if val is None:
+                val = await conn.fetchval(
+                    'SELECT faction FROM characters WHERE player_id = $1 '
+                    'AND deleted = FALSE ORDER BY id DESC LIMIT 1', pid)
+        return int(val or 0)
+
+    async def get_player_war_faction(self, player_id, war_id):
+        """本场战争的阵营选择（官服 join_war_request 落库行）。
+
+        未选择返回 None（调用方据此把 player f11 发 0，客户端弹
+        FactionSelectionWindow / 首页 CTA）。"""
         async with self.pool.acquire() as conn:
             val = await conn.fetchval(
-                'SELECT faction FROM characters WHERE player_id = $1 '
-                'ORDER BY id DESC LIMIT 1', player_id)
-        return int(val or 0)
+                'SELECT faction FROM player_war_factions '
+                'WHERE player_id = $1 AND war_id = $2',
+                int(player_id), int(war_id))
+        return int(val) if val is not None else None
+
+    async def set_player_war_faction(self, player_id, war_id, faction):
+        """记录/更新本场战争的阵营选择（UPSERT；同 war 重选覆盖）。"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'INSERT INTO player_war_factions (player_id, war_id, faction) '
+                'VALUES ($1, $2, $3) '
+                'ON CONFLICT (player_id, war_id) DO UPDATE SET faction = $3',
+                int(player_id), int(war_id), int(faction))
+        return True
 
     async def add_friend(self, player_id, friend_id):
         """添加好友（单向请求行 status=0；对方也已请求则双向转正 status=1）。
@@ -4024,18 +4102,21 @@ class PlayerStore:
 
     async def create_command_node(self, war_id, template_id, owner_player_id,
                                   faction, name, resources=None,
-                                  abbreviation='', rank=1):
+                                  abbreviation='', rank=0,
+                                  parent_command_node_id=0):
         """购买 AT → 新实例（state=0 首都待命）。返回 AT 行 dict。"""
         import json as _json
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 'INSERT INTO command_nodes (war_id, template_id, '
                 'owner_player_id, faction, name, abbreviation, rank, '
-                'resources) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) '
+                'resources, parent_command_node_id) '
+                'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) '
                 'RETURNING *',
                 int(war_id), int(template_id), int(owner_player_id),
                 int(faction), str(name or ''), str(abbreviation or ''),
-                int(rank or 1), _json.dumps(resources or {}))
+                int(rank or 0), _json.dumps(resources or {}),
+                int(parent_command_node_id or 0))
         return dict(row) if row else None
 
     async def get_command_node(self, node_id):
@@ -4077,13 +4158,18 @@ class PlayerStore:
         return [dict(r) for r in rows]
 
     async def update_command_node(self, node_id, **fields):
-        """AT 字段更新（name/rank/xp/resources/morale/state/map_entity_id/
-        map_entity_type/general_character_id/is_deployed/abbreviation）。返回是否更新。"""
-        allowed = {'name', 'abbreviation', 'rank', 'xp', 'resources', 'morale',
+        """AT 字段更新（name/rank/xp/battles/battles_won/resources/morale/
+        state/map_entity_id/map_entity_type/general_character_id/is_deployed/
+        abbreviation）。rank/xp/battles/battles_won 任一变更时自动刷新
+        stats_updated_at（Definition f10 → 客户端重拉 GetAssaultTeamStats）。
+        返回是否更新。"""
+        allowed = {'name', 'abbreviation', 'rank', 'xp', 'battles',
+                   'battles_won', 'resources', 'morale',
                    'max_morale', 'state', 'map_entity_id', 'map_entity_type',
                    'general_character_id', 'is_deployed', 'upgrade_level',
                    'owner_player_id', 'faction', 'template_id',
-                   'has_gotten_soldier_free', 'has_gotten_vehicle_free'}
+                   'has_gotten_soldier_free', 'has_gotten_vehicle_free',
+                   'parent_command_node_id'}
         import json as _json
         sets, args = [], []
         for k, v in fields.items():
@@ -4095,6 +4181,8 @@ class PlayerStore:
             sets.append(f'{k} = ${len(args)}')
         if not sets:
             return False
+        if {'rank', 'xp', 'battles', 'battles_won'} & fields.keys():
+            sets.append('stats_updated_at = now()')
         args.append(int(node_id))
         async with self.pool.acquire() as conn:
             n = await conn.execute(

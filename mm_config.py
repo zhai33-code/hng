@@ -176,8 +176,9 @@ WAR_DISSOLVE_REFUND = _float_env('MM_WAR_DISSOLVE_REFUND', 0.5)
 WAR_AT_REQUIRE_COMMAND_POINTS = bool(
     _int_env('MM_WAR_AT_REQUIRE_COMMAND_POINTS', 1))
 # AT 移动（Phase 6）：段时长 = 城市坐标距离 / (模板speed × WAR_TIMESCALE ×
-# WAR_AT_MOVE_SCALE) 秒。官服移动耗时数小时级，默认 1.0 近似，可校准。
-WAR_AT_MOVE_SCALE = _float_env('MM_WAR_AT_MOVE_SCALE', 1.0)
+# WAR_AT_MOVE_SCALE) 秒。1.0=官服真实时间节奏（步兵跨半图 ~4 小时）；
+# 2026-09-03 应玩家要求提速 10 倍（步兵邻城 ~19 秒、跨半图 ~25 分钟）。
+WAR_AT_MOVE_SCALE = _float_env('MM_WAR_AT_MOVE_SCALE', 10.0)
 # 战争推进 tick 间隔秒（移动换段/到达判定/会战成局桩；realtest_server 挂载）
 WAR_TICK_SECONDS = _int_env('MM_WAR_TICK_SECONDS', 5)
 
@@ -218,3 +219,9 @@ WAR_PRODUCTION_MIN_TICK = _int_env('MM_WAR_PRODUCTION_MIN_TICK', 60)
 # 增援/部署受阵营库存约束时，库存可交付比例下限（0=有多少给多少，缺口入队）
 WAR_SUPPLY_INSTANT_PARTIAL = bool(
     _int_env('MM_WAR_SUPPLY_INSTANT_PARTIAL', 1))
+# 补给队（Reserve，官服机制 §10.2 #6）：0=关闭（一律即时/库存入队，旧
+# 行为）；1=自动（AT 所在城市非己方领地 → 购买的兵员装上补给队从最近己方
+# 城市沿补给线机动，到达与父 AT 汇合后入编）；2=一律生成补给队。
+# 官服口径：客户端 AT_TEMPLATE_RESERVE(4) + parentCommandNodeInstanceId
+# 汇合链（AssaultTeamModel.updateArmyResources OnTheWay 汇总）。
+WAR_SUPPLY_COLUMN_MODE = _int_env('MM_WAR_SUPPLY_COLUMN_MODE', 1)

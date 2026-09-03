@@ -731,6 +731,7 @@ async def _init_war_mission_resources(mission_id, battle_id, attacker,
     保证会战可玩（宁要可打的局，不要空池死局）。"""
     comps = {int(attacker): [], int(defender): []}
     names = {int(attacker): [], int(defender): []}
+    ats = {int(attacker): [], int(defender): []}   # AT 实例（战报 f11.f3 归属）
     try:
         wb = await STORE.get_war_battle(int(battle_id))
         roster = (wb or {}).get('factions') or []
@@ -750,6 +751,12 @@ async def _init_war_mission_resources(mission_id, battle_id, attacker,
                 continue
             comps[fac].append(comp)
             names[fac].append(force_pool.template_name(tid) or f'at{tid}')
+            ats[fac].append({
+                'id': int(node.get('id', 0) or 0),
+                'name': str(node.get('name') or ''),
+                'owner_player_id': int(node.get('owner_player_id', 0) or 0),
+                'template_id': tid,
+            })
     except Exception as ex:
         _log(f'[war] battle {battle_id} AT roster load failed: {ex}')
     if not comps[int(attacker)] or not comps[int(defender)]:
@@ -758,7 +765,8 @@ async def _init_war_mission_resources(mission_id, battle_id, attacker,
              f'dfd={len(comps[int(defender)])}) -> fallback mirror draw')
         _init_mission_resources(mission_id, 10, attacker, defender)
         return
-    force_pool.init_mission_war(mission_id, attacker, defender, comps, names)
+    force_pool.init_mission_war(mission_id, attacker, defender, comps, names,
+                                 ats)
 
 
 def mission_resource_pool(mission_id):

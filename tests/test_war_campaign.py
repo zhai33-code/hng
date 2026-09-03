@@ -133,7 +133,8 @@ async def main():
           f'{sorted(top.keys())}')
     check('f1 id', int(top[1]) == 42)
     check('f2 name', top[2].decode() == 'Test War')
-    check('f3 begintime STR', top[3].decode() == '2026-09-02 08:30:00')
+    check('f3 begintime STR（紧凑 Zulu，客户端 convertZuluTime 解析）',
+          top[3].decode() == '20260902083000Z', top[3].decode())
     check('f4 endtime 进行中空串', top[4] == b'')
     check('f7 winningfactionid=0', int(top[7]) == 0)
     check('f8 pointsNeededForVictory', int(top[8]) == 15)
@@ -351,9 +352,9 @@ async def main():
           and int(ar_rows[0][5]) == w['id'])
     mor = {int(pb_parse(p)[3]): pb_parse(p) for t, p in snapshot
            if t == b'CommandNodeMorale'}
-    check('CommandNodeMorale playerId/warId/STR 时间戳',
+    check('CommandNodeMorale playerId/warId/STR 时间戳（紧凑 Zulu）',
           int(mor[11][2]) == 7 and int(mor[11][4]) == w['id']
-          and mor[11][5].decode() == '2026-09-02 10:00:00')
+          and mor[11][5].decode() == '20260902100000Z')
     # 退化路径：store=None / 无 pool
     check('快照 store=None 返回 []',
           await war_campaign.build_warmap_snapshot(None) == [])

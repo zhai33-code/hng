@@ -141,16 +141,23 @@ async def handle_login2_response(sess, writer, cmd_id, req_type, proto):
         note = 'wrong_password=98'
     # currentplayer.id 用数据库真实 player_id（客户端战报界面按它
     # 匹配本局玩家行，恒 1 会让 DB id≥2 的玩家结算窗口不弹）；
-    # factionid 同理取最新角色阵营（阵营颜色/部署过滤/资源总览都读它）
+    # f10/f11 官服口径：当前战争 id + 本场阵营选择（无选择发 0 →
+    # 客户端弹 FactionSelectionWindow，join_war_request 落库后修正）
     pid = await sess.ensure_player() if code == RC['login_success'] else None
     faction = None
+    war = None
     if pid:
         try:
-            faction = await STORE.get_player_faction(pid)
+            import war_campaign
+            war = await war_campaign.ensure_war(STORE)
+            if war is not None:
+                sel = await STORE.get_player_war_faction(pid, war['id'])
+                faction = int(sel) if sel is not None else 0
         except Exception as e:
-            log(f'[DB] get_player_faction failed: {e}')
+            log(f'[DB] player war faction failed: {e}')
     resp_proto = msg_login2_result(sess.username or 'DemoPlayer', code,
-                                   pid=pid or 1, faction=faction)
+                                   pid=pid or 1, faction=faction,
+                                   war=war['id'] if war is not None else 0)
     resp = build_response(cmd_id, 'login2_result', resp_proto)
     log(f'S->C cmd={cmd_id:<4} login2_result -- {note}')
     log(f'      resp bytes ({len(resp)}B): {resp.hex()}')

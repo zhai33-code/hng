@@ -29,6 +29,7 @@ import zlib
 
 import matchmaking
 import war_campaign
+import force_pool
 from protocol import (
     build_response,
     pb_bool,
@@ -1040,16 +1041,37 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                     for c_raw in _all(p, 11):            # BattleReportCharacter
                         c = _split_fields(c_raw)
                         # f13 ribbons：PlayerBattleReportRibbon{f1 模板id,
-                        # f2 startValue, f3 endValue}——战报界面勋带进度条
-                        # 直接用这两个值画（客户端 start==end 会跳过不显示）
+                        # f2 startValue, f3 endValue, f4-f8 各 XP 加成,
+                        # f9 ribbonStatValues}——战报界面勋带进度条用
+                        # start/end + 加成画（客户端 start==end 会跳过不显示），
+                        # 点开勋带后的经验明细列表由 f9 驱动（spbc 描述符
+                        # 0x1807B42F0 + sub_1802C0350/sub_1802BFDB0 实锤：
+                        # 战斗服构建时必填 f4-f9，子元素 f1 id/f2 statValue/
+                        # f3 xpValue 均为 varint，xpValue 由 float 截断）
                         ribbons = []
                         for r_raw in _all(c, 13):
                             rf = _split_fields(r_raw)
-                            ribbons.append({
+                            rb = {
                                 'id': int(_get(rf, 1, 0) or 0),
                                 'start': int(_get(rf, 2, 0) or 0),
                                 'end': int(_get(rf, 3, 0) or 0),
-                            })
+                                'xpVet': int(_get(rf, 4, 0) or 0),
+                                'xpBooster': int(_get(rf, 5, 0) or 0),
+                                'xpCampaign': int(_get(rf, 6, 0) or 0),
+                                'xpUnderdog': int(_get(rf, 7, 0) or 0),
+                                'xpSquadVet': int(_get(rf, 8, 0) or 0),
+                                'stats': [],
+                            }
+                            for rs_raw in _all(rf, 9):
+                                rs = _split_fields(rs_raw)
+                                rs_id = int(_get(rs, 1, 0) or 0)
+                                if rs_id:
+                                    rb['stats'].append({
+                                        'id': rs_id,
+                                        'value': int(_get(rs, 2, 0) or 0),
+                                        'xp': float(int(_get(rs, 3, 0) or 0)),
+                                    })
+                            ribbons.append(rb)
                         credit = _earnings_value(_get(c, 10, b''))
                         warfund = _earnings_value(_get(c, 11, b''))
                         # f12 xpStatValues：士兵详情"战斗经验明细"列表
@@ -1126,6 +1148,72 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
         log(f'      [combat] msid missing, synthesized '
             f'{report["mission_session_id"]} (mission={report["mission_id"]}, '
             f'start={report["battle_start_time"]})')
+
+    # ---- 战报 f11.f3/f4/f5（参战突击队 / 损失 / 缴获）：C→S 协议不上报，
+    # 官服由 war 侧战图状态推导——本服从 force_pool 资源池推导（须在
+    # release_match 释放池之前快照）：
+    #   f3 assaultTeams：每方本局 AT 名单——war 局发 AT 实例名 + 真实
+    #      ownerPlayerId/ownerGamerTag（客户端显示属主与加好友按钮），
+    #      staged 局 owner=0 → 客户端判自动生成 AT（无加好友按钮）；
+    #   f4 resourcesDestroyed：本方出战消耗（初始-剩余，即本方战损）；
+    #   f5 resourcesCaptured：胜方缴获败方未出战的剩余兵力。
+    report['factions_extra'] = {}
+    try:
+        fst = force_pool.faction_stats(report['mission_id'])
+        if fst:
+            winner = int(report['winner_faction_id'] or 0)
+            loser = None
+            if winner:
+                loser = next((f for f in fst if f != winner), None)
+            # AT 实例归属的 gamertag：本局玩家优先（BattleReport f9 已带），
+            # 缺的按 owner_player_id 查 players 表（部署 AT 的将军可能
+            # 未进战局）
+            tags = {p['player_id']: p['gamertag'] for p in br_players}
+            miss = {a['owner_player_id']
+                    for fs in fst.values() if fs.get('ats')
+                    for a in fs['ats']
+                    if a['owner_player_id'] and a['owner_player_id'] not in tags}
+            if miss and STORE is not None:
+                try:
+                    rows = await STORE.pool.fetch(
+                        'SELECT id, username FROM players WHERE id = ANY($1)',
+                        sorted(miss))
+                    tags.update({int(r['id']): r['username'] for r in rows})
+                except Exception as e:
+                    log(f'      [combat] AT owner gamertag lookup failed: {e}')
+            for fac, fs in fst.items():
+                fac = int(fac)
+                ats = []
+                if fs.get('ats'):
+                    # war 局：AT 实例（command_nodes）——实例名 + 真实 owner
+                    for a in fs['ats']:
+                        owner = int(a.get('owner_player_id') or 0)
+                        ats.append({'name': a.get('name') or '',
+                                    'tmpl': int(a.get('tmpl', 0) or 0),
+                                    'owner': owner,
+                                    'tag': tags.get(owner, '')})
+                else:
+                    # staged 局：服务器抽取的镜像名单 → owner=0（客户端判
+                    # 自动生成 AT，语义正确）
+                    for name in fs['names']:
+                        tmpl = commandnode_template(fac, name)
+                        if tmpl:
+                            ats.append({'name': name, 'tmpl': int(tmpl)})
+                destroyed = {}
+                for cat, init_n in fs['initial'].items():
+                    lost = max(0, init_n - fs['remaining'].get(cat, 0))
+                    if lost:
+                        destroyed[cat] = lost
+                report['factions_extra'][fac] = {
+                    'ats': ats, 'destroyed': destroyed,
+                }
+            if winner in fst and loser is not None:
+                captured = {c: n for c, n in fst[loser]['remaining'].items() if n}
+                if captured:
+                    report['factions_extra'].setdefault(winner, {})[
+                        'captured'] = captured
+    except Exception as e:
+        log(f'      [combat] factions_extra build failed: {e}')
 
     # ---- PlayerBattleResult（f5）：货币 + 角色战斗明细
     currency_ops = []       # (player_id, credits, warfunds)
@@ -1390,9 +1478,13 @@ async def _settle_war_mission(mission_id, report):
     winner = int((report or {}).get('winner_faction_id') or 0)
     if not winner:
         winner = int(det.get('defender_faction') or 0)
+    # 缴获入账（war 局）：factions_extra.captured 在 release_match 之前
+    # 快照（combat 主流程已构建），此处传给战争结算回写胜方阵营库存
+    captured = dict(((report or {}).get('factions_extra') or {}).get(
+        winner, {}).get('captured') or {})
     try:
         events = await war_campaign.settle_war_battle(
-            STORE, int(mission_id), battle_id, winner)
+            STORE, int(mission_id), battle_id, winner, captured=captured)
         await war_campaign.broadcast_war_events(events)
     except Exception as e:
         log(f'      [war] settle battle {battle_id} (mission={mission_id}) '

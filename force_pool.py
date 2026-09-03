@@ -258,13 +258,17 @@ def init_mission(mission_id, gamemode_id, attacker, defender):
 
 
 def init_mission_war(mission_id, attacker, defender, comps_by_faction,
-                     names_by_faction):
+                     names_by_faction, ats_by_faction=None):
     """war 会战建池（M2）：兵力 = 双方实际参战 AT 编制之和（官方口径：
     战争局兵力 = 将军部署的 AT 之和，攻守各自独立、不镜像）。
 
     comps_by_faction: {faction: [{资源类别id: count}, ...]} 每 AT 一份编制
     names_by_faction: {faction: [AT 兵种名, ...]}（f4 渲染按阵营翻译）
     'names' 存攻方名单（assign_lines 攻方分线兼容：分线池合计=攻方主池）。
+    ats_by_faction: {faction: [{id, name, owner_player_id, template_id}, ...]}
+    AT 实例信息（command_nodes 行）——结算战报 f11.f3 归属用（客户端
+    ownerPlayerId=0 判"自动生成 AT"，war 局是玩家部署的 AT，须发真实
+    owner + 实例名，否则结算页丢失 AT 属主与加好友按钮）。
     """
     pools = {}
     for fac, comps in (comps_by_faction or {}).items():
@@ -279,6 +283,8 @@ def init_mission_war(mission_id, attacker, defender, comps_by_faction,
         'mode': 'war',
         'names': list(names_by_faction.get(int(attacker)) or []),
         'names_by_faction': names_by_faction,
+        'war_ats': {int(f): [dict(a) for a in (v or [])]
+                    for f, v in (ats_by_faction or {}).items()},
         'attacker': int(attacker), 'defender': int(defender),
         'pool': pools,
         'lines': None, 'line_pool': None, 'ap_line': {},
@@ -413,3 +419,36 @@ def assault_team_names(mission_id, faction=None):
     if faction is not None and rec.get('names_by_faction'):
         return list(rec['names_by_faction'].get(int(faction)) or [])
     return list(rec['names']) if rec.get('names') else None
+
+
+def faction_stats(mission_id):
+    """结算战报用：每方 {names, ats, initial, remaining}（资源类别 → 数量）。
+
+    initial 由本方 AT 名单编制重算（init 未存初值，池即剩余量）；
+    ats 是 AT 实例列表 [{name, tmpl, owner_player_id}]（war 局有实例归属，
+    staged 局为 None → 调用方回退兵种名+owner=0 即"自动生成 AT"）；
+    无池返回 None。调用须在 release()（release_match）之前。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if rec is None:
+        return None
+    stats = {}
+    war_ats = rec.get('war_ats') or {}
+    for fac in rec['pool']:
+        names = assault_team_names(mission_id, fac) or []
+        initial = {}
+        for name in names:
+            for cat, cnt in _AT_COMP.get(name, {}).items():
+                initial[int(cat)] = initial.get(int(cat), 0) + int(cnt)
+        ats = None
+        if war_ats.get(int(fac)):
+            ats = [{'name': str(a.get('name') or ''),
+                    'tmpl': int(a.get('template_id', 0) or 0),
+                    'owner_player_id': int(a.get('owner_player_id', 0) or 0)}
+                   for a in war_ats[int(fac)]]
+        stats[int(fac)] = {
+            'names': names,
+            'ats': ats,
+            'initial': initial,
+            'remaining': {int(c): int(n) for c, n in rec['pool'][fac].items()},
+        }
+    return stats

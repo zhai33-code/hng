@@ -32,10 +32,9 @@ _DELEGATED = {
 
 # 白名单：明确不实现（回 HandlerErrorResponse 解锁队列，无功能影响）
 _WHITELIST = {
-    # --- 战争地图/统计族（暂缓；AT 五请求已实装 war_at.HANDLERS，已摘除）---
+    # --- 战争地图/统计族（暂缓；AT 请求已实装 war_at.HANDLERS，已摘除）---
     'ReorderSupplyQueueRequest', 'LeaveSupplyQueueRequest',
     'QueryFactionsOnBattlefieldRequest', 'MonitorLoadRequest',
-    'CompleteAssaultTeamRankRequest', 'GetAssaultTeamStatsRequest',
     'AddCharacterStatisticsRequest', 'AddAssaultTeamStatisticsRequest',
     'war_create_request',
     # stats 族（RequestReadRibbonValue/RequestXPs 等命名不含 Request 结尾的

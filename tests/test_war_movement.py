@@ -125,6 +125,10 @@ class FakeStore:
     async def get_war_cities(self, war_id):
         return dict(self.city_owners.get(int(war_id), {}))
 
+    async def set_city_owner(self, war_id, battlefield_id, owner_faction):
+        self.city_owners.setdefault(int(war_id), {})[int(battlefield_id)] = \
+            int(owner_faction)
+
     async def create_mission_record(self, preset, **kw):
         self.next_mission_id = getattr(self, 'next_mission_id', 500) + 1
         return self.next_mission_id
@@ -562,6 +566,69 @@ async def main():
     check('快照 在途空运 → air_transport 行（f2 instance/f5 to）',
           facode == war_campaign.RC_OK
           and int(frow[2]) == 71 and int(frow[5]) == 10)
+
+    # ---- H. 占城（途经 + 到达 + 敌驻军拦截 + force）----
+    store8 = FakeStore()
+    war8 = await war_campaign.ensure_war(store8)
+    mover = _mk_at(store8, war8['id'], 81, 1, 10)      # 无敌对 AT：10→30
+    mvh2, codeh2 = await war_campaign.start_movement(
+        store8, mover, 30, now=NOW)
+    check('H0 占城链 start RC_OK', codeh2 == war_campaign.RC_OK)
+
+    # H1 换段占城：途经城市 20 → faction 1 + 三类状态行
+    evh1 = await war_campaign.advance_movements(
+        store8, war8, now=NOW + datetime.timedelta(seconds=SEG_SEC * 1.5))
+    tagsh1 = {(k, tag) for k, tag, _ in evh1}
+    bf_rows1 = [pb_parse(p) for k, tag, p in evh1
+                if tag == b'battlefieldstatus']
+    ap_rows1 = [pb_parse(p) for k, tag, p in evh1
+                if tag == b'accesspointstatus']
+    check('H1 换段占城 途经城市 20 → faction 1',
+          store8.city_owners[war8['id']].get(20) == 1
+          and ('set', b'battlefieldstatus') in tagsh1
+          and any(int(r[3]) == 20 and int(r[4]) == 1 for r in bf_rows1),
+          f"owners={store8.city_owners[war8['id']]}")
+    check('H1 出兵点状态行随城易主',
+          any(int(r[3]) == 2 and int(r[4]) == 1 for r in ap_rows1))
+
+    # H2 到达占城：终点 30 → faction 1 + 补给线 20-30 同阵营成行
+    evh2 = await war_campaign.advance_movements(
+        store8, war8, now=NOW + datetime.timedelta(seconds=2 * SEG_SEC + 5))
+    bf_rows2 = [pb_parse(p) for k, tag, p in evh2
+                if tag == b'battlefieldstatus']
+    sl_rows2 = [pb_parse(p) for k, tag, p in evh2
+                if tag == b'supplylinestatus']
+    check('H2 到达占城 终点 30 → faction 1',
+          store8.city_owners[war8['id']].get(30) == 1
+          and any(int(r[3]) == 30 and int(r[4]) == 1 for r in bf_rows2))
+    check('H2 补给线 20-30 同阵营 → supplylinestatus set',
+          any(int(r[4]) == 102 and int(r[3]) == 1 for r in sl_rows2))
+
+    # H3 归属未变 → 无事件（幂等）
+    evh3 = await war_campaign._capture_city_events(
+        store8, war8['id'], 1, 30)
+    check('H3 归属未变无事件', evh3 == [])
+
+    # H4 敌驻军 → 不占领（交由会战）
+    store9 = FakeStore()
+    war9 = await war_campaign.ensure_war(store9)
+    atk = _mk_at(store9, war9['id'], 91, 1, 10)
+    _def = _mk_at(store9, war9['id'], 92, 2, 20)       # 敌 AT 驻 20
+    await war_campaign.start_movement(store9, atk, 20, now=NOW)
+    await war_campaign.advance_movements(
+        store9, war9, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    check('H4 敌驻军不占城（会战成局归属待结算）',
+          store9.city_owners[war9['id']].get(20) != 1
+          and store9.ats[91]['state'] == 2
+          and len(store9.battles) == 1)
+
+    # H5 force 占城（settle 复用）：跳过敌驻军检查
+    evh5 = await war_campaign._capture_city_events(
+        store9, war9['id'], 1, 20, force=True)
+    check('H5 force 占城跳过敌驻军检查',
+          store9.city_owners[war9['id']].get(20) == 1
+          and any(tag == b'battlefieldstatus'
+                  for _, tag, _ in evh5))
 
     fails = [l for l, ok in RESULTS if not ok]
     print(f'\n{"="*50}\nwar_movement 回归：{len(RESULTS)-len(fails)}/{len(RESULTS)} PASS')

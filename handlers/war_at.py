@@ -18,6 +18,7 @@ from protocol import (
     build_response,
     pb_int32,
     pb_int64,
+    pb_message,
     pb_parse,
     pb_parse_multi,
     pb_string,
@@ -238,17 +239,20 @@ async def handle_create_command_node_request(sess, writer, cmd_id, req_type,
                     except Exception as e:
                         log(f'      [war_at] create_command_node failed: {e}')
                         code = war_campaign.RC_COMMANDNODE_TEMPLATE_NOT_FOUND
-    if at is not None:
-        await _push_at_rows(sess, writer, at, at['war_id'])
-        await _push_player_refresh(sess, writer)
-        log(f'      [war] AT 购买 player={pid} template={template_id} '
-            f'name={name!r} cost={cost}')
     code = code or war_campaign.RC_OK   # 内部 0=通过 → 协议 ok=1
     resp = build_response(cmd_id, 'CreateCommandNodeResponse',
                           pb_int32(1, code))
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} CreateCommandNodeResponse (result={code})')
+    if at is not None:
+        # 响应先于行推送（与升级/官服时序一致）：客户端先收 ack（关窗/解绑窗口
+        # 监听器）再应用行变更；否则行应用链上的窗口监听器一旦抛异常，会卡死
+        # 客户端请求管线（_runningRequest 永久为 true，之后任何请求都发不出）
+        await _push_at_rows(sess, writer, at, at['war_id'])
+        await _push_player_refresh(sess, writer)
+        log(f'      [war] AT 购买 player={pid} template={template_id} '
+            f'name={name!r} cost={cost}')
 
 
 async def handle_upgrade_command_node_request(sess, writer, cmd_id, req_type,
@@ -283,6 +287,13 @@ async def handle_upgrade_command_node_request(sess, writer, cmd_id, req_type,
                 tgt = commandnode_templates().get(target_tpl)
                 if not tgt or not war_campaign.upgrade_allowed(cur, tgt):
                     code = war_campaign.RC_COMMANDNODE_TEMPLATE_NOT_FOUND
+                elif int(at.get('rank') or 0) < int(tgt.get('level') or 0):
+                    # 官服门槛：AT rank >= 目标模板 level（客户端
+                    # AssaultTeamMultiUpgradeWindowMediator 同判定；服务端
+                    # 兜底防改包 0 XP 直升）
+                    code = war_campaign.RC_COMMANDNODE_TEMPLATE_NOT_FOUND
+                    log(f'      [war_at] upgrade blocked: AT {at["id"]} '
+                        f'rank={at.get("rank")} < target level={tgt.get("level")}')
                 else:
                     cost, ok = await _charge_player(sess, pricing_id, currency)
                     if not ok:
@@ -297,16 +308,18 @@ async def handle_upgrade_command_node_request(sess, writer, cmd_id, req_type,
                         except Exception as e:
                             log(f'      [war_at] upgrade failed: {e}')
                             code = war_campaign.RC_COMMANDNODE_TEMPLATE_NOT_FOUND
-    if at is not None and not code:
-        await _push_at_rows(sess, writer, at, at['war_id'])
-        await _push_player_refresh(sess, writer)
-        log(f'      [war] AT 升级 node={node_id} -> template={target_tpl}')
+    ok = not code
+    # 响应先于行推送（与买等级同理：客户端先收 ack 再按序消费行变更事件）
     code = code or war_campaign.RC_OK   # 内部 0=通过 → 协议 ok=1
     resp = build_response(cmd_id, 'UpgradeCommandNodeResponse',
                           pb_int32(1, code))
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} UpgradeCommandNodeResponse (result={code})')
+    if at is not None and ok:
+        await _push_at_rows(sess, writer, at, at['war_id'])
+        await _push_player_refresh(sess, writer)
+        log(f'      [war] AT 升级 node={node_id} -> template={target_tpl}')
 
 
 # ------------------------------------------------------------- 部署 / 撤退
@@ -378,16 +391,18 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
                         elif rcode:
                             log(f'      [war_at] deploy resupply '
                                 f'skipped: {rcode}')
-    if at is not None and code in (
-            0, war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES):
-        await _push_at_rows(sess, writer, at, at['war_id'])
-        await _push_player_refresh(sess, writer)
     code = code or war_campaign.RC_OK   # 内部 0=通过 → 协议 ok=1
     resp = build_response(cmd_id, 'DeployCommandNodeResponse',
                           pb_int32(1, code))
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} DeployCommandNodeResponse (msg={code})')
+    if at is not None and code in (
+            1, war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES):
+        # 响应先于行推送（客户端先收 ack 关窗/解绑监听器，再应用行变更，
+        # 避免行应用链上的窗口监听器抛异常卡死客户端请求管线）
+        await _push_at_rows(sess, writer, at, at['war_id'])
+        await _push_player_refresh(sess, writer)
 
 
 async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
@@ -424,31 +439,70 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
                 except Exception as e:
                     log(f'      [war_at] retreat failed: {e}')
                     code = war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
-    if at is not None and not code:
-        await _push_at_rows(sess, writer, at, at['war_id'])
     code = code or war_campaign.RC_OK   # 内部 0=通过 → 协议 ok=1
     resp = build_response(cmd_id, 'RetreatCommandNodeResponse',
                           pb_int32(1, code))
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RetreatCommandNodeResponse (msg={code})')
+    if at is not None and code == war_campaign.RC_OK:
+        # 响应先于行推送（客户端先收 ack 再应用行变更，理由同购买/部署）
+        await _push_at_rows(sess, writer, at, at['war_id'])
 
 
 # ------------------------------------------------------------- 增援（#2）
 
+async def _pending_column_resources(war_id, at_id):
+    """父 AT 在途补给队载量 {cat: n}（官服口径缺编计价扣除 OnTheWay：
+    getNumberOfInfantryMissing = 编制 - 现有 - 在途，客户端实锤）。"""
+    out = {}
+    try:
+        for o in await STORE.list_war_command_nodes(war_id):
+            if (int(o.get('parent_command_node_id') or 0) == int(at_id)
+                    and war_campaign.is_reserve(o)
+                    and int(o.get('state') or 0) < 3):
+                for cat, n in war_campaign._as_resources(
+                        o.get('resources')).items():
+                    try:
+                        out[int(cat)] = out.get(int(cat), 0) + int(n)
+                    except (TypeError, ValueError):
+                        continue
+    except Exception as e:
+        log(f'      [war_at] pending column lookup failed: {e}')
+    return out
+
+
 async def _apply_resupply(at, pid, war, currency,
-                          soldier_pricing, vehicle_pricing):
+                          soldier_pricing, vehicle_pricing,
+                          near_capital=0):
     """缺编补编公共链（deploy/resupply 共用，§10.2 #4/#5）：
     每侧首次免费（has_gotten_*_free 置位后转付费）→ 按模板 Pricing 计价
-    扣款 → 阵营库存（war_faction_resources）即时交付 → 缺口入
-    war_supply_queue（supply_queue_tick 周期 FIFO 交付）。
+    扣款 → 交付：
 
-    返回 (code, at)：0=已处理（全额即时交付/已满），
+    - AT 所在城市在己方补给网络内（归属本方且沿补给线连通本方首都；
+      或 MM_WAR_SUPPLY_COLUMN_MODE=0）：阵营库存（war_faction_resources）
+      即时交付 → 缺口入 war_supply_queue（supply_queue_tick 周期 FIFO
+      交付）。
+    - 网络外（MM_WAR_SUPPLY_COLUMN_MODE=1 自动 / 2 一律）：官服补给队
+      （Reserve）机制——购买兵员装上补给队从阵营首都沿补给线机动，
+      到达与父 AT 汇合入编（war_campaign.spawn_supply_column /
+      _arrive_supply_column）；此路径不动阵营库存、不入 226 队列。
+
+    在途补给队载量先从缺编中扣除（防重复购买，同客户端计价口径）。
+
+    返回 (code, at)：0=已处理（全额即时交付/已满/补给队已派出），
     RC_COMMANDNODE_QUEUED_FOR_RESOURCES=有缺口入队（客户端特判 226），
-    其他=失败码（余额不足 153 等，AT 未变更）。状态校验（101/116）由
-    调用方自理。"""
+    其他=失败码（余额不足 153；不可达拒单 7，均不扣款，AT 未变更）。
+    状态校验（101/116）由调用方自理。"""
     tpl = commandnode_templates().get(_i(at.get('template_id'))) or {}
+    fac = int(at.get('faction') or 0)
     missing = _at_missing_resources(at, tpl)
+    pending = (await _pending_column_resources(war['id'], at['id'])
+               if missing else {})
+    if pending:
+        missing = {c: n - pending.get(c, 0)
+                   for c, n in missing.items()}
+        missing = {c: n for c, n in missing.items() if n > 0}
     if not missing:
         return war_campaign.RC_NO_RESUPPLY_ALREADY_FULL, at
     veh_cats = tpl.get('vehicle_cats') or set()
@@ -459,17 +513,61 @@ async def _apply_resupply(at, pid, war, currency,
               bool(at.get('has_gotten_soldier_free')))
     v_free = (m_veh > 0 and not
               bool(at.get('has_gotten_vehicle_free')))
+    # ---- 补给队模式判定（官服 §10.2 #6；置于扣款前——不可达直接
+    # 拒单不扣钱（RC_CANNOT_FIND_COMMANDNODE，真·孤岛理论不达））----
+    use_column = False
+    mode = mm_config.WAR_SUPPLY_COLUMN_MODE
+    if mode and at.get('is_deployed'):
+        if mode >= 2:
+            use_column = True
+        else:
+            try:
+                owners = dict(await STORE.get_war_cities(war['id']))
+            except Exception as e:
+                log(f'      [war_at] city owners read failed: {e}')
+                owners = {}
+            use_column = not war_campaign.bf_in_faction_supply(
+                owners, fac,
+                war_campaign.at_current_battlefield(at))
+    if use_column:
+        _sbf, _pbf, ok = await war_campaign.column_route(
+            STORE, war, at, near_capital_bf=near_capital)
+        if not ok:
+            log('      [war_at] resupply rejected: column route unreachable')
+            return war_campaign.RC_CANNOT_FIND_COMMANDNODE, at
     total = 0
     if m_sold and not s_free:
         total += _unit_price(soldier_pricing, key) * m_sold
     if m_veh and not v_free:
         total += _unit_price(vehicle_pricing, key) * m_veh
     if total > 0:
-        ok, _bal = await STORE.spend_currency(int(pid), key, total)
-        if not ok:
+        ok_pay, _bal = await STORE.spend_currency(int(pid), key, total)
+        if not ok_pay:
             return war_campaign.RC_NOT_ENOUGH_WARFUNDS, at
+    if use_column:
+        upd = {}
+        if s_free:
+            upd['has_gotten_soldier_free'] = True
+        if v_free:
+            upd['has_gotten_vehicle_free'] = True
+        try:
+            if upd:
+                await STORE.update_command_node(at['id'], **upd)
+            col, events, ecode = await war_campaign.spawn_supply_column(
+                STORE, war, at, missing, near_capital_bf=near_capital)
+            if col is None and ecode:
+                return ecode, at
+            await war_campaign.broadcast_war_events(events)
+            at = await STORE.get_command_node(at['id'])
+            log(f'      [war] AT 补编(补给队) node={at["id"]} '
+                f'infantry={m_sold} vehicles={m_veh} '
+                f'free={int(s_free) + int(v_free)} cost={total} '
+                f'column={col["id"] if col else "?"}')
+        except Exception as e:
+            log(f'      [war_at] resupply column failed: {e}')
+            return war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND, at
+        return 0, at
     # ---- M3-2 库存核算：即时交付 + 缺口入队 ----
-    fac = int(at.get('faction') or 0)
     give, queued = {}, {}
     try:
         stock = {int(r['category_id']):
@@ -534,18 +632,23 @@ async def _apply_resupply(at, pid, war, currency,
 async def handle_resupply_request(sess, writer, cmd_id, req_type, proto):
     """resupply_request {f1 instance, f2 soldierPricingId, f3 soldierDiscountId,
     f4 vehiclePricingId, f5 vehicleDiscountId, f6 nearCapitalBattlefieldId?,
-    f7 path(忽略), f8 paymentCurrency} → resupply_request_response{f2 response}。
+    f7 path(老客户端选路，现客户端不发，忽略——服务端自动寻路), f8
+    paymentCurrency} → resupply_request_response{f2 response}。
 
-    增援链（§10.2 #2）：状态校验（101/116）后走 _apply_resupply 公共
-    补编链（首次免费/计价扣款/阵营库存交付/缺口入队 226）。客户端
+    增援链（§10.2 #2/#6）：状态校验（101/116）后走 _apply_resupply 公共
+    补编链（首次免费/计价扣款/阵营库存交付/缺口入队 226；AT 在补给
+    网络外时改由补给队从己方城市机动汇合）。f6 为老客户端指定的
+    补给队出生城市（须己方领地，否则忽略走服务端就近选择）。客户端
     ReinforcementWindowMediator.issueSupplyRequest 发送，response=ok 关窗，
     否则错误反馈。"""
     node_id = soldier_pricing = vehicle_pricing = currency = 0
+    near_capital = 0
     try:
         f = pb_parse(proto)
         node_id = _i(f.get(1))
         soldier_pricing = _i(f.get(2))
         vehicle_pricing = _i(f.get(4))
+        near_capital = _i(f.get(6))
         currency = _i(f.get(8))
     except Exception as e:
         log(f'      [war_at] resupply_request parse error: {e}')
@@ -572,16 +675,22 @@ async def handle_resupply_request(sess, writer, cmd_id, req_type, proto):
                 else:
                     code, at = await _apply_resupply(
                         at, pid, war, currency,
-                        soldier_pricing, vehicle_pricing)
-    if at is not None and code in (
-            0, war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES):
-        await _push_at_rows(sess, writer, at, at['war_id'])
+                        soldier_pricing, vehicle_pricing,
+                        near_capital=near_capital)
     code = code or war_campaign.RC_OK   # _load_at 成功返回 0 → 协议 ok=1
     resp = build_response(cmd_id, 'resupply_request_response',
                           pb_int32(2, code))          # 响应 f2=response（AS3 实锤）
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} resupply_request_response (response={code})')
+    if at is not None and code in (
+            1, war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES):
+        # 响应先于行推送（与升级/购买一致）：客户端 requestSuppliesResponse
+        # 收 ok 先关窗（解绑 ArmyResourceTable 等表的窗口监听器），行变更
+        # 之后再应用——否则补编行在窗口开着时同步触发监听器重算，升级后
+        # AT 模型中间态下任一监听器抛异常会卡死客户端请求管线
+        # （_runningRequest 永久 true，之后所有请求都发不出，重登才恢复）
+        await _push_at_rows(sess, writer, at, at['war_id'])
 
 
 # ------------------------------------------------------------- 装备（#1）
@@ -672,8 +781,6 @@ async def handle_set_command_node_equipment_request(sess, writer, cmd_id,
                     log(f'      [war_at] equipment update failed: {e}')
                     code = war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
                     break
-    for at, war_id in changed:
-        await _push_at_rows(sess, writer, at, war_id)
     # 注意：此处无 0→1 重映射——本 handler code 恒为 RC_OK(1) 或协议错误码，
     # 空 items 的 RC_FAIL(0) 必须原样回传（重映射会翻成假成功）。
     resp = build_response(cmd_id, 'SetCommandNodeEquipmentResponse',
@@ -681,6 +788,9 @@ async def handle_set_command_node_equipment_request(sess, writer, cmd_id,
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} SetCommandNodeEquipmentResponse (msg={code})')
+    for at, war_id in changed:
+        # 响应先于行推送（理由同购买/部署/补编）
+        await _push_at_rows(sess, writer, at, war_id)
 
 
 # ------------------------------------------------------------- 改名 / 解散 / 查询
@@ -732,15 +842,16 @@ async def handle_rename_commandnode_request(sess, writer, cmd_id, req_type,
                         except Exception as e:
                             log(f'      [war_at] rename failed: {e}')
                             code = war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
-    if at is not None and not code:
-        await _push_at_rows(sess, writer, at, at['war_id'])
-        await _push_player_refresh(sess, writer)
     code = code or war_campaign.RC_OK   # 内部 0=通过 → 协议 ok=1
     resp = build_response(cmd_id, 'RenameCommandnodeResponse',
                           pb_int32(1, code))
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RenameCommandnodeResponse (result={code})')
+    if at is not None and code == war_campaign.RC_OK:
+        # 响应先于行推送（理由同购买/部署/补编）
+        await _push_at_rows(sess, writer, at, at['war_id'])
+        await _push_player_refresh(sess, writer)
 
 
 async def handle_dissolve_commandnode(sess, writer, cmd_id, req_type, proto):
@@ -778,15 +889,16 @@ async def handle_dissolve_commandnode(sess, writer, cmd_id, req_type, proto):
                 except Exception as e:
                     log(f'      [war_at] dissolve failed: {e}')
                     code = war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
-    if at is not None and not code:
-        await _push_at_delete(sess, writer, at)
-        await _push_player_refresh(sess, writer)
     code = code or war_campaign.RC_OK   # 内部 0=通过 → 协议 ok=1
     resp = build_response(cmd_id, 'dissolve_commandnode_response',
                           pb_int32(1, code))
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} dissolve_commandnode_response (msg={code})')
+    if at is not None and code == war_campaign.RC_OK:
+        # 响应先于行删除推送（理由同购买/部署/补编）
+        await _push_at_delete(sess, writer, at)
+        await _push_player_refresh(sess, writer)
 
 
 async def handle_query_commandnode_owner(sess, writer, cmd_id, req_type,
@@ -899,13 +1011,16 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                         mv, mcode = await war_campaign.start_movement(
                             STORE, at, dest_bf, override_ap=override_ap,
                             override_move=override_move)
+                        # 注意：start_movement/start_air_transport 返回协议
+                        # 风格码（RC_OK=1 / RC_FAIL=0），真值判断会把成功
+                        # （1）误当错误吞掉段行广播 → 客户端无移动动画。
                         if mcode == war_campaign.RC_CANNOT_FIND_COMMANDNODE:
                             # 地面不可达 → 空运回退（M3 §9.4）：携运输机
                             # （cat10≥1）消耗 1 架直达目标城市，响应 21
                             amv, acode = await war_campaign.start_air_transport(
                                 STORE, at, dest_bf)
-                            if acode:
-                                code = acode
+                            if acode != war_campaign.RC_OK or amv is None:
+                                code = acode or mcode
                             else:
                                 at = await STORE.get_command_node(at['id'])
                                 segs = war_campaign.movement_segments(amv)
@@ -926,7 +1041,7 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                                     f'({mm_config.WAR_AIR_TRANSIT_SECONDS}s)')
                                 code = (
                                     war_campaign.RC_RELOCATING_TO_NEW_AIRBASE)
-                        elif mcode:
+                        elif mcode and mcode != war_campaign.RC_OK:
                             code = mcode
                         elif mv is not None:
                             at = await STORE.get_command_node(at['id'])
@@ -993,6 +1108,144 @@ async def handle_reorder_supply_queue_request(sess, writer, cmd_id, req_type,
     log(f'S->C cmd={cmd_id:<4} ReorderSupplyQueueResponse (111 not in queue)')
 
 
+# ------------------------------------------------------------- AT 统计 / 买等级
+
+async def handle_get_assault_team_stats_request(sess, writer, cmd_id, req_type,
+                                                proto):
+    """GetAssaultTeamStatsRequest {f1 repeated int64 commandNodeDefinitionIds}
+    → GetAssaultTeamStatsResponse {f1 repeated GetAssaultTeamStatsRecord}。
+
+    进展页 / AT 详情数据源：客户端 CommandnodeTable.setCommandNodeDefinitionStats
+    缓存 record（rank/xp/nextLevelUpXp/battles/battlesWon），驱动
+    CharacterCareerRequirementInfo 进度条、买等级价格 scale 与升级按钮可用性。
+    id 口径 = command_nodes.id（与 CommandNodeDefinition.id 同源）。
+    未知 id 跳过不回 record（客户端 stats==null 下次再拉，不报错）。"""
+    node_ids = []
+    try:
+        f = pb_parse_multi(proto)
+        node_ids = [int(v) for v in (f.get(1) or []) if int(v)]
+    except Exception as e:
+        log(f'      [war_at] GetAssaultTeamStats parse error: {e}')
+
+    records = b''
+    n = 0
+    if STORE is not None:
+        for node_id in node_ids:
+            at = None
+            try:
+                at = await STORE.get_command_node(node_id)
+            except Exception as e:
+                log(f'      [war_at] get_command_node({node_id}) failed: {e}')
+            if not at:
+                continue
+            rank = int(at.get('rank') or 0)
+            records += pb_message(1, (
+                pb_int32(1, war_campaign.RC_OK)             # result (ok)
+                + pb_int32(2, rank)                          # rank
+                + pb_int32(3, int(at.get('xp') or 0))        # xp
+                + pb_int32(4, war_campaign.next_level_xp(rank))
+                + pb_int32(5, int(at.get('battles') or 0))   # battles
+                + pb_int32(6, int(at.get('battles_won') or 0))
+                + pb_int64(7, node_id)))                     # definitionId
+            n += 1
+    resp = build_response(cmd_id, 'GetAssaultTeamStatsResponse', records)
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} GetAssaultTeamStatsResponse '
+        f'({n}/{len(node_ids)} records)')
+
+
+async def handle_complete_assault_team_rank_request(sess, writer, cmd_id,
+                                                    req_type, proto):
+    """CompleteAssaultTeamRankRequest {f1 commandNodeDefinitionId, f2 pricingId,
+    f3 storeDiscountId, f4 paymentCurrency} → CompleteAssaultTeamRankResponse
+    {f1 response}。
+
+    买等级（跳过剩余 XP）：价格按剩余比例计（客户端
+    finalWarfundFractionPrice(scale)，scale=(下级阈值-已有xp)/下级阈值），
+    扣款后 rank+1、xp 置新等级阈值+5（客户端段位基线，裸阈值会被
+    percentageToNextATLevel 渲染成满条），先回响应再推
+    CommandNodeDefinition 行——客户端响应 code=1 置 isAwaitingRankUpdate，
+    由随后行内更高 rank（rankHasChanged→UPDATE_RANK）解锁按钮。
+    满级回 template_not_found。"""
+    node_id = pricing_id = currency = 0
+    try:
+        f = pb_parse(proto)
+        node_id = _i(f.get(1))
+        pricing_id = _i(f.get(2))
+        currency = _i(f.get(4))
+    except Exception as e:
+        log(f'      [war_at] CompleteAssaultTeamRank parse error: {e}')
+
+    # 余额不足码随货币（客户端 handleCompleteAssaultTeamRankResponse 按
+    # not_enough_warfunds/gold/credits 分支弹购买反馈）
+    _NO_FUNDS = {1: 56, 2: 153, 3: 57}    # credits/warfunds/gold
+
+    pid = await sess.ensure_player()
+    code = war_campaign.RC_OK
+    at = None
+    if pid is None or STORE is None:
+        code = war_campaign.RC_CHARACTER_NOT_FOUND
+    else:
+        war = await war_campaign.ensure_war(STORE)
+        if war is None:
+            code = war_campaign.RC_WAR_NOT_FOUND
+        elif not _currency_ok(currency):
+            code = war_campaign.RC_INVALID_CURRENCY
+        else:
+            at, code = await _load_at(pid, node_id, war)
+            if not code:
+                rank = int(at.get('rank') or 0)
+                next_xp = war_campaign.next_level_xp(rank)
+                if next_xp <= 0:
+                    code = war_campaign.RC_COMMANDNODE_TEMPLATE_NOT_FOUND
+                    log(f'      [war_at] rank purchase blocked: AT {at["id"]} '
+                        f'rank={rank} already max')
+                else:
+                    # 剩余 XP 比例计价（与客户端 setPrices scale 同口径；
+                    # rank>0 时客户端对下限阈值 +5 显示偏移，一并跟齐）
+                    prev_xp = 0 if rank == 0 else \
+                        war_campaign.next_level_xp(rank - 1) + 5
+                    scale = max(
+                        0.0, (next_xp - (int(at.get('xp') or 0) - prev_xp))
+                        / next_xp)
+                    cost, ok = await _charge_player(sess, pricing_id, currency,
+                                                    fraction=scale)
+                    if not ok:
+                        code = _NO_FUNDS.get(int(currency),
+                                             war_campaign.RC_NOT_ENOUGH_WARFUNDS)
+                    else:
+                        try:
+                            # 官服 xp 口径 = 阈值 + 5：客户端段位基线
+                            # （setPrices getXpNeededForAtLevel(rank)+5；
+                            # percentageToNextATLevel 以 threshold+1 分段，
+                            # xp=裸阈值会渲染成上一段 100% 满条）
+                            new_xp = max(int(at.get('xp') or 0), next_xp + 5)
+                            await STORE.update_command_node(
+                                at['id'], rank=rank + 1, xp=new_xp)
+                            at = await STORE.get_command_node(at['id'])
+                        except Exception as e:
+                            log(f'      [war_at] rank purchase failed: {e}')
+                            code = war_campaign.RC_COMMANDNODE_TEMPLATE_NOT_FOUND
+    ok = not code
+    # 响应必须先于行推送：客户端 handleCompleteAssaultTeamRankResponse
+    # code=1 时置 isAwaitingRankUpdate=true，等随后 Definition 行的更高
+    # rank 解锁（AssaultTeamObject.rank setter）；行先到会被响应重新锁死
+    # → 经验条消失、买等级按钮永久禁用
+    code = code or war_campaign.RC_OK
+    resp = build_response(cmd_id, 'CompleteAssaultTeamRankResponse',
+                          pb_int32(1, code))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} CompleteAssaultTeamRankResponse '
+        f'(response={code})')
+    if at is not None and ok:
+        await _push_at_rows(sess, writer, at, at['war_id'])
+        await _push_player_refresh(sess, writer)
+        log(f'      [war] AT 买等级 node={node_id} -> rank={at.get("rank")}'
+            f' (cost={cost})')
+
+
 HANDLERS = {
     'CreateCommandNodeRequest': handle_create_command_node_request,
     'UpgradeCommandNodeRequest': handle_upgrade_command_node_request,
@@ -1006,4 +1259,6 @@ HANDLERS = {
     'transport_commandnode': handle_transport_commandnode,
     'LeaveSupplyQueueRequest': handle_leave_supply_queue_request,
     'ReorderSupplyQueueRequest': handle_reorder_supply_queue_request,
+    'GetAssaultTeamStatsRequest': handle_get_assault_team_stats_request,
+    'CompleteAssaultTeamRankRequest': handle_complete_assault_team_rank_request,
 }
