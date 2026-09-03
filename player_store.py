@@ -667,6 +667,84 @@ ALTER TABLE player_boosters ADD COLUMN IF NOT EXISTS is_ribbon BOOLEAN NOT NULL 
 -- 历史行回填：模板不在通用表（1-5）内的一定是勋带加成
 UPDATE player_boosters SET is_ribbon = TRUE
  WHERE is_ribbon = FALSE AND booster_template_id NOT IN (1,2,3,4,5);
+
+-- ===== U8 迁移（RTS 战争域，docs/hng-rts-protocol.md Phase 2）=====
+-- 战争实例（war_campaign.py 状态机：开战→running→结算→sequel 续战）
+CREATE TABLE IF NOT EXISTS wars (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    begintime TIMESTAMPTZ NOT NULL DEFAULT now(),
+    endtime TIMESTAMPTZ,
+    winning_faction_id BIGINT NOT NULL DEFAULT 0,   -- 0=进行中；1/2/3
+    points_needed_for_victory INT NOT NULL DEFAULT 15,
+    sequel_war_id BIGINT NOT NULL DEFAULT 0,
+    mapid BIGINT NOT NULL DEFAULT 1,
+    state INT NOT NULL DEFAULT 1,                  -- 1=running 2=ended
+    config_json JSONB NOT NULL DEFAULT '{}'        -- timescale/morale 等配置快照
+);
+
+-- 城市归属（battlefield 行 id = 城市；owner 1/2/3，0=中立）
+CREATE TABLE IF NOT EXISTS war_cities (
+    war_id BIGINT NOT NULL REFERENCES wars(id) ON DELETE CASCADE,
+    battlefield_id BIGINT NOT NULL,
+    owner_faction BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (war_id, battlefield_id)
+);
+
+-- AT 实例：扩展既有 command_nodes（原表零使用，纯 schema 占位）
+-- state：0=首都待命 1=移动中 2=会战中 3=已解散；morale/maxMorale 按
+-- CommandNodeMoraleTemplate 官服实值（100）由 war_campaign 层维护
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS abbreviation TEXT NOT NULL DEFAULT '';
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS rank INT NOT NULL DEFAULT 1;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS xp BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS resources JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS morale INT NOT NULL DEFAULT 100;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS max_morale INT NOT NULL DEFAULT 100;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS state INT NOT NULL DEFAULT 0;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS map_entity_id BIGINT NOT NULL DEFAULT 0;
+-- map_entity_type：0=按旧规则推导（id≠0 视为 battlefield）；1/2/3 显式实体类型
+--（3=SUPPLYLINE 在途，transport_commandnode_segment 驱动动画）
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS map_entity_type INT NOT NULL DEFAULT 0;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS general_character_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS is_deployed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+CREATE INDEX IF NOT EXISTS idx_command_nodes_war ON command_nodes(war_id);
+
+-- AT 移动（transport_commandnode 路径；path_json=段列表
+-- [{sl_id,from_ap,to_ap,from_bf,to_bf,seconds}]）
+CREATE TABLE IF NOT EXISTS commandnode_movements (
+    id BIGSERIAL PRIMARY KEY,
+    commandnode_id BIGINT NOT NULL REFERENCES command_nodes(id) ON DELETE CASCADE,
+    war_id BIGINT NOT NULL DEFAULT 0,
+    path_json JSONB NOT NULL DEFAULT '[]',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    arrive_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    state INT NOT NULL DEFAULT 0,                   -- 0=moving 1=arrived 2=cancelled
+    dest_ap BIGINT NOT NULL DEFAULT 0               -- 目标出兵点（0=城市本体）
+);
+ALTER TABLE commandnode_movements ADD COLUMN IF NOT EXISTS dest_ap BIGINT NOT NULL DEFAULT 0;
+
+-- 会战登记（M1 桩：敌对相遇登记+地图 battle 标记；M2 接战斗服）
+CREATE TABLE IF NOT EXISTS war_battles (
+    id BIGSERIAL PRIMARY KEY,
+    war_id BIGINT NOT NULL,
+    battlefield_id BIGINT NOT NULL,
+    factions_json JSONB NOT NULL DEFAULT '[]',      -- [{at_id, faction}]
+    state INT NOT NULL DEFAULT 0,                   -- 0=active 1=ended
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at TIMESTAMPTZ
+);
+
+-- warfunds 流水（余额仍在 players.warfunds）
+CREATE TABLE IF NOT EXISTS war_funds_ledger (
+    id BIGSERIAL PRIMARY KEY,
+    player_id BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    amount BIGINT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    balance_after BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_war_funds_player ON war_funds_ledger(player_id);
 """
 
 
@@ -3655,3 +3733,310 @@ class PlayerStore:
                     'DELETE FROM squad_members WHERE character_id NOT IN '
                     '(SELECT id FROM characters)')
         return deleted
+
+    # ================================================================
+    # RTS 战争域（docs/hng-rts-protocol.md Phase 2；war_campaign.py 使用）
+    # ================================================================
+
+    _WAR_COLUMNS = ('id, name, begintime, endtime, winning_faction_id, '
+                    'points_needed_for_victory, sequel_war_id, mapid, state, '
+                    'config_json')
+
+    @staticmethod
+    def _war_row(row):
+        if row is None:
+            return None
+        d = dict(row)
+        d['config'] = d.pop('config_json') or {}
+        return d
+
+    async def create_war(self, name, points_needed_for_victory=15, mapid=1,
+                         config=None):
+        """开一场新战争（war_campaign.ensure_war）。返回 war 行 dict。"""
+        import json as _json
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'INSERT INTO wars (name, points_needed_for_victory, mapid, '
+                'config_json) VALUES ($1, $2, $3, $4) RETURNING ' + self._WAR_COLUMNS,
+                str(name or ''), int(points_needed_for_victory or 15),
+                int(mapid or 1), _json.dumps(config or {}))
+        return self._war_row(row)
+
+    async def get_war(self, war_id):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT ' + self._WAR_COLUMNS + ' FROM wars WHERE id = $1',
+                int(war_id))
+        return self._war_row(row)
+
+    async def get_active_war(self):
+        """当前 running 的战争（state=1）；无则 None。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT ' + self._WAR_COLUMNS +
+                ' FROM wars WHERE state = 1 ORDER BY id DESC LIMIT 1')
+        return self._war_row(row)
+
+    async def list_wars(self, limit=20):
+        """战争目录列表（新→旧，war_campaign.build_war_catalogue 用）。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT ' + self._WAR_COLUMNS +
+                ' FROM wars ORDER BY id DESC LIMIT $1', int(limit))
+        return [self._war_row(r) for r in rows]
+
+    async def end_war(self, war_id, winning_faction_id, sequel_war_id=0):
+        """战争结算（state=2 + 胜方 + 续战 id）。返回是否更新。"""
+        async with self.pool.acquire() as conn:
+            n = await conn.execute(
+                'UPDATE wars SET state = 2, endtime = now(), '
+                'winning_faction_id = $2, sequel_war_id = $3 WHERE id = $1 '
+                'AND state = 1',
+                int(war_id), int(winning_faction_id or 0),
+                int(sequel_war_id or 0))
+        return _rowcount(n) > 0
+
+    async def update_war_sequel(self, war_id, sequel_war_id):
+        """回填续战 id（war_campaign.check_victory 续战后调用）。"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE wars SET sequel_war_id = $2 WHERE id = $1',
+                int(war_id), int(sequel_war_id or 0))
+
+    # ---- war_cities ----
+
+    async def init_war_cities(self, war_id, owner_map):
+        """批量写入城市归属 {battlefield_id: owner_faction}（开战时一次性）。"""
+        if not owner_map:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.executemany(
+                'INSERT INTO war_cities (war_id, battlefield_id, owner_faction) '
+                'VALUES ($1, $2, $3) ON CONFLICT (war_id, battlefield_id) '
+                'DO UPDATE SET owner_faction = EXCLUDED.owner_faction',
+                [(int(war_id), int(bf), int(owner))
+                 for bf, owner in owner_map.items()])
+
+    async def get_war_cities(self, war_id):
+        """[(battlefield_id, owner_faction), ...]。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT battlefield_id, owner_faction FROM war_cities '
+                'WHERE war_id = $1 ORDER BY battlefield_id', int(war_id))
+        return [(r['battlefield_id'], r['owner_faction']) for r in rows]
+
+    async def set_city_owner(self, war_id, battlefield_id, owner_faction):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'INSERT INTO war_cities (war_id, battlefield_id, owner_faction) '
+                'VALUES ($1, $2, $3) ON CONFLICT (war_id, battlefield_id) '
+                'DO UPDATE SET owner_faction = $3',
+                int(war_id), int(battlefield_id), int(owner_faction))
+
+    async def count_war_city_owners(self, war_id, battlefield_ids=None):
+        """各阵营城市占有数 {faction: count}（首都名单由 wardb.battlefields
+        提供静态判定，war_campaign 层负责交集过滤）。"""
+        wanted = (None if battlefield_ids is None
+                  else set(int(b) for b in battlefield_ids))
+        counts = {}
+        for bf, owner in await self.get_war_cities(war_id):
+            if owner > 0 and (wanted is None or bf in wanted):
+                counts[owner] = counts.get(owner, 0) + 1
+        return counts
+
+    # ---- command_nodes（AT 实例）----
+
+    async def create_command_node(self, war_id, template_id, owner_player_id,
+                                  faction, name, resources=None,
+                                  abbreviation='', rank=1):
+        """购买 AT → 新实例（state=0 首都待命）。返回 AT 行 dict。"""
+        import json as _json
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'INSERT INTO command_nodes (war_id, template_id, '
+                'owner_player_id, faction, name, abbreviation, rank, '
+                'resources) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) '
+                'RETURNING *',
+                int(war_id), int(template_id), int(owner_player_id),
+                int(faction), str(name or ''), str(abbreviation or ''),
+                int(rank or 1), _json.dumps(resources or {}))
+        return dict(row) if row else None
+
+    async def get_command_node(self, node_id):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT * FROM command_nodes WHERE id = $1', int(node_id))
+        return dict(row) if row else None
+
+    async def list_player_command_nodes(self, player_id, war_id=None):
+        """玩家名下 AT 列表（war_id=None 取全部战争）。"""
+        q = ('SELECT * FROM command_nodes WHERE owner_player_id = $1 '
+             'AND state < 3')
+        args = [int(player_id)]
+        if war_id is not None:
+            q += ' AND war_id = $2'
+            args.append(int(war_id))
+        q += ' ORDER BY id'
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(q, *args)
+        return [dict(r) for r in rows]
+
+    async def list_war_command_nodes(self, war_id):
+        """本战争全部存活 AT（含各玩家），warmapview 快照用。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT * FROM command_nodes WHERE war_id = $1 AND state < 3 '
+                'ORDER BY id', int(war_id))
+        return [dict(r) for r in rows]
+
+    async def update_command_node(self, node_id, **fields):
+        """AT 字段更新（name/rank/xp/resources/morale/state/map_entity_id/
+        map_entity_type/general_character_id/is_deployed/abbreviation）。返回是否更新。"""
+        allowed = {'name', 'abbreviation', 'rank', 'xp', 'resources', 'morale',
+                   'max_morale', 'state', 'map_entity_id', 'map_entity_type',
+                   'general_character_id', 'is_deployed', 'upgrade_level',
+                   'owner_player_id', 'faction', 'template_id'}
+        import json as _json
+        sets, args = [], []
+        for k, v in fields.items():
+            if k not in allowed:
+                continue
+            if k == 'resources' and not isinstance(v, str):
+                v = _json.dumps(v or {})
+            args.append(v)
+            sets.append(f'{k} = ${len(args)}')
+        if not sets:
+            return False
+        args.append(int(node_id))
+        async with self.pool.acquire() as conn:
+            n = await conn.execute(
+                f'UPDATE command_nodes SET {", ".join(sets)} '
+                f'WHERE id = ${len(args)}', *args)
+        return _rowcount(n) > 0
+
+    async def delete_command_node(self, node_id):
+        """解散 AT（state=3 标记，保留历史行）。返回是否更新。"""
+        async with self.pool.acquire() as conn:
+            n = await conn.execute(
+                'UPDATE command_nodes SET state = 3 WHERE id = $1 AND state < 3',
+                int(node_id))
+        return _rowcount(n) > 0
+
+    # ---- commandnode_movements ----
+
+    async def create_movement(self, commandnode_id, war_id, path,
+                              started_at=None, arrive_at=None, dest_ap=0):
+        """AT 移动登记（path=段列表；dest_ap=目标出兵点，0=城市本体）。"""
+        import json as _json
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'INSERT INTO commandnode_movements (commandnode_id, war_id, '
+                'path_json, started_at, arrive_at, dest_ap) '
+                'VALUES ($1, $2, $3, $4, $5, $6) '
+                'RETURNING id, commandnode_id, war_id, path_json, started_at, '
+                'arrive_at, state, dest_ap',
+                int(commandnode_id), int(war_id), _json.dumps(list(path or [])),
+                started_at, arrive_at, int(dest_ap or 0))
+        if row:
+            d = dict(row)
+            import json as _j
+            d['path'] = _j.loads(d.pop('path_json') or '[]')
+            return d
+        return None
+
+    async def get_active_movement(self, commandnode_id):
+        """AT 当前进行中的移动（state=0）；无则 None。"""
+        import json as _j
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT id, commandnode_id, war_id, path_json, started_at, '
+                'arrive_at, state, dest_ap FROM commandnode_movements '
+                'WHERE commandnode_id = $1 AND state = 0 '
+                'ORDER BY id DESC LIMIT 1', int(commandnode_id))
+        if not row:
+            return None
+        d = dict(row)
+        d['path'] = _j.loads(d.pop('path_json') or '[]')
+        return d
+
+    async def list_active_movements(self, war_id):
+        """本战争全部进行中移动（增量推进器轮询用）。"""
+        import json as _j
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT id, commandnode_id, war_id, path_json, started_at, '
+                'arrive_at, state, dest_ap FROM commandnode_movements '
+                'WHERE war_id = $1 AND state = 0 ORDER BY id', int(war_id))
+        out = []
+        for r in rows:
+            d = dict(r)
+            d['path'] = _j.loads(d.pop('path_json') or '[]')
+            out.append(d)
+        return out
+
+    async def finish_movement(self, movement_id, state=1):
+        """移动结束（1=arrived 2=cancelled）。返回是否更新。"""
+        async with self.pool.acquire() as conn:
+            n = await conn.execute(
+                'UPDATE commandnode_movements SET state = $2 '
+                'WHERE id = $1 AND state = 0', int(movement_id), int(state))
+        return _rowcount(n) > 0
+
+    # ---- war_battles（M1 桩）----
+
+    async def create_war_battle(self, war_id, battlefield_id, factions):
+        """敌对 AT 相遇 → 会战登记（factions=[{at_id, faction}]）。返回行。"""
+        import json as _json
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'INSERT INTO war_battles (war_id, battlefield_id, factions_json) '
+                'VALUES ($1, $2, $3) RETURNING id, war_id, battlefield_id, '
+                'factions_json, state, started_at, ended_at',
+                int(war_id), int(battlefield_id),
+                _json.dumps(list(factions or [])))
+        if not row:
+            return None
+        d = dict(row)
+        d['factions'] = _json.loads(d.pop('factions_json') or '[]')
+        return d
+
+    async def list_active_war_battles(self, war_id):
+        import json as _j
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT id, war_id, battlefield_id, factions_json, state, '
+                'started_at, ended_at FROM war_battles WHERE war_id = $1 '
+                'AND state = 0 ORDER BY id', int(war_id))
+        out = []
+        for r in rows:
+            d = dict(r)
+            d['factions'] = _j.loads(d.pop('factions_json') or '[]')
+            out.append(d)
+        return out
+
+    async def end_war_battle(self, battle_id, winning_faction=0):
+        async with self.pool.acquire() as conn:
+            n = await conn.execute(
+                'UPDATE war_battles SET state = 1, ended_at = now() '
+                'WHERE id = $1 AND state = 0', int(battle_id))
+        return _rowcount(n) > 0
+
+    # ---- warfunds 流水 ----
+
+    async def add_war_funds(self, player_id, amount, reason=''):
+        """战争资金变动（事务：余额 + 流水）。amount 可负；玩家不存在时
+        事务回滚并抛 ValueError。返回新余额。"""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                balance = await conn.fetchval(
+                    'UPDATE players SET warfunds = warfunds + $2 '
+                    'WHERE id = $1 RETURNING warfunds',
+                    int(player_id), int(amount))
+                if balance is None:
+                    raise ValueError(f'player {player_id} not found')
+                await conn.execute(
+                    'INSERT INTO war_funds_ledger (player_id, amount, reason, '
+                    'balance_after) VALUES ($1, $2, $3, $4)',
+                    int(player_id), int(amount), str(reason or ''),
+                    int(balance))
+        return balance

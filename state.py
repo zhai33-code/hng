@@ -126,6 +126,8 @@ class Session:
         self.soldier_view_cmd = None  # SOLDIER_VIEW 的 cmd_id，用于推送 character 数据
         self.shop_view_cmd = None     # SHOP_VIEW 的 cmd_id，用于后续推送商店更新
         self.playerview_cmd = None    # PLAYER_VIEW 的 cmd_id，用于购买后推送 player 更新
+        self.warmap_view_cmd = None   # WARMAP_VIEW 的 cmd_id，用于战争图增量推送
+        self.commandnode_view_cmd = None  # COMMANDNODE_VIEW 的 cmd_id（玩家个人 AT 视图）
         self.player_id = None         # 数据库 players.id（登录后惰性加载）
         self.pw = None                # 该账号的数据库密码（login2_begin 时加载）
         self.user_exists = True       # 账号是否存在于数据库（False 时直接拒登）

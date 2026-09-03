@@ -24,6 +24,7 @@ interface VehicleItem {
   name: string
   parent: number
   parent_name: string
+  equipped: boolean
   equipped_in_slot: number
   upgrades: { id: number; template_id: number; equipped_slot_id: number }[]
 }
@@ -80,7 +81,9 @@ onMounted(load)
 function weaponIcon(w: WeaponItem): string {
   return `/icons/Weapons/${w.template_id}.webp`
 }
-/** 载具图标：客户端 images/Vehicles/{vehicleTemplate id}.png（variant 级无图，用父模板图） */
+/** 载具图标：客户端 HnGGUIVehicleImage 按 variantTemplateId 取
+ * images/Vehicles/{variantTemplateId}.png（注意是涂装变体 id，不是父载具 id——
+ * 两套 id 空间不同，用父 id 会拿到别的载具图，如 Blitz Truck 显示成飞机） */
 function vehicleIcon(v: VehicleItem): string {
   return `/icons/Vehicles/${v.parent}.webp`
 }
@@ -119,6 +122,8 @@ function pipStyle(r: { overlay_style?: { scale: number; x: number; y: number } }
 
 const equippedWeapons = computed(() => data.value?.weapons.filter((w) => w.equipped) ?? [])
 const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipped) ?? [])
+const equippedVehicles = computed(() => data.value?.vehicles.filter((v) => v.equipped) ?? [])
+const storedVehicles = computed(() => data.value?.vehicles.filter((v) => !v.equipped) ?? [])
 </script>
 
 <template>
@@ -179,7 +184,7 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
 
       <!-- 武器（仓库） -->
       <div v-if="storedWeapons.length" class="gear-section">
-        <span class="section-title">仓库武器（{{ storedWeapons.length }}）</span>
+        <span class="section-title">仓库武器（{{ storedWeapons.length }}，账号共享未装备）</span>
         <div class="gear-list weapons">
           <div v-for="w in storedWeapons" :key="w.id" class="gear-card weapon-card">
             <div class="weapon-visual">
@@ -201,11 +206,11 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
         </div>
       </div>
 
-      <!-- 载具 -->
+      <!-- 载具（已装备） -->
       <div class="gear-section">
-        <span class="section-title">载具（{{ data.vehicles.length }}）</span>
-        <div v-if="data.vehicles.length" class="gear-list vehicles">
-          <div v-for="v in data.vehicles" :key="v.id" class="gear-card">
+        <span class="section-title">已装备载具（{{ equippedVehicles.length }}）</span>
+        <div v-if="equippedVehicles.length" class="gear-list vehicles">
+          <div v-for="v in equippedVehicles" :key="v.id" class="gear-card">
             <img class="gear-icon vehicle" :src="vehicleIcon(v)" :alt="v.name" @error="onImgError" />
             <div class="gear-main">
               <div class="gear-name">{{ v.name }}</div>
@@ -220,7 +225,28 @@ const storedWeapons = computed(() => data.value?.weapons.filter((w) => !w.equipp
             </div>
           </div>
         </div>
-        <el-empty v-else description="无载具" :image-size="50" />
+        <el-empty v-else description="无已装备载具" :image-size="50" />
+      </div>
+
+      <!-- 载具（仓库） -->
+      <div v-if="storedVehicles.length" class="gear-section">
+        <span class="section-title">仓库载具（{{ storedVehicles.length }}，账号共享未装备）</span>
+        <div class="gear-list vehicles">
+          <div v-for="v in storedVehicles" :key="v.id" class="gear-card">
+            <img class="gear-icon vehicle" :src="vehicleIcon(v)" :alt="v.name" @error="onImgError" />
+            <div class="gear-main">
+              <div class="gear-name">{{ v.name }}</div>
+              <div class="gear-meta">
+                {{ v.parent_name }} · 变体 #{{ v.variant_template_id }}
+              </div>
+              <div v-if="v.upgrades.length" class="gear-parts">
+                <span v-for="u in v.upgrades" :key="u.id" class="part-tag">
+                  升级件 #{{ u.template_id }}（槽 {{ u.equipped_slot_id }}）
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- 勋带 -->

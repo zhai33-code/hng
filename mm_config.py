@@ -155,3 +155,28 @@ if SNOW_CHANCE is None or not 0.0 <= SNOW_CHANCE <= 1.0:
     print(f'[mm_config] WARNING: MM_SNOW_CHANCE={os.environ.get("MM_SNOW_CHANCE")!r} '
           f'not in [0,1], using 0.3')
     SNOW_CHANCE = 0.3
+
+# ===== RTS 战争域（war_campaign.py / docs/hng-rts-protocol.md Phase 3）=====
+# 数值默认取官服近似（CommandNodeMoraleTemplate 实值 / wiki 考据），
+# 全部可被环境变量覆盖，留实测校准空间。
+WAR_AUTO_CREATE = bool(_int_env('MM_WAR_AUTO_CREATE', 1))     # 无进行中战争时自动开战
+WAR_POINTS_VICTORY = _int_env('MM_WAR_POINTS_VICTORY', 15)     # 胜利所需首都数（官服 12~15）
+WAR_TIMESCALE = _float_env('MM_WAR_TIMESCALE', 1.0)            # 战略时间倍率（AT 移动速度乘数）
+WAR_DAYCYCLE_TIMESCALE = _float_env('MM_WAR_DAYCYCLE_TIMESCALE', 1.0)
+WAR_MAX_PLAYERS_PER_FACTION = _int_env('MM_WAR_MAX_PLAYERS_PER_FACTION', 100)
+WAR_NAME = os.environ.get('MM_WAR_NAME') or 'The Great War'    # 新战争名
+WAR_SEQUEL_AUTO = bool(_int_env('MM_WAR_SEQUEL_AUTO', 1))      # 战争结束自动开续战
+WAR_CATALOGUE_LIMIT = _int_env('MM_WAR_CATALOGUE_LIMIT', 20)   # 目录返回战争数上限
+# AT 生命周期（Phase 5）：单玩家 AT 持有上限 / 解散返还比例（官服近似，可校准）
+WAR_AT_MAX = _int_env('MM_WAR_AT_MAX', 10)
+WAR_DISSOLVE_REFUND = _float_env('MM_WAR_DISSOLVE_REFUND', 0.5)
+# 购买/部署 AT 需拥有指挥点角色（官服 gate = commandPointsUnlocked > 0：
+# 将军默认 3 点；普通角色军衔 12+ 起每级 +1；客户端无 isGeneral 检查。
+# 0=放开便于测试）
+WAR_AT_REQUIRE_COMMAND_POINTS = bool(
+    _int_env('MM_WAR_AT_REQUIRE_COMMAND_POINTS', 1))
+# AT 移动（Phase 6）：段时长 = 城市坐标距离 / (模板speed × WAR_TIMESCALE ×
+# WAR_AT_MOVE_SCALE) 秒。官服移动耗时数小时级，默认 1.0 近似，可校准。
+WAR_AT_MOVE_SCALE = _float_env('MM_WAR_AT_MOVE_SCALE', 1.0)
+# 战争推进 tick 间隔秒（移动换段/到达判定/会战成局桩；realtest_server 挂载）
+WAR_TICK_SECONDS = _int_env('MM_WAR_TICK_SECONDS', 5)

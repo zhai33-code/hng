@@ -1187,10 +1187,13 @@ _ARMY_RESOURCE_CATEGORY_CACHE = None
 
 
 def army_resource_categories():
-    """armyresourcecategory 表 [(行 id, 生产值 f6 float), ...]（缓存）。
+    """armyresourcecategory 表 [(行 id, 名称), ...]（缓存）。
 
     阵营资源总览窗口（FactionResourceOverviewMediator）按分类渲染行，
-    FactionResourceProduction/Consumption 行需逐分类配对推送。"""
+    FactionResourceProduction/Consumption 行需逐分类配对推送。
+    注意：本表 f6 是 speed（移动速度 0.9~3.3）不是产量——产量/间隔/开战
+    库存取 ArmyResourceProductionTemplate（armyresource_production()，
+    docs/hng-rts-protocol.md §3.12.1）。"""
     global _ARMY_RESOURCE_CATEGORY_CACHE
     if _ARMY_RESOURCE_CATEGORY_CACHE is None:
         out = []
@@ -1199,13 +1202,10 @@ def army_resource_categories():
                 rid = int(r.get(1, 0) or 0)
                 if not rid:
                     continue
-                f6 = r.get(6, b'')
-                try:
-                    prod = struct.unpack('<f', f6)[0] if isinstance(
-                        f6, (bytes, bytearray)) else float(f6 or 0)
-                except Exception:
-                    prod = 0.0
-                out.append((rid, prod))
+                name = r.get(2, b'')
+                if isinstance(name, (bytes, bytearray)):
+                    name = name.decode('utf-8', 'replace')
+                out.append((rid, name))
         except Exception as e:
             log(f'[!] armyresourcecategory parse failed: {e}')
         _ARMY_RESOURCE_CATEGORY_CACHE = out
@@ -1353,4 +1353,261 @@ def battlefield_pos(entity_id):
         log(f'[!] battlefield pos parse failed: {e}')
     _BATTLEFIELD_POS_CACHE[entity_id] = pos
     return pos
+
+
+# ===== RTS（将军/战略层）静态数据接口（docs/hng-rts-protocol.md §2.2/§3）=====
+# 字段号均为客户端 Descriptor 实锤；macOS 开发机无 WarDatabase 时各接口
+# 返回空结构（沿用 battlefield_pos 返回 None 的容忍策略，测试侧跳过）。
+
+_RTS_CACHE = {}
+
+
+def _wardb_str(v):
+    return v.decode('utf-8', 'replace') if isinstance(v, (bytes, bytearray)) and v else ''
+
+
+def _wardb_f32(v):
+    if isinstance(v, (bytes, bytearray)) and len(v) == 4:
+        return struct.unpack('<f', bytes(v))[0]
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def capitals():
+    """capital 表行 [{id, battlefield_id, default_faction, victory_points}, ...]。
+
+    战争地图城市节点：battlefield_id 关联 battlefield 表（即"城市"），
+    default_faction 为开战初始归属（factiontemplateid 1/2/3 空间）。"""
+    if 'capitals' not in _RTS_CACHE:
+        out = []
+        try:
+            for r in _parse_wardb_table('capital'):
+                rid = int(r.get(1, 0) or 0)
+                if not rid:
+                    continue
+                out.append({
+                    'id': rid,
+                    'battlefield_id': int(r.get(2, 0) or 0),
+                    'default_faction': int(r.get(3, 0) or 0),
+                    'victory_points': int(r.get(4, 0) or 0),
+                })
+        except Exception as e:
+            log(f'[!] capital parse failed: {e}')
+        _RTS_CACHE['capitals'] = out
+    return _RTS_CACHE['capitals']
+
+
+def battlefields():
+    """battlefield 表全量行 [{id, mapid, title, sector, posx, posy, gamemap}, ...]。
+
+    战役地图上的城镇/工厂/机场节点（RTS 拓扑的"城市"本体）。"""
+    if 'battlefields' not in _RTS_CACHE:
+        out = []
+        try:
+            for r in _parse_wardb_table('battlefield'):
+                rid = int(r.get(1, 0) or 0)
+                if not rid:
+                    continue
+                out.append({
+                    'id': rid,
+                    'mapid': int(r.get(2, 0) or 0),
+                    'title': _wardb_str(r.get(3, b'')),
+                    'sector': _wardb_str(r.get(4, b'')),
+                    'posx': _wardb_f32(r.get(5)),
+                    'posy': _wardb_f32(r.get(6)),
+                    'gamemap': int(r.get(7, 0) or 0),
+                })
+        except Exception as e:
+            log(f'[!] battlefields parse failed: {e}')
+        _RTS_CACHE['battlefields'] = out
+    return _RTS_CACHE['battlefields']
+
+
+def supplylines():
+    """supplyline 表行 [{id, mapid, ap1, ap2, template_id}, ...]。
+
+    城市间连接（边）：ap1/ap2 为两端 accesspoint 行 id，
+    accesspoint.f4 再关联所属 battlefield（城市）。"""
+    if 'supplylines' not in _RTS_CACHE:
+        out = []
+        try:
+            for r in _parse_wardb_table('supplyline'):
+                rid = int(r.get(1, 0) or 0)
+                if not rid:
+                    continue
+                out.append({
+                    'id': rid,
+                    'mapid': int(r.get(2, 0) or 0),
+                    'ap1': int(r.get(3, 0) or 0),
+                    'ap2': int(r.get(4, 0) or 0),
+                    'template_id': int(r.get(5, 0) or 0),
+                })
+        except Exception as e:
+            log(f'[!] supplyline parse failed: {e}')
+        _RTS_CACHE['supplylines'] = out
+    return _RTS_CACHE['supplylines']
+
+
+def accesspoints():
+    """accesspoint 表行 [{id, mapid, template, battlefield}, ...]（RTS 拓扑端点）。"""
+    if 'accesspoints' not in _RTS_CACHE:
+        out = []
+        try:
+            for r in _parse_wardb_table('accesspoint'):
+                rid = int(r.get(1, 0) or 0)
+                if not rid:
+                    continue
+                out.append({
+                    'id': rid,
+                    'mapid': int(r.get(2, 0) or 0),
+                    'template': int(r.get(3, 0) or 0),
+                    'battlefield': int(r.get(4, 0) or 0),
+                })
+        except Exception as e:
+            log(f'[!] accesspoint parse failed: {e}')
+        _RTS_CACHE['accesspoints'] = out
+    return _RTS_CACHE['accesspoints']
+
+
+def commandnode_templates():
+    """AT（Assault Team）模板注册表 {template_id: {...}, ...}。
+
+    commandnodetemplate 主表 + armyresourcetemplaterelation（编制资源
+    {armyresourcecategoryid: count}）+ charactertemplaterelation（可携带士兵
+    [(charactertemplateid, spawnslots), ...]）整合。字段号见
+    docs/hng-rts-protocol.md：f4 speed/float、f8 actionid、f10 level、
+    f11 convertTo（升级链）、f12 parenttemplateid、f13/f14 战利 warfund 加成。"""
+    if 'cn_templates' not in _RTS_CACHE:
+        out = {}
+        try:
+            for r in _parse_wardb_table('commandnodetemplate'):
+                tid = int(r.get(1, 0) or 0)
+                if not tid:
+                    continue
+                out[tid] = {
+                    'id': tid,
+                    'name': _wardb_str(r.get(2, b'')),
+                    'faction': int(r.get(3, 0) or 0),
+                    'speed': _wardb_f32(r.get(4)),
+                    'attackradius': int(r.get(6, 0) or 0),
+                    'transportradius': int(r.get(7, 0) or 0),
+                    'actionid': int(r.get(8, 0) or 0),
+                    'size': int(r.get(9, 0) or 0),
+                    'level': int(r.get(10, 0) or 0),
+                    'convert_to': int(r.get(11, 0) or 0),
+                    'parent_template_id': int(r.get(12, 0) or 0),
+                    'victory_warfund_bonus': int(r.get(13, 0) or 0),
+                    'participation_warfund_bonus': int(r.get(14, 0) or 0),
+                    'view_range': int(r.get(15, 0) or 0),
+                    'general_character_template_id': int(r.get(16, 0) or 0),
+                    'resources': {},
+                    'characters': [],
+                }
+            for r in _parse_wardb_table(
+                    'commandnodetemplatearmyresourcetemplaterelation'):
+                tid = int(r.get(3, 0) or 0)
+                if tid in out:
+                    cat = int(r.get(2, 0) or 0)
+                    out[tid]['resources'][cat] = int(r.get(4, 0) or 0)
+            for r in _parse_wardb_table(
+                    'commandnodetemplatecharactertemplaterelation'):
+                tid = int(r.get(2, 0) or 0)
+                if tid in out:
+                    out[tid]['characters'].append(
+                        (int(r.get(3, 0) or 0), int(r.get(4, 0) or 0)))
+        except Exception as e:
+            log(f'[!] commandnode templates parse failed: {e}')
+        _RTS_CACHE['cn_templates'] = out
+    return _RTS_CACHE['cn_templates']
+
+
+def at_levels():
+    """AssaultTeamLevel 表 [(level, xp), ...]（AT 等级经验阈值，升序）。"""
+    if 'at_levels' not in _RTS_CACHE:
+        out = []
+        try:
+            for r in _parse_wardb_table('AssaultTeamLevel'):
+                out.append((int(r.get(2, 0) or 0), int(r.get(3, 0) or 0)))
+            out.sort()
+        except Exception as e:
+            log(f'[!] AssaultTeamLevel parse failed: {e}')
+        _RTS_CACHE['at_levels'] = out
+    return _RTS_CACHE['at_levels']
+
+
+def morale_template():
+    """CommandNodeMoraleTemplate 首行（战争 morale 参数缺省值来源）。
+
+    返回 {min, max, lost_per_battle, gained_per_win, gained_per_minute,
+    surrender_limit}；无表（macOS 开发机）返回 None。"""
+    if 'morale_template' not in _RTS_CACHE:
+        row = None
+        try:
+            for r in _parse_wardb_table('CommandNodeMoraleTemplate'):
+                row = {
+                    'min': int(r.get(2, 0) or 0),
+                    'max': int(r.get(3, 0) or 0),
+                    'lost_per_battle': int(r.get(4, 0) or 0),
+                    'gained_per_win': int(r.get(5, 0) or 0),
+                    'gained_per_minute': _wardb_f32(r.get(6)),
+                    'surrender_limit': int(r.get(7, 0) or 0),
+                }
+                break
+        except Exception as e:
+            log(f'[!] CommandNodeMoraleTemplate parse failed: {e}')
+        _RTS_CACHE['morale_template'] = row
+    return _RTS_CACHE['morale_template']
+
+
+def armyresource_production():
+    """ArmyResourceProductionTemplate 表行 [{id, faction, category_id,
+    run_every_seconds, produce_per_run, war_start_value}, ...]（M3 生产 tick 用）。"""
+    if 'ar_production' not in _RTS_CACHE:
+        out = []
+        try:
+            for r in _parse_wardb_table('ArmyResourceProductionTemplate'):
+                rid = int(r.get(1, 0) or 0)
+                if not rid:
+                    continue
+                out.append({
+                    'id': rid,
+                    'faction': int(r.get(2, 0) or 0),
+                    'category_id': int(r.get(3, 0) or 0),
+                    'run_every_seconds': int(r.get(4, 0) or 0),
+                    'produce_per_run': int(r.get(5, 0) or 0),
+                    'war_start_value': int(r.get(6, 0) or 0),
+                })
+        except Exception as e:
+            log(f'[!] ArmyResourceProductionTemplate parse failed: {e}')
+        _RTS_CACHE['ar_production'] = out
+    return _RTS_CACHE['ar_production']
+
+
+def at_pricing():
+    """AT 购买/升级定价 {objectId: {gold, warfunds, credits}, ...}。
+
+    Pricing 表（f2 type 字符串 / f3 objectId / f4-f6 三币种价格）中
+    type 含 'commandnode'（不区分大小写）的行；过滤后为空（type 命名
+    未知/macOS 无表）则退回全表按 objectId 索引。"""
+    if 'at_pricing' not in _RTS_CACHE:
+        matched, allrows = {}, {}
+        try:
+            for r in _parse_wardb_table('Pricing'):
+                oid = int(r.get(3, 0) or 0)
+                if not oid:
+                    continue
+                price = {
+                    'gold': _wardb_f32(r.get(4)),
+                    'warfunds': _wardb_f32(r.get(5)),
+                    'credits': _wardb_f32(r.get(6)),
+                }
+                allrows.setdefault(oid, price)
+                if 'commandnode' in _wardb_str(r.get(2, b'')).lower():
+                    matched[oid] = price
+        except Exception as e:
+            log(f'[!] Pricing parse failed: {e}')
+        _RTS_CACHE['at_pricing'] = matched or allrows
+    return _RTS_CACHE['at_pricing']
 

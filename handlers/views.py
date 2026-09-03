@@ -13,6 +13,7 @@ from protocol import (
     build_response,
     pb_int32,
     pb_int64,
+    pb_message,
     pb_string,
     )
 
@@ -41,6 +42,7 @@ from matchmaking import (
     )
 
 import login_queue
+import war_campaign
 
 from .career import (
     push_all_battle_pass_rows,
@@ -83,8 +85,10 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         # player 表数据设置 PlayerModel.currentPlayer
         # 两者在 subscriberesponse 触发 viewSubscribtionSynced 时处理
 
-        # 1. war 表数据
-        war_proto = _msg_war()
+        # 1. war 表数据（DB 战争状态机优先；DB 不可用回退静态 mock）
+        war_proto = await war_campaign.war_kvcs_proto(STORE)
+        if war_proto is None:
+            war_proto = _msg_war()
         war_data_chunk = Chunk(war_proto)
         war_table_chunk = Chunk(b'war', [war_data_chunk])
         war_action_chunk = Chunk(b'set', [war_table_chunk])
@@ -175,6 +179,21 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
             await _push_kvcs(writer, cmd_id, b'FactionResourceConsumption', row)
         log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (supreme command ×3 factions, '
             f'resource production/consumption ×{len(prods)}) ★CommandnodeTable fill')
+
+    if req_type.lower() in ('subscribewarmapview', 'subscribewarmaplightview'):
+        # 战争地图全量快照（进入战争图时客户端订阅，WarMapViewMediator.setupWar
+        # 图层初始化顺序推 battlefieldstatus → supplylinestatus →
+        # accesspointstatus → CommandNodeDefinition/WarInstance →
+        # CommandNodeMorale → armyresource；battle/transport 段 M1 无数据）。
+        # 必须在 subscriberesponse 之前发送（客户端收 response 即触发
+        # viewSubscribedSignal 开始按表取数渲染）。
+        sess.warmap_view_cmd = cmd_id
+        snapshot = await war_campaign.build_warmap_snapshot(STORE)
+        for table_tag, row in snapshot:
+            await _push_kvcs(writer, cmd_id, table_tag, row)
+        n_tables = len({tag for tag, _ in snapshot})
+        log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (warmap snapshot: '
+            f'{len(snapshot)} rows / {n_tables} tables) ★warmapview fill')
 
     # 跟踪 PLAYER_VIEW 的 cmd_id，用于购买后推送 player 更新
     if req_type.lower() == 'subscribeplayerview':
@@ -269,19 +288,27 @@ async def handle_unsubscribe(sess, writer, cmd_id, req_type, proto):
 
 
 async def handle_query_war_catalogue_request(sess, writer, cmd_id, req_type, proto):
-    # 战争目录查询，返回完整 war_catalogue（1个战争 + 3个阵营 US/GE/SU）
-    resp_proto = msg_query_war_catalogue_response()
+    # 战争目录查询：DB 聚合（war_campaign 状态机）优先，DB 不可用回退静态 mock
+    rows = await war_campaign.build_war_catalogue_protos(STORE)
+    if rows:
+        resp_proto = b''.join(
+            pb_message(1, row) for row in rows) + pb_int64(2, 0)
+        n_wars = len(rows)
+    else:
+        resp_proto = msg_query_war_catalogue_response()
+        n_wars = 1
     resp = build_response(cmd_id, 'query_war_catalogue_response', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} query_war_catalogue_response (1 war, 3 factions, {len(resp_proto)}B)')
+    log(f'S->C cmd={cmd_id:<4} query_war_catalogue_response ({n_wars} war, 3 factions, {len(resp_proto)}B)')
 
 
 
 async def handle_join_war_request(sess, writer, cmd_id, req_type, proto):
-    # 加入战争请求，返回 msg=1 (ResponseCodes.ok)
+    # 加入战争请求：确保战争存在（自动开战）后返回 msg=1 (ResponseCodes.ok)
     # war 数据已通过 subscribeplayerview 的 KeyValueChangeSet 推送，currentWar 已设置
     # 客户端应直接走 onCurrentWarDataReceived → startPostLoginSignal
+    await war_campaign.ensure_war(STORE)
     resp_proto = pb_int32(1, 1)  # msg = 1 (ok)
     resp = build_response(cmd_id, 'join_war_response', resp_proto)
     writer.write(resp)

@@ -121,6 +121,13 @@ def pb_uint32(field, value):
 def pb_float(field, value):
     return _pb_tag(field, 5) + struct.pack('<f', value)
 
+def pb_sfixed64(field, value):
+    """SFIXED64 字段（wire type 1，定长 8 字节小端有符号）。
+
+    battle/battlefieldstatus/supplylinestatus/accesspointstatus 的 f1 id
+    为 S64（docs/hng-rts-protocol.md §3/§7.5），与 INT64 varint 编码不同。"""
+    return _pb_tag(field, 1) + struct.pack('<q', int(value))
+
 def _pb_len(n):
     out = bytearray()
     while True:

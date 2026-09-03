@@ -16,6 +16,7 @@ const titles: Record<string, string> = {
   'player-detail': '玩家详情',
   'character-detail': '角色装备明细',
   battles: '战报',
+  war: '战争（RTS）',
   reports: '举报处理',
   mail: '发送邮件',
   vouchers: '兑换码',
@@ -49,6 +50,7 @@ async function onLogout() {
         <el-menu-item index="/dashboard">仪表盘</el-menu-item>
         <el-menu-item index="/players">玩家管理</el-menu-item>
         <el-menu-item index="/battles">战报</el-menu-item>
+        <el-menu-item index="/war">战争（RTS）</el-menu-item>
         <el-menu-item index="/reports">举报处理</el-menu-item>
         <el-menu-item index="/mail">发送邮件</el-menu-item>
         <el-menu-item index="/vouchers">兑换码</el-menu-item>

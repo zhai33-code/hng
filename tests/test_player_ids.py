@@ -425,3 +425,58 @@ def test_subscribeplayerview_pushes_faction_rows():
     last_root, _ = Chunk.parse(writer.frames[-1], 0)
     assert last_root.subs[0].as_str() == 'subscriberesponse', \
         f'最后一帧应为 subscriberesponse，实际 {last_root.subs[0].as_str()!r}'
+
+
+# ---------- 8. FactionResourceProduction 行取官服模板值（2026-09-02 勘误） ----------
+# 修复点：nextProductionValue 原误用 armyresourcecategory f6（speed）×10，
+# 官服语义 = ArmyResourceProductionTemplate f5（produceEveryRun）、间隔 f4=600s、
+# 开战库存 f6（warStartValue），三阵营数值相同
+# （docs/hng-rts-protocol.md §3.12.1，客户端只渲染不本地模拟）。
+import calendar  # noqa: E402
+import time as _time  # noqa: E402
+
+
+def test_faction_resource_production_rows_use_official_template():
+    """步兵（cat 1）三阵营：nextProductionValue=900 / warStartValue=850000 /
+    nextRunTimeStamp≈now+600s / f6 模板 id 非 0；总行数=3 阵营×18 分类。"""
+    if not matchmaking.armyresource_production():
+        print('  [skip] WarDatabase ArmyResourceProductionTemplate 不可用')
+        return
+    prods, cons = matchmaking._msg_faction_resource_rows()
+    assert len(prods) == 54 and len(cons) == 54, \
+        f'应 3 阵营×18 分类=54 行，实际 prods={len(prods)} cons={len(cons)}'
+    infantry = {}
+    for row in prods:
+        f = pb_parse_loose(row)
+        if int(f[5]) == 1:                    # armyResourceCategoryId=1 infantryman
+            infantry[int(f[2])] = f           # 按 factionId 索引
+    assert set(infantry) == {1, 2, 3}, \
+        f'步兵生产行缺阵营：{set(infantry)}'
+    for fid, f in infantry.items():
+        assert int(f[8]) == 900, \
+            f'faction{fid} f8 应 900（官服步兵每跳产量），实际 {f[8]}'
+        assert int(f[9]) == 850000, \
+            f'faction{fid} f9 应 850000（官服开战库存），实际 {f[9]}'
+        assert int(f[6]) > 0, \
+            f'faction{fid} f6 模板 id 应非 0，实际 {f[6]}'
+        ts = calendar.timegm(
+            _time.strptime(f[7].decode(), '%Y%m%d%H%M%S'))
+        delta = ts - _time.time()
+        assert 540 <= delta <= 660, \
+            f'faction{fid} nextRunTimeStamp 应≈now+600s，实际 Δ{delta:.0f}s'
+
+
+def test_faction_resource_production_rows_heavy_armor_anchor():
+    """重坦（cat 17）锚点：产量 2/跳、开战库存 225——与步兵梯度拉开，
+    确认没把全部分类填成同值（旧 bug 的速度×10 恰好会命中这种假象）。"""
+    if not matchmaking.armyresource_production():
+        print('  [skip] WarDatabase ArmyResourceProductionTemplate 不可用')
+        return
+    prods, _cons = matchmaking._msg_faction_resource_rows()
+    for row in prods:
+        f = pb_parse_loose(row)
+        if int(f[5]) == 17 and int(f[2]) == 1:    # US 重坦
+            assert int(f[8]) == 2, f'US 重坦 f8 应 2，实际 {f[8]}'
+            assert int(f[9]) == 225, f'US 重坦 f9 应 225，实际 {f[9]}'
+            return
+    raise AssertionError('未找到 US(faction=1) 重坦(cat=17) 生产行')

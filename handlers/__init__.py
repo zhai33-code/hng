@@ -21,13 +21,15 @@ from . import (
     uniforms,
     vehicles,
     views,
+    war_at,
     weapons,
     )
 from state import CURRENT_PID
 
 _EXACT = {}
 for _m in (acks, auth, battlereport, career, characters, combat, economy, misc,
-           mission, shop, social, squad, uniforms, vehicles, views, weapons):
+           mission, shop, social, squad, uniforms, vehicles, views, war_at,
+           weapons):
     _EXACT.update(_m.HANDLERS)
 
 _PREFIX_HANDLERS = {

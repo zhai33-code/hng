@@ -31,7 +31,9 @@ import game_server
 import handlers
 import login_queue
 import matchmaking
+import mm_config
 import statistics_server
+import war_campaign
 import web_server
 
 from protocol import (
@@ -335,10 +337,21 @@ async def main():
                 await asyncio.sleep(min(2 ** failures, 10))
             else:
                 failures = 0        # 正常退出（不应发生）→ 也重启
+
+    async def _war_ticker():
+        """战争推进 tick（Phase 6）：AT 在途移动换段/到达/会战成局桩
+        + warmapview 事件广播。间隔 MM_WAR_TICK_SECONDS（默认 5s）。"""
+        while True:
+            await asyncio.sleep(mm_config.WAR_TICK_SECONDS)
+            try:
+                await war_campaign.war_tick(STORE)
+            except Exception as e:
+                log(f'[WAR] tick failed: {e}')
     try:
         await asyncio.gather(_supervise('TCP', start_tcp),
                              _supervise('PING', start_ping_responder),
-                             _supervise('STATS', statistics_server.start))
+                             _supervise('STATS', statistics_server.start),
+                             _war_ticker())
     finally:
         await STORE.close()
 

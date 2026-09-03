@@ -25,7 +25,7 @@ export function setUnauthorizedHandler(fn: () => void) {
 }
 
 export async function http<T = unknown>(
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'DELETE',
   path: string,
   body?: unknown,
   timeoutMs = 15000,
@@ -37,6 +37,8 @@ export async function http<T = unknown>(
     const headers: Record<string, string> = {}
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json'
+    }
+    if (method !== 'GET') {
       // CSRF 自定义头：跨站表单无法携带（write_guard 校验）
       headers['X-Requested-With'] = 'XMLHttpRequest'
     }

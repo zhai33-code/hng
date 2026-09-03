@@ -38,7 +38,7 @@ from wardb import (
     _capturepoint_ap_map, _load_accesspoint_templates,
     _load_capturepoint_templates, _load_objective_capturepoints,
     _load_preset, _missiontype_for_gamemap, _rank_from_combat_xp,
-    army_resource_categories, assault_ap_decision,
+    army_resource_categories, armyresource_production, assault_ap_decision,
     battlefield_entity_for_gamemap, battlefield_pos,
     commandnode_template, is_general_character, preset_scene,
     squad_template_for_character, squad_template_name,
@@ -565,23 +565,34 @@ def _msg_faction_resource_rows():
     """KVS 'FactionResourceProduction' + 'FactionResourceConsumption' 行
     （三阵营 × 全部 armyresourcecategory 分类）：阵营资源总览窗口数据源，
     缺 FactionResourceProduction 行时客户端每分类 dd.error 并留空。
+
+    官服语义（2026-09-02 实锤，docs/hng-rts-protocol.md §3.12.1）：产量/
+    间隔/开战库存取 WarDatabase ArmyResourceProductionTemplate（三阵营数值
+    相同：步兵 900/85 万、重坦 2/225、战斗机 3/1800……），间隔全表恒 600s。
+    此前误用 armyresourcecategory f6（speed）×10 当产量、间隔取 1h，已废弃。
     时间戳为 Zulu 'YYYYMMDDHHmmss'（TimeUtilities.convertZuluTimeToMilliseconds），
-    nextRunTimeStamp 取当前时间 +1 小时（倒计时展示值）。"""
+    nextRunTimeStamp = 当前时间 + 模板间隔（客户端倒计时展示值）。"""
     prods, cons = [], []
-    next_ts = time.strftime('%Y%m%d%H%M%S', time.gmtime(time.time() + 3600))
-    prev_ts = time.strftime('%Y%m%d%H%M%S', time.gmtime())
+    templates = {(t['faction'], t['category_id']): t
+                 for t in armyresource_production()}
+    now = time.time()
+    prev_ts = time.strftime('%Y%m%d%H%M%S', time.gmtime(now))
     for tmpl, fid in FACTION_ROW_IDS.items():
         hq = FACTION_SUPREME_COMMANDS[tmpl]
-        for cat, prod_val in army_resource_categories():
+        for cat, _name in army_resource_categories():
+            t = templates.get((tmpl, cat))
+            interval = t['run_every_seconds'] if t else 600
+            next_ts = time.strftime(
+                '%Y%m%d%H%M%S', time.gmtime(now + interval))
             p = pb_int64(1, fid * 1000 + cat)                # id（faction×分类 唯一）
             p += pb_int64(2, fid)                              # factionId
             p += pb_int64(3, _WAR_ID)                          # warId
             p += pb_int64(4, hq)                               # factionHQCommandNodeWarInstanceId
             p += pb_int64(5, cat)                              # armyResourceCategoryId
-            p += pb_int64(6, 0)                                # armyResourceProductionTemplateId（窗口不读）
+            p += pb_int64(6, t['id'] if t else 0)              # armyResourceProductionTemplateId
             p += pb_string(7, next_ts)                         # nextRunTimeStamp
-            p += pb_int32(8, max(1, int(round(prod_val * 10))))  # nextProductionValue
-            p += pb_int32(9, 0)                                # warStartValue
+            p += pb_int32(8, t['produce_per_run'] if t else 0)  # nextProductionValue（=模板 produceEveryRun）
+            p += pb_int32(9, t['war_start_value'] if t else 0)  # warStartValue
             prods.append(p)
 
             c = pb_int64(1, fid * 1000 + cat)                # id

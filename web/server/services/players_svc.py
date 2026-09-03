@@ -158,7 +158,7 @@ async def character_detail(pool, player_id: int, character_id: int) -> dict:
             player_id, character_id)
         vehicles = await conn.fetch(
             'SELECT id, vehicle_variant_template_id, equipped_in_slot, '
-            'created_at FROM vehicles WHERE player_id = $1 '
+            'character_id, created_at FROM vehicles WHERE player_id = $1 '
             'AND (character_id = $2 OR character_id = 0)',
             player_id, character_id)
         upgrades = await conn.fetch(
@@ -213,6 +213,7 @@ async def character_detail(pool, player_id: int, character_id: int) -> dict:
             'id': v['id'],
             'variant_template_id': v['vehicle_variant_template_id'],
             **wardb_meta.vehicle_info(int(v['vehicle_variant_template_id'])),
+            'equipped': int(v['character_id']) == character_id,
             'equipped_in_slot': int(v['equipped_in_slot']),
             'upgrades': upg_by_vehicle.get(int(v['id']), []),
         } for v in vehicles],
