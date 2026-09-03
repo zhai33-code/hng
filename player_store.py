@@ -1199,13 +1199,30 @@ class PlayerStore:
             return float(val or 0)
 
     async def set_combat_badge(self, player_id, character_id, slot, badge_id):
-        """设置角色战斗徽章槽（slot=0/1）；badge_id=0 表示卸下。"""
-        column = 'combat_badge_0' if int(slot) == 0 else 'combat_badge_1'
+        """设置角色战斗徽章槽（slot=0/1）；badge_id=0 表示卸下。
+
+        官方语义是"移动"而非"复制"：客户端把已装备徽章拖到另一槽时只发
+        set 新槽一条请求、不发卸下旧槽（SoldierOverviewMediator.
+        badgesList_dragDropHandler:960-973），故装备非 0 徽章时若另一槽
+        持有同一徽章需同步清 0，否则两槽同 id → UI 显示"复制"。
+        """
+        if int(slot) == 0:
+            column, other = 'combat_badge_0', 'combat_badge_1'
+        else:
+            column, other = 'combat_badge_1', 'combat_badge_0'
+        badge_id = int(badge_id)
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                'UPDATE characters SET %s = $1 '
-                'WHERE id = $2 AND player_id = $3' % column,
-                int(badge_id), int(character_id), int(player_id))
+            if badge_id:
+                await conn.execute(
+                    'UPDATE characters SET {0} = $1, '
+                    '{1} = CASE WHEN {1} = $1 THEN 0 ELSE {1} END '
+                    'WHERE id = $2 AND player_id = $3'.format(column, other),
+                    badge_id, int(character_id), int(player_id))
+            else:
+                await conn.execute(
+                    'UPDATE characters SET {0} = 0 '
+                    'WHERE id = $1 AND player_id = $2'.format(column),
+                    int(character_id), int(player_id))
 
     async def set_uniform_variant(self, player_id, character_id, variant_id):
         """装备/卸下角色军服迷彩变体（variant_id=0 卸下），返回该角色 uniform_variant_id。"""

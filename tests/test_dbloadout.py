@@ -447,6 +447,76 @@ def main():
     e = fields(pb_field_payload(entry))
     check('无激活加成 → f5 整体省略', 5 not in e)
 
+    print('== 12. 徽章换槽防复制（set_combat_badge 移动语义，DB 级）==')
+    # 现场复现（2026-09-03 bug）：A 槽装 badge 拖到 B 槽 → 两槽都显示该 badge。
+    # 客户端 SoldierOverviewMediator.badgesList_dragDropHandler:960-973：
+    # 目标槽为空时只发 set(badge→B) 一条、不发卸下 A 槽；交换时发
+    # set(B徽章→A槽) + set(A徽章→B槽) 两条。旧实现盲写单列 → A/B 同 id，
+    # refreshBadges() 按 combatbadgeslot0/1 逐槽渲染 → "复制"。
+    # 修复：装非 0 徽章时另一槽同 id 则清 0（移动而非复制）。
+    import asyncio
+
+    async def _badge_db():
+        import player_store
+        st = player_store.PlayerStore()
+        await st.start()
+        pid = cid = None
+        try:
+            pid = (await st.get_player('u12badge_a')
+                   or await st.create_player('u12badge_a', 'pw'))
+            ch = await st.get_latest_character(pid)
+            if ch is None:
+                await st.create_character(pid, 'U12BadgeSoldier', 1, 0)
+                ch = await st.get_latest_character(pid)
+            cid = int(ch['id'])
+
+            async def slots():
+                async with st.pool.acquire() as conn:
+                    r = await conn.fetchrow(
+                        'SELECT combat_badge_0, combat_badge_1 FROM characters '
+                        'WHERE id = $1', cid)
+                    return int(r['combat_badge_0']), int(r['combat_badge_1'])
+
+            # ① 换位到空槽：A 槽 501 → 拖到 B 槽（客户端只发一条 set B=501）
+            await st.set_combat_badge(pid, cid, 0, 501)
+            await st.set_combat_badge(pid, cid, 1, 501)
+            check('换位到空槽 → A 清 0、B=501（旧实现两槽同 501 = 复制）',
+                  await slots() == (0, 501))
+
+            # ② 交换两徽章：现场 A 槽=502、B 槽=501，拖 A 到 B → 客户端发
+            #    set(B 徽章 501→A 槽) 再 set(A 徽章 502→B 槽)
+            await st.set_combat_badge(pid, cid, 0, 502)
+            check('交换现场 → (502, 501)', await slots() == (502, 501))
+            await st.set_combat_badge(pid, cid, 0, 501)   # 交换第 1 步
+            check('交换第 1 步（501→A 槽）：B 槽同 id 同步清 0，无瞬态复制',
+                  await slots() == (501, 0))
+            await st.set_combat_badge(pid, cid, 1, 502)   # 交换第 2 步
+            check('交换完成 → (501, 502)', await slots() == (501, 502))
+
+            # ③ 卸下 badge_id=0 只清本槽；④ 不同徽章互不清
+            await st.set_combat_badge(pid, cid, 0, 0)
+            check('卸下 A 槽 → B 槽不受影响', await slots() == (0, 502))
+            await st.set_combat_badge(pid, cid, 0, 503)
+            check('装不同徽章（B≠新 id）→ 两槽并存',
+                  await slots() == (503, 502))
+        finally:
+            # 清理：整号删除（角色+玩家行，测试自清不留痕）
+            if pid is not None:
+                try:
+                    async with st.pool.acquire() as conn:
+                        await conn.execute(
+                            'DELETE FROM characters WHERE player_id = $1', pid)
+                        await conn.execute(
+                            'DELETE FROM players WHERE id = $1', pid)
+                except Exception:
+                    pass
+            await st.close()
+
+    try:
+        asyncio.run(_badge_db())
+    except Exception as exc:
+        print(f'  [skip] DB 测试不可用：{exc}')
+
     print()
     print('ALL PASS' if ok else 'SOME CHECKS FAILED')
     return 0 if ok else 1
