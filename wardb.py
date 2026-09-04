@@ -31,10 +31,12 @@ try:
     # 7=伞兵(lv6) 9=侦察(lv9) 11=坦克兵(lv5) 12=飞行员(lv8) 26=将军(lv12)。
     # 按等级置位后客户端为每个阵营×已解锁兵种生成"可招募"占位士兵（fake
     # slot），点击弹输入名字 → CreateCharacterRequest（按定价扣银币建号，
-    # 服务器 CHARACTER_PACKS 全支持）。将军（26）例外：将军不随等级赠送
-    # （官方需 17 级军衔角色 + 单独解锁链路），恒 false。
+    # 服务器 CHARACTER_PACKS 全支持）。将军（26）lv12 起置位：客户端
+    # PlayerModel 把将军排除在 characterTemplateUnlocks 之外（单独存
+    # _generalUnlock），士兵栏 carousel 不生成将军 fake 卡，仅 SoldierShop
+    # 兵种页签按位解锁（SoldierShopMediator 直读 PlayerLevelUnlockTable），
+    # 购买按将军包（rank 18）定价扣款，不走免费首兵路径。
     _PLAYER_CHARACTER_TEMPLATE_UNLOCKS = {7, 9, 11, 12, 26}
-    _PLAYER_GENERAL_UNLOCK_ID = 26
     _player_set = set(PLAYER_LEVEL_UNLOCK_IDS) - _PLAYER_CHARACTER_TEMPLATE_UNLOCKS
     _char_unlock_bits = [i in _prog_set for i in range(_prog_max + 1)]
     _player_unlock_bits = [i in _player_set for i in range(_player_max + 1)]
@@ -626,14 +628,13 @@ def player_unlock_bits_for_level(level):
     （eWar lv10）/匹配模式（eMissionType）/武器组（eWeaponGroup）等——
     全 true 会让低级玩家也解锁全部模式（进展限制失效的根因）。
     位 true = 条目 available 且 unlockMetaLevel <= level；
-    将军（_PLAYER_GENERAL_UNLOCK_ID）恒 false（不随等级赠送）；
-    其余兵种（坦克兵 lv5/伞兵 lv6/飞行员 lv8/侦察 lv9）按等级置位 →
-    客户端生成"可招募"占位士兵，招募走 CreateCharacterRequest。"""
+    兵种（坦克兵 lv5/伞兵 lv6/飞行员 lv8/侦察 lv9/将军 lv12）按等级置位
+    → SoldierShop 兵种页签解锁可招募（CreateCharacterRequest）。将军位
+    置位不产生士兵栏 fake 卡：PlayerModel 将军不入 characterTemplateUnlocks。"""
     lvl = int(level)
     return [uid in _PLAYER_LEVEL_UNLOCK_META
             and _PLAYER_LEVEL_UNLOCK_META[uid][1] != 0
             and _PLAYER_LEVEL_UNLOCK_META[uid][0] <= lvl
-            and uid != _PLAYER_GENERAL_UNLOCK_ID
             for uid in range(_PLAYER_LEVEL_UNLOCK_MAX + 1)]
 
 

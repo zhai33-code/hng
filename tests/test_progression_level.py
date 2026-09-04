@@ -231,7 +231,7 @@ def test_notification_row():
 def test_unlock_bits():
     print('[D] player unlockBits 按等级置位')
     # PlayerLevelUnlock 行：id=1(Assault lv1) / id=2(captureHoldInfantry lv2)
-    # / id=17(eWar lv10) / id=7,9,11,12,26(角色模板，恒关)
+    # / id=17(eWar lv10) / id=7,9,11,12,26(角色模板：兵种按等级，将军 lv12)
     b1 = player_unlock_bits_for_level(1)
     check('D1 1 级仅默认 Assault 模式位开',
           b1[1] and not b1[2] and not b1[17], f'on={[i for i, v in enumerate(b1) if v]}')
@@ -250,8 +250,9 @@ def test_unlock_bits():
     b7 = player_unlock_bits_for_level(7)
     b8 = player_unlock_bits_for_level(8)
     b12 = player_unlock_bits_for_level(12)
-    check('D5 兵种位按等级开（坦克5/伞兵6/飞行员8/侦察9），将军(26)恒关',
-          b5[11] and b6[7] and b8[12] and b9[9] and not b12[26]
+    b11 = player_unlock_bits_for_level(11)
+    check('D5 兵种位按等级开（坦克5/伞兵6/飞行员8/侦察9），将军(26) lv12 开、lv11 仍关',
+          b5[11] and b6[7] and b8[12] and b9[9] and b12[26] and not b11[26]
           and not b4[11] and not b5[7] and not b7[12] and not b8[9],
           f'on12={[i for i, v in enumerate(b12) if v]}')
     check('D6 avail=0 行恒关（id=10 金币 / id=27-29 referral）',

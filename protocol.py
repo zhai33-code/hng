@@ -393,7 +393,8 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     # unlockBits (field 37): repeated bool, 位索引 = PlayerLevelUnlock.id。
     # 客户端 hasPlayerLevelUnlock 用它门控 War 模式（eWar lv10）/匹配模式
     # （eMissionType）/武器组等——必须按等级置位，全 true 会让低级玩家
-    # 也解锁全部模式（进展限制失效）；角色模板位恒 false（避免 fake 招募槽）
+    # 也解锁全部模式（进展限制失效）；兵种模板位按等级置位（将军 lv12，
+    # 客户端士兵栏不生成将军 fake 卡，仅 SoldierShop 页签解锁）
     from wardb import player_unlock_bits_for_level
     m += pb_packed_bool(37, player_unlock_bits_for_level(int(level)))
     m += pb_int32(38, int(level))     # level

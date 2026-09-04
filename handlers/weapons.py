@@ -54,6 +54,7 @@ from player_service import (
     )
 
 from handlers.characters import _repush_character_row
+from starting_gear import STARTING_GEAR
 
 
 async def _repush_character_unlocks(sess, writer, char_id):
@@ -579,9 +580,25 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
     req = None
     if pid_v is not None:
         wtemplate = await _weapon_template_id(sess, mod_weapon_id)
+        # 起始瞄具豁免：侦察兵随枪赠送瞄具（STARTING_GEAR.sight_mod，如德军
+        # K98 的 ZF-39=107）——unlockBits 授予认 STARTING_GEAR（客户端显示
+        # 可购），镜子放仓库转走实例后重新购买同样放行；否则"显示可买却
+        # 被 uid 37（K98 Specialist 7 级）勋带门槛拒绝"两套判定自相矛盾
+        try:
+            ch = await STORE.get_character(pid_v, mod_char_id)
+        except Exception:
+            ch = None
+        gear = (STARTING_GEAR.get((int(ch['faction']), int(ch['template'])), {})
+                if ch else {})
+        starting_sight = (int(gear.get('weapon') or 0) == int(wtemplate or 0)
+                          and int(gear.get('sight_mod') or 0)
+                          == int(mod_template_id or 0))
+        if starting_sight:
+            log(f'      starting-gear sight {mod_template_id} on weapon tpl '
+                f'{wtemplate}: ribbon check waived')
         mapping_id = _MOD_MAPPING_IDS.get((mod_template_id, wtemplate), 0)
         req = _MOD_REQ_LEVEL.get(mapping_id) if mapping_id else None
-        if req is not None:
+        if req is not None and not starting_sight:
             ribbon_id, need_level = req
             have = await _char_ribbon_level(sess, mod_char_id, ribbon_id)
             if have < need_level:

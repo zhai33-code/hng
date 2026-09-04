@@ -65,6 +65,7 @@ from player_service import (
     _charge_player,
     _official_name_error,
     _push_player_refresh,
+    _weapon_template_id,
     )
 
 from starting_gear import STARTING_GEAR
