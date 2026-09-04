@@ -26,8 +26,12 @@ from state import (
 from wardb import (
     _AMMO_MAXCOND,
     CHARACTER_PACKS,
+    _E_WEAPON_MOD_MAPPING,
     _EXPERIENCE_LEVELS,
+    _MOD_MAPPING_IDS,
     _PRICING_MAP,
+    _REQ_UNLOCK_BY_ITEM,
+    _UNLOCK_UID_META,
     _default_ammo_for,
     _default_vehicle_ammo_for,
     _VEHICLE_VARIANT_PARENT,
@@ -40,6 +44,7 @@ from messages import (
     _msg_character,
     _msg_character_stats_entry,
     _msg_depot_new_item,
+    _msg_tracer_effect,
     _msg_uniform_part,
     _msg_uniform_variant,
     _msg_vehicle,
@@ -896,6 +901,9 @@ _DEPOT_STR_TYPE = {
     'weapon': 1, 'vehicle': 2, 'uniformpart': 3, 'uniformvariant': 4,
     'weaponmodifier': 5, 'weaponammo': 6, 'weaponvariant': 7,
     'vehicleupgrade': 8, 'vehicleammo': 9, 'vehiclevariant': 10,
+    # 客户端 ad-hoc 值（ItemInfoOverlayMediator.buildSendItemToSoldierRequest
+    # case 42 → "tracereffect"；WeaponDepotViewMediator 同用 42）
+    'tracereffect': 42,
 }
 
 
@@ -986,12 +994,37 @@ async def _repush_item_row(sess, writer, pid, item_type, item_id):
                         vv['id'], vv['character_id'], vv['vehicle_id'],
                         vv['vehicle_variant_template_id'])
                     break
+        elif tid == 42:
+            # 曳光弹实例行（指派/退仓后 TracerEffectTable 收敛：客户端按
+            # characterId 分流仓库列表与角色名下）
+            for t in await STORE.list_tracer_effects(pid):
+                if int(t['id']) == int(item_id):
+                    tname, proto = b'TracerEffect', _msg_tracer_effect(
+                        t['id'], t['tracer_template_id'], t['character_id'],
+                        t['weapon_id'], t['is_equipped'])
+                    break
         if proto is not None:
             await _push_kvcs(writer, cmd, tname, proto)
             log(f'S->C cmd={cmd:<4} KeyValueChangeSet ({tname.decode()} '
                 f'id={item_id} re-pushed after depot transfer)')
     except Exception as e:
         log(f'[DB] repush item row failed: {e}')
+
+
+def _mod_usable_by_class(mod_template_id, weapon_template_id, faction, char_template):
+    """配件是否可供该阵营/兵种使用：WeaponModMapping 的 level>0 解锁需求
+    uid 中存在适用于该角色的一条（faction 相符或 0，且 characterType 相符
+    或 0）。无映射/无需求（即买即用）恒可用——兵种门槛只来自 uid 元数据
+    （如 K98 的 ZF-39 仅 uid(0,6) 侦察、ZF-41 有 (0,6)+(0,1) 双兵种）。"""
+    mid = _MOD_MAPPING_IDS.get((int(mod_template_id), int(weapon_template_id)))
+    reqs = _REQ_UNLOCK_BY_ITEM.get((mid, _E_WEAPON_MOD_MAPPING)) if mid else None
+    if not reqs:
+        return True
+    for uid in reqs:
+        ft, ct = _UNLOCK_UID_META.get(int(uid), (0, 0))
+        if (not ft or ft == int(faction)) and (not ct or ct == int(char_template)):
+            return True
+    return False
 
 
 async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_type, proto):
@@ -1032,6 +1065,40 @@ async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_ty
         except Exception as e:
             log(f'[DB] set_inventory_item_character failed: {e}')
 
+    # 兵种专属配件剥离（2026-09-04 98k 事故：侦察带镜武器入库再指派步兵，
+    # set_inventory_item_character 无差别带走全部挂靠配件 → 步兵拿到侦察
+    # 专属瞄具）。入库不拆挂靠（客户端 isModded + "卸下升级件"按钮依赖
+    # weapon_id 关联，同兵种往返也应保留配件），在出库指派时按目标兵种
+    # 过滤：不兼容配件剥离回仓库（weapon_id/character_id 清 0，单件版
+    # SendUpgradesToDepot）。无映射/无需求（即买即用）配件不限制，随武器走。
+    stripped_mods = []
+    if updated and pid is not None and si_char_id and _si_tid == 1:
+        try:
+            faction = template = 0
+            for ch in await STORE.list_characters(pid):
+                if int(ch['id']) == int(si_char_id):
+                    faction, template = int(ch['faction']), int(ch['template'])
+                    break
+            wtemplate = await _weapon_template_id(sess, int(si_item_id))
+            if faction and wtemplate:
+                for m in await STORE.list_weapon_modifiers(pid):
+                    if int(m['weapon_id']) != int(si_item_id):
+                        continue
+                    if not _mod_usable_by_class(m['template_id'], wtemplate,
+                                                faction, template):
+                        stripped_mods.append(m)
+        except Exception as e:
+            log(f'[DB] mod class-compat check failed: {e}')
+        if stripped_mods:
+            try:
+                await STORE.detach_weapon_modifiers(
+                    pid, [m['id'] for m in stripped_mods])
+                log(f'      stripped {len(stripped_mods)} class-incompatible '
+                    f'mod(s) from weapon {si_item_id} -> depot')
+            except Exception as e:
+                log(f'[DB] detach_weapon_modifiers failed: {e}')
+                stripped_mods = []
+
     resp_proto = pb_int32(1, 1 if updated else 0)
     resp = build_response(cmd_id, 'SetInventoryItemToCharacterResponse', resp_proto)
     writer.write(resp)
@@ -1045,6 +1112,15 @@ async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_ty
         # 连点重发；此前只覆盖 weapon/vehicle 两类，制服/配件/皮肤/弹药/
         # 载具件指派一律不推 → 官方对齐补全）
         await _repush_item_row(sess, writer, pid, si_item_type, si_item_id)
+        # 剥离回仓库的配件行（weapon_id 已清 0，_repush_weapon_rows 按
+        # weapon_id 过滤不会带上）需显式重推，否则客户端仍显示挂在武器上
+        if stripped_mods and sess.soldier_view_cmd is not None:
+            for m in stripped_mods:
+                await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponModifier',
+                                 _msg_weapon_modifier(m['id'], m['template_id'],
+                                                      0, 0,
+                                                      m.get('auto_repair', 0),
+                                                      m.get('condition', 1.0)))
         # 重推 character KVCS：unlockBits 随指派增减（武器+随行弹药/配件
         # 指派到角色 → 增加对应 uid；原角色 → 摘掉 uid。不推则本会话内
         # 弹药勾选框锁死 + "Ribbon required"，重登才恢复）

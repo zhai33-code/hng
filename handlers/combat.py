@@ -38,9 +38,18 @@ from protocol import (
     pb_message,
     pb_string,
 )
-from messages import _msg_character, _push_kvcs
-from player_service import _char_unlock_bits_for
-from state import FLASH_SESSIONS, PUBLIC_HOST, STORE, log
+from messages import (
+    _msg_character,
+    _msg_vehicle,
+    _msg_vehicle_ammo,
+    _msg_vehicle_upgrade,
+    _msg_weapon,
+    _msg_weapon_ammo,
+    _msg_weapon_modifier,
+    _push_kvcs,
+)
+from player_service import _char_unlock_bits_for, _msg_player_for
+from state import CURRENT_PID, FLASH_SESSIONS, PUBLIC_HOST, STORE, log
 from wardb import (
     _RIBBON_LEVEL_XP,
     _rank_from_combat_xp,
@@ -779,12 +788,14 @@ _AR_CURRENCY_KEY = {1: 'credits', 2: 'gold'}
 
 
 async def _auto_repair_after_wear(pid, auto_flag, params, worn_cond,
-                                  price_type, template_id):
+                                  price_type, template_id, spent=None):
     """战后自动维修：autoRepair=1(Credits)/2(Gold) 的物品扣费修复到满耐久。
 
     价格与客户端 PriceObject.calculateFractionPrice 同式：
     max(1, int(基础价 × (max-cur)/max))；定价缺失（基础价 0）按免费修复；
-    余额不足时保持磨损（返回 worn_cond 不修复）。"""
+    余额不足时保持磨损（返回 worn_cond 不修复）。
+    spent 非 None 时累计实际扣费 {pid: {credits/gold: 总额}}（结算后
+    ItemMaintenance 通知用）。"""
     cur_key = _AR_CURRENCY_KEY.get(int(auto_flag or 0))
     if cur_key is None or not params:
         return worn_cond
@@ -800,6 +811,9 @@ async def _auto_repair_after_wear(pid, auto_flag, params, worn_cond,
                 f'{template_id} skipped: not enough {cur_key} '
                 f'(need {cost}, balance {balance})')
             return worn_cond
+        if spent is not None:
+            acc = spent.setdefault(pid, {})
+            acc[cur_key] = acc.get(cur_key, 0) + cost
         log(f'      [autorepair] player={pid} -{cost} {cur_key} '
             f'({price_type} template={template_id} '
             f'{worn_cond:.2f} -> {max_cond:.2f})')
@@ -817,7 +831,13 @@ async def _apply_equipment_wear(char_times):
     战斗服统计只到模板粒度（statrequests.WeaponStats 无实例磨损），只能
     lobby 侧估算。模板磨损全 0（不可维护物品）与已扣到 0 的行跳过；
     仅对参战角色已装备（container_slot / equipped_in_slot / 挂靠已装备
-    武器/载具）的物品生效。char_times: {(pid, charId): timeActive}。"""
+    武器/载具）的物品生效。char_times: {(pid, charId): timeActive}。
+    返回 (spent, worn_rows)：
+      spent      {pid: {credits/gold: 总额}}（>0 才有键，ItemMaintenance 通知用）
+      worn_rows  {pid: [(表名 bytes, 物品行 dict, 新 condition)]}——结算后
+                 逐玩家重推刷新客户端表缓存（不推则耐久/弹药 UI 需重登才变）"""
+    spent = {}
+    worn_rows = {}
     for (pid, char_id), t_active in sorted(char_times.items()):
         if not pid or not char_id or t_active <= 0:
             continue
@@ -841,10 +861,13 @@ async def _apply_equipment_wear(char_times):
                     if new_cond < cond:
                         new_cond = await _auto_repair_after_wear(
                             pid, w.get('auto_repair'), params, new_cond,
-                            'WeaponMaxConditionRepair', w['template_id'])
+                            'WeaponMaxConditionRepair', w['template_id'],
+                            spent)
                         if new_cond != cond:
                             await STORE.update_weapon_condition(pid, wid,
                                                                 new_cond)
+                            worn_rows.setdefault(pid, []).append(
+                                (b'weapon', w, new_cond))
                             worn += 1
 
             # ---- 配件/弹药（挂在已装备武器上；弹药须已装备到弹药槽）----
@@ -862,10 +885,12 @@ async def _apply_equipment_wear(char_times):
                             new_cond = await _auto_repair_after_wear(
                                 pid, m.get('auto_repair'), params, new_cond,
                                 'WeaponModifierMaxConditionRepair',
-                                m['template_id'])
+                                m['template_id'], spent)
                             if new_cond != cond:
                                 await STORE.update_weapon_modifier_condition(
                                     pid, m['id'], new_cond)
+                                worn_rows.setdefault(pid, []).append(
+                                    (b'WeaponModifier', m, new_cond))
                                 worn += 1
                 for a in await STORE.list_weapon_ammo(pid, char_id):
                     if int(a.get('weapon_id') or 0) not in equipped_w:
@@ -882,10 +907,12 @@ async def _apply_equipment_wear(char_times):
                             new_cond = await _auto_repair_after_wear(
                                 pid, a.get('auto_repair'), params, new_cond,
                                 'AmmoMaxConditionRepair',
-                                a['ammo_template_id'])
+                                a['ammo_template_id'], spent)
                             if new_cond != cond:
                                 await STORE.update_weapon_ammo_condition(
                                     pid, a['id'], new_cond)
+                                worn_rows.setdefault(pid, []).append(
+                                    (b'WeaponAmmo', a, new_cond))
                                 worn += 1
 
             # ---- 载具（装备中：character_id==角色 && equipped_in_slot>0）----
@@ -904,10 +931,12 @@ async def _apply_equipment_wear(char_times):
                             pid, v.get('auto_repair'), params, new_cond,
                             'VehicleMaxConditionRepair',
                             vehicle_parent_template_id(
-                                v['vehicle_variant_template_id']))
+                                v['vehicle_variant_template_id']), spent)
                         if new_cond != cond:
                             await STORE.update_vehicle_condition(pid, vid,
-                                                                new_cond)
+                                                                 new_cond)
+                            worn_rows.setdefault(pid, []).append(
+                                (b'Vehicle', v, new_cond))
                             worn += 1
 
             # ---- 载具升级/载具弹药（装在已装备载具上）----
@@ -927,10 +956,12 @@ async def _apply_equipment_wear(char_times):
                             new_cond = await _auto_repair_after_wear(
                                 pid, u.get('auto_repair'), params, new_cond,
                                 'VehicleUpgradeMaxConditionRepair',
-                                u['upgrade_template_id'])
+                                u['upgrade_template_id'], spent)
                             if new_cond != cond:
                                 await STORE.update_vehicle_upgrade_condition(
                                     pid, u['id'], new_cond)
+                                worn_rows.setdefault(pid, []).append(
+                                    (b'VehicleUpgrade', u, new_cond))
                                 worn += 1
                 for a in await STORE.list_vehicle_ammo(pid):
                     if int(a.get('vehicle_id') or 0) not in equipped_v:
@@ -945,10 +976,12 @@ async def _apply_equipment_wear(char_times):
                             new_cond = await _auto_repair_after_wear(
                                 pid, a.get('auto_repair'), params, new_cond,
                                 'AmmoMaxConditionRepair',
-                                a['ammo_template_id'])
+                                a['ammo_template_id'], spent)
                             if new_cond != cond:
                                 await STORE.update_vehicle_ammo_condition(
                                     pid, a['id'], new_cond)
+                                worn_rows.setdefault(pid, []).append(
+                                    (b'VehicleAmmo', a, new_cond))
                                 worn += 1
 
             if worn:
@@ -957,6 +990,7 @@ async def _apply_equipment_wear(char_times):
                     f'-> {worn} item(s) worn/repaired')
         except Exception as e:
             log(f'      [wear] player={pid} char={char_id} failed: {e}')
+    return spent, worn_rows
 
 
 async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, proto):
@@ -1304,8 +1338,8 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 f'{len(br_players)} players)')
         except Exception as e:
             log(f'      [DB] save_battle_report failed: {e}')
-        # 首局日期（player f19 firstActionGameDate / 签到连续天数起点）：
-        # 幂等只写一次，bot/不可结算 pid 跳过
+        # 首局日期（player f19 firstActionGameDate）：幂等只写一次（登录
+        # touch_daily_login 已按天刷新，此处仅兜底），bot/不可结算 pid 跳过
         for p in br_players:
             if not _is_settleable(p['player_id']):
                 continue
@@ -1439,7 +1473,9 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 continue
             key = (pid, ch['characterId'])
             char_times[key] = max(char_times.get(key, 0), ch['timeActive'])
-        await _apply_equipment_wear(char_times)
+        repair_spent, wear_rows = await _apply_equipment_wear(char_times)
+        if repair_spent:
+            log(f'      [combat] autorepair spent: {repair_spent}')
 
     # 战局结束：清空据点归属覆盖（下局从布局重新开始）+ 会话收尾
     # （PMS DELETE 清 rejoin + 战报通知触发结算界面）+ 释放本场
@@ -1458,7 +1494,9 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
             earned_chars.setdefault(p['player_id'], set()).update(ids)
     if mission_id:
         try:
-            await _finish_mission_sessions(mission_id, report_id, earned_chars)
+            await _finish_mission_sessions(mission_id, report_id,
+                                           earned_chars, repair_spent,
+                                           wear_rows)
         except Exception as e:
             log(f'      [combat] finish mission sessions failed: {e}')
         await _settle_war_mission(mission_id, report)
@@ -1530,7 +1568,85 @@ def _msg_battle_report_notification(notif_id, player_id, report_id):
     return m
 
 
-async def _finish_mission_sessions(mission_id, report_id, earned_chars=None):
+def _msg_notification_data(data_id, notif_id, key, value):
+    """NotificationData 行：维修通知的金额明细。
+
+    客户端 ItemMaintenanceNotificationItemRenderer 按 key 命中
+    'credits'/'gold' 分组显示 value（HnGGUIGlobal.addDecimalSeparator）。"""
+    m = pb_int64(1, int(data_id))                     # id
+    m += pb_int64(2, int(notif_id))                   # notificationId
+    m += pb_string(3, key)                            # key（credits/gold）
+    m += pb_int64(4, int(value))                      # value
+    return m
+
+
+def _msg_item_maintenance_notification(notif_id, player_id):
+    """Notification 行（type=6 ItemMaintenance，自动维修消耗记录）。
+
+    客户端 NotificationModel.handleNotification：ItemMaintenance → 通知
+    托盘条目（不自动弹窗）；渲染器读 NotificationData 的 credits/gold
+    显示维修花费，typeId 不使用（固定 0）。"""
+    expires = time.strftime('%Y%m%d%H%M%S',
+                            time.gmtime(time.time() + 7 * 86400)) + 'Z'
+    timestamp = matchmaking._zulu_now()
+    m = pb_int64(1, int(notif_id))                    # id
+    m += pb_int64(2, int(player_id))                  # playerId
+    m += pb_int32(3, 6)                               # type = ItemMaintenance
+    m += pb_int64(4, 0)                               # typeId（客户端不使用）
+    m += pb_int32(5, 0)                               # readStatus = Unread
+    m += pb_string(6, timestamp)                      # timestamp（zulu）
+    m += pb_string(7, expires)                        # expires（7 天）
+    _NOTIF_ROWS[int(notif_id)] = (int(player_id), 6, 0,
+                                  timestamp, expires)
+    return m
+
+
+def _build_wear_row_msg(kind, row, cond):
+    """磨损/维修后的物品行 → 对应表 KVCS proto（结算重推用）。
+
+    与登录全量同步（player_service）同款构造器/字段；kind 见
+    _apply_equipment_wear 的 worn_rows 收集点。"""
+    if kind == b'weapon':
+        return _msg_weapon(row['id'], row['name'], row['template_id'],
+                           row.get('character_id', 0),
+                           row.get('container_id', 0),
+                           row.get('container_slot', 0),
+                           row.get('variant_id', 0),
+                           row.get('clip_count', 0),
+                           row.get('auto_repair', 0), cond)
+    if kind == b'WeaponModifier':
+        return _msg_weapon_modifier(row['id'], row['template_id'],
+                                    row.get('character_id', 0),
+                                    row.get('weapon_id', 0),
+                                    row.get('auto_repair', 0), cond)
+    if kind == b'WeaponAmmo':
+        return _msg_weapon_ammo(row['id'], row['ammo_template_id'],
+                                row.get('character_id', 0),
+                                row.get('weapon_id', 0),
+                                row.get('slot_index', 0), cond,
+                                row.get('auto_repair', 0))
+    if kind == b'Vehicle':
+        return _msg_vehicle(row['id'], row['vehicle_variant_template_id'],
+                            row.get('character_id', 0),
+                            row.get('equipped_in_slot', 0),
+                            row.get('variant_id', 0),
+                            row.get('auto_repair', 0), cond)
+    if kind == b'VehicleUpgrade':
+        return _msg_vehicle_upgrade(row['id'], row['upgrade_template_id'],
+                                    row.get('vehicle_id', 0),
+                                    row.get('equipped_slot_id', 0),
+                                    row.get('character_id', 0), cond,
+                                    row.get('auto_repair', 0))
+    return _msg_vehicle_ammo(row['id'], row['ammo_template_id'],
+                             row.get('vehicle_id', 0),
+                             row.get('equipped_storage_id', 0),
+                             row.get('slot_index', 0) or 0,
+                             row.get('character_id', 0), cond,
+                             row.get('auto_repair', 0))
+
+
+async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
+                                   repair_spent=None, wear_rows=None):
     """战局正常结束（earnings 已入库）对局内每名玩家收尾。
 
     earned_chars：{player_id → {本局实际获 XP 的 characterId}}（来自战报
@@ -1618,6 +1734,58 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None):
                 log(f'S->C cmd={flash.playerview_cmd:<4} KeyValueChangeSet '
                     f'(Notification NewBattleReport typeId={report_id} '
                     f'player={pid} ★结算界面触发)')
+            # 自动维修消耗通知（type=6 ItemMaintenance，官服行为）：右上角
+            # 托盘条目显示本场维修扣费。NotificationData 行必须先于
+            # Notification 行推——渲染器 set data 时一次性读
+            # NotificationDataTable，后到的数据行不触发重绘
+            spent = (repair_spent or {}).get(pid) or {}
+            if any(int(spent.get(k) or 0) > 0 for k in ('credits', 'gold')):
+                maint_id = _next_notif_id()
+                for cur in ('credits', 'gold'):
+                    amount = int(spent.get(cur) or 0)
+                    if amount > 0:
+                        await matchmaking._push_kvcs(
+                            flash.writer, flash.playerview_cmd,
+                            b'NotificationData',
+                            _msg_notification_data(
+                                _next_notif_id(), maint_id, cur, amount))
+                await matchmaking._push_kvcs(
+                    flash.writer, flash.playerview_cmd, b'Notification',
+                    _msg_item_maintenance_notification(maint_id, pid))
+                log(f'S->C cmd={flash.playerview_cmd:<4} KeyValueChangeSet '
+                    f'(Notification ItemMaintenance credits='
+                    f'{int(spent.get("credits") or 0)} gold='
+                    f'{int(spent.get("gold") or 0)} player={pid} '
+                    f'★维修消耗记录)')
+            # 战后磨损/维修物品行重推（weapon/WeaponModifier/WeaponAmmo/
+            # Vehicle/VehicleUpgrade/VehicleAmmo 表）：磨损只写 DB 不推则
+            # 客户端表缓存停留旧 condition，武器耐久/弹药余量需重登才刷新。
+            # 物品行 playerId 由 CURRENT_PID 填充——本函数跑在战斗服连接
+            # 上下文（pid 非本人），须临时切到目标玩家再还原。
+            rows = (wear_rows or {}).get(pid) or []
+            if rows:
+                if flash.soldier_view_cmd is None:
+                    log(f'      [combat] worn item rows NOT pushed '
+                        f'(no soldier view) player={pid} rows={len(rows)}')
+                else:
+                    tok = CURRENT_PID.set(pid)
+                    try:
+                        for kind, row, cond in rows:
+                            await matchmaking._push_kvcs(
+                                flash.writer, flash.soldier_view_cmd, kind,
+                                _build_wear_row_msg(kind, row, cond))
+                    finally:
+                        CURRENT_PID.reset(tok)
+                    log(f'S->C cmd={flash.soldier_view_cmd:<4} '
+                        f'KeyValueChangeSet ({len(rows)} worn/repaired '
+                        f'item row(s) player={pid} ★耐久刷新)')
+            # 自动维修扣费后货币行重推（顶栏余额即时刷新，官服结算行为）
+            if any(int(spent.get(k) or 0) > 0 for k in ('credits', 'gold')):
+                await matchmaking._push_kvcs(
+                    flash.writer, flash.playerview_cmd, b'player',
+                    await _msg_player_for(flash, gamertag))
+                log(f'S->C cmd={flash.playerview_cmd:<4} KeyValueChangeSet '
+                    f'(player currency refresh player={pid})')
         except Exception as e:
             log(f'      [combat] battle end push failed '
                 f'(player={pid}): {e}')

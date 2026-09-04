@@ -57,6 +57,9 @@ _TPLS = {
     101: {'id': 101, 'name': 'Infantry AT', 'faction': 1,
           'resources': {1: 12}, 'vehicle_cats': set(), 'size': 2,
           'general_character_template_id': 0, 'level': 1, 'speed': 1.0},
+    102: {'id': 102, 'name': 'Mechanized AT', 'faction': 1,
+          'resources': {1: 12, 2: 4}, 'vehicle_cats': {2}, 'size': 2,
+          'general_character_template_id': 0, 'level': 1, 'speed': 1.0},
     201: {'id': 201, 'name': 'Infantry AT GE', 'faction': 2,
           'resources': {1: 12}, 'vehicle_cats': set(), 'size': 2,
           'general_character_template_id': 0, 'level': 1, 'speed': 1.0},
@@ -590,8 +593,11 @@ async def section_c():
                     deployed=True, map_entity_id=30)     # 敌 AT 驻 30
     col, _e, _rc = await war_campaign.spawn_supply_column(
         st, war, parent, {1: 10}, now=_NOW)
+    # 地形减速（#2）：段 20-30 两端（中立/敌方）均非己方 → 时长 ×2；
+    # 到达时刻直接取 movement.arrive_at，测试对段时长不敏感
+    t1 = (await st.get_active_movement(col['id']))['arrive_at']
     ev = await war_campaign.advance_movements(
-        st, war, now=_NOW + datetime.timedelta(seconds=2 * SEG_SEC + 5))
+        st, war, now=t1 + datetime.timedelta(seconds=5))
     tags = _events_tags(ev)
     check('C1 汇合资源封顶并入（2+10 → 12）+ col 软删',
           st.ats[11]['resources'] == {'1': 12}
@@ -631,9 +637,9 @@ async def section_c():
         st2, war2, now=_NOW + datetime.timedelta(seconds=1))
     check('C2 前置：父 AT 已落位 10', st2.ats[21]['map_entity_id'] == 10
           and st2.ats[21]['state'] == 0)
+    t2 = (await st2.get_active_movement(col2['id']))['arrive_at']
     ev2 = await war_campaign.advance_movements(
-        st2, war2,
-        now=_NOW + datetime.timedelta(seconds=2 * SEG_SEC + 5))
+        st2, war2, now=t2 + datetime.timedelta(seconds=5))
     mv2 = await st2.get_active_movement(col2['id'])
     check('C2 追击（col 到 30 发现父在 10 → 新移动 30→10）',
           st2.ats[col2['id']]['state'] == 1
@@ -642,9 +648,9 @@ async def section_c():
           and mv2['path'][-1]['to_bf'] == 10
           and any(tag == b'transport_commandnode_segment'
                   for _, tag, _ in ev2))
+    t3 = (await st2.get_active_movement(col2['id']))['arrive_at']
     ev3 = await war_campaign.advance_movements(
-        st2, war2,
-        now=_NOW + datetime.timedelta(seconds=4 * SEG_SEC + 10))
+        st2, war2, now=t3 + datetime.timedelta(seconds=10))
     check('C2 追上汇合（父满编/col 软删/移动关闭）',
           st2.ats[21]['resources'] == {'1': 12}
           and st2.ats[col2['id']]['state'] == 3
@@ -659,9 +665,9 @@ async def section_c():
     col3, _e3, _rc3 = await war_campaign.spawn_supply_column(
         st3, war3, p3, {1: 10}, now=_NOW)
     st3.ats[31]['state'] = 3                      # 父 AT 歼灭
+    t4 = (await st3.get_active_movement(col3['id']))['arrive_at']
     ev4 = await war_campaign.advance_movements(
-        st3, war3,
-        now=_NOW + datetime.timedelta(seconds=2 * SEG_SEC + 5))
+        st3, war3, now=t4 + datetime.timedelta(seconds=5))
     check('C3 父亡就地解散（col 软删/父资源不动/无战局）',
           st3.ats[col3['id']]['state'] == 3
           and st3.ats[31]['resources'] == {'1': 2}
@@ -843,6 +849,41 @@ async def section_e():
           f.get(2) == 1 and st10.ats[500]['resources'] == {'1': 12}
           and not _cols(st10, 500)
           and st10.adjust_log == [(1, 1, 1, -10)], str(f))
+
+    # E11 官服 #3：机械化部队补队人员/车辆分队
+    st11 = await _ewar({10: 1, 30: 2})
+    _mk_at(st11, 500, template=102, deployed=True, map_entity_id=20,
+           resources={'1': 2}, sold_free=True, veh_free=True)
+    w, f = await _resupply(500)
+    cols11 = [c for c in _cols(st11, 500) if c['state'] < 3]
+    loads = sorted(sorted(c['resources'].items()) for c in cols11)
+    check('E11a 机械化缺编 → 人员/车辆分队（{1:10}+{2:4}/扣 2000）',
+          f.get(2) == 1 and loads == [[('1', 10)], [('2', 4)]]
+          and all(c['template_id'] == 104 for c in cols11)
+          and st11.spend_log == [(100, 'warfunds', 2000)],
+          f'{loads} spend={st11.spend_log}')
+    t11 = None
+    for c in cols11:
+        mv = await st11.get_active_movement(c['id'])
+        t11 = max(t11 or mv['arrive_at'], mv['arrive_at'])
+    await war_campaign.advance_movements(
+        st11, await st11.get_active_war(),
+        now=t11 + datetime.timedelta(seconds=5))
+    check('E11b 两队到达各自并入 → 父编制 {1:12, 2:4}',
+          st11.ats[500]['resources'] == {'1': 12, '2': 4}
+          and all(c['state'] == 3 for c in cols11),
+          str(st11.ats[500]['resources']))
+
+    # E11c 纯车辆缺编 → 单车辆队（步兵满编不出人员队）
+    st12 = await _ewar({10: 1, 30: 2})
+    _mk_at(st12, 500, template=102, deployed=True, map_entity_id=20,
+           resources={'1': 12}, sold_free=True, veh_free=True)
+    w, f = await _resupply(500)
+    cols12 = _cols(st12, 500)
+    check('E11c 纯车辆缺编 → 单队 {2:4}（扣 1000）',
+          f.get(2) == 1 and len(cols12) == 1
+          and cols12[0]['resources'] == {'2': 4}
+          and st12.spend_log == [(100, 'warfunds', 1000)], str(f))
 
 
 async def main():

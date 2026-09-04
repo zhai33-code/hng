@@ -50,7 +50,8 @@ async def cleanup(st, pid):
     """清掉本测试玩家的可测行（保留玩家行本身）。"""
     async with st.pool.acquire() as conn:
         for tbl in ('weapon_ammo', 'weapon_modifiers', 'weapon_variants',
-                    'vehicle_ammo', 'vehicle_upgrades', 'vehicle_variants'):
+                    'vehicle_ammo', 'vehicle_upgrades', 'vehicle_variants',
+                    'tracer_effects'):
             await conn.execute(f'DELETE FROM {tbl} WHERE player_id = $1', int(pid))
         await conn.execute("DELETE FROM weapons WHERE player_id = $1 "
                            "AND name = 'U10DepotGun'", int(pid))
@@ -249,6 +250,51 @@ async def main():
          ok and uv2row['character_id'] == cid,
          f' uv={uv2row["character_id"]}')
 
+    # 现场E：曳光弹（客户端 itemType='tracereffect' 字符串 / 退仓枚举 42）
+    # 2026-09-04 事故：itemType 不在 _ITEM_TABLES → 指派直接 response=0，
+    # 仓库拖曳光弹到士兵无效（itemId=1100/charId=25 实锤）
+    tr = await st.create_tracer_effect(pid, 1)     # 通行证发放=仓库在库
+    trid = int(tr['id'])
+    ok = await st.set_inventory_item_character(pid, 'tracereffect', trid, cid)
+    async with st.pool.acquire() as conn:
+        trrow = await conn.fetchrow('SELECT character_id, weapon_id, is_equipped '
+                                    'FROM tracer_effects WHERE id = $1', trid)
+    mark('曳光弹指派：character_id=角色（旧实现 itemType 未映射 → '
+         'response=0 拖拽无效）',
+         ok and trrow['character_id'] == cid,
+         f' tr=({trrow["character_id"]},{trrow["weapon_id"]},'
+         f'{trrow["is_equipped"]})')
+
+    # 装备到武器（武器引用该行）后再指派角色 → 指派应解除武器绑定
+    await st.set_weapon_tracer_effect(pid, w2id, trid, cid)
+    ok2 = await st.set_inventory_item_character(pid, 'tracereffect', trid, cid)
+    async with st.pool.acquire() as conn:
+        trrow = await conn.fetchrow('SELECT character_id, weapon_id, is_equipped '
+                                    'FROM tracer_effects WHERE id = $1', trid)
+        w2trow = await conn.fetchrow('SELECT tracer_effect_id FROM weapons '
+                                     'WHERE id = $1', w2id)
+    mark('曳光弹装备中指派：解除武器绑定（weapon_id=0/is_equipped=FALSE）'
+         '且 weapons.tracer_effect_id 复位',
+         ok2 and trrow['character_id'] == cid and trrow['weapon_id'] == 0
+         and not trrow['is_equipped'] and w2trow['tracer_effect_id'] == 0,
+         f' tr=({trrow["character_id"]},{trrow["weapon_id"]},'
+         f'{trrow["is_equipped"]}) w.tracer={w2trow["tracer_effect_id"]}')
+
+    # 装备到武器后退仓（客户端 SendItemToDepotRequest itemType=42）
+    await st.set_weapon_tracer_effect(pid, w2id, trid, cid)
+    ok3 = await st.send_item_to_depot(pid, 42, trid)
+    async with st.pool.acquire() as conn:
+        trrow = await conn.fetchrow('SELECT character_id, weapon_id, is_equipped '
+                                    'FROM tracer_effects WHERE id = $1', trid)
+        w2trow = await conn.fetchrow('SELECT tracer_effect_id FROM weapons '
+                                     'WHERE id = $1', w2id)
+    mark('曳光弹退仓（itemType=42）：归仓+卸装+武器引用复位'
+         '（旧实现枚举未映射 → response=0）',
+         ok3 and trrow['character_id'] == 0 and trrow['weapon_id'] == 0
+         and not trrow['is_equipped'] and w2trow['tracer_effect_id'] == 0,
+         f' tr=({trrow["character_id"]},{trrow["weapon_id"]},'
+         f'{trrow["is_equipped"]}) w.tracer={w2trow["tracer_effect_id"]}')
+
     print('== 5. depot_items 新物品标记（红点链路）==')
     await st.mark_depot_item_new(pid, 'weapons', wid)
     await st.mark_depot_item_new(pid, 'weapons', wid)      # 幂等：不重复插行
@@ -314,10 +360,14 @@ async def main():
                                 'VehicleUpgrade', 'VehicleAmmo',
                                 'VehicleVariant'))
          and '_repush_weapon_rows' in src and '_repush_vehicle_row' in src)
-    mark('重推器：_DEPOT_STR_TYPE 字符串映射含全部 10 类（客户端 '
-         'buildSendItemToSoldierRequest 取值）',
-         len(hc._DEPOT_STR_TYPE) == 10
-         and set(hc._DEPOT_STR_TYPE.values()) == set(range(1, 11)))
+    mark('重推器：_DEPOT_STR_TYPE 字符串映射含全部 10 类 + tracereffect=42'
+         '（客户端 buildSendItemToSoldierRequest case 42 → "tracereffect"）',
+         len(hc._DEPOT_STR_TYPE) == 11
+         and set(hc._DEPOT_STR_TYPE.values()) == set(range(1, 11)) | {42}
+         and hc._DEPOT_STR_TYPE.get('tracereffect') == 42)
+    src = inspect.getsource(hc._repush_item_row)
+    mark('重推器：tid=42 推 TracerEffect 行（指派/退仓后 UI 收敛）',
+         "tid == 42" in src and 'TracerEffect' in src)
 
     # player_store：挂靠件指派脱离容器（官方容器归属不变式；字典定义在
     # 类属性上，取类级源码校验）

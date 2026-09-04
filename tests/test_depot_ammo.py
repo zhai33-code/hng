@@ -110,7 +110,7 @@ async def main():
 
     src = inspect.getsource(hc.handle_setinventoryitemtocharacterrequest)
     mark('characters.SetInventoryItemToCharacter 武器指派后重推 character',
-         "_repush_character_row" in src and 'weapon' in src)
+         "_repush_character_by_id" in src and 'weapon' in src)
 
     # 收尾清理
     async with st.pool.acquire() as conn:

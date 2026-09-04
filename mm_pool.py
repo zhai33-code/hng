@@ -30,6 +30,7 @@ class QueueEntry:
     enqueued_at: float = field(default_factory=time.monotonic)
     group_key: int = 0           # 整队入池键（=squad_id）；0 = 单人
     battle_id: int = 0           # war 会战局 id（M2）；0 = 普通撮合
+    vehicle_cats: tuple = ()     # 已装备载具资源类别并集（成局覆盖保证）
 
 
 @dataclass

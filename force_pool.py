@@ -24,7 +24,8 @@
   war(10) / quickplay(11) / default  同上两种全兵种计划
 
 对外接口：
-  init_mission(mission_id, gamemode_id, attacker, defender)  成局建池
+  init_mission(mission_id, gamemode_id, attacker, defender,
+               require_cats=())                成局建池（类别覆盖保证）
   pool(mission_id)                → {faction: {cat: count}} | None
   counts_for(mission_id, faction) → {cat: count}（无池回退锚点值）
   categories(...)                 → [(cat, spawnInAir)]（渲染类别序）
@@ -175,6 +176,15 @@ _missing = [n for fam in AT_FAMILIES.values() for n in fam if n not in _AT_COMP]
 if _missing:
     log(f'[force_pool] WARNING: AT missing in WarDatabase: {_missing}')
 
+# 资源类别 → 提供族 {family: [AT 名]} 反查（require_cats 查缺补齐用）
+_CAT_PROVIDERS = {}
+for _fam, _ats in AT_FAMILIES.items():
+    for _nm in _ats:
+        if _nm not in _AT_COMP:
+            continue
+        for _c in _AT_COMP[_nm]:
+            _CAT_PROVIDERS.setdefault(int(_c), {}).setdefault(_fam, []).append(_nm)
+
 
 def template_name(template_id):
     """commandnodetemplate 模板 id → AT 兵种名（未知返回 None）。"""
@@ -217,15 +227,80 @@ def _draw_family(family, n):
     return picks
 
 
-def draw_at_names(gamemode_id):
-    """按模式抽一份 AT 名单（一场一份，双侧镜像）。"""
+def _ensure_required_cats(names, require_cats):
+    """官服口径"进局必有装备载具之一"：抽取后按 require_cats 查缺补齐。
+
+    优先同族替换（不增编制、保 _family_ok 族约束、不破坏其他必需类别
+    的覆盖）；无合适替换时追加 provider AT 兜底。
+    返回 (names, appended)；appended = 追加的 AT 名（替换不产生）。
+    """
+    require = {int(c) for c in require_cats if int(c)}
+    if not require:
+        return list(names), []
+
+    def provided(ns):
+        cats = set()
+        for nm in ns:
+            cats.update(_AT_COMP.get(nm, {}))
+        return cats
+
+    appended = []
+    for cat in sorted(require):
+        if cat in provided(names):
+            continue
+        fams = _CAT_PROVIDERS.get(cat) or {}
+        # 候选族序：名单里已有该族 AT 的在前（同族替换最省编制）
+        fam_order = [f for f in fams
+                     if any(n in AT_FAMILIES.get(f, ()) for n in names)]
+        fam_order += [f for f in fams if f not in fam_order]
+        swapped = False
+        for fam in fam_order:
+            fam_set = set(AT_FAMILIES.get(fam, ()))
+            for prov in fams[fam]:
+                if prov not in _AT_COMP:
+                    continue
+                for i, nm in enumerate(names):
+                    if nm not in fam_set:
+                        continue
+                    cand = names[:i] + [prov] + names[i + 1:]
+                    if not _family_ok(fam, [x for x in cand if x in fam_set]):
+                        continue
+                    if (require - {cat}) - provided(cand):
+                        continue    # 被换掉的 AT 是其他必需类别的唯一来源
+                    names = cand
+                    swapped = True
+                    break
+                if swapped:
+                    break
+            if swapped:
+                break
+        if not swapped:
+            # 追加兜底：池增一支 provider AT，保证类别可部署
+            prov = next((p for f in fam_order for p in fams[f]
+                         if p in _AT_COMP), None)
+            if prov:
+                names = names + [prov]
+                appended.append(prov)
+    return names, appended
+
+
+def draw_at_names(gamemode_id, require_cats=()):
+    """按模式抽一份 AT 名单（一场一份，双侧镜像）。
+
+    require_cats：本局必须覆盖的资源类别（成局玩家装备载具类别并集，
+    官服口径"坦克兵/飞行员进局必有装备载具之一，否则无法部署"）；
+    抽取后查缺补齐，见 _ensure_required_cats。
+    """
     mode_name = mm_config.gamemode_cfg(gamemode_id).get('name', 'default')
     if mode_name == 'training':
-        return list(ANCHOR_ATS), mode_name
+        names, _appended = _ensure_required_cats(list(ANCHOR_ATS),
+                                                require_cats)
+        return names, mode_name
     plan = MODE_PLANS.get(mode_name, DEFAULT_PLAN)
     names = []
     for family in ('infantry', 'recon', 'para', 'armor', 'air'):
         names += _draw_family(family, plan.get(family, 0))
+    names, _appended = _ensure_required_cats(names, require_cats)
     return names, mode_name
 
 
@@ -239,9 +314,13 @@ def draw_at_names(gamemode_id):
 _MISSIONS = {}
 
 
-def init_mission(mission_id, gamemode_id, attacker, defender):
-    """成局建池：按模式抽 AT 名单，双侧镜像同编制。"""
-    names, mode_name = draw_at_names(gamemode_id)
+def init_mission(mission_id, gamemode_id, attacker, defender,
+                 require_cats=()):
+    """成局建池：按模式抽 AT 名单，双侧镜像同编制。
+
+    require_cats：本局必须覆盖的资源类别（成局玩家装备载具类别并集，
+    官服口径保证坦克兵/飞行员进局必有装备载具之一，否则无法部署）。"""
+    names, mode_name = draw_at_names(gamemode_id, require_cats)
     counts = {}
     for name in names:
         for cat, cnt in _AT_COMP.get(name, {}).items():
@@ -253,7 +332,9 @@ def init_mission(mission_id, gamemode_id, attacker, defender):
         'lines': None, 'line_pool': None, 'ap_line': {},
     }
     log(f'[force_pool] mission={mission_id} mode={mode_name} '
-        f'ATs[{len(names)}]={",".join(names)} pool={counts}')
+        f'ATs[{len(names)}]={",".join(names)} pool={counts}'
+        + (f' require_cats={sorted(set(int(c) for c in require_cats))}'
+           if require_cats else ''))
     return True
 
 

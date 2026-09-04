@@ -141,8 +141,8 @@ async def main():
         # 2026-09-02 每日签到改造：redeem_daily_reward 拆为 claim_daily_reward
         # （标记/计数）+ handler 侧发放（货币/加成/会员按 dailyRewards.xml）
         print('== 3. claim_daily_reward 幂等 + 防双领 ==')
-        ok1, day1, n1 = await st.claim_daily_reward(pid)
-        ok2, day2, n2 = await st.claim_daily_reward(pid)
+        ok1, day1, n1, c1 = await st.claim_daily_reward(pid)
+        ok2, day2, n2, c2 = await st.claim_daily_reward(pid)
         check('当天首次领取 day=1', ok1 and day1 == 1 and n1 == 1,
               f'ok={ok1} day={day1} n={n1}')
         check('当天重复领取 day=0（幂等）', ok2 and day2 == 0 and n2 == 1,
@@ -152,7 +152,7 @@ async def main():
         pid2 = await st.create_player(f'{uname}_b', 'txn-test')
         res = await asyncio.gather(st.claim_daily_reward(pid2),
                                    st.claim_daily_reward(pid2))
-        granted_days = sum(1 for ok, d, n in res if d)
+        granted_days = sum(1 for ok, d, n, c in res if d)
         check('并发双领只发一次（FOR UPDATE）', granted_days == 1,
               f'res={res}')
 

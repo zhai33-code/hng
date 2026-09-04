@@ -42,11 +42,12 @@ from wardb import (
     battlefield_entity_for_gamemap, battlefield_pos,
     commandnode_template, is_general_character, preset_scene,
     squad_template_for_character, squad_template_name,
-    squad_template_slot_count,
+    squad_template_slot_count, vehicle_resource_category,
 )
 import mm_config
 import mm_pool
 import force_pool
+import war_campaign      # #1 underdog 倍率（faction 行 f6/f7 下发）
 
 # ---------------------------------------------------------------- combat server
 # 真实 warserver 流程：匹配成功 → 按需拉起 combat server 实例（hng.exe /D）→
@@ -501,16 +502,21 @@ def _faction_pair(det):
     return atk, dfd
 
 
-def _msg_faction_rows():
-    """KVS 'faction' 表 3 行（US/GE/SU，结构按他服 solo_kvcs_dump2 S2C#17 复刻）。"""
+def _msg_faction_rows(mults=None):
+    """KVS 'faction' 表 3 行（US/GE/SU，结构按他服 solo_kvcs_dump2 S2C#17 复刻）。
+
+    mults：#1 underdog 倍率 {faction: (xp_mult, wf_mult)}（war_campaign.
+    current_underdog_mults），写入 f6/f7 underdogBonus*Multiplier——
+    客户端阵营选择窗按 >1 显示"当前弱势阵营加成"；缺省全 1.0。"""
     rows = []
     for tmpl, fid in FACTION_ROW_IDS.items():
+        xp_m, wf_m = (mults or {}).get(tmpl, (1.0, 1.0))
         m = pb_int64(1, fid)                                   # id
         m += pb_int64(2, tmpl)                                 # factiontemplateid
         m += pb_int64(4, FACTION_SUPREME_COMMANDS[tmpl])       # supremecommand
         m += pb_int64(5, _WAR_ID)                              # war（本服运行时战争 id）
-        m += pb_float(6, 1.0)                                  # underdogBonusXpMultiplier
-        m += pb_float(7, 1.0)                                  # underdogBonusWarfundsMultiplier
+        m += pb_float(6, float(xp_m))                          # underdogBonusXpMultiplier
+        m += pb_float(7, float(wf_m))                          # underdogBonusWarfundsMultiplier
         rows.append(m)
     return rows
 
@@ -716,9 +722,38 @@ def _mission_capturepoints(gamemap_id):
 # 部署界面按资源条目判定各兵种可用生命数 —— 缺空军条目时飞行员即使有
 # 飞机也不显示乘机槽（只能徒步部署）。
 
-def _init_mission_resources(mission_id, gamemode_id, attacker, defender):
-    """成局时建立资源池（按模式抽 AT，攻防双方镜像同编制）。"""
-    force_pool.init_mission(mission_id, gamemode_id, attacker, defender)
+def _init_mission_resources(mission_id, gamemode_id, attacker, defender,
+                            require_cats=()):
+    """成局时建立资源池（按模式抽 AT，攻防双方镜像同编制）。
+
+    require_cats：本局玩家已装备载具资源类别并集——官服口径"进局必有
+    装备载具类别之一"（坦克兵/飞行员对齐飞行员匹配语义，缺类别即无法
+    部署）；池抽取后查缺补齐（force_pool._ensure_required_cats）。"""
+    force_pool.init_mission(mission_id, gamemode_id, attacker, defender,
+                            require_cats=require_cats)
+
+
+async def _char_vehicle_cats(pid, char_id):
+    """玩家角色已装备载具 → 资源类别并集（成局覆盖保证用）。
+
+    vehicles 表 equipped_in_slot>0 = 已装备到角色；变体模板经父模板归一
+    后查 vehicletemplate f4 资源类别。DB 异常/无装备返回 ()。"""
+    if STORE is None or not pid or not char_id:
+        return ()
+    try:
+        rows = await STORE.list_vehicles(int(pid), int(char_id))
+    except Exception as e:
+        _log(f'      [DB] list_vehicles(pid={pid}) failed: {e}')
+        return ()
+    cats = set()
+    for v in rows or ():
+        if int(v.get('equipped_in_slot', 0) or 0) <= 0:
+            continue
+        cat = vehicle_resource_category(
+            int(v.get('vehicle_variant_template_id', 0) or 0))
+        if cat:
+            cats.add(int(cat))
+    return tuple(sorted(cats))
 
 
 async def _init_war_mission_resources(mission_id, battle_id, attacker,
@@ -1611,7 +1646,9 @@ async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
             if old_q.get('pmm_id') is not None:
                 await _push_kvcs_delete(w, vc, b'PlayerMatchMaking',
                                         old_q['pmm_id'])
-        for row in _msg_faction_rows():
+        # faction 行 f6/f7 带当前 underdog 倍率（#1 人数较少阵营加成）
+        _ud = await war_campaign.current_underdog_mults(STORE)
+        for row in _msg_faction_rows(_ud):
             await _push_kvcs(w, vc, b'faction', row)
         pmm_id = _next_match_id(_MM_PMM_ID)
         rank = _rank_from_combat_xp(int(m['combat_xp']))
@@ -1635,7 +1672,9 @@ async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
         entries.append(mm_pool.QueueEntry(
             player_id=mpid, char_id=int(m['character_id']),
             faction=int(m['faction']), gamemode_id=gamemode_id,
-            presets=staged_presets, group_key=squad_id))
+            presets=staged_presets, group_key=squad_id,
+            vehicle_cats=await _char_vehicle_cats(
+                mpid, int(m['character_id']))))
     try:
         for m in members:
             await STORE.update_squad_member(m['id'], status=3)
@@ -1977,7 +2016,12 @@ async def _start_match(match):
         await _init_war_mission_resources(mission_id, battle_id, attacker,
                                           defender)
     else:
-        _init_mission_resources(mission_id, gamemode_id, attacker, defender)
+        # 官服口径"进局必有装备载具之一"：池按成局玩家装备载具类别并集
+        # 查缺补齐（坦克兵/飞行员缺类别即无法部署，攻方 120s 判负根因）
+        require_cats = {int(c) for e in match.players
+                        for c in getattr(e, 'vehicle_cats', ())}
+        _init_mission_resources(mission_id, gamemode_id, attacker, defender,
+                                require_cats)
     _log(f'match formed: mission={mission_id}, preset={preset}, map='
          f'{combat_map}, players={len(match.players)}, ai_fill={match.ai_fill}, '
          f'bots={enable_bots}, sa_bots={enable_sa_bots}, '
@@ -2118,7 +2162,8 @@ async def _push_player_into_mission(e, ctx, sess_rec, pms_id, mission_id,
          f'id={pms_id}, mission={mission_id}, state=3 Armed ★battle arm)')
 
 
-def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None):
+def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
+                           vehicle_cats=()):
     """找一个等待期内可中途加入的战局，返回 (mission_id, inst) 或 None。
 
     条件（全部满足）：
@@ -2127,6 +2172,10 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None):
     - 玩家阵营属于该局攻防双方（第三方阵营无出生侧，无法进图）
     - 成局后未超过 mm_config.JOIN_WINDOW 秒（开局等待/倒计时阶段）
     - 该局人数未达该模式 max_players
+    - 玩家侧池覆盖其装备载具类别之一（官服口径"进局必有装备载具之一"，
+      否则坦克兵/飞行员无法部署）——仅 staged 局过滤：war 会战局兵力 =
+      将军部署 AT（真实语义不因个人装备改池）、显式指定战局（only_mission
+      尊重玩家选择）均不过滤
     only_mission 非空时只考虑该 mission_id（JoinMatchMakingRequest f2
     指定战局加入，战争地图点进行中战斗的路径）。
     """
@@ -2161,6 +2210,13 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None):
         max_p = int(mm_config.gamemode_cfg(gamemode_id).get('max_players', 18))
         if len(det.get('players') or ()) >= max_p:
             continue
+        # 载具覆盖过滤（staged 局；war 局/显式指定战局不过滤，见 docstring）
+        if vehicle_cats and not only_mission and not det.get('battle_id'):
+            fac_counts = (force_pool.pool(mission_id) or {}).get(int(faction))
+            if not fac_counts or not any(
+                    int(c) in fac_counts and fac_counts[int(c)] > 0
+                    for c in vehicle_cats):
+                continue
         return mission_id, inst
     return None
 
@@ -2461,7 +2517,9 @@ async def _handle_join(sess, writer, cmd_id, proto):
     #   为空时 GetMissionDetailsResponse 处理中 getFromId 返回 null → #1009 卡死进对局。
     #   客户端在 JoinMM ok 后会立即发第一次 GetMissionDetailsRequest，必须先于它推送。
     if view_cmd is not None:
-        for row in _msg_faction_rows():
+        # f6/f7 带当前 underdog 倍率（#1 人数较少阵营经验/战资加成）
+        _ud = await war_campaign.current_underdog_mults(STORE)
+        for row in _msg_faction_rows(_ud):
             await _push_kvcs(writer, view_cmd, b'faction', row)
         _log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet (faction ×3 rows) ★FactionTable fill')
 
@@ -2642,9 +2700,12 @@ async def _handle_join(sess, writer, cmd_id, proto):
     #     等待窗口内（mm_config.JOIN_WINDOW）→ 直接进该局（不另开新局）；
     #     玩家指定了战局（f2 missionId，战争地图点进行中战斗）则只考虑该局。
     #     找不到/超窗/满员/阵营不符 → 正常入池撮合。
+    # 官服口径"进局必有装备载具之一"：已装备载具资源类别并集随条目
+    # 入池（成局建池查缺补齐 + 等待期中途加入过滤共用）
     entry = mm_pool.QueueEntry(
         player_id=pid, char_id=int(char_id), faction=faction,
-        gamemode_id=gamemode_id, presets=staged_presets)
+        gamemode_id=gamemode_id, presets=staged_presets,
+        vehicle_cats=await _char_vehicle_cats(pid, char_id))
     # 1c-0. ★ rejoin 只能回原局：玩家在存活战局中掉线重连（drop_player
     #       不清已成局会话）→ 直接回原局，不走 late join 搜索（否则按
     #       创建顺序会撞上别的局）、不另开新局。仅在未显式指定战局
@@ -2657,7 +2718,8 @@ async def _handle_join(sess, writer, cmd_id, proto):
             await _join_existing_mission(pid, rejoin_mid, entry, ctx)
             return
     joinable = _find_joinable_mission(gamemode_id, staged_presets, faction,
-                                      only_mission=req_mission_id or None)
+                                      only_mission=req_mission_id or None,
+                                      vehicle_cats=entry.vehicle_cats)
     if joinable is not None:
         await _join_existing_mission(pid, joinable[0], entry, ctx)
         return

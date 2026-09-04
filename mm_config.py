@@ -160,10 +160,10 @@ if SNOW_CHANCE is None or not 0.0 <= SNOW_CHANCE <= 1.0:
 # 数值默认取官服近似（CommandNodeMoraleTemplate 实值 / wiki 考据），
 # 全部可被环境变量覆盖，留实测校准空间。
 WAR_AUTO_CREATE = bool(_int_env('MM_WAR_AUTO_CREATE', 1))     # 无进行中战争时自动开战
-WAR_POINTS_VICTORY = _int_env('MM_WAR_POINTS_VICTORY', 15)     # 胜利所需首都数（官服 12~15）
+WAR_POINTS_VICTORY = _int_env('MM_WAR_POINTS_VICTORY', 9)     # 胜利所需首都数（官服 12~15）
 WAR_TIMESCALE = _float_env('MM_WAR_TIMESCALE', 1.0)            # 战略时间倍率（AT 移动速度乘数）
 WAR_DAYCYCLE_TIMESCALE = _float_env('MM_WAR_DAYCYCLE_TIMESCALE', 1.0)
-WAR_MAX_PLAYERS_PER_FACTION = _int_env('MM_WAR_MAX_PLAYERS_PER_FACTION', 100)
+WAR_MAX_PLAYERS_PER_FACTION = _int_env('MM_WAR_MAX_PLAYERS_PER_FACTION', 999999)
 WAR_NAME = os.environ.get('MM_WAR_NAME') or 'The Great War'    # 新战争名
 WAR_SEQUEL_AUTO = bool(_int_env('MM_WAR_SEQUEL_AUTO', 1))      # 战争结束自动开续战
 WAR_CATALOGUE_LIMIT = _int_env('MM_WAR_CATALOGUE_LIMIT', 20)   # 目录返回战争数上限
@@ -179,6 +179,21 @@ WAR_AT_REQUIRE_COMMAND_POINTS = bool(
 # WAR_AT_MOVE_SCALE) 秒。1.0=官服真实时间节奏（步兵跨半图 ~4 小时）；
 # 2026-09-03 应玩家要求提速 10 倍（步兵邻城 ~19 秒、跨半图 ~25 分钟）。
 WAR_AT_MOVE_SCALE = _float_env('MM_WAR_AT_MOVE_SCALE', 10.0)
+# 地形减速（#2 官方玩法：中立区/海面行军速度大大降低）。跨海判据=段距离
+# ≥ WAR_SEA_DISTANCE（2026-09-04 实测欧洲图 2661 条补给线：内陆最长 505、
+# 551-860 共 5 条全为丹麦↔挪威跨斯卡格拉克海峡线，550 为干净分界）；
+# 中立判据=段两端城市归属均非己方。系数为速度乘数（0.25=4 倍时长），
+# 同时命中取更小值。仅作用于地面补给线段（air 段不减速）。
+WAR_SEA_DISTANCE = _float_env('MM_WAR_SEA_DISTANCE', 550.0)
+WAR_SEA_SPEED_FACTOR = _float_env('MM_WAR_SEA_SPEED_FACTOR', 0.25)
+WAR_NEUTRAL_SPEED_FACTOR = _float_env('MM_WAR_NEUTRAL_SPEED_FACTOR', 0.5)
+# underdog 加成（#1 官方玩法：人数较少阵营经验/战资加成；faction 行
+# f6/f7 underdogBonus{Xp,Warfunds}Multiplier，客户端阵营选择窗
+# "当前弱势阵营加成"组按 >1 显示）。倍率 = 1 + cap × (1 - n/n_max)，
+# 人数口径=战争中各阵营 AT 持有玩家去重数。默认封顶 XP +25% / 战资 +15%
+# （官服数值失传，可校准）。
+WAR_UNDERDOG_XP_BONUS = _float_env('MM_WAR_UNDERDOG_XP_BONUS', 0.25)
+WAR_UNDERDOG_WF_BONUS = _float_env('MM_WAR_UNDERDOG_WF_BONUS', 0.15)
 # 战争推进 tick 间隔秒（移动换段/到达判定/会战成局桩；realtest_server 挂载）
 WAR_TICK_SECONDS = _int_env('MM_WAR_TICK_SECONDS', 5)
 

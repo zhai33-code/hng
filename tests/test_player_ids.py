@@ -300,6 +300,26 @@ def test_faction_rows_id_equals_template():
             f'faction 行 id({f[1]}) != factiontemplateid({f[2]})'
 
 
+def test_faction_rows_underdog_multipliers():
+    """faction 行 f6/f7 underdog 倍率（#1 人数较少阵营加成）：无参默认
+    1.0，传 mults 时按阵营下发（客户端 FactionOption.as 按 >1 显示
+    "当前弱势阵营加成"组）。"""
+    for row in matchmaking._msg_faction_rows():
+        f = pb_parse_loose(row)
+        assert abs(f[6] - 1.0) < 1e-6 and abs(f[7] - 1.0) < 1e-6, \
+            f'默认应全 1.0：f6={f[6]} f7={f[7]}'
+    rows = {int(f[2]): f for f in (
+        pb_parse_loose(r)
+        for r in matchmaking._msg_faction_rows({1: (1.0, 1.0),
+                                                2: (1.25, 1.15)}))}
+    assert abs(rows[2][6] - 1.25) < 1e-6 and abs(rows[2][7] - 1.15) < 1e-6, \
+        f'fac2 应带倍率：f6={rows[2][6]} f7={rows[2][7]}'
+    assert abs(rows[1][6] - 1.0) < 1e-6 and abs(rows[1][7] - 1.0) < 1e-6, \
+        f'fac1 多数阵营应 1.0：f6={rows[1][6]} f7={rows[1][7]}'
+    assert abs(rows[3][6] - 1.0) < 1e-6 and abs(rows[3][7] - 1.0) < 1e-6, \
+        f'fac3 缺省应 1.0：f6={rows[3][6]} f7={rows[3][7]}'
+
+
 def test_multi_gmd_f3_uses_template_ids_and_groups_by_faction():
     """德军 A + 苏军 B 成局：GMD f3 每条的 factionId 必须落在模板 id 空间
     （客户端 updateMissionDetailsFactionCounts 拿它 Equals

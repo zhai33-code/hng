@@ -68,7 +68,11 @@ from protocol import (
 
 from state import GAME_DIR, STORE, log
 
-from wardb import MEMBERSHIP_DAYS_BY_ID, _RIBBON_BOOSTERS
+from wardb import (
+    MEMBERSHIP_DAYS_BY_ID,
+    _RIBBON_BOOSTERS,
+    _load_wardb_kvcs,
+    )
 
 from messages import _push_kvcs
 from player_service import _PaymentFailed, _charge_player, _push_player_refresh
@@ -141,11 +145,54 @@ _DAILY_REWARD_GRANTS = {
 _RIBBON_BOOSTER_POOL = sorted(
     i for i in _RIBBON_BOOSTERS if 1 <= i <= 99)
 
+# 连续登录 bonus（客户端 bonus_reward 列 2..7 天）：
+# WarDatabase/consecutive_daily_login_rewards（KVCS 录制表，与客户端
+# ConsecutiveDailyLoginRewardsTable 同源）→ {day: [(kind, val), ...]}
+_CONSECUTIVE_REWARDS = {}
+
+
+def _load_consecutive_rewards():
+    """解析 consecutive_daily_login_rewards 表（客户端连续登录奖励 2..7 天）。
+
+    行 items 为 XML：`<items><credits amount="2000"/></items>` /
+    `<ShopMembershipItems id="11"/>`。day1 无 bonus（首日无连续奖励）。"""
+    global _CONSECUTIVE_REWARDS
+    chunk = _load_wardb_kvcs('consecutive_daily_login_rewards')
+    if chunk is None:
+        return
+    try:
+        for action in chunk.subs:                 # 'set'
+            for table in action.subs:             # 'consecutive_daily_login_rewards'
+                for row in table.subs:
+                    f = pb_parse(row.data)
+                    day = int(f.get(2, 0) or 0)
+                    if not day:
+                        continue
+                    try:
+                        root = ET.fromstring(_str(f.get(5, '') or ''))
+                    except Exception:
+                        continue
+                    items = []
+                    for it in root:
+                        tag = it.tag.lower()
+                        if tag in ('credits', 'gold', 'warfunds'):
+                            items.append((tag, int(it.get('amount', 0) or 0)))
+                        elif tag == 'shopmembershipitems':
+                            items.append(
+                                ('membership', int(it.get('id', 0) or 0)))
+                    if items:
+                        _CONSECUTIVE_REWARDS[day] = items
+    except Exception as e:
+        log(f'[daily] load consecutive rewards failed: {e}')
+
 
 def _str(v):
     if isinstance(v, bytes):
         return v.decode('utf-8', 'replace')
     return str(v)
+
+
+_load_consecutive_rewards()
 
 
 def _zulu(dt):
@@ -383,14 +430,45 @@ async def _grant_daily_reward(pid, day):
     return out
 
 
+async def _grant_consecutive_bonus(pid, consecutive):
+    """发放连续登录 bonus（客户端 bonus_reward 列，2..7 天）。
+
+    客户端 DailyRewardsWindowMediator.setUpConsecutiveRewards 的 TODAY 项
+    isRedeemed 直接镜像主签到 TODAY（同一次 RedeemDailyLoginReward 领取
+    即两奖齐发）；折算镜像客户端：连续天数 >=8 → 回到第 2 天开新一轮。
+    返回结构同 _grant_daily_reward。"""
+    cday = 2 if int(consecutive) >= 8 else int(consecutive)
+    out = {'items': [], 'push': set()}
+    if STORE is None:
+        return out
+    for kind, val in _CONSECUTIVE_REWARDS.get(cday, []):
+        try:
+            if kind in ('gold', 'credits', 'warfunds'):
+                await STORE.add_currency(pid, **{kind: val})
+                out['items'].append(_msg_voucher_pack_item(kind, val))
+                out['push'].add('player')
+            elif kind == 'membership':
+                days = MEMBERSHIP_DAYS_BY_ID.get(val, _MEMBERSHIP_DAYS)
+                await STORE.add_membership(pid, val, duration_days=days)
+                out['items'].append(
+                    _msg_voucher_pack_item('shopmembershipitems', val))
+                out['push'].add('membership')
+        except Exception as e:
+            log(f'      [DB] grant consecutive bonus (day={cday}, '
+                f'{kind} {val}) failed: {e}')
+    return out
+
+
 async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto):
     """RedeemDailyLoginRewardRequest {playerId=1}
     → RedeemDailyLoginRewardResponse{response=1, infos=2 repeated VoucherPackInfo}。
 
     当天首次领取：daily_reward_redeemed_count+1，按 dailyRewards.xml 当日
-    条目发放（货币/随机缎带加成/会员天数），响应带 VoucherPackInfo
-    （客户端 BundleWindow 显示获得内容），并重推 PlayerOfferMetrics /
-    货币 / 加成 / 会员 KVCS 行实时刷新。当天已领：幂等不发（infos 省略）。"""
+    条目发放（货币/随机缎带加成/会员天数）；连续登录第 2..7 天再随领
+    一并发放 bonus（consecutive_daily_login_rewards 表），响应带两个
+    VoucherPackInfo（客户端 BundleWindow 显示获得内容），并重推
+    PlayerOfferMetrics / 货币 / 加成 / 会员 KVCS 行实时刷新。
+    当天已领：幂等不发（infos 省略）。"""
     req_player_id = 0
     try:
         f = pb_parse(proto)
@@ -401,21 +479,32 @@ async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto
     pid = await sess.ensure_player()
     code = RC_OK
     day = 0
+    consecutive = 0
     if pid is not None and STORE is not None:
         try:
-            ok, day, redeemed = await STORE.claim_daily_reward(int(pid))
+            ok, day, redeemed, consecutive = \
+                await STORE.claim_daily_reward(int(pid))
             code = RC_OK if ok else 64            # player_not_found
             log(f'      [DB] claim_daily_reward player={pid}: '
-                f'day={day}, redeemed={redeemed}')
+                f'day={day}, redeemed={redeemed}, '
+                f'consecutive={consecutive}')
         except Exception as e:
             log(f'      [DB] claim_daily_reward failed: {e}')
             code = 64
 
     infos = b''
+    packs = []
     if day:
         granted = await _grant_daily_reward(int(pid), _adjust_day(day))
+        bonus = await _grant_consecutive_bonus(int(pid), consecutive)
         if granted['items']:
-            infos = pb_message(2, _msg_voucher_pack_info(granted['items']))
+            packs.append(_msg_voucher_pack_info(granted['items']))
+        if bonus['items']:
+            packs.append(_msg_voucher_pack_info(
+                bonus['items'], 'consecutive_daily_login_rewards'))
+        if packs:
+            infos = b''.join(pb_message(2, p) for p in packs)
+        granted['push'] |= bonus['push']
         # KVCS 实时刷新：签到进度行 + 获得物品对应表
         await push_player_offer_metrics_row(sess, writer, int(pid))
         if 'booster' in granted['push']:
@@ -434,7 +523,7 @@ async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RedeemDailyLoginRewardResponse '
         f'(player={req_player_id or pid}, response={code}, '
-        f'day={day or "-"}, items={len(infos) and 1 or 0})')
+        f'day={day or "-"}, packs={len(packs)})')
 
 
 async def handle_set_daily_reward(sess, writer, cmd_id, req_type, proto):

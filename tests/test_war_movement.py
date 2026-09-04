@@ -5,6 +5,7 @@
   A. 拓扑/寻路：supplyline_adjacency 邻接、find_supplyline_path BFS
      （同地 []、不可达 None、路径连续性）
   B. segment_seconds：坐标距离公式 + 无坐标回退 SEGMENT_FALLBACK_SECONDS
+     + 地形减速（#2：跨海段距离≥阈值、中立段两端城市均非己方）
   C. start_movement：movement 落库、AT 置在途（首段补给线）、同地 ok、
      不可达 fail、overrideMove 0 时长段、同城出兵点立即落位、dest_ap 持久化
   D. advance_movements：换段推送（segment+CommandNodeWarInstance）、
@@ -261,6 +262,33 @@ async def main():
     check('segment_seconds 下限 1.0',
           war_campaign.segment_seconds(10, 20, 1e9) >= 1.0)
 
+    # ---- B2. 地形减速（#2：中立区/海面大大降低行军速度）----
+    SEA = float(mm_config.WAR_SEA_SPEED_FACTOR or 0.25)
+    NEU = float(mm_config.WAR_NEUTRAL_SPEED_FACTOR or 0.5)
+    # 10-20 距离 500 < 550 海阈值；10-30 距离 1000 ≥ 550（跨海）
+    check('地形减速 中立段(两端均非己方) ×1/0.5',
+          abs(war_campaign.segment_seconds(
+                  10, 20, 1.0, 1, {10: 2, 20: 2}) - SEG_SEC / NEU) < 1e-6)
+    check('地形减速 一端己方不减速',
+          abs(war_campaign.segment_seconds(
+                  10, 20, 1.0, 1, {10: 1, 20: 2}) - SEG_SEC) < 1e-6)
+    check('地形减速 己方域不减速',
+          abs(war_campaign.segment_seconds(
+                  10, 20, 1.0, 1, {10: 1, 20: 1}) - SEG_SEC) < 1e-6)
+    check('地形减速 缺归属(owner=0 中立)计入减速',
+          abs(war_campaign.segment_seconds(
+                  10, 20, 1.0, 1, {10: 2}) - SEG_SEC / NEU) < 1e-6)
+    check('地形减速 owners 空(异常态)不减速',
+          abs(war_campaign.segment_seconds(
+                  10, 20, 1.0, 1, {}) - SEG_SEC) < 1e-6)
+    check('地形减速 跨海段(距离≥550) ×1/0.25',
+          abs(war_campaign.segment_seconds(10, 30, 1.0)
+              - (1000.0 / SCALE) / SEA) < 1e-6)
+    check('地形减速 海面+中立取更小系数',
+          abs(war_campaign.segment_seconds(
+                  10, 30, 1.0, 1, {10: 2, 30: 2})
+              - (1000.0 / SCALE) / min(SEA, NEU)) < 1e-6)
+
     # ---- C. start_movement ----
     store = FakeStore()
     war = await war_campaign.ensure_war(store)
@@ -314,6 +342,17 @@ async def main():
     check('dest_ap 持久化', code7 == war_campaign.RC_OK and mv7
           and mv7['dest_ap'] == 2
           and store.movements[mv7['id']]['dest_ap'] == 2)
+
+    # 中立域集成：三城归属均非 fac1 → 段时长 ×1/0.5
+    await store.set_city_owner(war['id'], 10, 2)
+    await store.set_city_owner(war['id'], 20, 2)
+    d = _mk_at(store, war['id'], 14, 1, 10)
+    mv8, code8 = await war_campaign.start_movement(store, d, 30, now=NOW)
+    check('start_movement 中立域段减速',
+          code8 == war_campaign.RC_OK and mv8
+          and all(abs(s['seconds'] - SEG_SEC / NEU) < 1e-6
+                  for s in mv8['path']),
+          f"secs={[round(s['seconds'], 1) for s in mv8['path']]}")
 
     # ---- D. advance_movements ----
     store2 = FakeStore()

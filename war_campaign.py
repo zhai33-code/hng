@@ -67,6 +67,19 @@ def capital_battlefield_ids():
             if c.get('battlefield_id')}
 
 
+def effective_points_needed(stored=None):
+    """胜利所需主城数（war f8 / war_catalogue f4 下发值与 check_victory 阈值）。
+
+    基准 = 落库值（无值回退 MM_WAR_POINTS_VICTORY，官服 15=完整地图
+    15 座主城），与 WarDatabase capital 表实际主城数取小：裁剪地图主城
+    不足时按实际数——否则客户端按 capital 表数出总数 N，显示"占领 N 座
+    城市中的 15 座"（N<15 永不可达，战争无法结束）。无 capital 表
+    （空地图）回退基准值。"""
+    base = int(stored or 0) or mm_config.WAR_POINTS_VICTORY
+    caps = len(capital_battlefield_ids())
+    return min(base, caps) if caps > 0 else base
+
+
 def initial_city_owners():
     """开战初始城市归属 {battlefield_id: faction}。
 
@@ -142,7 +155,7 @@ async def ensure_war(store):
         war_name = await _next_war_name(store)
         war = await store.create_war(
             war_name,
-            points_needed_for_victory=mm_config.WAR_POINTS_VICTORY,
+            points_needed_for_victory=effective_points_needed(),
             config=_war_config())
         await store.init_war_cities(war['id'], initial_city_owners())
         # 阵营种子库存 = ArmyResourceProductionTemplate warStartValue
@@ -156,7 +169,7 @@ async def ensure_war(store):
         if initial:
             await store.init_war_faction_resources(war['id'], initial)
         log(f'[war] 新战争开打 id={war["id"]} name={war_name!r} '
-            f'points={mm_config.WAR_POINTS_VICTORY} '
+            f'points={war.get("points_needed_for_victory")} '
             f'cities={len(initial_city_owners())} '
             f'stock_rows={sum(len(c) for c in initial.values())}')
         return war
@@ -179,8 +192,8 @@ def build_war_proto(war):
     m += pb_string(5, '')                                         # web
     m += pb_string(6, '0')                                        # friendlyfire
     m += pb_int64(7, war.get('winning_faction_id') or 0)          # winningfactionid
-    m += pb_int32(8, war.get('points_needed_for_victory')
-                  or mm_config.WAR_POINTS_VICTORY)                # pointsNeededForVictory
+    m += pb_int32(8, effective_points_needed(              # pointsNeededForVictory
+        war.get('points_needed_for_victory')))
     m += pb_uint32(9, mm_config.WAR_AUTOMISSION_NORMAL)      # automissionnormal
     m += pb_uint32(10, mm_config.WAR_AUTOMISSION_SKIRMISH)   # automissionskirmish
     m += pb_uint32(11, mm_config.WAR_AUTOMISSION_SUPPLY)     # automissionsupply
@@ -311,8 +324,8 @@ def _msg_catalogue(war, city_owners, ats, capitals):
     m += pb_int64(1, war['id'])
     m += pb_string(2, war.get('name') or '')
     m += pb_string(3, _fmt_ts(war.get('begintime')))              # wartime
-    m += pb_int32(4, war.get('points_needed_for_victory')
-                  or mm_config.WAR_POINTS_VICTORY)
+    m += pb_int32(4, effective_points_needed(
+        war.get('points_needed_for_victory')))
     m += pb_int64(5, war.get('winning_faction_id') or 0)
     m += pb_int32(6, len(city_owners))                             # battlefieldCount
     m += pb_int32(7, len(ats))                                     # assaultTeamCount
@@ -380,7 +393,7 @@ async def check_victory(store, war=None):
             return None
         counts = await store.count_war_city_owners(
             war['id'], capital_battlefield_ids())
-        needed = war.get('points_needed_for_victory') or mm_config.WAR_POINTS_VICTORY
+        needed = effective_points_needed(war.get('points_needed_for_victory'))
         winner = 0
         for faction in (1, 2, 3):
             if counts.get(faction, 0) >= needed:
@@ -669,6 +682,14 @@ async def build_warmap_snapshot(store, war=None):
         for at in ats:
             for p in msg_armyresource_rows(at, war_id):
                 rows.append((b'armyresource', p))
+        # 已部署空中半径单位（§10.2 #6/#7）：airbase 行（客户端
+        # isAirborneUnit 判定 + 半径规则；基地 = 当前驻地）
+        for at in ats:
+            if at.get('is_deployed') and is_radius_unit(at):
+                rows.append((b'air_commandnode_base',
+                             msg_air_commandnode_base_row(
+                                 at, war_id,
+                                 at_current_battlefield(at))))
         # 在途空运行（订阅时已起飞的 AT；§3.14 air_transport）
         for mv in await store.list_active_movements(war_id):
             segs = movement_segments(mv)
@@ -782,6 +803,66 @@ def rank_from_xp(xp):
     return rank
 
 
+# ---- underdog 加成（#1 官方玩法：人数较少阵营经验/战资加成）----
+
+WAR_FACTIONS = (1, 2, 3)
+
+
+def underdog_multipliers(counts):
+    """各阵营 (xp_mult, wf_mult)：人数相对最大阵营线性插值。
+
+    官方证据：faction 行 f6 underdogBonusXpMultiplier / f7
+    underdogBonusWarfundsMultiplier（float，FactionOption.as 按 >1 显示
+    "当前弱势阵营加成"）。mult = 1 + cap × (1 - n/n_max)；并列最多=1.0，
+    无人阵营拿满加成（吸引玩家填线）。counts 缺阵营按 0 人计。"""
+    ns = [int((counts or {}).get(f, 0) or 0) for f in WAR_FACTIONS]
+    cmax = max(ns) if ns else 0
+    out = {}
+    for f, n in zip(WAR_FACTIONS, ns):
+        if cmax <= 0 or n >= cmax:
+            out[f] = (1.0, 1.0)
+        else:
+            share = 1.0 - n / float(cmax)
+            out[f] = (
+                round(1.0 + (mm_config.WAR_UNDERDOG_XP_BONUS or 0) * share, 4),
+                round(1.0 + (mm_config.WAR_UNDERDOG_WF_BONUS or 0) * share, 4))
+    return out
+
+
+async def faction_player_counts(store, war_id):
+    """战争中各阵营人数（AT 持有玩家 owner 去重；软删 AT 不计）。"""
+    counts = {f: 0 for f in WAR_FACTIONS}
+    seen = {}
+    try:
+        ats = await store.list_war_command_nodes(int(war_id))
+    except Exception:
+        return counts
+    for at in ats:
+        if int(at.get('state') or 0) >= 3:
+            continue
+        fac = int(at.get('faction') or 0)
+        if fac not in counts:
+            continue
+        seen.setdefault(fac, set()).add(
+            int(at.get('owner_player_id') or 0))
+    for fac, players in seen.items():
+        counts[fac] = len(players)
+    return counts
+
+
+async def current_underdog_mults(store):
+    """当前战争 underdog 倍率 {faction: (xp, wf)}；无战争/异常回退全 1.0。"""
+    try:
+        war = await ensure_war(store)
+        if war is None:
+            return {f: (1.0, 1.0) for f in WAR_FACTIONS}
+        return underdog_multipliers(
+            await faction_player_counts(store, war['id']))
+    except Exception as e:
+        log(f'[war] underdog mults failed: {e}')
+        return {f: (1.0, 1.0) for f in WAR_FACTIONS}
+
+
 def next_level_xp(rank):
     """下一等级 XP 阈值（rank 已满级返回 0）。GetAssaultTeamStatsRecord f4。"""
     thresholds = wardb.at_levels() or [(1, 350), (2, 3450), (3, 9200)]
@@ -820,11 +901,82 @@ def upgrade_allowed(cur_tpl, target_tpl):
             and str(target_tpl.get('name') or '') == 'motorized_infantry')
 
 
-def deploy_battlefield(at, faction, near_capital_bf=0):
-    """部署落位 battlefield id：请求指定 nearCapital 优先，否则己方首都。"""
-    if near_capital_bf:
-        return int(near_capital_bf)
-    return _faction_capital_bf().get(int(faction or 0), 0)
+RC_DEPLOY_LOCATION_NOT_FOUND = 221    # 官服：主城交战/无可用落位城
+
+
+def faction_capital_bfs(faction):
+    """阵营全部首都 battlefield id 集合（部署 UI 玩家可选项，
+    AssaultTeamReinforcementWindowMediator：CapitalTable 己方首都）。"""
+    return {int(c['battlefield_id']) for c in wardb.capitals()
+            if c.get('battlefield_id')
+            and int(c.get('default_faction') or 0) == int(faction or 0)}
+
+
+async def _battling_battlefields(store, war_id):
+    """交战城市集合 {battlefield_id}（活跃 war battle 所在城市）。
+    存储无该接口/异常时回退空集（视为全域非交战，维持可部署）。"""
+    try:
+        rows = await store.list_active_war_battles(war_id)
+    except Exception:
+        return set()
+    out = set()
+    for b in rows or ():
+        try:
+            bid = int(b.get('battlefield_id') or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if bid:
+            out.add(bid)
+    return out
+
+
+async def resolve_deploy_battlefield(store, war, at, near_capital_bf=0):
+    """官服部署落位（§10.2 #4/#5）：主城非交战，且周边至少一座
+    非交战己方城市 → random.choice(主城 ∪ 周边非交战己方城)。
+
+    near_capital_bf（请求 f4 玩家所选首都）为本阵营首都时优先生效，
+    否则回退阵营默认主城。返回 (battlefield, 0)=成功；失败
+    (0, 221)=主城交战/周边无己方非交战城（官服 deploy_location_not_
+    found）、(0, 7)=无主城。"""
+    fac = int(at.get('faction') or 0)
+    capital = int(near_capital_bf or 0)
+    if capital not in faction_capital_bfs(fac):
+        capital = _faction_capital_bf().get(fac, 0)
+    if not capital:
+        return 0, RC_CANNOT_FIND_COMMANDNODE
+    battling = await _battling_battlefields(store, war['id'])
+    if capital in battling:
+        return 0, RC_DEPLOY_LOCATION_NOT_FOUND
+    try:
+        owners = dict(await store.get_war_cities(war['id']))
+    except Exception:
+        owners = {}
+    cands = [capital]
+    for edge in supplyline_adjacency().get(capital, ()):
+        nb = int(edge[3] or 0)
+        if nb in battling or nb == capital:
+            continue
+        try:
+            if int(owners.get(nb, 0) or 0) != fac:
+                continue
+        except (TypeError, ValueError):
+            continue
+        cands.append(nb)
+    if len(cands) < 2:
+        # 官服口径：周边须有一座非交战己方城市（含落位随机池来源）
+        return 0, RC_DEPLOY_LOCATION_NOT_FOUND
+    if is_radius_unit(at):
+        # §10.2 #7：飞机/伞兵（airborne）只出生在机场——候选池 ∩ 机场；
+        # 空池回退距主城最近的机场（官服"主城附近的机场"口径，不查归属，
+        # fac1 首都邻接无机场的既成事实）
+        af_cands = [c for c in cands if is_airfield(c)]
+        if not af_cands:
+            near = nearest_airfield(capital)
+            if not near:
+                return 0, RC_DEPLOY_LOCATION_NOT_FOUND
+            af_cands = [near]
+        return random.choice(af_cands), 0
+    return random.choice(cands), 0
 
 
 # ---- AT 移动（Phase 6，docs/hng-rts-protocol.md §5.3）----
@@ -921,19 +1073,36 @@ def at_speed(at):
         return 1.0
 
 
-def segment_seconds(from_bf, to_bf, speed):
-    """单段移动时长（秒）= 城市坐标距离 / (speed × timescale × move_scale)。
+def segment_seconds(from_bf, to_bf, speed, faction=0, owners=None):
+    """单段移动时长（秒）= 城市坐标距离 / (speed × timescale × move_scale × 地形系数)。
 
     官服语义：步兵 AT 数小时跨越半张图；speed 0.45-5.6（实测表值）、
-    城市间典型距离 1100-6400 坐标单位，默认参数下首都对首都 ~1-4 小时。"""
+    城市间典型距离 1100-6400 坐标单位，默认参数下首都对首都 ~1-4 小时。
+    地形减速（#2，仅地面补给线段，air 段不适用）：
+    - 跨海段：距离 ≥ WAR_SEA_DISTANCE（实测欧洲图内陆最长 505、
+      551+ 全为丹麦↔挪威海峡线）→ × WAR_SEA_SPEED_FACTOR；
+    - 中立段：段两端城市归属均非己方（owners 提供）→ × WAR_NEUTRAL_SPEED_FACTOR；
+    - 同时命中取更小系数（"速度大大降低"）。"""
     p = _bf_pos()
-    a, b = p.get(int(from_bf or 0)), p.get(int(to_bf or 0))
+    from_bf, to_bf = int(from_bf or 0), int(to_bf or 0)
+    a, b = p.get(from_bf), p.get(to_bf)
     if not a or not b:
         return SEGMENT_FALLBACK_SECONDS
     import math
     dist = math.hypot(a[0] - b[0], a[1] - b[1])
+    factor = 1.0
+    thr = float(mm_config.WAR_SEA_DISTANCE or 0)
+    if thr > 0 and dist >= thr:
+        factor = float(mm_config.WAR_SEA_SPEED_FACTOR or 1.0)
+    fac = int(faction or 0)
+    if fac and owners:
+        o1 = int((owners.get(from_bf) or 0) or 0)
+        o2 = int((owners.get(to_bf) or 0) or 0)
+        if o1 != fac and o2 != fac:
+            factor = min(factor,
+                         float(mm_config.WAR_NEUTRAL_SPEED_FACTOR or 1.0))
     denom = (float(speed or 1.0) * (mm_config.WAR_TIMESCALE or 1.0)
-             * (mm_config.WAR_AT_MOVE_SCALE or 1.0))
+             * (mm_config.WAR_AT_MOVE_SCALE or 1.0) * factor)
     if denom <= 0:
         denom = 1.0
     return max(1.0, dist / denom)
@@ -996,11 +1165,16 @@ async def start_movement(store, at, target_bf, override_ap=0,
     if path is None:
         return None, RC_CANNOT_FIND_COMMANDNODE
     speed = at_speed(at)
+    try:
+        owners = dict(await store.get_war_cities(at['war_id']))
+    except Exception:
+        owners = {}
+    fac = int(at.get('faction') or 0)
     now = now or datetime.datetime.now(datetime.timezone.utc)
     for seg in path:
         seg['seconds'] = (0 if override_move
                           else segment_seconds(seg['from_bf'], seg['to_bf'],
-                                               speed))
+                                               speed, fac, owners))
     arrive = now + datetime.timedelta(
         seconds=sum(s['seconds'] for s in path))
     mv = await store.create_movement(at['id'], at['war_id'], path,
@@ -1050,6 +1224,174 @@ async def start_air_transport(store, at, target_bf, now=None):
         arrive_at=now + datetime.timedelta(seconds=seconds))
     await store.update_command_node(at['id'], state=1, resources=res)
     return mv, RC_OK
+
+
+# ---- 空中半径单位（官服 §10.2 #6/#7，CommandnodeArrow.detectBattleField）----
+
+# 机场判定（swf BattlefieldSchema.isAirfield 实锤：gamemap 204/205）
+AIRFIELD_GAMEMAPS = (204, 205)
+# transportradius 无限哨兵（表内 -1 → uint64 max = 2^63-1 量级）
+RADIUS_INFINITE = 1 << 63
+# 空中单位模板 actionid（p0 勘查：12/13 伞兵族、14/15 飞机族）
+PARADROP_ACTIONIDS = (12, 13)
+AIRCRAFT_ACTIONIDS = (14, 15)
+
+_AIRFIELD_CACHE = None
+
+
+def airfield_bfs():
+    """机场 battlefield id 集合（gamemap ∈ 204/205；勘查 127 座）。"""
+    global _AIRFIELD_CACHE
+    if _AIRFIELD_CACHE is None:
+        _AIRFIELD_CACHE = {
+            int(b['id']) for b in wardb.battlefields()
+            if int(b.get('gamemap') or 0) in AIRFIELD_GAMEMAPS}
+    return _AIRFIELD_CACHE
+
+
+def is_airfield(bf_id):
+    return int(bf_id or 0) in airfield_bfs()
+
+
+def _tpl_of(at):
+    return wardb.commandnode_templates().get(
+        int(at.get('template_id') or 0)) or {}
+
+
+def is_radius_unit(at):
+    """有限半径空中单位（伞兵 + 飞机）：1 < transportradius < 无限哨兵。
+
+    客户端 CommandnodeArrow L440-570：有限半径 + air_commandnode_base
+    行存在 → airborne 单位（不走补给线，按半径直达）。"""
+    try:
+        tr = int(_tpl_of(at).get('transportradius') or 0)
+    except (TypeError, ValueError):
+        return False
+    return 1 < tr < RADIUS_INFINITE
+
+
+def is_aircraft(at):
+    """飞机族（actionid 14 fighter_recon / 15 战斗机·重型战斗机）。"""
+    try:
+        return int(_tpl_of(at).get('actionid') or 0) in AIRCRAFT_ACTIONIDS
+    except (TypeError, ValueError):
+        return False
+
+
+def is_paradrop_unit(at):
+    """伞兵族（actionid 12 pathfinders / 13 paratroopers）。"""
+    try:
+        return int(_tpl_of(at).get('actionid') or 0) in PARADROP_ACTIONIDS
+    except (TypeError, ValueError):
+        return False
+
+
+def bf_distance(from_bf, to_bf):
+    """城市坐标直线距离；任一端无坐标返回 None（回退全允许）。"""
+    p = _bf_pos()
+    a, b = p.get(int(from_bf or 0)), p.get(int(to_bf or 0))
+    if not a or not b:
+        return None
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def nearest_airfield(bf_id):
+    """距指定城市最近的机场（官服"主城附近的机场"口径，不查归属——
+    fac1 首都 6724566 邻接无机场，最近机场距离 114）。无坐标返回 0。"""
+    src = _bf_pos().get(int(bf_id or 0))
+    if not src:
+        return 0
+    best, best_d = 0, None
+    for af in airfield_bfs():
+        q = _bf_pos().get(af)
+        if not q:
+            continue
+        d = (src[0] - q[0]) ** 2 + (src[1] - q[1]) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = af, d
+    return best
+
+
+def check_radius_move(at, cur_bf, target_bf, owners, battling):
+    """空中半径单位移动校验 → (allowed, is_attack)。
+
+    官服规则（CommandnodeArrow.detectBattleField L440-570）：
+      dist ≤ attackradius/2   → 任意战场（攻击/参战/空降作战）；
+      attackradius/2 < dist ≤ transportradius/2 → 仅己方非交战机场
+        （换基地；reserve 补给队例外允许交战机场）；
+      超出 transportradius/2  → 无效；不可落出兵点（调用方拦）。
+    目标城不在战图 → 拒（对齐地面链 BFS 不可达）；当前位坐标缺失
+    （异常态）回退全允许 (True, True)。"""
+    p = _bf_pos()
+    if int(cur_bf or 0) not in p:
+        return True, True
+    if int(target_bf or 0) not in p:
+        return False, False
+    a, b = p[int(cur_bf)], p[int(target_bf)]
+    dist = math.hypot(a[0] - b[0], a[1] - b[1])
+    try:
+        attack = int(_tpl_of(at).get('attackradius') or 0)
+        transport = int(_tpl_of(at).get('transportradius') or 0)
+    except (TypeError, ValueError):
+        attack = transport = 0
+    target_bf = int(target_bf or 0)
+    if dist * 2 <= attack:
+        return True, True
+    if dist * 2 <= transport:
+        fac = int(at.get('faction') or 0)
+        try:
+            owner = int((owners or {}).get(target_bf, 0) or 0)
+        except (TypeError, ValueError):
+            owner = 0
+        ok = (is_airfield(target_bf) and owner == fac
+              and (target_bf not in (battling or set())
+                   or is_reserve(at)))
+        return ok, False
+    return False, False
+
+
+async def start_radius_move(store, war, at, target_bf, override_move=False,
+                            now=None):
+    """空中半径单位单段 air 直达移动（不走补给线、不消耗 cat10 运输机）。
+
+    返回 (movement, error_code, is_attack)；成功码 RC_OK、段带
+    air=True + radius_attack（到达分支判定换基地/落地变体用）。"""
+    cur_bf = at_current_battlefield(at)
+    target_bf = int(target_bf or 0)
+    if not cur_bf or not target_bf or cur_bf == target_bf:
+        return None, RC_CANNOT_FIND_COMMANDNODE, False
+    try:
+        owners = dict(await store.get_war_cities(war['id']))
+    except Exception:
+        owners = {}
+    battling = await _battling_battlefields(store, war['id'])
+    allowed, is_attack = check_radius_move(
+        at, cur_bf, target_bf, owners, battling)
+    if not allowed:
+        return None, RC_CANNOT_FIND_COMMANDNODE, False
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    seconds = (0 if override_move
+               else segment_seconds(cur_bf, target_bf, at_speed(at)))
+    seg = {'from_bf': cur_bf, 'to_bf': target_bf, 'sl_id': 0,
+           'from_ap': 0, 'to_ap': 0, 'seconds': seconds, 'air': True,
+           'radius_attack': is_attack}
+    mv = await store.create_movement(
+        at['id'], at['war_id'], [seg], started_at=now,
+        arrive_at=now + datetime.timedelta(seconds=seconds))
+    await store.update_command_node(at['id'], state=1)
+    return mv, RC_OK, is_attack
+
+
+def msg_air_commandnode_base_row(at, war_id, base_bf):
+    """air_commandnode_base 行（proto 实锤 f1-f6）：f1 id / f2
+    commandNodeWarInstanceId / f3 battlefieldid（基地机场）/ f4
+    targetentityid / f5 targetentitytype（'battlefield'，String）/ f6 warid。
+
+    行 id = AT id；客户端 AirCommandnodeBaseTable 按 f2 join →
+    isAirborneUnit 判定（有行 = airborne，应用半径规则）。"""
+    return (pb_int64(1, int(at['id'])) + pb_int64(2, int(at['id']))
+            + pb_int64(3, int(base_bf or 0)) + pb_int64(4, int(base_bf or 0))
+            + pb_string(5, 'battlefield') + pb_int64(6, int(war_id)))
 
 
 # ---- 补给队（Reserve，官服 §10.2 #6）----
@@ -1451,6 +1793,35 @@ async def advance_movements(store, war=None, now=None):
                                mv['id']))
                 events.append(('set', b'CommandNodeWarInstance',
                                msg_commandnode_instance_row(at, war_id, caps)))
+                # ---- 空中半径单位到达（§10.2 #6/#7）----
+                if is_radius_unit(at):
+                    if not segs[-1].get('radius_attack'):
+                        # 换基地到达：airbase 行指向新机场
+                        events.append((
+                            'set', b'air_commandnode_base',
+                            msg_air_commandnode_base_row(
+                                at, war_id, segs[-1]['to_bf'])))
+                    elif is_paradrop_unit(at):
+                        # 空降作战到达：伞兵落地变体（convert_to，*_on_
+                        # ground 半径无限、地面速度）+ 删 airbase 行
+                        cvt = int(_tpl_of(at).get('convert_to') or 0)
+                        if cvt and wardb.commandnode_templates().get(cvt):
+                            await store.update_command_node(
+                                at['id'], template_id=cvt)
+                            at = await store.get_command_node(at['id'])
+                            events.append((
+                                'set', b'CommandNodeDefinition',
+                                msg_commandnode_definition_row(at)))
+                            events.append((
+                                'set', b'CommandNodeWarInstance',
+                                msg_commandnode_instance_row(
+                                    at, war_id, caps)))
+                            for p in msg_armyresource_rows(at, war_id):
+                                events.append(('set', b'armyresource', p))
+                        events.append(('del', b'air_commandnode_base',
+                                       at['id']))
+                    # 飞机作战到达：airbase 行保持原基地（作战后拖回机场
+                    # = 换基地，届时更新）
                 # ---- 会战成局桩：目标城市有敌对 AT 驻扎 ----
                 dest_bf = (segs[-1]['to_bf'] if not dest_ap
                            else _ap_battlefield(dest_ap))
@@ -1689,6 +2060,10 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
         caps = _faction_capital_bf()
         morale_cfg = morale_defaults()
         surrender = int(morale_cfg.get('surrender_limit', 25))
+        # #1 underdog 加成：人数较少阵营 XP/战资结算倍率（faction 行
+        # f6/f7 同源），按参战各阵营 AT 持有玩家数计算
+        ud_mults = underdog_multipliers(
+            await faction_player_counts(store, war_id))
 
         for entry in (wb.get('factions') or []):
             at = await store.get_command_node(int(entry.get('at_id') or 0))
@@ -1702,16 +2077,21 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
             morale += (mm_config.WAR_MORALE_GAINED_PER_WIN if won
                        else -mm_config.WAR_MORALE_LOST_PER_BATTLE)
             morale = max(0, min(int(at.get('max_morale') or 100), morale))
-            # ⑤ warfunds（先行：与状态回写解耦，玩家不存在不阻断结算）
+            # ⑤ warfunds（先行：与状态回写解耦，玩家不存在不阻断结算）；
+            #    underdog 阵营（#1）按 f7 倍率放大每局/胜方加成
             owner = int(at.get('owner_player_id') or 0)
+            _, wf_mult = ud_mults.get(
+                int(at.get('faction') or 0), (1.0, 1.0))
             if owner and mm_config.WAR_WARFUNDS_PER_BATTLE:
                 try:
                     await store.add_war_funds(
-                        owner, mm_config.WAR_WARFUNDS_PER_BATTLE,
+                        owner,
+                        int(mm_config.WAR_WARFUNDS_PER_BATTLE * wf_mult),
                         f'war_battle {battle_id}')
                     if won and mm_config.WAR_WARFUNDS_WIN_BONUS:
                         await store.add_war_funds(
-                            owner, mm_config.WAR_WARFUNDS_WIN_BONUS,
+                            owner,
+                            int(mm_config.WAR_WARFUNDS_WIN_BONUS * wf_mult),
                             f'war_battle {battle_id} win')
                 except ValueError:
                     pass                      # 玩家已删除，跳过
@@ -1731,11 +2111,15 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
             # ---- 存活：编制/士气回写 + XP/等级 + 投降判定 ----
             # ②b AT XP（客户端 ExperienceCalculation.createATXpList 口径：
             #     battles×5 + battlesWon×25）→ rank 按阈值自动晋升；
-            #     买等级注入的 XP（阈值+5）取 max 保护，不被公式重算冲掉
+            #     买等级注入的 XP（阈值+5）取 max 保护，不被公式重算冲掉；
+            #     underdog 阵营（#1）增量按 f6 倍率放大
             battles = int(at.get('battles') or 0) + 1
             battles_won = int(at.get('battles_won') or 0) + (1 if won else 0)
+            xp_mult, _ = ud_mults.get(
+                int(at.get('faction') or 0), (1.0, 1.0))
             xp = max(battles * 5 + battles_won * 25,
-                     int(at.get('xp') or 0) + 5 + (25 if won else 0))
+                     int(at.get('xp') or 0)
+                     + int((5 + (25 if won else 0)) * xp_mult))
             rank = max(int(at.get('rank') or 0), rank_from_xp(xp))
             fields = {'resources': new_res, 'morale': morale,
                       'battles': battles, 'battles_won': battles_won,

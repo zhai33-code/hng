@@ -30,6 +30,7 @@ import copy
 import datetime
 import importlib.util
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -73,12 +74,53 @@ _TPLS = {
           'resources': {1: 24}, 'vehicle_cats': set(), 'size': 4,
           'general_character_template_id': 0, 'level': 2,
           'parent_template_id': 501},
+    # R 组（§10.2 #6/#7）：空中半径单位（真实表值 fighter_squadron/
+    # paratroopers 的半径/速度比例）
+    # 504 补给空运队（reserve 模板：504%100==4，交战机场例外）
+    504: {'id': 504, 'name': 'Supply Flight', 'faction': 1,
+          'resources': {1: 4}, 'vehicle_cats': set(), 'size': 1,
+          'general_character_template_id': 0, 'level': 1,
+          'attackradius': 550, 'transportradius': 1850, 'actionid': 14,
+          'speed': 3.0},
+    # 505 战斗机中队（actionid 15：attack 950 / transport 2850 / 5.2）
+    505: {'id': 505, 'name': 'Fighter Squadron', 'faction': 1,
+          'resources': {1: 6}, 'vehicle_cats': set(), 'size': 2,
+          'general_character_template_id': 0, 'level': 1,
+          'attackradius': 950, 'transportradius': 2850, 'actionid': 15,
+          'speed': 5.2},
+    # 506 伞兵（actionid 13：attack 1850 / transport 3600 / convert 507）
+    506: {'id': 506, 'name': 'Paratroopers', 'faction': 1,
+          'resources': {1: 16}, 'vehicle_cats': set(), 'size': 2,
+          'general_character_template_id': 0, 'level': 1,
+          'attackradius': 1850, 'transportradius': 3600, 'actionid': 13,
+          'convert_to': 507, 'speed': 2.7},
+    # 507 伞兵落地变体（半径 -1=无限 → 非 radius 单位，地面速度）
+    507: {'id': 507, 'name': 'Paratroopers On Ground', 'faction': 1,
+          'resources': {1: 16}, 'vehicle_cats': set(), 'size': 2,
+          'general_character_template_id': 0, 'level': 1,
+          'attackradius': -1, 'transportradius': -1, 'convert_to': 0,
+          'speed': 0.48},
 }
 
-wardb.accesspoints = lambda: []
-wardb.supplylines = lambda: []
-wardb.battlefields = lambda: []
+wardb.accesspoints = lambda: [
+    {'id': 101, 'battlefield': 10}, {'id': 102, 'battlefield': 11}]
+wardb.supplylines = lambda: [{'id': 1, 'ap1': 101, 'ap2': 102}]
+# 城市图（R 组半径判定的坐标/机场）：10 首都(0,0)、11 邻城+机场(100,0)、
+# 12 远机场(800,0)、13 非机场城(800,100)、14 超半径城(2000,0)、
+# 15 敌机场(850,0)、16 攻击半径内城(450,0)、17 伞兵换基地机场(1200,0)
+wardb.battlefields = lambda: [
+    {'id': 10, 'posx': 0, 'posy': 0, 'gamemap': 0},
+    {'id': 11, 'posx': 100, 'posy': 0, 'gamemap': 204},
+    {'id': 12, 'posx': 800, 'posy': 0, 'gamemap': 204},
+    {'id': 13, 'posx': 800, 'posy': 100, 'gamemap': 0},
+    {'id': 14, 'posx': 2000, 'posy': 0, 'gamemap': 0},
+    {'id': 15, 'posx': 850, 'posy': 0, 'gamemap': 205},
+    {'id': 16, 'posx': 450, 'posy': 0, 'gamemap': 0},
+    {'id': 17, 'posx': 1200, 'posy': 0, 'gamemap': 204},
+]
 wardb.capitals = lambda: [{'battlefield_id': 10, 'default_faction': 1}]
+# 部署官服语义（#4/#5）：11 为 10 的邻接己方城（首都 10 + 邻城 11 池）
+war_campaign.initial_city_owners = lambda: {10: 1, 11: 1}
 wardb.commandnode_templates = lambda: {k: dict(v) for k, v in _TPLS.items()}
 wardb.morale_template = lambda: None
 # M3 生产种子库存禁用（ensure_war 不落 war_start_value，队列用例自控库存）
@@ -148,6 +190,11 @@ class FakeStore:
         self.adjust_log = []
         self.supply_queue = []
         self.dequeue_log = []
+        # 活跃战况（#4 部署校验：主城/邻城交战判定）
+        self.battles = []
+        # 移动（R 组：空中半径单位飞行）
+        self.movements = {}
+        self.next_mv_id = 1
 
     # ---- war ----
     async def get_active_war(self):
@@ -171,8 +218,34 @@ class FakeStore:
     async def init_war_cities(self, war_id, owner_map):
         self.city_owners[war_id] = dict(owner_map)
 
+    async def set_city_owner(self, war_id, bf_id, faction):
+        self.city_owners.setdefault(int(war_id), {})[int(bf_id)] = int(faction)
+
     async def get_war_cities(self, war_id):
         return dict(self.city_owners.get(int(war_id), {}))
+
+    async def list_active_war_battles(self, war_id):
+        return [dict(b) for b in self.battles
+                if b['war_id'] == int(war_id)]
+
+    # ---- movement（R 组）----
+    async def create_movement(self, at_id, war_id, path, started_at=None,
+                              arrive_at=None, dest_ap=0):
+        mid = self.next_mv_id
+        self.next_mv_id += 1
+        self.movements[mid] = {
+            'id': mid, 'commandnode_id': int(at_id), 'war_id': int(war_id),
+            'path': [dict(s) for s in path], 'started_at': started_at,
+            'arrive_at': arrive_at, 'dest_ap': int(dest_ap or 0), 'state': 0}
+        return copy.deepcopy(self.movements[mid])
+
+    async def list_active_movements(self, war_id):
+        return [copy.deepcopy(m) for m in self.movements.values()
+                if m['war_id'] == int(war_id) and m['state'] == 0]
+
+    async def finish_movement(self, mv_id, state):
+        if int(mv_id) in self.movements:
+            self.movements[int(mv_id)]['state'] = int(state)
 
     async def init_war_faction_resources(self, war_id, initial):
         """幂等种子（对齐 ON CONFLICT DO NOTHING：已有不覆盖）。"""
@@ -381,6 +454,22 @@ def _rows(w, table):
         act = c.subs[0].subs[0]
         if act.data == b'set' and act.subs and act.subs[0].data == t:
             out.append(pb_parse(act.subs[0].subs[0].data))
+    return out
+
+
+def _dels(w, table):
+    """全部 KeyValueChangeSet delete 帧中指定表的行 id 列表
+    （delete 行内容为 8 字节 LE int64，非 proto 编码）。"""
+    import struct as _struct
+    t = table.encode() if isinstance(table, str) else table
+    out = []
+    for c in _chunks(w.buf):
+        if not c.subs or c.subs[0].data != b'KeyValueChangeSet':
+            continue
+        act = c.subs[0].subs[0]
+        if (act.data == b'delete' and act.subs
+                and act.subs[0].data == t and act.subs[0].subs):
+            out.append(_struct.unpack('<q', act.subs[0].subs[0].data)[0])
     return out
 
 
@@ -883,23 +972,67 @@ async def section_d():
           and st.spend_log == [(100, 'warfunds', 500)]
           and defn and defn[-1].get(2) == b'Alpha', str(f))
 
-    # D2 deploy：落位己方首都（capitals 合成 {1: bf10}）+ 部署即补编
-    # （§10.2 #4/#5：新 AT 首次免费满编置位，余额不动）
+    # D2 deploy：官服随机落位（#4/#5：主城10 + 邻接己方非交战城11 池）
+    # + 部署即补编（§10.2 #4/#5：新 AT 首次免费满编置位，余额不动）
     st = _setup()
     _mk_at(st, 500, template=501)
     w, f = await _deploy(500)
     inst = [r for r in _rows(w, 'CommandNodeWarInstance')
             if r.get(1) == 500]
-    check('D2 部署+首补免费（响应1/满编{1:12}/free置位/余额不动/bf=10）',
+    check('D2 部署+首补免费（响应1/满编{1:12}/free置位/余额不动/bf∈{10,11}）',
           f.get(1) == 1 and st.ats[500]['is_deployed'] is True
-          and st.ats[500]['map_entity_id'] == 10
+          and st.ats[500]['map_entity_id'] in (10, 11)
+          and st.ats[500]['map_entity_type'] == 1
           and st.ats[500]['resources'] == {'1': 12}
           and st.ats[500]['has_gotten_soldier_free'] is True
           and st.balance(100) == 3000 and not st.spend_log
-          and inst and inst[-1].get(5) == 10 and inst[-1].get(10) == 1,
+          and inst and inst[-1].get(5) in (10, 11)
+          and inst[-1].get(10) == 1,
           str(f))
 
-    # D3 重复部署 → 150
+    # D2b 随机落位池覆盖：固定种子多次部署，主城/邻城均出现
+    random.seed(7)
+    spots = set()
+    for i in range(40):
+        st = _setup()
+        _mk_at(st, 500 + i, template=501)
+        await _deploy(500 + i)
+        spots.add(st.ats[500 + i]['map_entity_id'])
+    check('D2b 落位随机池 {10,11} 全覆盖', spots == {10, 11}, str(spots))
+
+    # D2c 主城交战 → 221（官服 deploy_location_not_found），AT 不部署
+    st = _setup()
+    st.battles.append({'war_id': 1, 'battlefield_id': 10})
+    _mk_at(st, 500, template=501)
+    w, f = await _deploy(500)
+    check('D2c 主城交战 → 221 拒单',
+          f.get(1) == war_campaign.RC_DEPLOY_LOCATION_NOT_FOUND
+          and not st.ats[500]['is_deployed'], str(f))
+
+    # D2d 周边无非交战己方城（11 中立）→ 221
+    # （ensure_war 在 deploy 时才建 war：owners 须经 initial_city_owners 注入）
+    st = _setup()
+    _orig_ico = war_campaign.initial_city_owners
+    war_campaign.initial_city_owners = lambda: {10: 1, 11: 0}
+    _mk_at(st, 500, template=501)
+    w, f = await _deploy(500)
+    war_campaign.initial_city_owners = _orig_ico
+    check('D2d 周边无己方非交战城 → 221 拒单',
+          f.get(1) == war_campaign.RC_DEPLOY_LOCATION_NOT_FOUND
+          and not st.ats[500]['is_deployed'], str(f))
+
+    # D2e 唯一邻城交战 → 候选池仅剩主城（周边无非交战己方城）→ 221
+    st = _setup()
+    st.battles.append({'war_id': 1, 'battlefield_id': 11})
+    _mk_at(st, 500, template=501)
+    w, f = await _deploy(500)
+    check('D2e 唯一邻城交战 → 221 拒单',
+          f.get(1) == war_campaign.RC_DEPLOY_LOCATION_NOT_FOUND, str(f))
+
+    # D3 重复部署 → 150（先成功部署一次）
+    st = _setup()
+    _mk_at(st, 500, template=501)
+    await _deploy(500)
     w, f = await _deploy(500)
     check('D3 重复部署 → 150',
           f.get(1) == war_campaign.RC_COMMANDNODE_ALREADY_DEPLOYED, str(f))
@@ -920,21 +1053,26 @@ async def section_d():
     w, f = await _deploy(500, sp=9001, vp=9002)
     inst = [r for r in _rows(w, 'CommandNodeWarInstance')
             if r.get(1) == 500]
-    check('D5 部署缺库存 → 226（入队(1,12)/扣1200/编制不动/AT行照推/bf=10）',
+    check('D5 部署缺库存 → 226（入队(1,12)/扣1200/编制不动/AT行照推/bf∈{10,11}）',
           f.get(1) == war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES
           and [(r['category_id'], r['count']) for r in st.supply_queue]
           == [(1, 12)]
           and st.spend_log == [(100, 'warfunds', 1200)]
           and st.ats[500]['resources'] == {}
           and st.ats[500]['is_deployed'] is True
-          and inst and inst[-1].get(5) == 10, str(f))
+          and inst and inst[-1].get(5) in (10, 11), str(f))
 
 
 # ================================================= E transport/升级口径
 
-async def _transport(node, target=30, ttype='battlefield'):
+async def _transport(node, target=30, ttype='battlefield', override_ap=0,
+                     override_move=False):
     w = FakeWriter()
-    req = pb_int64(1, node) + pb_int64(2, target) + pb_string(3, ttype)
+    req = (pb_int64(1, node) + pb_int64(2, target) + pb_string(3, ttype))
+    if override_ap:
+        req += pb_int64(4, override_ap)
+    if override_move:
+        req += pb_bool(5, True)
     await war_at.handle_transport_commandnode(
         FakeSess(), w, 900, b'transport_commandnode', req)
     return w, _resp(w, 'transport_commandnode_response')
@@ -977,6 +1115,235 @@ async def section_e():
           and st.spend_log == [(100, 'warfunds', 500)], str(f))
 
 
+# ============================================== R 空中半径单位（§10.2 #6/#7）
+
+def section_r_unit():
+    """R0 半径规则纯单元（城市图：10(0,0) 11(100,0)机 12(800,0)机
+    13(800,100) 14(2000,0) 15(850,0)敌机 16(450,0) 17(1200,0)机）。"""
+    at505 = {'template_id': 505, 'faction': 1}      # 战斗机 950/2850
+
+    ok, atk = war_campaign.check_radius_move(at505, 10, 16, {16: 0}, set())
+    check('R0a 攻击半径内任意城（450×2≤950）→ (True,True)', ok and atk)
+
+    ok, atk = war_campaign.check_radius_move(at505, 10, 12, {12: 1}, set())
+    check('R0b 运输半径内己方非交战机场（800×2∈(950,2850]）→ (True,False)',
+          ok and not atk)
+
+    ok, _ = war_campaign.check_radius_move(at505, 10, 13, {13: 1}, set())
+    check('R0c 运输半径内非机场城 → 拒', not ok)
+
+    ok, _ = war_campaign.check_radius_move(at505, 10, 15, {15: 2}, set())
+    check('R0d 运输半径内敌方机场 → 拒', not ok)
+
+    ok, _ = war_campaign.check_radius_move(at505, 10, 12, {12: 1}, {12})
+    check('R0e 交战机场 → 拒', not ok)
+
+    at504 = {'template_id': 504, 'faction': 1}      # 补给空运队（reserve）
+    ok, atk = war_campaign.check_radius_move(at504, 10, 12, {12: 1}, {12})
+    check('R0e2 reserve 补给队交战机场例外 → (True,False)', ok and not atk)
+
+    ok, _ = war_campaign.check_radius_move(at505, 10, 14, {14: 1}, set())
+    check('R0f 超运输半径（2000×2>2850）→ 拒', not ok)
+
+    ok, atk = war_campaign.check_radius_move(at505, 999, 16, {}, set())
+    check('R0g 当前位无坐标回退全允许 (True,True)', ok and atk)
+    ok, _ = war_campaign.check_radius_move(at505, 10, 999, {}, set())
+    check('R0g2 目标城不在战图 → 拒（对齐地面不可达）', not ok)
+
+    check('R0h 单位族判定（飞机/伞兵/落地变体非radius/地面AT）',
+          war_campaign.is_radius_unit({'template_id': 505})
+          and war_campaign.is_aircraft({'template_id': 505})
+          and not war_campaign.is_paradrop_unit({'template_id': 505})
+          and war_campaign.is_paradrop_unit({'template_id': 506})
+          and not war_campaign.is_aircraft({'template_id': 506})
+          and not war_campaign.is_radius_unit({'template_id': 507})
+          and not war_campaign.is_radius_unit({'template_id': 501}))
+
+    check('R0i 机场判定（204/205）/最近机场',
+          war_campaign.is_airfield(11) and war_campaign.is_airfield(15)
+          and not war_campaign.is_airfield(10)
+          and war_campaign.nearest_airfield(10) == 11)
+
+    row = pb_parse(war_campaign.msg_air_commandnode_base_row(
+        {'id': 500}, 1, 12))
+    check('R0j airbase 行 f1-f6（f5 String battlefield）',
+          row.get(1) == 500 and row.get(2) == 500 and row.get(3) == 12
+          and row.get(4) == 12 and row.get(5) == b'battlefield'
+          and row.get(6) == 1, str(row))
+
+
+async def section_r():
+    section_r_unit()
+
+    # ---- R1 部署落机场（#7：飞机/伞兵只出生在机场）----
+    # R1a 候选池 {10,11} ∩ 机场 = {11} → 落 11 + airbase 行推送
+    st = _setup()
+    _mk_at(st, 500, template=505)
+    w, f = await _deploy(500)
+    ab = _rows(w, 'air_commandnode_base')
+    check('R1a 飞机部署落机场（11）+ airbase 行（f3=11）',
+          f.get(1) == 1 and st.ats[500]['map_entity_id'] == 11
+          and ab and ab[-1].get(3) == 11 and ab[-1].get(2) == 500, str(f))
+
+    # R1b 候选池无机场 → 回退距主城最近机场（官服"主城附近的机场"）
+    orig_bf, orig_af = wardb.battlefields, war_campaign._AIRFIELD_CACHE
+    wardb.battlefields = lambda: [
+        {'id': 10, 'posx': 0, 'posy': 0, 'gamemap': 0},
+        {'id': 11, 'posx': 100, 'posy': 0, 'gamemap': 0},
+        {'id': 12, 'posx': 800, 'posy': 0, 'gamemap': 204},
+        {'id': 14, 'posx': 2000, 'posy': 0, 'gamemap': 0}]
+    war_campaign._BF_POS_CACHE = None
+    war_campaign._AIRFIELD_CACHE = None
+    try:
+        st = _setup()
+        _mk_at(st, 500, template=505)
+        w, f = await _deploy(500)
+        check('R1b 候选池无机场 → 回退最近机场（12）',
+              f.get(1) == 1 and st.ats[500]['map_entity_id'] == 12, str(f))
+    finally:
+        wardb.battlefields = orig_bf
+        war_campaign._BF_POS_CACHE = None
+        war_campaign._AIRFIELD_CACHE = orig_af
+
+    # R1c 伞兵同规则（airborne 统一语义）
+    st = _setup()
+    _mk_at(st, 500, template=506)
+    w, f = await _deploy(500)
+    check('R1c 伞兵部署同落机场（11）',
+          f.get(1) == 1 and st.ats[500]['map_entity_id'] == 11
+          and _rows(w, 'air_commandnode_base'), str(f))
+
+    # ---- R2 半径移动（transport_commandnode 半径分支）----
+    # R2a 换基地：11→12（700×2=1400∈(950,2850]，己方非交战机场）→ 21
+    st = _setup()
+    war = await war_campaign.ensure_war(st)
+    st.city_owners[1][12] = 1
+    _mk_at(st, 500, template=505, deployed=True, map_entity_id=11)
+    w, f = await _transport(500, target=12)
+    seg0 = st.movements[1]['path'][0]
+    check('R2a 换基地 → 21 + air 单段(radius_attack=False) + state=1 不耗cat10',
+          f.get(3) == war_campaign.RC_RELOCATING_TO_NEW_AIRBASE
+          and st.ats[500]['state'] == 1
+          and seg0['air'] is True and seg0['radius_attack'] is False
+          and seg0['to_bf'] == 12
+          and st.ats[500].get('resources', {}).get('10') is None, str(f))
+
+    # R2b 到达换基地 → 落位 12 + airbase 行 set（f3=12）
+    mv = st.movements[1]
+    events = await war_campaign.advance_movements(
+        st, war, now=mv['arrive_at'] + datetime.timedelta(seconds=1))
+    ab_ev = [e for e in events if e[1] == b'air_commandnode_base']
+    check('R2b 到达换基地 → AT 落位 12 + airbase 行 set',
+          st.ats[500]['map_entity_id'] == 12
+          and st.ats[500]['state'] == 0
+          and len(ab_ev) == 1 and ab_ev[0][0] == 'set'
+          and pb_parse(ab_ev[0][2]).get(3) == 12)
+
+    # R2c 攻击半径内任意城：12→16（350×2=700≤950）→ 1；飞机作战到达
+    # airbase 行不变
+    w, f = await _transport(500, target=16)
+    mv = st.movements[2]
+    events = await war_campaign.advance_movements(
+        st, war, now=mv['arrive_at'] + datetime.timedelta(seconds=1))
+    check('R2c 攻击半径内任意城 → 1；作战到达 airbase 行不变',
+          f.get(3) == war_campaign.RC_OK
+          and st.ats[500]['map_entity_id'] == 16
+          and not [e for e in events
+                   if e[1] == b'air_commandnode_base'], str(f))
+
+    # R2d-f 拒单：运输半径内非机场 / 超运输半径 / override_ap 出兵点
+    st = _setup()
+    war = await war_campaign.ensure_war(st)
+    for nid, tgt, oap, label in (
+            (531, 13, 0, '运输半径内非机场城'),
+            (532, 14, 0, '超运输半径城'),
+            (533, 16, 102, 'airborne 落出兵点'),
+            (534, 30, 0, '无坐标目标')):
+        _mk_at(st, nid, template=505, deployed=True, map_entity_id=10)
+    w1, f1 = await _transport(531, target=13)
+    w2, f2 = await _transport(532, target=14)
+    w3, f3 = await _transport(533, target=16, override_ap=102)
+    w4, f4 = await _transport(534, target=30)
+    check('R2d 半径拒单族 → 7（非机场/超半径/出兵点/无坐标）',
+          f1.get(3) == 7 and f2.get(3) == 7 and f3.get(3) == 7
+          and f4.get(3) == 7
+          and not st.movements
+          and all(st.ats[n]['state'] == 0
+                  for n in (531, 532, 533, 534)),
+          f'{f1.get(3)}/{f2.get(3)}/{f3.get(3)}/{f4.get(3)}')
+
+    # R2g 敌方机场（owners 15=2）→ 拒
+    st = _setup()
+    war = await war_campaign.ensure_war(st)
+    st.city_owners[1][15] = 2
+    _mk_at(st, 540, template=505, deployed=True, map_entity_id=10)
+    w, f = await _transport(540, target=15)
+    check('R2g 运输半径内敌方机场 → 7', f.get(3) == 7, str(f))
+
+    # ---- R3 伞兵落地变体（#6：空降作战到达 → *_on_ground）----
+    st = _setup()
+    war = await war_campaign.ensure_war(st)
+    _mk_at(st, 510, template=506, deployed=True, map_entity_id=11)
+    w, f = await _transport(510, target=16)      # 350×2=700≤1850 攻击半径
+    mv = st.movements[1]
+    events = await war_campaign.advance_movements(
+        st, war, now=mv['arrive_at'] + datetime.timedelta(seconds=1))
+    ev_set_def = [e for e in events if e[1] == b'CommandNodeDefinition']
+    ev_del_ab = [e for e in events
+                 if e[0] == 'del' and e[1] == b'air_commandnode_base']
+    check('R3 伞兵空降到达 → 落地变体 507 + airbase 删行 + Definition 重推',
+          f.get(3) == war_campaign.RC_OK
+          and st.ats[510]['template_id'] == 507
+          and st.ats[510]['map_entity_id'] == 16
+          and not war_campaign.is_radius_unit(st.ats[510])
+          and ev_del_ab and ev_del_ab[0][2] == 510
+          and ev_set_def
+          and pb_parse(ev_set_def[0][2]).get(6) == 507)
+
+    # R3b 伞兵换基地（11→17：1100×2=2200∈(1850,3600]）→ 保持 airborne
+    st.city_owners[1][17] = 1
+    _mk_at(st, 511, template=506, deployed=True, map_entity_id=11)
+    w, f = await _transport(511, target=17)
+    mv = st.movements[2]
+    events = await war_campaign.advance_movements(
+        st, war, now=mv['arrive_at'] + datetime.timedelta(seconds=1))
+    ab_ev = [e for e in events if e[1] == b'air_commandnode_base']
+    check('R3b 伞兵换基地 → 21 保持 airborne（模板不变 + airbase set 17）',
+          f.get(3) == war_campaign.RC_RELOCATING_TO_NEW_AIRBASE
+          and st.ats[511]['template_id'] == 506
+          and st.ats[511]['map_entity_id'] == 17
+          and len(ab_ev) == 1 and ab_ev[0][0] == 'set'
+          and pb_parse(ab_ev[0][2]).get(3) == 17, str(f))
+
+    # ---- R4 airbase 行生命周期（撤退/快照/解散）----
+    # R4a 撤退待命 → airbase 删行推送
+    st = _setup()
+    await war_campaign.ensure_war(st)
+    _mk_at(st, 520, template=505, deployed=True, map_entity_id=11)
+    w = FakeWriter()
+    await war_at.handle_retreat_command_node_request(
+        FakeSess(), w, 900, b'RetreatCommandNodeRequest', pb_int64(1, 520))
+    fr = _resp(w, 'RetreatCommandNodeResponse')
+    check('R4a 撤退 → airbase 删行',
+          fr.get(1) == 1 and 520 in _dels(w, 'air_commandnode_base')
+          and not st.ats[520]['is_deployed'], str(fr))
+
+    # R4b 快照：已部署 radius 单位含 airbase 行，待命不含
+    _mk_at(st, 521, template=506, deployed=True, map_entity_id=12)
+    rows = await war_campaign.build_warmap_snapshot(st)
+    ab_rows = [r for r in rows if r[0] == b'air_commandnode_base']
+    check('R4b 快照 airbase 行（已部署 521 f3=12；待命 520 不含）',
+          len(ab_rows) == 1
+          and pb_parse(ab_rows[0][1]).get(2) == 521
+          and pb_parse(ab_rows[0][1]).get(3) == 12)
+
+    # R4c 解散推送含 airbase 删行
+    w = FakeWriter()
+    await war_at._push_at_delete(FakeSess(), w, st.ats[521])
+    check('R4c 解散 → airbase 删行',
+          521 in _dels(w, 'air_commandnode_base'))
+
+
 async def main():
     await section_a()
     await section_b()
@@ -985,6 +1352,7 @@ async def main():
     await section_g()
     await section_d()
     await section_e()
+    await section_r()
     fails = [label for label, ok in RESULTS if not ok]
     print(f'\n==== {len(RESULTS) - len(fails)}/{len(RESULTS)} PASS ====')
     for label in fails:

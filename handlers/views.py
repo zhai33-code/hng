@@ -102,6 +102,17 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (war data, {len(war_proto)}B)')
 
         # 2. player 表数据
+        # ★ 每日签到：推 player 行前先记连续登录天数（同日幂等 / 昨日+1 /
+        #   断签重置 1）并同步 firstActionGameDate（f19 = 连续链基准日，
+        #   见 player_store.touch_daily_login）——f19 在这里随行下发，先
+        #   touch 才能保证客户端拿到的基准日与 consecutive_day_count 同日。
+        if STORE is not None:
+            try:
+                tpid = await sess.ensure_player()
+                if tpid is not None:
+                    await STORE.touch_daily_login(int(tpid))
+            except Exception as e:
+                log(f'      [DB] touch_daily_login failed: {e}')
         player_proto = await _msg_player_for(sess)
         data_chunk = Chunk(player_proto)
         table_chunk = Chunk(b'player', [data_chunk])
@@ -118,7 +129,10 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         #    打开战斗浏览器/战争图，getFromId(factionId) 返回 null → #1009；
         #    且行 id 必须==factiontemplateid（见 matchmaking.FACTION_ROW_IDS），
         #    登录即推保证 currentPlayer.factionid 的"我方"判定处处可用。
-        for faction_row in _msg_faction_rows():
+        # f6/f7 带当前 underdog 倍率（#1 人数较少阵营经验/战资加成）
+        _ud = (await war_campaign.current_underdog_mults(STORE)
+               if STORE is not None else None)
+        for faction_row in _msg_faction_rows(_ud):
             await _push_kvcs(writer, cmd_id, b'faction', faction_row)
         log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (faction ×3 rows) ★FactionTable fill')
 
@@ -274,13 +288,8 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
             # 会员/加成/修理票 UI 数据源，不推则购买记录重启后丢失。
             await push_economy_rows(sess, writer, int(pid))
             # 每日签到（PlayerOfferMetrics 行）：客户端签到窗口/主界面 tile 的
-            # 唯一数据源，不推则窗口永不弹出；推前先记连续登录天数
-            # （同日幂等 / 昨日+1 / 断签重置 1）。
-            if STORE is not None:
-                try:
-                    await STORE.touch_daily_login(int(pid))
-                except Exception as e:
-                    log(f'      [DB] touch_daily_login failed: {e}')
+            # 唯一数据源，不推则窗口永不弹出。连续登录天数已在上面 player 行
+            # 推送前 touch（views.handle_subscribe 第一分支）。
             await push_player_offer_metrics_row(sess, writer, int(pid))
             # 进展 tab 等级补发：totalScore 已跨过 PlayerLevel 阈值但奖励
             # 未发（历史数据 / 服务器停机期间结算）时登录即入账；升级则

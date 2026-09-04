@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import matchmaking
 from handlers import combat as combat_handlers
+from protocol import Chunk
 from state import FLASH_SESSIONS
 
 
@@ -176,9 +177,108 @@ def test_finish_sessions_repush_earned_chars():
         _cleanup(mid, pms, 'ExitGuyD')
 
 
+def _kvcs_rows(buf):
+    """从原始字节流收集 KVCS 行：(action, 表名, 行 proto)，按推送顺序。"""
+    rows, off = [], 0
+    while off < len(buf):
+        c, off = Chunk.parse(buf, off)
+        if c is None:
+            break
+        title = c.subs[0] if c.subs else None
+        if title is not None and title.as_str() == 'KeyValueChangeSet':
+            action = title.subs[0]
+            table = action.subs[0]
+            row = table.subs[0] if table.subs else None
+            rows.append((action.as_str(), table.as_str(),
+                         row.data if row is not None else b''))
+    return rows
+
+
+def _pb_fields(b):
+    """极简 protobuf 解析：{字段号: [varint 或 bytes]}。"""
+    out, i = {}, 0
+    while i < len(b):
+        tag = b[i]
+        i += 1
+        fn, wt = tag >> 3, tag & 7
+        if wt == 0:
+            v = 0
+            shift = 0
+            while True:
+                byte = b[i]
+                i += 1
+                v |= (byte & 0x7F) << shift
+                shift += 7
+                if not byte & 0x80:
+                    break
+            out.setdefault(fn, []).append(v)
+        elif wt == 2:
+            n, shift, j = 0, 0, i
+            while True:
+                byte = b[j]
+                j += 1
+                n |= (byte & 0x7F) << shift
+                shift += 7
+                if not byte & 0x80:
+                    break
+            i = j
+            out.setdefault(fn, []).append(b[i:i + n])
+            i += n
+        else:
+            break
+    return out
+
+
+def test_finish_sessions_pushes_maintenance_notification():
+    """自动维修消耗记录（2026-09-04 玩家反馈缺失）：
+
+    结算扣费后应推 NotificationData(credits/gold 金额) + Notification
+    (type=6 ItemMaintenance)；数据行必须先于通知行（客户端渲染器
+    set data 时一次性读 NotificationDataTable）。"""
+    mid, pms = 987005, 987105
+    writer = _MockWriter()
+    flash = types.SimpleNamespace(writer=writer, playerview_cmd=8,
+                                  soldier_view_cmd=None)
+    FLASH_SESSIONS['ExitGuyE'] = flash
+    matchmaking.PMS_TO_MISSION[pms] = mid
+    matchmaking.PMS_TO_SESSION[pms] = {
+        'player_id': 4, 'gamertag': 'ExitGuyE', 'squad_db_id': 0}
+    try:
+        asyncio.run(combat_handlers._finish_mission_sessions(
+            mid, 666, None, {4: {'credits': 120, 'gold': 7}}))
+        rows = _kvcs_rows(writer.sent)
+        data_rows = [(t, r) for a, t, r in rows if t == 'NotificationData']
+        notif_rows = [(t, r) for a, t, r in rows if t == 'Notification']
+        assert len(data_rows) == 2, f'应有 credits/gold 两条数据行，实际 {data_rows}'
+        amounts = {}
+        for _, r in data_rows:
+            f = _pb_fields(r)
+            key = f[3][0].decode()
+            amounts[key] = f[4][0]                 # key → value
+        assert amounts == {'credits': 120, 'gold': 7}, amounts
+        # 通知行：type=6 ItemMaintenance、未读；数据行先于通知行
+        maint = [r for _, r in notif_rows
+                 if _pb_fields(r).get(3) == [6]]
+        assert len(maint) == 1, '应推一条 ItemMaintenance 通知'
+        nf = _pb_fields(maint[0])
+        assert nf[5] == [0] and nf[2] == [4], '应未读且归属本局玩家'
+        notif_id = nf[1][0]
+        for _, r in data_rows:
+            assert _pb_fields(r)[2] == [notif_id], '数据行应挂在本通知下'
+        order = [t for _, t, _ in rows]
+        maint_idx = max(i for i, (_, t, r) in enumerate(rows)
+                        if t == 'Notification' and _pb_fields(r).get(3) == [6])
+        assert maint_idx > max(i for i, t in enumerate(order)
+                               if t == 'NotificationData'), \
+            'NotificationData 必须先于 ItemMaintenance 通知推送'
+    finally:
+        _cleanup(mid, pms, 'ExitGuyE')
+
+
 if __name__ == '__main__':
     test_finish_sessions_without_report()
     test_watch_proc_exit_finishes_sessions()
     test_watch_proc_exit_normal_path_no_finish()
     test_finish_sessions_repush_earned_chars()
-    print('test_combat_exit_finish: 4 项全部通过')
+    test_finish_sessions_pushes_maintenance_notification()
+    print('test_combat_exit_finish: 5 项全部通过')

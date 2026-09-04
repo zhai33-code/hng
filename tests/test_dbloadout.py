@@ -518,6 +518,88 @@ def main():
         print(f'  [skip] DB 测试不可用：{exc}')
 
     print()
+    print('== 13. 账户级伪装网装备绑定（set_vehicle_upgrade_equipment vehicle_id，DB 级）==')
+    # 现场复现（2026-09-04 bug）：战斗通行证送的伪装网经 career.py
+    # create_vehicle_upgrade(pid, tid, 0, 0, ...) 落库为账户级库存行
+    # （vehicle_id=0）。装备时 SetVehicleUpgrade 旧实现只写 equipped_slot_id、
+    # 不绑定载具 → loadout v_ups 按 vehicle_id 分组（key=0）与
+    # _msg_character_entry 按真实载具 id 取数错开 → VehicleSetting f5
+    # 不含伪装网 → 进战斗无外观（购买的升级件创建即绑定，故仅送的失效）。
+    # 修复：装备时传入 vehicleId，行内 vehicle_id 不同（库存件/跨载具转移）
+    # 则先校验归属并绑定 vehicle_id + character_id，互斥清理也用绑定后的载具。
+    async def _vu_db():
+        import player_store
+        st = player_store.PlayerStore()
+        await st.start()
+        pid = None
+        try:
+            pid = (await st.get_player('u13vu_a')
+                   or await st.create_player('u13vu_a', 'pw'))
+            ch = await st.get_latest_character(pid)
+            if ch is None:
+                await st.create_character(pid, 'U13VuSoldier', 1, 0)
+                ch = await st.get_latest_character(pid)
+            cid = int(ch['id'])
+            # 模板 36=Panzer IV（test 12 同款真实模板，条件默认满耐久）
+            v = await st.create_vehicle(pid, 36, cid)
+            vid = int(v['id'])
+
+            async def vu_row(uid):
+                async with st.pool.acquire() as conn:
+                    r = await conn.fetchrow(
+                        'SELECT vehicle_id, character_id, equipped_slot_id '
+                        'FROM vehicle_upgrades WHERE id = $1', uid)
+                    return (int(r['vehicle_id']), int(r['character_id']),
+                            int(r['equipped_slot_id']))
+
+            # ① 通行证发放库存件（vehicle_id=0）装备 → 绑定目标载具
+            net = await st.create_vehicle_upgrade(pid, 5, 0, 0, 100.0)  # eCamoNet
+            uid = int(net['id'])
+            await st.set_vehicle_upgrade_equipment(pid, uid, 1, True, vid)
+            r = await vu_row(uid)
+            check('库存件装备 → vehicle_id/character_id 绑定 + slot=1 '
+                  '（旧实现 vehicle_id 恒 0 → 进战斗无外观）',
+                  r == (vid, cid, 1))
+
+            # ② 同槽互斥：再装一件同载具同槽，旧件被挤下但绑定保留
+            net2 = await st.create_vehicle_upgrade(pid, 5, 0, 0, 100.0)
+            uid2 = int(net2['id'])
+            affected = await st.set_vehicle_upgrade_equipment(
+                pid, uid2, 1, True, vid)
+            check('后装挤掉前件（affected 含两行）', len(affected) == 2)
+            check('旧件被挤下 slot=0（绑定保留）', await vu_row(uid) == (vid, cid, 0))
+            check('新件 slot=1 生效', await vu_row(uid2) == (vid, cid, 1))
+
+            # ③ 卸下不清绑定（与购买件创建即绑定的卸下行为一致）
+            await st.set_vehicle_upgrade_equipment(pid, uid2, 0, False)
+            check('卸下 → slot=0、绑定保留', await vu_row(uid2) == (vid, cid, 0))
+
+            # ④ 目标载具不属于该玩家 → 拒绝（返回空，行不变）
+            other = await st.set_vehicle_upgrade_equipment(pid, uid2, 1, True, vid + 99999)
+            check('装备到他人载具 → 拒绝（返回空且行不变）',
+                  other == [] and await vu_row(uid2) == (vid, cid, 0))
+        finally:
+            if pid is not None:
+                try:
+                    async with st.pool.acquire() as conn:
+                        await conn.execute(
+                            'DELETE FROM vehicle_upgrades WHERE player_id = $1', pid)
+                        await conn.execute(
+                            'DELETE FROM vehicles WHERE player_id = $1', pid)
+                        await conn.execute(
+                            'DELETE FROM characters WHERE player_id = $1', pid)
+                        await conn.execute(
+                            'DELETE FROM players WHERE id = $1', pid)
+                except Exception:
+                    pass
+            await st.close()
+
+    try:
+        asyncio.run(_vu_db())
+    except Exception as exc:
+        print(f'  [skip] DB 测试不可用：{exc}')
+
+    print()
     print('ALL PASS' if ok else 'SOME CHECKS FAILED')
     return 0 if ok else 1
 

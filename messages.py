@@ -9,7 +9,7 @@ import struct
 
 from protocol import (
     Chunk,
-    pb_string, pb_int32, pb_int64, pb_uint32, pb_float, pb_message, pb_packed_bool,
+    pb_string, pb_int32, pb_int64, pb_uint32, pb_float, pb_message, pb_packed_bool, pb_bool,
 )
 from state import CURRENT_PID, log
 from wardb import _prog_max, _AMMO_MAXCOND, _RIBBON_LEVEL_XP, _ribbon_level_from_xp

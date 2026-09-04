@@ -507,15 +507,17 @@ async def handle_setvehicleupgraderequest(sess, writer, cmd_id, req_type, proto)
     # SetVehicleUpgradeRequest { int64 vehicleId=1; int64 vehicleUpgradeId=2;
     #   int64 vehicleUpgradeSlotId=3; bool doEquip=4; }
     # SetVehicleUpgradeResponse { int32 response = 1; }
+    su_vehicle_id = 0
     su_upgrade_id = 0
     su_slot_id = 0
     su_do_equip = True
     try:
         f = pb_parse(proto)
+        su_vehicle_id = f.get(1, 0)
         su_upgrade_id = f.get(2, 0)
         su_slot_id = f.get(3, 0)
         su_do_equip = bool(f.get(4, 1))
-        log(f'      SetVehicleUpgrade: vehicleId={f.get(1, 0)}, upgradeId={su_upgrade_id}, '
+        log(f'      SetVehicleUpgrade: vehicleId={su_vehicle_id}, upgradeId={su_upgrade_id}, '
             f'slotId={su_slot_id}, doEquip={su_do_equip}')
     except Exception as e:
         log(f'      SetVehicleUpgrade parse error: {e}')
@@ -524,8 +526,10 @@ async def handle_setvehicleupgraderequest(sess, writer, cmd_id, req_type, proto)
     pid = await sess.ensure_player()
     if pid is not None:
         try:
-            affected = await STORE.set_vehicle_upgrade_equipment(pid, su_upgrade_id,
-                                                                 su_slot_id, su_do_equip)
+            # vehicleId 一并传入：账户级库存件（vehicle_id=0，通行证奖励）装备时
+            # 需绑定到目标载具，否则战斗配装按 vehicle_id 分组取不到 → 进战斗无外观
+            affected = await STORE.set_vehicle_upgrade_equipment(
+                pid, su_upgrade_id, su_slot_id, su_do_equip, su_vehicle_id)
         except Exception as e:
             log(f'[DB] set_vehicle_upgrade_equipment failed: {e}')
 

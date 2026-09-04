@@ -125,6 +125,9 @@ async def _push_at_delete(sess, writer, at):
     for cat in war_campaign.template_resources(tpl):
         await _push_kvcs_delete(writer, cmd, b'armyresource',
                                 int(at['id']) * 1000 + int(cat))
+    if war_campaign.is_radius_unit(at):
+        await _push_kvcs_delete(writer, cmd, b'air_commandnode_base',
+                                at['id'])
 
 
 def _currency_ok(currency):
@@ -370,16 +373,27 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
                 if at.get('is_deployed'):
                     code = war_campaign.RC_COMMANDNODE_ALREADY_DEPLOYED
                 else:
-                    bf = war_campaign.deploy_battlefield(
-                        at, at.get('faction'), near_capital)
-                    try:
-                        await STORE.update_command_node(
-                            at['id'], is_deployed=True, map_entity_id=bf)
-                        at = await STORE.get_command_node(at['id'])
-                        log(f'      [war] AT 部署 node={node_id} -> bf={bf}')
-                    except Exception as e:
-                        log(f'      [war_at] deploy failed: {e}')
-                        code = war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
+                    # 官服部署校验（§10.2 #4/#5）：主城非交战 + 周边有
+                    # 非交战己方城 → 随机落位（主城∪周边）；失败 221
+                    bf, dep_code = await war_campaign.resolve_deploy_battlefield(
+                        STORE, war, at, near_capital)
+                    if dep_code:
+                        code = dep_code
+                        log(f'      [war] AT 部署拒单 node={node_id} '
+                            f'({dep_code})')
+                    else:
+                        try:
+                            await STORE.update_command_node(
+                                at['id'], is_deployed=True, map_entity_id=bf,
+                                map_entity_type=war_campaign.
+                                MAP_ENTITY_BATTLEFIELD)
+                            at = await STORE.get_command_node(at['id'])
+                            log(f'      [war] AT 部署 node={node_id} '
+                                f'-> bf={bf}')
+                        except Exception as e:
+                            log(f'      [war_at] deploy failed: {e}')
+                            code = (war_campaign.
+                                    RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND)
                     if not code:
                         # 部署即补编（§10.2 #4/#5）：请求内计价 id 在此
                         # 消费——Deploy All 路径客户端绝不发 resupply
@@ -402,6 +416,13 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
         # 响应先于行推送（客户端先收 ack 关窗/解绑监听器，再应用行变更，
         # 避免行应用链上的窗口监听器抛异常卡死客户端请求管线）
         await _push_at_rows(sess, writer, at, at['war_id'])
+        # §10.2 #7：空中半径单位部署落机场 → airbase 行（isAirborneUnit）
+        cmd = _view_cmd(sess)
+        if cmd and war_campaign.is_radius_unit(at):
+            await _push_kvcs(writer, cmd, b'air_commandnode_base',
+                             war_campaign.msg_air_commandnode_base_row(
+                                 at, at['war_id'],
+                                 war_campaign.at_current_battlefield(at)))
         await _push_player_refresh(sess, writer)
 
 
@@ -448,6 +469,12 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
     if at is not None and code == war_campaign.RC_OK:
         # 响应先于行推送（客户端先收 ack 再应用行变更，理由同购买/部署）
         await _push_at_rows(sess, writer, at, at['war_id'])
+        # §10.2 #7：空中半径单位撤回待命 → 删 airbase 行（重新部署时
+        # 再按落位机场重建）
+        cmd = _view_cmd(sess)
+        if cmd and war_campaign.is_radius_unit(at):
+            await _push_kvcs_delete(writer, cmd, b'air_commandnode_base',
+                                    at['id'])
 
 
 # ------------------------------------------------------------- 增援（#2）
@@ -553,16 +580,29 @@ async def _apply_resupply(at, pid, war, currency,
         try:
             if upd:
                 await STORE.update_command_node(at['id'], **upd)
-            col, events, ecode = await war_campaign.spawn_supply_column(
-                STORE, war, at, missing, near_capital_bf=near_capital)
-            if col is None and ecode:
-                return ecode, at
-            await war_campaign.broadcast_war_events(events)
+            # 官服 #3：机械化部队补队时人员/车辆分队（各一队 Reserve
+            # 分别承载，同城汇合/在途到达各自并入父 AT）
+            col_ids = []
+            for part, label in (
+                    ({c: n for c, n in missing.items() if c not in veh_cats},
+                     'soldier'),
+                    ({c: n for c, n in missing.items() if c in veh_cats},
+                     'vehicle')):
+                if not part:
+                    continue
+                col, events, ecode = await war_campaign.spawn_supply_column(
+                    STORE, war, at, part, near_capital_bf=near_capital)
+                if col is None and ecode:
+                    log(f'      [war_at] supply column ({label}) '
+                        f'spawn failed: {ecode}')
+                    continue
+                col_ids.append(col['id'] if col else 0)
+                await war_campaign.broadcast_war_events(events)
             at = await STORE.get_command_node(at['id'])
             log(f'      [war] AT 补编(补给队) node={at["id"]} '
                 f'infantry={m_sold} vehicles={m_veh} '
                 f'free={int(s_free) + int(v_free)} cost={total} '
-                f'column={col["id"] if col else "?"}')
+                f'columns={col_ids}')
         except Exception as e:
             log(f'      [war_at] resupply column failed: {e}')
             return war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND, at
@@ -1007,7 +1047,52 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                         code = war_campaign.RC_FAIL
                     if not code and not dest_bf:
                         code = war_campaign.RC_FAIL
-                    if not code:
+                    if not code and war_campaign.is_radius_unit(at):
+                        # ---- 空中半径单位（§10.2 #6/#7）：不走补给线，
+                        # 按攻击/运输半径直达（CommandnodeArrow 半径规则）；
+                        # 不消耗 cat10 运输机（空运回退仅地面 AT）----
+                        if override_ap:
+                            # 官服 detectBattleField：airborne 单位
+                            # 不可落出兵点
+                            code = war_campaign.RC_CANNOT_FIND_COMMANDNODE
+                        else:
+                            rmv, rcode, atk = (
+                                await war_campaign.start_radius_move(
+                                    STORE, war, at, dest_bf,
+                                    override_move=override_move))
+                            if rcode != war_campaign.RC_OK or rmv is None:
+                                code = rcode
+                            else:
+                                at = await STORE.get_command_node(at['id'])
+                                segs = war_campaign.movement_segments(rmv)
+                                caps = war_campaign._faction_capital_bf()
+                                events = [
+                                    ('set', b'air_transport',
+                                     war_campaign.msg_air_transport_row(
+                                         at, war['id'], rmv, segs[0])),
+                                    ('set', b'CommandNodeWarInstance',
+                                     war_campaign.
+                                     msg_commandnode_instance_row(
+                                         at, war['id'], caps))]
+                                for p in war_campaign.msg_armyresource_rows(
+                                        at, war['id']):
+                                    events.append(
+                                        ('set', b'armyresource', p))
+                                if override_move:
+                                    # 瞬移：立即推进入途到达（airbase 行
+                                    # 更新/伞兵落地变体含在内）
+                                    events.extend(
+                                        await war_campaign.advance_movements(
+                                            STORE, war))
+                                await war_campaign.broadcast_war_events(events)
+                                log(f'      [war] 空中单位飞行 node={node_id}'
+                                    f' -> bf={dest_bf} attack={atk}')
+                                code = (
+                                    war_campaign.RC_RELOCATING_TO_NEW_AIRBASE
+                                    if not atk
+                                    else await _dest_semantic_code(
+                                        STORE, war, at, dest_bf))
+                    elif not code:
                         mv, mcode = await war_campaign.start_movement(
                             STORE, at, dest_bf, override_ap=override_ap,
                             override_move=override_move)

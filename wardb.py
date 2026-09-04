@@ -349,6 +349,26 @@ def vehicle_full_condition(variant_template_id):
     return params[0] if params and params[0] > 0 else 100.0
 
 
+# vehicletemplate f4 = armyResourceCategoryId（实测：Willys=15、Tiger=17、
+# M72=11）——载具模板 → 出身资源类别，匹配端"进局必有装备载具类别"用
+_VEHICLE_RESOURCE_CAT = {}
+for _f in _parse_wardb_table('vehicletemplate'):
+    _vc_tid = int(_f.get(1, 0) or 0)
+    _vc_cat = int(_f.get(4, 0) or 0)
+    if _vc_tid and _vc_cat:
+        _VEHICLE_RESOURCE_CAT[_vc_tid] = _vc_cat
+
+
+def vehicle_resource_category(template_id):
+    """载具（变体）模板 → 资源类别 id（vehicletemplate f4，变体经父模板
+    归一）；未知返回 None。"""
+    vid = int(template_id or 0)
+    if not vid:
+        return None
+    parent = _VEHICLE_VARIANT_PARENT.get(vid, 0) or vid
+    return _VEHICLE_RESOURCE_CAT.get(parent) or _VEHICLE_RESOURCE_CAT.get(vid)
+
+
 # VehicleWeaponSlot { id=1, vehicleTemplateId=2, weaponTemplateId=3, firingSequence=4,
 #   weaponSlotUser=5(eDriver=1), vehicleAmmoStorageId=6, weaponPriority=7(ePrimaryWeapon=0) }
 # 载具弹药归属链：载具变体 -> parentVehicleTemplateId -> VehicleWeaponSlot(驾驶员主武器)

@@ -116,6 +116,11 @@ async def main():
     has_wardb = bool(wardb.capitals())
     check('WarDatabase capital 表可用（macOS 缺表时降级）', True,
           'present' if has_wardb else 'absent -> 官服缺省回退分支')
+    # f8/胜利阈值预期：落库值（缺省 MM_WAR_POINTS_VICTORY）与实际主城数
+    # 取小（effective_points_needed 语义：stored 优先；私服配置
+    # WAR_POINTS_VICTORY 可与官服 15 不同，期望式按同式计算）
+    exp_pts = war_campaign.effective_points_needed(15)
+    exp_pts_def = war_campaign.effective_points_needed()
 
     # ---- A. build_war_proto 29 字段 ----
     war = {'id': 42, 'name': 'Test War',
@@ -137,7 +142,8 @@ async def main():
           top[3].decode() == '20260902083000Z', top[3].decode())
     check('f4 endtime 进行中空串', top[4] == b'')
     check('f7 winningfactionid=0', int(top[7]) == 0)
-    check('f8 pointsNeededForVictory', int(top[8]) == 15)
+    check('f8 pointsNeededForVictory（按实际主城数钳制）',
+          int(top[8]) == exp_pts, f'{int(top[8])}')
     check('f12 strategytimescale 快照', abs(f32(top[12]) - 2.0) < 1e-5)
     check('f13 daycycletimescale 快照', abs(f32(top[13]) - 1.5) < 1e-5)
     check('f15 maxPlayerPerFaction 快照', int(top[15]) == 50)
@@ -155,8 +161,8 @@ async def main():
          'winning_faction_id': 0, 'points_needed_for_victory': 0,
          'sequel_war_id': 0, 'mapid': 0, 'state': 1, 'config': {}})
     top2 = pb_parse(proto2)
-    check('缺省回退 f8=MM_WAR_POINTS_VICTORY',
-          int(top2[8]) == mm_config.WAR_POINTS_VICTORY)
+    check('缺省回退 f8=MM_WAR_POINTS_VICTORY（钳制后）',
+          int(top2[8]) == exp_pts_def)
     check('缺省回退 f12=MM_WAR_TIMESCALE',
           abs(f32(top2[12]) - mm_config.WAR_TIMESCALE) < 1e-5)
 
@@ -362,6 +368,50 @@ async def main():
     nopool.pool = None
     check('快照无 pool 返回 []',
           await war_campaign.build_warmap_snapshot(nopool) == [])
+
+    # ---- G. underdog 倍率（#1 人数较少阵营经验/战资加成）----
+    u = war_campaign.underdog_multipliers({1: 5, 2: 5, 3: 5})
+    check('underdog 平衡全员 1.0', u == {1: (1.0, 1.0), 2: (1.0, 1.0),
+                                         3: (1.0, 1.0)}, f'{u}')
+    u = war_campaign.underdog_multipliers({1: 10, 2: 0, 3: 0})
+    check('underdog 无人阵营拿满加成（1.25/1.15）',
+          u[1] == (1.0, 1.0)
+          and abs(u[2][0] - 1.25) < 1e-9 and abs(u[2][1] - 1.15) < 1e-9
+          and abs(u[3][0] - 1.25) < 1e-9 and abs(u[3][1] - 1.15) < 1e-9,
+          f'{u}')
+    u = war_campaign.underdog_multipliers({1: 4, 2: 2})
+    check('underdog 线性插值（share=0.5 → 1.125/1.075；缺阵营=0 人）',
+          abs(u[2][0] - 1.125) < 1e-9 and abs(u[2][1] - 1.075) < 1e-9
+          and abs(u[3][0] - 1.25) < 1e-9 and abs(u[3][1] - 1.15) < 1e-9,
+          f'{u}')
+    check('underdog 空计数全 1.0',
+          war_campaign.underdog_multipliers({}) ==
+          {1: (1.0, 1.0), 2: (1.0, 1.0), 3: (1.0, 1.0)})
+    u = war_campaign.underdog_multipliers({1: 5, 2: 5, 3: 1})
+    check('underdog 并列最多不加分（fac3 share=0.8 → 1.2/1.12）',
+          u[1] == (1.0, 1.0) and u[2] == (1.0, 1.0)
+          and abs(u[3][0] - 1.2) < 1e-9 and abs(u[3][1] - 1.12) < 1e-9,
+          f'{u}')
+    # 人数口径：AT 持有玩家 owner 去重、软删（state>=3）不计、
+    # 阵营号外（9）与其他战争的 AT 不计
+    gst = FakeStore()
+    gst.ats = [
+        {'war_id': 1, 'faction': 1, 'owner_player_id': 7, 'state': 0},
+        {'war_id': 1, 'faction': 1, 'owner_player_id': 7, 'state': 2},
+        {'war_id': 1, 'faction': 2, 'owner_player_id': 9, 'state': 1},
+        {'war_id': 1, 'faction': 2, 'owner_player_id': 11, 'state': 3},
+        {'war_id': 1, 'faction': 9, 'owner_player_id': 13, 'state': 0},
+        {'war_id': 2, 'faction': 1, 'owner_player_id': 15, 'state': 0},
+    ]
+    cnt = await war_campaign.faction_player_counts(gst, 1)
+    check('faction_player_counts owner 去重/软删剔除/异战争过滤',
+          cnt == {1: 1, 2: 1, 3: 0}, f'{cnt}')
+    # 无战争（pool=None → ensure_war None）回退全 1.0
+    nopool2 = FakeStore()
+    nopool2.pool = None
+    m = await war_campaign.current_underdog_mults(nopool2)
+    check('current_underdog_mults 无战争回退全 1.0',
+          m == {1: (1.0, 1.0), 2: (1.0, 1.0), 3: (1.0, 1.0)}, f'{m}')
 
     fails = [l for l, ok in RESULTS if not ok]
     print(f'\n{"="*50}\nwar_campaign 回归：{len(RESULTS)-len(fails)}/{len(RESULTS)} PASS')

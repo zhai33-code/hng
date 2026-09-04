@@ -1392,9 +1392,13 @@ class PlayerStore:
                 player_id, upgrade_template_id, vehicle_id, character_id, condition)
             return dict(row)
 
-    async def set_vehicle_upgrade_equipment(self, player_id, upgrade_id, slot_id, do_equip):
+    async def set_vehicle_upgrade_equipment(self, player_id, upgrade_id, slot_id,
+                                            do_equip, vehicle_id=0):
         """装备（do_equip=true）或卸下（false）载具升级。装备时先清空同载具同槽位
-        的其他升级（互斥：一个槽位只能装一件）。返回受影响升级行列表。"""
+        的其他升级（互斥：一个槽位只能装一件）。装备账户级库存件（vehicle_id=0，
+        通行证/军令奖励发放）或跨载具转移时，先把该行绑定到 vehicle_id 对应载具
+        （vehicle_id + character_id 一并更新——否则战斗配装按 vehicle_id 分组
+        取不到该件，伪装网进战斗无外观）。返回受影响升级行列表。"""
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -1405,20 +1409,35 @@ class PlayerStore:
                     return []
                 affected = [dict(row)]
                 if do_equip:
+                    if vehicle_id and int(vehicle_id) != int(row['vehicle_id'] or 0):
+                        # 账户级库存件（vehicle_id=0）/跨载具转移：绑定目标载具
+                        vrow = await conn.fetchrow(
+                            'SELECT character_id FROM vehicles '
+                            'WHERE id = $1 AND player_id = $2', vehicle_id, player_id)
+                        if vrow is None:
+                            return []  # 目标载具不属于该玩家 → 拒绝
+                        await conn.execute(
+                            'UPDATE vehicle_upgrades SET vehicle_id = $1, character_id = $2 '
+                            'WHERE id = $3', vehicle_id, vrow['character_id'], upgrade_id)
+                        affected[0]['vehicle_id'] = vehicle_id
+                        affected[0]['character_id'] = vrow['character_id']
                     # 先记录同载具同槽位被挤掉的升级，再清槽（互斥：一个槽位只能装一件）
+                    # （车辆级件用绑定后的 vehicle_id，兼容未传 vehicle_id 的旧调用）
+                    clear_vehicle = int(vehicle_id) if vehicle_id else int(row['vehicle_id'] or 0)
                     cleared = await conn.fetch(
                         'SELECT id, upgrade_template_id, vehicle_id, character_id, equipped_slot_id, condition '
                         'FROM vehicle_upgrades WHERE player_id = $1 AND vehicle_id = $2 '
                         'AND equipped_slot_id = $3 AND id != $4',
-                        player_id, row['vehicle_id'], slot_id, upgrade_id)
+                        player_id, clear_vehicle, slot_id, upgrade_id)
                     await conn.execute(
                         'UPDATE vehicle_upgrades SET equipped_slot_id = 0 '
                         'WHERE player_id = $1 AND vehicle_id = $2 '
                         'AND equipped_slot_id = $3 AND id != $4',
-                        player_id, row['vehicle_id'], slot_id, upgrade_id)
+                        player_id, clear_vehicle, slot_id, upgrade_id)
                     for c in cleared:
-                        c['equipped_slot_id'] = 0
-                        affected.append(dict(c))
+                        cd = dict(c)          # Record 只读，转 dict 再改
+                        cd['equipped_slot_id'] = 0
+                        affected.append(cd)
                 new_slot = slot_id if do_equip else 0
                 await conn.execute(
                     'UPDATE vehicle_upgrades SET equipped_slot_id = $1 '
@@ -2679,9 +2698,11 @@ class PlayerStore:
         """每日签到领取（RedeemDailyLoginRewardRequest）。
 
         当天首次领取 → daily_reward_redeemed_count+1、last_daily_reward_at=now()
-        返回 (True, day, redeemed_count)；当天已领 → (True, 0, n) 幂等不发；
-        账号不存在 → (False, 0, 0)。day 即客户端 dailyRewards.xml 的奖励日
-        （连续计数，handler 侧做 365 天循环折算）。发放内容（货币/加成/会员）
+        返回 (True, day, redeemed_count, consecutive)；当天已领 →
+        (True, 0, n, c) 幂等不发；账号不存在 → (False, 0, 0, 0)。
+        day 即客户端 dailyRewards.xml 的奖励日（连续计数，handler 侧做
+        365 天循环折算）；consecutive 为连续登录天数（handler 侧随每日
+        奖励一并发放 2..7 天连续 bonus）。发放内容（货币/加成/会员）
         由 handler 按当日 day 执行——标记与计数在同一事务内（FOR UPDATE
         锁行防并发双领），发放失败不回滚（已计入的 day 只少发一次奖励，
         不会重复发）。"""
@@ -2689,24 +2710,29 @@ class PlayerStore:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     'SELECT last_daily_reward_at::date AS d, '
-                    'daily_reward_redeemed_count AS n FROM players '
+                    'daily_reward_redeemed_count AS n, '
+                    'consecutive_day_count AS c FROM players '
                     'WHERE id = $1 FOR UPDATE', int(player_id))
                 if row is None:
-                    return False, 0, 0
+                    return False, 0, 0, 0
                 if row['d'] is not None:
                     today = await conn.fetchval('SELECT now()::date')
                     if row['d'] == today:
-                        return True, 0, int(row['n'])
+                        return True, 0, int(row['n']), int(row['c'])
                 n = int(row['n']) + 1
                 await conn.execute(
                     'UPDATE players SET last_daily_reward_at = now(), '
                     'daily_reward_redeemed_count = $2 WHERE id = $1',
                     int(player_id), n)
-        return True, n, n
+        return True, n, n, int(row['c'])
 
     async def touch_daily_login(self, player_id):
-        """登录即记连续天数（subscribeplayerview 推签到行前调用）：
-        同日幂等；昨日已登录 → +1；断签 → 重置 1。返回连续天数。"""
+        """登录即记连续天数（subscribeplayerview 推 player 行前调用）：
+        同日幂等；昨日已登录 → +1；断签 → 重置 1。返回连续天数。
+        同时把 first_action_game_date（player f19）刷成当天——它是客户端
+        DailyRewardsWindowMediator 连续奖励链的基准日（C = f8 +
+        (f19 != 今天 ? 1 : 0)，f19 距今 >1 天则链条判死恒为 1），必须与
+        consecutive_day_count 同基准日，否则第 2 天起 bonus 列错位/卡死。"""
         async with self.pool.acquire() as conn:
             return int(await conn.fetchval(
                 'UPDATE players SET consecutive_day_count = CASE '
@@ -2714,7 +2740,9 @@ class PlayerStore:
                 '  THEN consecutive_day_count '
                 'WHEN last_login_date = CURRENT_DATE - 1 '
                 '  THEN consecutive_day_count + 1 '
-                'ELSE 1 END, last_login_date = CURRENT_DATE '
+                'ELSE 1 END, '
+                'first_action_game_date = CURRENT_DATE, '
+                'last_login_date = CURRENT_DATE '
                 'WHERE id = $1 RETURNING consecutive_day_count',
                 int(player_id)) or 1)
 
@@ -3605,19 +3633,23 @@ class PlayerStore:
                 int(vehicle_id), int(player_id), float(condition))
         return _rowcount(n) > 0
 
-    # itemType 字符串（SetInventoryItemToCharacterRequest f1）→ 表名
+    # itemType 字符串（SetInventoryItemToCharacterRequest f1）→ 表名。
+    # 'tracereffect'=42：客户端 ad-hoc 值（buildSendItemToSoldierRequest
+    # case 42），指派 = tracer_effects.character_id 置角色 id
     _ITEM_TABLES = {
         'weapon': 'weapons', 'vehicle': 'vehicles',
         'uniformvariant': 'uniform_variants', 'uniformpart': 'uniform_parts',
         'weaponmodifier': 'weapon_modifiers', 'weaponammo': 'weapon_ammo',
         'weaponvariant': 'weapon_variants', 'vehicleammo': 'vehicle_ammo',
         'vehicleupgrade': 'vehicle_upgrades', 'vehiclevariant': 'vehicle_variants',
+        'tracereffect': 'tracer_effects',
     }
     # ItemType 枚举（SendItemToDepotRequest/SendUpgradesToDepotRequest f1 int）→ 表名
     _ITEM_TYPE_ID_TABLES = {
         1: 'weapons', 2: 'vehicles', 3: 'uniform_parts', 4: 'uniform_variants',
         5: 'weapon_modifiers', 6: 'weapon_ammo', 7: 'weapon_variants',
         8: 'vehicle_upgrades', 9: 'vehicle_ammo', 10: 'vehicle_variants',
+        42: 'tracer_effects',
     }
     # 挂靠件（配件/皮肤/弹药/载具升级与弹药）指派角色时需同步清 0 的外键列。
     # 官方容器归属不变式：客户端 ModifyWeaponMediator 只认
@@ -3681,6 +3713,19 @@ class PlayerStore:
                     'UPDATE vehicle_variants SET character_id = $3 '
                     'WHERE vehicle_id = $1 AND player_id = $2',
                     int(item_id), int(player_id), int(character_id))
+            elif tbl == 'tracer_effects':
+                # 曳光弹指派角色：character_id 置目标角色；若此前装备在某
+                # 武器上需解除绑定（武器不得引用别的角色名下的曳光弹行，
+                # 官方容器归属不变式），weapons.tracer_effect_id 脏引用同步
+                # 复位（对齐 weapon_variants 指派时复位 weapons.variant_id）
+                n = await conn.execute(
+                    'UPDATE tracer_effects SET character_id = $3, weapon_id = 0, '
+                    'is_equipped = FALSE WHERE id = $1 AND player_id = $2',
+                    int(item_id), int(player_id), int(character_id))
+                await conn.execute(
+                    'UPDATE weapons SET tracer_effect_id = 0 '
+                    'WHERE tracer_effect_id = $1 AND player_id = $2',
+                    int(item_id), int(player_id))
             else:
                 # 挂靠件指派角色 → 同步脱离原容器（weapon_id/vehicle_id 清 0），
                 # 详见 _ITEM_DETACH_SETS 注释（官方容器归属不变式）
@@ -3762,6 +3807,22 @@ class PlayerStore:
                     'UPDATE vehicle_variants SET character_id = 0 '
                     'WHERE vehicle_id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
+            elif tbl == 'tracer_effects':
+                # 曳光弹退仓：解除武器绑定与装备位，weapons.tracer_effect_id
+                # 脏引用同步复位（否则战斗配装仍读到已回仓库的曳光弹）
+                wref = await conn.fetchval(
+                    'SELECT weapon_id FROM tracer_effects '
+                    'WHERE id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                n = await conn.execute(
+                    'UPDATE tracer_effects SET character_id = 0, weapon_id = 0, '
+                    'is_equipped = FALSE WHERE id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                if wref:
+                    await conn.execute(
+                        'UPDATE weapons SET tracer_effect_id = 0 '
+                        'WHERE id = $1 AND player_id = $2 AND tracer_effect_id = $3',
+                        int(wref), int(player_id), int(object_id))
             else:
                 n = await conn.execute(
                     f'UPDATE {tbl} SET character_id = 0 WHERE id = $1 '
@@ -3804,6 +3865,20 @@ class PlayerStore:
                     int(object_id), int(player_id))
             return _rowcount(n) + _rowcount(m)
         return 0
+
+    async def detach_weapon_modifiers(self, player_id, modifier_ids):
+        """按实例 id 批量卸下武器配件（指派武器到不相容兵种时剥离留仓库）：
+        weapon_id/character_id 清 0 → 仓库独立配件（客户端 WeaponDepotView
+        getDepotMods 按 characterId.isZero 收录）。返回受影响行数。"""
+        ids = [int(i) for i in (modifier_ids or []) if int(i) > 0]
+        if not ids:
+            return 0
+        async with self.pool.acquire() as conn:
+            n = await conn.execute(
+                'UPDATE weapon_modifiers SET weapon_id = 0, character_id = 0 '
+                'WHERE id = ANY($1::bigint[]) AND player_id = $2',
+                ids, int(player_id))
+        return _rowcount(n)
 
     async def mark_depot_item_viewed(self, player_id, tab_name, item_id):
         """仓库物品已读（SetDepotItemViewedRequest）。

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """每日签到（Daily Rewards）实现的回归测试（2026-09-02）。
 
 覆盖三层：
@@ -35,7 +35,7 @@ for _cand in (os.environ.get('HNG_GAME_DIR'),
         os.environ['HNG_GAME_DIR'] = _cand
         break
 
-from protocol import Chunk, pb_parse  # noqa: E402
+from protocol import Chunk, pb_parse, pb_parse_multi  # noqa: E402
 from handlers import economy           # noqa: E402
 from handlers import career            # noqa: E402
 
@@ -81,9 +81,9 @@ class _FakeSess:
 
 
 class _FakeStore:
-    """记录发放调用；claim 结果可编程。"""
+    """记录发放调用；claim 结果可编程（ok, day, redeemed, consecutive）。"""
 
-    def __init__(self, metrics, claim_result=(True, 1, 0)):
+    def __init__(self, metrics, claim_result=(True, 1, 1, 1)):
         self.metrics = metrics
         self.claim_result = claim_result
         self.claim_calls = 0
@@ -261,13 +261,50 @@ def test_unit():
           and not store.currency_ops and not store.booster_ops
           and not store.membership_ops)
 
+    print('== 5b. 连续登录 bonus 表加载 + 发放 ==')
+    check('bonus 表加载（6 天）', len(economy._CONSECUTIVE_REWARDS) == 6,
+          f'got {sorted(economy._CONSECUTIVE_REWARDS)}')
+    check('day2 = credits 2000',
+          economy._CONSECUTIVE_REWARDS.get(2) == [('credits', 2000)])
+    check('day7 = membership 11',
+          economy._CONSECUTIVE_REWARDS.get(7) == [('membership', 11)])
+    check('day1 无 bonus', 1 not in economy._CONSECUTIVE_REWARDS)
+
+    async def _run_bonus(c):
+        store = _FakeStore(None)
+        old = economy.STORE
+        economy.STORE = store
+        try:
+            return await economy._grant_consecutive_bonus(42, c), store
+        finally:
+            economy.STORE = old
+
+    # 连续第 2 天 → 2000 银币（★本次修复的"连续两天登录奖励"）
+    out, store = asyncio.run(_run_bonus(2))
+    check('连续 2 天发 2000 银币', store.currency_ops == [(42, 2000, 0, 0)])
+    f = pb_parse(out['items'][0])
+    check('bonus item 字段', _s(f.get(1)) == 'credits'
+          and int(f.get(2, 0)) == 2000)
+    check('bonus push 标记 player', out['push'] == {'player'})
+
+    # 连续第 7 天 → 会员 1 天；>=8 折算回第 2 天（镜像客户端 wrap）
+    out, store = asyncio.run(_run_bonus(7))
+    check('连续 7 天发会员 1 天', store.membership_ops == [(42, 11, 1)])
+    out, store = asyncio.run(_run_bonus(8))
+    check('连续 8 天折算回 day2（2000 银币）',
+          store.currency_ops == [(42, 2000, 0, 0)])
+    # 第 1 天 / 未知 → 不发
+    out, store = asyncio.run(_run_bonus(1))
+    check('连续 1 天无 bonus', not store.currency_ops
+          and not store.membership_ops)
+
 
 # ------------------------------------------------------------ B. handler 流程
 
 def test_handler():
     print('== 6. 首次领取（响应 + 发放 + KVCS 重推）==')
     store = _FakeStore({'n': 0, 'c': 1, 'available': True, 'fagd': ''},
-                       claim_result=(True, 1, 1))
+                       claim_result=(True, 1, 1, 1))
     w = _FakeWriter()
     old_store, old_career = economy.STORE, career.complete_order_and_push
     economy.STORE = store
@@ -296,9 +333,35 @@ def test_handler():
               for t, fields in kvcs if t == 'PlayerOfferMetrics'))
     check('发放调用 day1 gold', store.currency_ops == [(42, 0, 0, 10)])
 
+    print('== 6b. 连续第 2 天领取（主奖励 + bonus 双包）==')
+    store = _FakeStore({'n': 1, 'c': 2, 'available': True, 'fagd': ''},
+                       claim_result=(True, 2, 2, 2))
+    w = _FakeWriter()
+    economy.STORE = store
+    career.complete_order_and_push = _noop_complete_order_and_push
+    try:
+        asyncio.run(economy.handle_redeem_daily_login_reward(
+            _FakeSess(), w, 123, 'RedeemDailyLoginRewardRequest', b''))
+    finally:
+        economy.STORE = old_store
+        career.complete_order_and_push = old_career
+    # 重复解析需要原始字节（_parse_response_frame 返回单值 dict）
+    root, _ = Chunk.parse(w.frames[-1], 0)
+    fm = pb_parse_multi(root.subs[0].subs[0].data)
+    check('响应带 2 个 VoucherPackInfo', len(fm.get(2, [])) == 2)
+    main_pack = pb_parse(fm[2][0])
+    bonus_pack = pb_parse(fm[2][1])
+    check('主包 identifier=daily_login_reward',
+          _s(main_pack.get(1)) == 'daily_login_reward')
+    check('bonus 包 identifier=consecutive_daily_login_rewards',
+          _s(bonus_pack.get(1)) == 'consecutive_daily_login_rewards')
+    check('主包 day2 = 1000 银币，bonus = 2000 银币',
+          store.currency_ops == [(42, 1000, 0, 0), (42, 2000, 0, 0)],
+          str(store.currency_ops))
+
     print('== 7. 当天二领（幂等）==')
     store = _FakeStore({'n': 1, 'c': 1, 'available': False, 'fagd': ''},
-                       claim_result=(True, 0, 1))
+                       claim_result=(True, 0, 1, 1))
     w = _FakeWriter()
     economy.STORE = store
     try:
@@ -334,16 +397,17 @@ async def _db_main():
     uname = f'test_daily_{int(time.time())}'
     pid = await st.create_player(uname, 'daily-test')
     check('建测试账号', pid is not None)
-    ok1, day1, n1 = await st.claim_daily_reward(pid)
-    ok2, day2, n2 = await st.claim_daily_reward(pid)
+    ok1, day1, n1, c1 = await st.claim_daily_reward(pid)
+    ok2, day2, n2, c2 = await st.claim_daily_reward(pid)
     check('首次领取 day=1', ok1 and day1 == 1 and n1 == 1)
     check('当天二领 day=0（幂等）', ok2 and day2 == 0 and n2 == 1)
+    check('领取返回连续天数（未 touch 的号=0）', c1 == 0 and c2 == 0)
 
     # 并发：两个 claim 同时进，只有一个 day>0
     pid2 = await st.create_player(uname + '2', 'daily-test')
     res = await asyncio.gather(st.claim_daily_reward(pid2),
                                st.claim_daily_reward(pid2))
-    granted = sum(1 for ok, d, n in res if d)
+    granted = sum(1 for ok, d, n, c in res if d)
     check('并发只有一个领取成功', granted == 1, str(res))
 
     print('== 10. touch_daily_login 连续性 ==')
@@ -365,6 +429,14 @@ async def _db_main():
             'WHERE id = $1', pid)
     c = await st.touch_daily_login(pid)
     check('断签重置 1', c == 1)
+    # firstActionGameDate（player f19）随 touch 刷成当天：客户端连续奖励链
+    # 基准日 C = f8 + (f19 != 今天 ? 1 : 0)，f19 过期会使链条错位/卡死
+    async with st.pool.acquire() as conn:
+        f19 = await conn.fetchval(
+            'SELECT to_char(first_action_game_date, \'YYYYMMDD\') '
+            'FROM players WHERE id = $1', pid)
+    check('touch 同步 f19 = 当天', f19 == time.strftime('%Y%m%d'),
+          f'f19={f19}')
 
     print('== 11. mark_first_action_game / get_daily_metrics ==')
     await st.mark_first_action_game(pid)

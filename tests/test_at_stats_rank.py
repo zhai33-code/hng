@@ -168,6 +168,10 @@ class FakeStore:
     async def list_active_movements(self, war_id):
         return []
 
+    async def list_war_command_nodes(self, war_id):
+        return [dict(a) for a in self.ats.values()
+                if a['war_id'] == int(war_id)]
+
     async def get_war_cities(self, war_id):
         return sorted(self.city_owners.get(war_id, {}).items())
 
@@ -725,6 +729,38 @@ async def section_e():
     _mk_battle(st, 1, ats=[(9, 1)])
     await war_campaign.settle_war_battle(st, 0, 1, 1)
     check('E5b 无 captured 不入账', st.faction_stock == {}, '')
+
+    # E7：#1 underdog 加成——人数较少阵营 XP/战资结算倍率（faction 行
+    #     f6/f7 同源公式 mult = 1 + cap×(1-n/n_max)）
+    # E7a：fac1 两玩家 / fac2 一玩家 → fac2 share=0.5 →
+    #     xp_mult=1.125（30×1.125→33）/ wf_mult=1.075（100→107 / 200→215）
+    st = _setup()
+    _mk_at(st, 9, owner=100, faction=1, state=2, resources={1: 100})
+    _mk_at(st, 10, owner=101, faction=1, state=0)   # 待命：只抬 fac1 人数
+    _mk_at(st, 19, owner=200, faction=2, state=2, resources={1: 100})
+    _mk_battle(st, 1, ats=[(9, 1), (19, 2)])
+    await war_campaign.settle_war_battle(st, 0, 1, 2)      # fac2 胜
+    check('E7a underdog XP 33（30×1.125）/ warfunds 107+215',
+          st.ats[19]['xp'] == 33
+          and (200, 107, 'war_battle 1') in st.funds_log
+          and (200, 215, 'war_battle 1 win') in st.funds_log,
+          f'xp={st.ats[19]["xp"]} funds={st.funds_log}')
+    check('E7a 强势阵营 mult=1.0（败方 xp=5 / 战资 100）',
+          st.ats[9]['xp'] == 5
+          and (100, 100, 'war_battle 1') in st.funds_log,
+          f'xp={st.ats[9]["xp"]}')
+
+    # E7b：软删 AT（state=3）不计人数 → 双方各 1 人 mult=1.0 → xp=30
+    st = _setup()
+    _mk_at(st, 9, owner=100, faction=1, state=2, resources={1: 100})
+    _mk_at(st, 10, owner=101, faction=1, state=3)   # 软删不计
+    _mk_at(st, 19, owner=200, faction=2, state=2, resources={1: 100})
+    _mk_battle(st, 1, ats=[(9, 1), (19, 2)])
+    await war_campaign.settle_war_battle(st, 0, 1, 2)
+    check('E7b 软删 AT 不计人数（平衡 mult=1.0 → xp=30 / 200 战资）',
+          st.ats[19]['xp'] == 30
+          and (200, 200, 'war_battle 1 win') in st.funds_log,
+          f'xp={st.ats[19]["xp"]} funds={st.funds_log}')
 
 
 # ------------------------------------------------------------- main
