@@ -534,8 +534,50 @@ def main():
             FLASH_SESSIONS.pop('GenMate', None)
             FLASH_SESSIONS.pop('RifleMate', None)
 
+        # ---- 14. 重登 rejoin：push_relogin_rejoin 登录订阅重推存活局 ----
+        # 客户端整端崩溃重开后 playerMissionSessionId=null；登录订阅时
+        # 服务端必须重推存活 PMS 行（同 pms id，state=3 Entered，避免
+        # 登录瞬间走 Admitted 分支自动拉起 hng.exe）+ BattleInfo，客户端
+        # StatusMediator 才显示"恢复战斗"按钮。无存活战局则不推。
+        rpid3 = 555
+        pms_c = 600100
+        seed_mission(900008, gamemode=5, preset=10, players=1)
+        matchmaking.PMS_TO_SESSION[pms_c] = {
+            'pms_id': pms_c, 'player_id': rpid3, 'char_id': 42,
+            'gamertag': 'CrashTest', 'faction': 3,
+            'battle_session_id': 778899, 'metrics_uid': 'uid-crash',
+            'metrics_session_id': 123456}
+        matchmaking.PMS_TO_MISSION[pms_c] = 900008
+        w14 = FakeWriter()
+        ok14 = asyncio.run(matchmaking.push_relogin_rejoin(w14, 105, rpid3))
+        data14 = w14.data
+        check('重登 rejoin：有存活战局 → 推送（返回 True）', ok14 is True)
+        check('重登 rejoin：推 PlayerMissionSession + BattleInfo 各一次',
+              data14.count(b'PlayerMissionSession') == 1 and
+              data14.count(b'BattleInfo') == 1)
+        check('重登 rejoin：同 pms id 重推（f1=600100，hng.exe /P 精确回会话）',
+              pb_varint(1, pms_c) in data14)
+        check('重登 rejoin：connectionState=3 Entered（非 2 Admitted 自动拉起）',
+              b'\x70\x03' in data14 and b'\x70\x02' not in data14)
+        check('重登 rejoin：gameConnect 指向本局 combat 端口',
+              f':{5600 + 900008 % 100}'.encode() in data14)
+        w14n = FakeWriter()
+        check('重登 rejoin：无存活战局 → 不推送（正常登录）',
+              asyncio.run(matchmaking.push_relogin_rejoin(
+                  w14n, 105, 424242)) is False and w14n.data == b'')
+        matchmaking.COMBAT_INSTANCES.pop(900008, None)   # 模拟战局已结束
+        w14b = FakeWriter()
+        check('重登 rejoin：战局已释放 → 不推送',
+              asyncio.run(matchmaking.push_relogin_rejoin(
+                  w14b, 105, rpid3)) is False and w14b.data == b'')
+        matchmaking.PMS_TO_SESSION.pop(pms_c, None)
+        matchmaking.PMS_TO_MISSION.pop(pms_c, None)
+        matchmaking._MM_QUEUES.pop(rpid3, None)
+        matchmaking._SOLO_SQUADS.pop(rpid3, None)
+
         # ---- 清理（模块级全局，防污染其它测试） ----
-        for mid in (900001, 900002, 900003, 900004, 900005, 900006, 900007):
+        for mid in (900001, 900002, 900003, 900004, 900005, 900006, 900007,
+                    900008):
             matchmaking.COMBAT_INSTANCES.pop(mid, None)
             matchmaking._MM_MISSION_DETAILS.pop(mid, None)
             matchmaking._MM_MISSION_SQUADS.pop(mid, None)

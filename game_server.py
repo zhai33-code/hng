@@ -21,6 +21,7 @@ import uuid
 from eos import oidc_issuer
 # matchmaking 的运行时状态（PMS 会话 / 动态 id 发号 / COMBAT_READY）
 import matchmaking
+import mm_config
 
 from protocol import (
     build_response,
@@ -174,12 +175,14 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             pass
 
         username = gamertag
-        try:
-            eos_token = oidc_issuer.make_id_token(username, subject=str(player_id))
-            log(f'      [oidc] issued id_token for {username!r} sub={player_id} ({len(eos_token)}B)')
-        except Exception as e:
-            log(f'      [oidc] token issue FAILED: {e}')
-            eos_token = ''
+        eos_token = ''
+        if mm_config.EOS_TOKEN_ENABLED:
+            try:
+                eos_token = oidc_issuer.make_id_token(username, subject=str(player_id))
+                log(f'      [oidc] issued id_token for {username!r} sub={player_id} ({len(eos_token)}B)')
+            except Exception as e:
+                log(f'      [oidc] token issue FAILED: {e}')
+                eos_token = ''
         # ★★ 2026-08-20 定论（14:26 成功运行 vs 16:05 崩溃 dump 对比 +
         #    ResponseSquadCallback sub_1802C4150 反编译证实）：
         #    requesterType=1（EAC 路径）与 type=0 必须回同一份完整 PlayerSettings。
@@ -619,7 +622,10 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             enable_sa_bots = bool(det.get('enable_sa_bots', False))
             # 本局天气/时段（成局时随机抽取，与简报 MissionInfo f12/f13 同源）
             weather_tod = int(det.get('weather_tod', 1))
-            weather_condition = int(det.get('weather_condition', 0))
+            # f22 = 天气列 | 雪掩码（雪局 0x30 高位，snow-unified-patch.md §3：
+            # 补丁版 dll 于 CreateInstance 拆开；details 的 weather_condition
+            # 保持 0..2，简报 f13 同源不受污染）
+            weather_condition = matchmaking.snow_f22_condition(det)
             timeofday = det.get('timeofday')
             # ★ 记在连接上：战斗服后续 ActiveMissionRequestEventList 轮询
             #   请求同样不带 mission_id（实测 mission=0），combat.py 用它

@@ -41,6 +41,7 @@ from matchmaking import (
     _msg_faction_resource_rows,
     _msg_faction_rows,
     _msg_supreme_command_rows,
+    push_relogin_rejoin,
     )
 
 import login_queue
@@ -284,6 +285,14 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
                     squad = None
                 if squad is not None:
                     await push_squad_rows(sess, writer, squad['id'])
+            # 掉线/崩溃重登 rejoin：玩家仍在存活战局 → 重推该局
+            # PlayerMissionSession 行（同 pms id，state=3）+ BattleInfo，
+            # 客户端 StatusMediator 据此回 REJOIN 态显示"恢复战斗"按钮
+            # （点击重拉 hng.exe 回原局）；无存活战局时不推（正常登录）。
+            try:
+                await push_relogin_rejoin(writer, cmd_id, int(pid))
+            except Exception as e:
+                log(f'      [views] relogin rejoin push failed: {e}')
             # 经济道具行（PlayerMembershipItem / Booster / Ticket / TicketTimed）：
             # 会员/加成/修理票 UI 数据源，不推则购买记录重启后丢失。
             await push_economy_rows(sess, writer, int(pid))

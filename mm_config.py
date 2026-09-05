@@ -146,15 +146,27 @@ FALLBACK_PRESET = 10
 # 由 warserver 内嵌模拟——bind UDP 端口 + 直接完成 BattleFieldSettings 握手
 SIMULATE_COMBAT = bool(_int_env('MM_SIMULATE_COMBAT'))
 
-# 随机下雪概率（0.0-1.0）：成局时按此概率抽签，抽中则战斗服命令行加
-# /R seasonal.forceSnowEvent=1 强制开启引擎季节雪事件（渲染层功能，不走
-# 游戏协议；选项表见 docs/hng-combat-protocol.md §B.13 ZOption_Seasonal）。
+# 随机下雪概率（0.0-1.0）：成局时按此概率抽签，抽中则战斗服握手
+# BattleFieldSettings f22 高位 OR 雪掩码 0x30（低 2 位天气列原样；补丁版
+# player.dll 于 ZGameMode_CreateInstance 拆开 → 全员同雪，
+# snow-unified-patch.md §3 方案一）。
 # 0=永不下雪，1=每局都下。MM_SNOW_CHANCE 环境变量覆盖，非法值回退 0.3。
-SNOW_CHANCE = _float_env('MM_SNOW_CHANCE', 0.3)
+SNOW_CHANCE = _float_env('MM_SNOW_CHANCE', 1)
 if SNOW_CHANCE is None or not 0.0 <= SNOW_CHANCE <= 1.0:
     print(f'[mm_config] WARNING: MM_SNOW_CHANCE={os.environ.get("MM_SNOW_CHANCE")!r} '
           f'not in [0,1], using 0.3')
     SNOW_CHANCE = 0.3
+
+# 是否向客户端下发 EOS openid token（PlayerSettings f999/f1000）。
+# 发了 → 客户端 EOS_Connect_Login 真实走通 → EAC 客户端会话激活 → 进战斗时
+#   EAC 按官方 Epic 云端清单校验 player.dll 哈希（原版过、任何补丁版弹
+#   "未知的文件版本" 并退出 10011，2026-09-05 实证）。白名单在官方产品
+#   e47c7a3e… 云端后台，私服无权登记补丁哈希。
+# 不发 → EOS 登录流不启动（2026-08-20 前的常态）→ EAC 不激活、不做文件
+#   校验，客户端 dll 可自由打补丁；副作用仅为 requesterType=1（EAC 路径）
+#   的 GetPlayerSettings 不再出现（服务端 EAC 本就禁用，无消费方）。
+# MM_EOS_TOKEN=1 临时开启（如需回归官方 dll + 真 EAC 环境）。
+EOS_TOKEN_ENABLED = bool(_int_env('MM_EOS_TOKEN', 0))
 
 # ===== RTS 战争域（war_campaign.py / docs/hng-rts-protocol.md Phase 3）=====
 # 数值默认取官服近似（CommandNodeMoraleTemplate 实值 / wiki 考据），

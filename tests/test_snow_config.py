@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""随机下雪功能回归测试（2026-09-01，DB-free）。
+"""随机下雪功能回归测试（2026-09-01，DB-free；2026-09-05 改 f22 编码）。
 
 功能链：成局时 roll_weather() 按 mm_config.SNOW_CHANCE（环境变量
-MM_SNOW_CHANCE 覆盖，默认 0.3=30%）独立抽签 snow 字段 → snow_r_args()
-据此返回 /R seasonal.forceSnowEvent=1 参数对拼进战斗服命令行（引擎
-季节雪事件，渲染层，不走协议；docs/hng-combat-protocol.md §B.13）。
+MM_SNOW_CHANCE 覆盖，默认 0.3=30%）独立抽签 snow 字段 → game_server
+战斗服握手套 snow_f22_condition() 把雪掩码（SNOW_MASK=0x30）OR 进
+BattleFieldSettings f22 高位（低 2 位天气列原样；补丁版 player.dll 于
+ZGameMode_CreateInstance 拆开，snow-unified-patch.md §3 方案一）。
+mission details 的 weather_condition 恒 0..2（简报 MissionInfo f13
+同源，不带掩码）。
 """
 import importlib
 import os
@@ -42,7 +45,7 @@ def test_snow_chance_env():
 
 # ---------- 2. roll_weather 抽签 ----------
 def test_roll_weather_snow_boundaries():
-    """概率边界：1.0 必下 / 0.0 必不下；天气三元组仍来自预设池。"""
+    """概率边界：1.0 必下 / 0.0 必不下；details 天气三元组保持预设池原值。"""
     old = mm_config.SNOW_CHANCE
     try:
         mm_config.SNOW_CHANCE = 1.0
@@ -50,26 +53,27 @@ def test_roll_weather_snow_boundaries():
         assert w['snow'] is True, w
         assert (w['weather_tod'], w['weather_condition'],
                 w['timeofday']) in matchmaking.WEATHER_PRESETS, w
+        # 雪局编码后：低 2 位天气列不变 + 高位雪掩码
+        f22 = matchmaking.snow_f22_condition(w)
+        assert f22 & 0x30 == matchmaking.SNOW_MASK, hex(f22)
+        assert f22 & 3 == w['weather_condition'], hex(f22)
 
         mm_config.SNOW_CHANCE = 0.0
         w = matchmaking.roll_weather()
         assert w['snow'] is False, w
+        assert w['weather_condition'] in (0, 1, 2), w
+        assert matchmaking.snow_f22_condition(w) == w['weather_condition']
     finally:
         mm_config.SNOW_CHANCE = old
 
 
-# ---------- 3. spawn 参数拼接 ----------
-def test_snow_r_args():
-    """抽中→完整注册名参数对；未抽中/无本局详情→空（宁可不雪不错拼）。"""
-    mid = 987654
-    matchmaking._MM_MISSION_DETAILS[mid] = {'snow': True}
-    try:
-        assert matchmaking.snow_r_args(mid) == \
-            ['/R', 'seasonal.forceSnowEvent=1'], matchmaking.snow_r_args(mid)
-
-        matchmaking._MM_MISSION_DETAILS[mid] = {'snow': False}
-        assert matchmaking.snow_r_args(mid) == []
-
-        assert matchmaking.snow_r_args(mid + 1) == []   # 无 det = 不下雪
-    finally:
-        matchmaking._MM_MISSION_DETAILS.pop(mid, None)
+# ---------- 3. f22 编码 ----------
+def test_snow_f22_condition():
+    """雪局 f22 = 天气列|0x30；非雪局 = 原值；无天气详情回退 0。"""
+    for det, want in (({'weather_condition': 1, 'snow': True}, 0x31),
+                      ({'weather_condition': 2, 'snow': True}, 0x32),
+                      ({'weather_condition': 0, 'snow': True}, 0x30),
+                      ({'weather_condition': 2, 'snow': False}, 2),
+                      ({'snow': False}, 0),
+                      ({}, 0)):
+        assert matchmaking.snow_f22_condition(det) == want, (det, want)

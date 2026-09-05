@@ -37,6 +37,7 @@ from wardb import (
     battlefield_pos,
     charactertemplate_actionid,
     default_uniform_variant,
+    is_general_character,
     spawn_clips_for,
     vehicle_ammo_spawn_clips,
     )
@@ -128,7 +129,17 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
                 break
     faction_chars = [ch for ch in (db_chars or [])
                      if int(ch.get('faction', 0) or 0) == int(faction or 0)]
-    char_entries = [_msg_character_entry(ch, loadout) for ch in faction_chars]
+    # ★ 将军不进备选士兵列表（官方设计将军只在大地图指挥 AssaultTeam；
+    #   其 actionid 与伞兵同为 7，混进 f12 会被客户端当伞兵选中。
+    #   入口拦截（JoinMatchMaking/_squad_eligible_members）只挡"用将军
+    #   点匹配"，此处清洗已进局玩家同阵营的全量角色 —— 2026-09-05 修复）
+    combat_chars = [ch for ch in faction_chars
+                    if not is_general_character(ch.get('template', 0))]
+    if len(combat_chars) != len(faction_chars):
+        log(f'      [FULL] PlayerSettings: filtered out '
+            f'{len(faction_chars) - len(combat_chars)} general char(s) '
+            f'from characterlist (generals cannot enter combat)')
+    char_entries = [_msg_character_entry(ch, loadout) for ch in combat_chars]
     if not char_entries:
         e = b''
         e += pb_int64(1, int(char_id or 0))
@@ -197,7 +208,7 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     m += pb_bool(39, False)                      # 39 isChatModerator
     if eos_token:
         m += pb_string(999, eos_token)            # 999 eos_openid_token ★
-    m += pb_int32(1000, 300)                      # 1000 eos_openid_expires_in
+        m += pb_int32(1000, 300)                  # 1000 eos_openid_expires_in
     log(f'      [FULL] PlayerSettings: field1(player_id)={player_id}, field15(char)={char_id}, '
         f'chars={len(char_entries)}, field22(metricsUid)={metrics_uid}, '
         f'field25(missionSession)={mission_session_id}, '

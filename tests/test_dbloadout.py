@@ -599,6 +599,33 @@ def main():
     except Exception as exc:
         print(f'  [skip] DB 测试不可用：{exc}')
 
+    print('== 14. 将军不进备选士兵列表（f12 过滤 general 模板）==')
+    # 现场复现（2026-09-05）：将军只在大地图指挥 AssaultTeam，不能进 FPS
+    # 战斗局；其 actionid 与伞兵同为 7，混进 f12 会被客户端当伞兵选中
+    # （部署界面备选士兵轮播出现"将军当伞兵"）。入口拦截（JoinMatchMaking/
+    # _squad_eligible_members）只挡"用将军点匹配"，此处清洗已进局玩家
+    # 同阵营全量角色 —— 修复前 general 模板条目原样进 f12。
+    from wardb import GENERAL_TEMPLATE_IDS, is_general_character  # noqa: E402
+    check('GENERAL_TEMPLATE_IDS 解析非空（charactertemplate name=general）',
+          len(GENERAL_TEMPLATE_IDS) > 0)
+    gen_tid = sorted(GENERAL_TEMPLATE_IDS)[0]
+    chars_with_gen = chars + [
+        {'id': 999, 'name': 'Zhukov', 'faction': 3, 'template': gen_tid,
+         'combat_xp': 0, 'combat_badge_0': 0, 'combat_badge_1': 0,
+         'uniform_variant_id': 0, 'headgear_id': 0, 'squad_points': 0,
+         'receive_daily_bonus': False},
+    ]
+    check('将军模板判定（is_general_character）', is_general_character(gen_tid))
+    full = _msg_player_settings(
+        player_id=1, pms_id=77, char_id=3, faction=3,
+        db_chars=chars_with_gen, loadout=loadout)
+    f = fields(full)
+    f12_ids = [fields(ent)[1][0] for ent in f[12]]
+    check('f12 条目数=2（同阵营 3 角色，将军被过滤——修复前=3）',
+          len(f[12]) == 2)
+    check('f12 不含将军角色 id=999（否则部署界面出现"将军当伞兵"）',
+          999 not in f12_ids and set(f12_ids) == {1, 3})
+
     print()
     print('ALL PASS' if ok else 'SOME CHECKS FAILED')
     return 0 if ok else 1

@@ -56,6 +56,63 @@ from wardb import WARDB_CAS_MAP, WARDB_SYNC_UNIQUE, WARDB_UNIQUE
 # 供 hngsync GET /<sha256>-<size>_<flag> 下载（见 do_GET 内 CAS 路由）
 CAS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cas')
 
+# CAS 文件 .bz2 变体内存缓存：hngsync 拉 CAS 文件优先 GET <name>.bz2
+# （downloadfiles.log 实锤），MB 级 dll 现压太慢，压缩一次复用
+_CAS_BZ2_CACHE = {}
+
+
+def _cas_bz2_body(cas_name, body):
+    hit = _CAS_BZ2_CACHE.get(cas_name)
+    if hit is None:
+        hit = bz2.compress(body)
+        _CAS_BZ2_CACHE[cas_name] = hit
+    return hit
+
+
+# ---- hngsync .sgn 动态签名（2026-09-06 定案，hng-client-file-integrity.md §2.5.6）----
+# hngsync 下载清单/文件走 sub_1400483A0：GET <name>.bz2 成功后必再 GET
+# <name>_<年>.sgn，sub_1400516E0 验签 = CryptQueryObject 从本机 hngservice.exe
+# 的 Authenticode 证书取公钥（实测日志 "using D:\...\hngservice.exe"）→
+# SHA1(明文字节) → CryptVerifySignatureA（RSA PKCS#1 v1.5，CryptoAPI
+# little-endian 字节序）。
+# 缺 .sgn（404）= 文件不落盘 → 空同步"成功"（实测最后断链点
+# 6d0f77e2…-5178_0_2026.sgn 404）。闭环方案（私服同款）：客户端
+# hngservice.exe 已用 certs/hngsync_codesign.pfx 的证书重签
+# （Set-AuthenticodeSignature，CN=hng-ps-codesign thumb F66D0D7C…，pfx
+# 文件名 hngsync_* 为历史遗留），服务器在此用同一私钥对
+# 文件明文动态签名（Http_FileDownload 收 .bz2 后解压，验签哈希明文）。
+_CODESIGN_PFX = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'certs', 'hngsync_codesign.pfx')
+_SGN_KEY = None
+if os.path.isfile(_CODESIGN_PFX):
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        with open(_CODESIGN_PFX, 'rb') as f:
+            _SGN_KEY, _sgn_cert, _ = pkcs12.load_key_and_certificates(
+                f.read(), b'hngps')
+    except Exception as _e:
+        print(f'[web_server] codesign pfx load failed: {_e}')
+_SGN_CACHE = {}
+
+
+def _sgn_body(cas_name, plain_body):
+    """对文件明文做 CryptoAPI 兼容签名（CryptVerifySignatureA）。
+
+    hngsync 端 Http_FileDownload 收 .bz2 后内部解压，验签哈希的是明文
+    （sub_1400516E0 CryptHashData，data_ 转储实测），故签名对象 = 明文。
+    """
+    if _SGN_KEY is None:
+        return None
+    hit = _SGN_CACHE.get(cas_name)
+    if hit is None:
+        # CryptVerifySignatureA 期望 little-endian 签名 blob，需字节反转
+        hit = _SGN_KEY.sign(
+            plain_body, padding.PKCS1v15(), hashes.SHA1())[::-1]
+        _SGN_CACHE[cas_name] = hit
+    return hit
+
 
 # ---- 本地化文件补全 ----
 # 客户端 HnG_Strategy_en.xml 的 ErrorMessages/StrategyGame 段缺少部分 ResponseCodes
@@ -236,6 +293,11 @@ SETTINGS_JS = (f"flash_dynhttp=\"{PUBLIC_HOST}:15110\";\n"
                          for lang in SUPPORTED_LOCALES)
                + "version=\"173293\";\n"
                "distribution=\"live\";\n"
+               # hngsync settings.js 解析器（settings_js_parse）要求 4 个必需键，
+               # 缺 retoxdistribution 整体 return 0 → DOWNLOADNAMED 同步中止
+               # （2026-09-05 根因：hngsync 零网络请求、currentfiles.txt 被清 0）。
+               # 值与官方 live 实测一致（hng-client-file-integrity.md §2.5.1）
+               "retoxdistribution=\"live\";\n"
                "language=\"en\";\n"
                "releasename=\"QQ\";\n"
                f"ircserver=\"{PUBLIC_HOST}:6667\";\n"
@@ -247,20 +309,38 @@ SETTINGS_JS = (f"flash_dynhttp=\"{PUBLIC_HOST}:15110\";\n"
                "uniqueversionfilename=\"hng_unique_v173293\";\n"
                "siteonly=\"false\";\n").encode()
 
-# hng_unique_v173293: 静态数据文件清单，客户端登录成功后请求
-# 格式: <root><list id="WarDatabase" uniquefile="wardb_unique"/><list id="Flash_Resources" uniquefile="flashres_unique"/></root>
-# desktop_client list：swf 登录时让 hngsync 发 CMD_DOWNLOADNAMED
-# (set:desktop_client,...)（LocalCallsService.syncGameAssets →
-# GameClientAssets.desktop_clientAssestToSync），hngsync 按该清单
-# 校验/修复远程客户端的 WarDatabase 表 → 远程改表推送通道。
-UNIQUE_FILE_XML = (b'<?xml version="1.0" encoding="utf-8"?>\n<root>\n'
-                   b'<list id="WarDatabase" uniquefile="wardb_unique"/>\n'
-                   b'<list id="desktop_client" uniquefile="wardb_sync"/>\n'
-                   b'<list id="Flash_Resources" uniquefile="flashres_unique"/>\n'
-                   b'</root>\n')
+# hng_unique_v173293: 静态数据文件清单，客户端登录成功后 hngsync 请求。
+# 根元素必须是 <uniquelists>：hngsync 的 XML 解析器（sub_1400430F0）只认它，
+# 写成 <root> 会导致解析失败 → set 全部无法解析 → 同步第 1 步即中止，
+# cas/ 里的补丁文件永远不会被比对下载（2026-09-05 实锤：客户端拉取
+# /hng_unique_v173293 后，服务器日志再无任何清单/CAS 请求）。
+# list 条目 = swf 登录同步固定请求的集合（HngSyncDownloadSession）：
+#   Game_Client_Executables_64  m_sMandatory 强制集，缺失会让同步报错
+#   desktop_client              → wardb_sync（WarDatabase 表 + texts + 补丁 player.dll）
+#   Flash_Resources             → flashres_unique（军衔图标清单）
+#   WarDatabase                 → wardb_unique（表清单）
+# 清单体在文件后段生成（见 MANIFEST_BODIES）：uniquefile 必须用 CAS 名，
+# 不能是裸名——hngsync 下载后强制校验文件名前缀（详见后段注释）。
 # 清单类文件同时提供 .bz2 变体（hngsync 拉清单优先 bz2，见
 # hng-client-file-integrity.md §2.5.2）
-UNIQUE_FILE_XML_BZ2 = bz2.compress(UNIQUE_FILE_XML)
+
+# GCE64 集清单：swf 端 HngSyncDownloadSession.m_sMandatory 写死的强制同步集，
+# 官方清单登记 hng.exe/player.dll 等 663 个游戏二进制。本地客户端二进制是
+# 手工维护的基线（如 7235512C 版 player.dll），不逐一登记真实哈希；补丁文件
+# 推送统一走 desktop_client（wardb_sync），避免两个清单对同一文件登记不同
+# 哈希导致反复互拉。
+# 2026-09-06 根因修正（hngsync.exe 逆向实锤，详见 hng-client-file-integrity.md
+# §2.5.7）：子清单解析出 0 条目会被 sub_14004BB40 当作整体失败（return 0）
+# → sub_14004A5D0 管线提前退出、不发 0x2002 完成消息 → 监控线程
+# sub_14001FF40 死等 byte_1400B4D35 → 客户端登录同步卡死（三行 Downloading
+# 后 code 200 永不返回）。故不管理的集合也必须登记 ≥1 个真实条目：引用
+# cas/ 已部署的 64 字节 nop.txt（CAS 名同 _SMALLFILES_BUNDLE，行格式同
+# player.dll 已验证的三字段格式），客户端下载校验一次即过，文件落在客户端
+# 根目录，无害。
+_NOP_CAS = ('e2d5813ed1e0b3eba3e85ea9591bf436a6e808d5'
+            '2b84ddd7df894a74ee67c5aa-64_0')
+GCE64_UNIQUE = f'"nop.txt",{_NOP_CAS},64\n'.encode('utf-8')
+GCE64_UNIQUE_BZ2 = bz2.compress(GCE64_UNIQUE)
 
 
 # texts/ 语言文件并入 hngsync desktop_client 同步清单（远程客户端推送）：
@@ -294,8 +374,34 @@ def _generate_texts_sync():
 
 TEXTS_SYNC_UNIQUE, TEXTS_CAS_MAP = _generate_texts_sync()
 
-# 完整 desktop_client 清单 = WarDatabase 表 + texts 语言文件
-WARDB_SYNC_FULL = WARDB_SYNC_UNIQUE + TEXTS_SYNC_UNIQUE
+
+# player.dll 雪补丁版推送（snow-unified-patch.md 方案一 + §8 rollout）：
+# 本体 = cas/ 目录手工放置的补丁版 dll（CAS 名 = sha256-<size>_0，由
+# work/patch_playerdll_snow.py 生成，客户端基线 7235512C 不含战斗服 EAC
+# 适配 6 字节）；此处启动时按尺寸 9941400（与客户端 player.dll 同 build
+# 同尺寸）识别并登记进 desktop_client 清单 → 登录期 hngsync 比对客户端
+# player.dll 哈希不符 → 走 CAS 通道自动下载补丁版（客户端 dll 自动更新）。
+# 文件本体下发走 CAS 路由第 1 优先级（cas/ 目录）。
+# 回滚 = 删 cas 文件 + 重启 warserver：清单不再登记，客户端保持现状
+# （如需强制还原官方版，另放官方哈希的 cas 文件并登记即可）。
+def _generate_playerdll_sync():
+    if os.path.isdir(CAS_DIR):
+        for fn in os.listdir(CAS_DIR):
+            m = re.fullmatch(r'([0-9a-f]{64})-(\d+)_0', fn)
+            if not m:
+                continue
+            sha, size = m.group(1), int(m.group(2))
+            if size == 9941400 and os.path.isfile(os.path.join(CAS_DIR, fn)):
+                # 目录切换：上一节 cur_dir=texts/，须用 ../ 回退到客户端根
+                return f'"../player.dll",{sha}-{size}_0,{size}\n'.encode('utf-8')
+    return b''
+
+
+PLAYERDLL_SYNC_UNIQUE = _generate_playerdll_sync()
+
+# 完整 desktop_client 清单 = WarDatabase 表 + texts 语言文件 + player.dll
+WARDB_SYNC_FULL = (WARDB_SYNC_UNIQUE + TEXTS_SYNC_UNIQUE
+                   + PLAYERDLL_SYNC_UNIQUE)
 WARDB_SYNC_BZ2 = bz2.compress(WARDB_SYNC_FULL)
 
 # Flash_Resources 文件：列出 images/Rank 目录下军衔图标的清单映射。
@@ -308,10 +414,12 @@ def _generate_flashres_unique():
     import posixpath as _pp
     root = os.path.join(GAME_DIR, 'images', 'Rank')
     if not os.path.isdir(root):
-        return b'\n'
+        # 空清单会被 hngsync 视为失败（见 GCE64_UNIQUE 注释），兜底登记 nop.txt
+        return GCE64_UNIQUE, {}
     files = sorted(n for n in os.listdir(root)
                    if os.path.isfile(os.path.join(root, n)))
     lines = []
+    cas = {}
     cur_dir = ''
     for fn in files:
         rel = _pp.join('images/Rank', fn)
@@ -324,15 +432,107 @@ def _generate_flashres_unique():
             continue
         sha = hashlib.sha256(data).hexdigest()
         size = len(data)
+        # 注意条目名无 _0 后缀（flashres 格式），hngsync 按注册名原样请求
+        # GET /<sha>-<size>（.bz2/.sgn 同名），CAS 路由须兼容无 _0 形式
         lines.append(f'"{rel_path}",{sha}-{size},{size},0,0')
+        cas[f'{sha}-{size}'] = data
         cur_dir = _pp.dirname(rel)
-    return ('\n'.join(lines) + '\n').encode('utf-8')
+    return ('\n'.join(lines) + '\n').encode('utf-8'), cas
 
 
-FLASHRES_UNIQUE = _generate_flashres_unique()
+FLASHRES_UNIQUE, FLASHRES_CAS_MAP = _generate_flashres_unique()
+FLASHRES_UNIQUE_BZ2 = bz2.compress(FLASHRES_UNIQUE)
+WARDB_UNIQUE_BZ2 = bz2.compress(WARDB_UNIQUE)
 _flashres_n = FLASHRES_UNIQUE.count(b'\n')
 log(f'[init] flashres_unique generated: {_flashres_n} files, '
     f'{len(FLASHRES_UNIQUE)}B (scanned {os.path.join(GAME_DIR, "images", "Rank")})')
+
+
+# ================================================================ hngsync 清单 CAS 命名
+# 2026-09-06 根因（hngsync.exe 逆向实锤，hng-client-file-integrity.md §2.5.5）：
+# hngsync 下载任何清单后强制校验——sha256(明文内容) 的 64 位小写 hex 必须是
+# 请求文件名的前缀（sub_14003A7F0 = strncmp(文件名, hex, 64)；sub_14003D5D0
+# = SHA-256；sub_14003F430 = hex 小写编码）。裸名（hng_unique_v173293 /
+# wardb_sync / ...）不满足 → "Checksum failure" → 清单从不落盘缓存 →
+# 所有 set 查空 → 空同步但协议层报 200 成功（text/player.dll 推送失效）。
+# 官方 CAS 名 <sha256>-<size>_0 天然满足前缀规则（官方 downloadfiles.log 的
+# file list 均为 CAS 名），故所有 hngsync 清单一律按自身内容哈希命名，
+# 经 MANIFEST_CAS_MAP 按名回源（.bz2 变体按需压缩）。
+def _cas_name(body):
+    return f'{hashlib.sha256(body).hexdigest()}-{len(body)}_0'
+
+
+# 子清单体（= <uniquelists> 各 <list> 的 uniquefile 目标，明文；顺序即 XML 顺序）
+# 集合与顺序 = 参考私服主清单（synccache111 9013d578…-1654_0）同构：13 个裸 id。
+# 未管理的集合一律空清单（b'\n'，与 GCE64_UNIQUE 同体共享同一 CAS 名合法），
+# 即集合可解析、0 文件校验（基线二进制手工维护，不推送）。
+MANIFEST_BODIES = {
+    'DirectX': GCE64_UNIQUE,                      # 登录基础集，空
+    'Game_Client_Executables_64': GCE64_UNIQUE,   # 强制集（刻意置空）
+    'game_client_executables_linux': GCE64_UNIQUE,
+    'desktop_client_boot': GCE64_UNIQUE,
+    'desktop_client': WARDB_SYNC_FULL,            # 表 + texts + 补丁 player.dll
+    'T00M00_AllLevels': GCE64_UNIQUE,
+    'Flash_Resources': FLASHRES_UNIQUE,           # 军衔图标
+    'Game_Client_data': GCE64_UNIQUE,
+    'Game_Client_texts': GCE64_UNIQUE,
+    'Game_Client_video': GCE64_UNIQUE,
+    'RetoX_Depends': GCE64_UNIQUE,
+    'WarDatabase': WARDB_UNIQUE,                  # 表清单
+    'SmallFiles': GCE64_UNIQUE,                   # 登录基础集，空
+}
+MANIFEST_CAS_MAP = {_cas_name(b): b for b in MANIFEST_BODIES.values()}
+
+# 主清单 uniquelists：与参考私服逐属性同构——
+#   <?xml version="1.0" ?>（无 encoding）、tab 缩进、13 个裸 id（无 "set:" 前缀副本）、
+#   SmallFiles 带 uniquefilebundle。
+# 2026-09-06 实测：双 id + encoding="utf-8" 版主清单虽能被 hngsync 拉取落盘，
+# 但解析后不发任何子清单请求（参考版则触发 desktop_client 子清单下载），
+# 故除 uniquefile 指向外全盘照抄参考格式（差异项未逐一二分）。
+_SMALLFILES_BUNDLE = _NOP_CAS  # = nop.txt 本体，cas/ 已部署
+_lines = []
+for _lid, _body in MANIFEST_BODIES.items():
+    if _lid == 'SmallFiles':
+        _lines.append(f'\t<list id="{_lid}" uniquefile="{_cas_name(_body)}" '
+                      f'uniquefilebundle="{_SMALLFILES_BUNDLE}"/>')
+    else:
+        _lines.append(f'\t<list id="{_lid}" uniquefile="{_cas_name(_body)}"/>')
+UNIQUE_FILE_XML = ('<?xml version="1.0" ?>\n<uniquelists>\n'
+                   + '\n'.join(_lines) + '\n</uniquelists>\n').encode('utf-8')
+UNIQUE_FILE_XML_BZ2 = bz2.compress(UNIQUE_FILE_XML)
+UNIQUE_VERSION_FILENAME = _cas_name(UNIQUE_FILE_XML)
+MANIFEST_CAS_MAP[UNIQUE_VERSION_FILENAME] = UNIQUE_FILE_XML
+# settings.js 下发给客户端的清单名（swf 经 1003 param[2] 原样转发给 hngsync）
+SETTINGS_JS = SETTINGS_JS.replace(
+    b'uniqueversionfilename="hng_unique_v173293";',
+    f'uniqueversionfilename="{UNIQUE_VERSION_FILENAME}";'.encode())
+log(f'[init] hngsync manifests CAS-named: uniqueversionfilename='
+    f'{UNIQUE_VERSION_FILENAME} ({len(MANIFEST_CAS_MAP)} manifests)')
+log(f'[init] hngsync .sgn codesign key: '
+    f'{"loaded" if _SGN_KEY is not None else "MISSING"}')
+
+
+def _cas_source_body(cas_name):
+    """CAS 名 → 明文体，按 CAS 路由的 5 级回源（cas/ 目录 → 内存清单
+    → WarDatabase 表 → texts → flashres 图标）。.bz2 与 .sgn 路由共用，
+    保证同源。"""
+    cas_path = os.path.realpath(os.path.join(CAS_DIR, cas_name))
+    if (cas_path.startswith(os.path.realpath(CAS_DIR) + os.sep)
+            and os.path.isfile(cas_path)):
+        with open(cas_path, 'rb') as f:
+            return f.read()
+    body = MANIFEST_CAS_MAP.get(cas_name)
+    if body is not None:
+        return body
+    wb = WARDB_CAS_MAP.get(cas_name)
+    if wb and os.path.isfile(wb):
+        with open(wb, 'rb') as f:
+            return f.read()
+    body = TEXTS_CAS_MAP.get(cas_name)
+    if body is not None:
+        return body
+    # flashres 军衔图标（注册名 <sha>-<size>，无 _0，与清单条目同名）
+    return FLASHRES_CAS_MAP.get(cas_name)
 
 
 # ================================================================ 注册页（Vue SPA）
@@ -710,15 +910,17 @@ class HttpHandler(SimpleHTTPRequestHandler):
             self.wfile.write(UNIQUE_FILE_XML_BZ2)
             log(f'[HTTP] served /hng_unique_v173293.bz2 ({len(UNIQUE_FILE_XML_BZ2)}B)')
             return
-        if path == '/wardb_unique' or path == '//wardb_unique':
+        if path in ('/wardb_unique', '//wardb_unique', '/wardb_unique.bz2',
+                    '//wardb_unique.bz2'):
             # WarDatabase manifest: 列出所有静态表文件（表名,sha256-size）
+            body = WARDB_UNIQUE_BZ2 if path.endswith('.bz2') else WARDB_UNIQUE
             self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
-            self.send_header('Content-Length', str(len(WARDB_UNIQUE)))
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            self.wfile.write(WARDB_UNIQUE)
-            tbl_count = WARDB_UNIQUE.count(b'\n')
-            log(f'[HTTP] served /wardb_unique ({len(WARDB_UNIQUE)}B, {tbl_count} tables)')
+            self.wfile.write(body)
+            tbl_count = body.count(b'\n')
+            log(f'[HTTP] served {path} ({len(body)}B, {tbl_count} tables)')
             return
         if path in ('/wardb_sync', '//wardb_sync', '/wardb_sync.bz2',
                     '//wardb_sync.bz2'):
@@ -752,13 +954,27 @@ class HttpHandler(SimpleHTTPRequestHandler):
                 self.end_headers()
                 log(f'[HTTP] 404 /WarDatabase/{table_name} (not found)')
             return
-        if path == '/flashres_unique' or path == '//flashres_unique':
-            # Flash_Resources: 空内容，让 parseUniqueFileList 跳过文件映射
+        if path in ('/flashres_unique', '//flashres_unique',
+                    '/flashres_unique.bz2', '//flashres_unique.bz2'):
+            # Flash_Resources: 军衔图标清单（目录缺失时为空 → 跳过文件映射）
+            body = FLASHRES_UNIQUE_BZ2 if path.endswith('.bz2') else FLASHRES_UNIQUE
             self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            self.wfile.write(FLASHRES_UNIQUE)
-            log(f'[HTTP] served /flashres_unique ({len(FLASHRES_UNIQUE)}B)')
+            self.wfile.write(body)
+            log(f'[HTTP] served {path} ({len(body)}B)')
+            return
+        if path in ('/gce64_unique', '//gce64_unique', '/gce64_unique.bz2',
+                    '//gce64_unique.bz2'):
+            # Game_Client_Executables_64 强制集清单（空，见 GCE64_UNIQUE 注释）
+            body = GCE64_UNIQUE_BZ2 if path.endswith('.bz2') else GCE64_UNIQUE
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            log(f'[HTTP] served {path} ({len(body)}B)')
             return
         if path == '/undefined':
             # Client didn't parse localizerFile from settings.js;
@@ -800,36 +1016,54 @@ class HttpHandler(SimpleHTTPRequestHandler):
         # 三个来源：
         #   1. cas/ 目录：手工放入的改动文件（如 IP 版 HeroesAndGeneralsDesktop.swf）
         #      —— 与 currentfiles.txt 登记的哈希保持一致；
-        #   2. WARDB_CAS_MAP 回源：hngsync 按 wardb_sync 清单修复远程客户端的
+        #   2. MANIFEST_CAS_MAP 回源：hngsync 清单本体（主 uniquelists + 各子
+        #      清单，CAS 名 = sha256(内容)，满足 hngsync 文件名前缀校验）；
+        #   3. WARDB_CAS_MAP 回源：hngsync 按 wardb_sync 清单修复远程客户端的
         #      WarDatabase 表时，CAS 名即当前表文件的 sha256-size_0，直接回源
         #      WarDatabase 目录（改表后无需手工生成 cas 文件，重启服务器即可）；
-        #   3. TEXTS_CAS_MAP 回源：texts 语言文件（TEXTS_DIR 原始字节，与
-        #      wardb_sync 清单同源），直接回内存字节。
+        #   4. TEXTS_CAS_MAP 回源：texts 语言文件（TEXTS_DIR 原始字节，与
+        #      wardb_sync 清单同源），直接回内存字节；
+        #   5. FLASHRES_CAS_MAP 回源：军衔图标（images/Rank，注册名 <sha>-<size>）。
         # 注意：hngsync 解析响应依赖 Content-Length（Http_FileDownload 0x1400410F0），
         # 此处必须显式下发该头。
-        m = re.fullmatch(r'/([0-9a-f]{64}-\d+_\d+)', path)
+        # 注意：flashres 条目注册名无 _0 后缀（见 _generate_flashres_unique），
+        # hngsync 按注册名原样请求 GET /<sha>-<size>，故 _<flag> 为可选。
+        m = re.fullmatch(r'/([0-9a-f]{64}-\d+(?:_\d+)?)_(\d{4})\.sgn', path)
         if m:
+            # hngsync 清单/文件验签（sub_1400483A0）：Http_FileDownload 内部
+            # 已解压 .bz2，CryptHashData 哈希的是解压后明文（02:07 实测
+            # synccache\data_<name> 转储 5178B=明文 ≠ bz2 2745B），故此处
+            # 对明文体签名；验证失败/404 = 文件不落盘。
             cas_name = m.group(1)
-            cas_path = os.path.realpath(os.path.join(CAS_DIR, cas_name))
-            body = None
-            if (cas_path.startswith(os.path.realpath(CAS_DIR) + os.sep)
-                    and os.path.isfile(cas_path)):
-                with open(cas_path, 'rb') as f:
-                    body = f.read()
-            if body is None:
-                wb = WARDB_CAS_MAP.get(cas_name)
-                if wb and os.path.isfile(wb):
-                    with open(wb, 'rb') as f:
-                        body = f.read()
-            if body is None:
-                body = TEXTS_CAS_MAP.get(cas_name)
-            if body is not None:
+            sbody = _cas_source_body(cas_name) if _SGN_KEY is not None else None
+            if sbody is not None:
+                body = _sgn_body(cas_name, sbody)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/octet-stream')
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-                log(f'[HTTP] served CAS /{cas_name} ({len(body)}B)')
+                log(f'[HTTP] served sgn {path} ({len(body)}B)')
+            else:
+                self.send_response(404)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                log(f'[HTTP] 404 sgn /{cas_name} '
+                    f'(no source / codesign key missing)')
+            return
+        m = re.fullmatch(r'/([0-9a-f]{64}-\d+(?:_\d+)?)(?:\.bz2)?', path)
+        if m:
+            cas_name = m.group(1)
+            body = _cas_source_body(cas_name)
+            if body is not None:
+                if path.endswith('.bz2'):
+                    body = _cas_bz2_body(cas_name, body)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/octet-stream')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                log(f'[HTTP] served CAS {path} ({len(body)}B)')
             else:
                 self.send_response(404)
                 self.send_header('Content-Length', '0')

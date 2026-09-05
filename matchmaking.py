@@ -338,9 +338,6 @@ async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
         # 开局等待时间覆盖（秒），见文件头 COMBAT_START_COUNTDOWN_OVERRIDE 注释
         args += ['/R',
                  f'controllers.overrideStartCountdown={COMBAT_START_COUNTDOWN_OVERRIDE}']
-    # 本局抽中下雪（roll_weather 概率 mm_config.SNOW_CHANCE）：强制引擎
-    # 季节雪事件（渲染层，不走协议；MM_SIMULATE_COMBAT 分支已提前 return）
-    args += snow_r_args(mission_id)
     launch_args = args
     if os.environ.get('TTD_RECORD') and os.path.exists(TTD_EXE):
         os.makedirs(TTD_OUT_DIR, exist_ok=True)
@@ -662,22 +659,31 @@ def roll_weather():
 
     返回 dict 直接并入 mission details：weather_tod / weather_condition /
     timeofday（战斗服 BattleFieldSettings f9/f21/f22 与简报 MissionInfo
-    f12/f13 均从这里取，保证简报图标与实际战斗一致）；snow 为独立抽签的
-    季节雪事件开关（概率 mm_config.SNOW_CHANCE 默认 30%——雪是引擎渲染层
-    功能不走协议，简报不显示，仅经 snow_r_args 拼进战斗服命令行）。"""
+    f12/f13 均从这里取，保证简报图标与实际战斗一致；weather_condition
+    恒为 0..2 原值，不带雪掩码）；snow 为独立抽签的下雪开关（概率
+    mm_config.SNOW_CHANCE 默认 30%），由 game_server 战斗服握手处经
+    snow_f22_condition() 把雪掩码 OR 进 f22 高位（snow-unified-patch.md
+    §3：补丁版 player.dll 于 CreateInstance 拆开，全员同雪）。"""
     tod, cond, hour = random.choice(WEATHER_PRESETS)
     return {'weather_tod': tod, 'weather_condition': cond, 'timeofday': hour,
             'snow': random.random() < mm_config.SNOW_CHANCE}
 
 
-def snow_r_args(mission_id):
-    """本局抽中下雪时返回 seasonal 雪事件 /R 参数对（拼进 hng.exe 命令行）。
+# f22 高位雪掩码（snow-unified-patch.md §3 方案一）：0x20=小雪、0x30=雪+大雪，
+# 与低 2 位天气列独立组合；补丁版 player.dll 在 ZGameMode_CreateInstance 拆开
+# 分别生效（雪位 OR 进季节字节 byte+0x146，天气列照常查表）。原版 dll 收到
+# 0x20-0x32 越表读不崩溃但天气错乱——启用前提：客户端与战斗服均已换补丁 dll。
+SNOW_MASK = 0x30
 
-    /R 必须用完整注册名（组.选项）；forceSnowEvent 为 float 默认 -1
-    （-1=跟随官方日期窗口），≥0 强制——传 1 即常开雪（docs §B.13）。"""
-    if _MM_MISSION_DETAILS.get(int(mission_id), {}).get('snow'):
-        return ['/R', 'seasonal.forceSnowEvent=1']
-    return []
+
+def snow_f22_condition(det):
+    """本局 BattleFieldSettings f22 = 天气列 |（雪局 OR 雪掩码 SNOW_MASK）。
+
+    只用于 game_server 战斗服握手的 f22 编码；mission details 的
+    weather_condition 保持 0..2 原值（简报 MissionInfo f13 同源，
+    不能带掩码）。"""
+    cond = int(det.get('weather_condition', 0))
+    return (cond | SNOW_MASK) if det.get('snow') else cond
 # f4 突击队构成：本局 force_pool 抽取的 AT 名单（双侧镜像，名单见
 # force_pool.init_mission 日志）。模板 id 是【阵营相关】库值
 # （commandnodetemplate f2 兵种名 × f3 阵营：infantry US=103/GE=203/SU=303），
@@ -2423,6 +2429,96 @@ def _find_player_active_mission(pid):
         if mid and mid in COMBAT_INSTANCES and mid > best:
             best = mid
     return best or None
+
+
+def _find_player_live_pms(pid):
+    """玩家当前存活战局的 (pms_id, sess_rec, mission_id)（重登 rejoin 用）。
+
+    与 _find_player_active_mission 同口径（mission 必须仍在
+    COMBAT_INSTANCES 存活，多条取最新成局），多返回会话记录本身；
+    无 → (None, None, None)。
+    """
+    if pid is None:
+        return None, None, None
+    pid = int(pid)
+    best_mid = 0
+    best = (None, None)
+    for pms_id, rec in list(PMS_TO_SESSION.items()):
+        if int((rec or {}).get('player_id', 0) or 0) != pid:
+            continue
+        mid = int(PMS_TO_MISSION.get(pms_id, 0) or 0)
+        if mid and mid in COMBAT_INSTANCES and mid > best_mid:
+            best_mid = mid
+            best = (pms_id, rec)
+    if best_mid:
+        return best[0], best[1], best_mid
+    return None, None, None
+
+
+async def push_relogin_rejoin(writer, view_cmd, pid):
+    """掉线/崩溃重登 rejoin 恢复：登录订阅时重推存活的 PlayerMissionSession 行。
+
+    根因（2026-09-06 排查）：客户端整端崩溃重开后 ActionGameStatusModel 是
+    全新的，playerMissionSessionId=null；而登录表同步（views.handle_subscribe）
+    不带回流局 PMS 行 → StatusMediator.onRegister 判 BASE_STATE，主按钮是
+    普通"进入战斗"，没有"恢复战斗"（REJOIN）——用户只能再点一次匹配，
+    靠 1c-0 rejoin 路径静默回局。
+
+    官方行为：登录时服务器把仍在进行的 PMS 行重新下发。此处复刻：
+    - 同一 pms 行 id / battle_session_id / metrics id（hng.exe 重拉后
+      GetPlayerSettings 按 pms 精确命中原会话，game_server 无需兜底）；
+    - connectionState=3 (Entered)：ADD 不走 handleSessionUpdates 的
+      Admitted 自动拉起分支（state=2 会在登录瞬间直接重启 hng.exe，
+      没有按钮可点），客户端仅置 playerMissionSessionId → REJOIN 态，
+      点按钮 onEnterCombatClicked → launchActionGame 重拉回原局；
+    - timeAdmitted 刷新为当前（该字段同时是 Admitted 分支 300s 会话
+      丢失倒时基，推旧值会秒判 GAME_TIMED_OUT）；
+    - 附带 BattleInfo 'set'（同局同 id 幂等）：PMS 行在而 BattleInfo
+      缺失时客户端不连 game server（见 _push_player_into_mission）。
+    战局结束/放弃仍走 _finish_mission_sessions / mission abandon 照常
+    PMS DELETE（REJOIN 消失回 BASE_STATE）。无存活战局 → 不推（正常登录）。
+    """
+    pms_id, rec, mission_id = _find_player_live_pms(pid)
+    if pms_id is None or rec is None:
+        return False
+    inst = COMBAT_INSTANCES.get(mission_id) or {}
+    det = _MM_MISSION_DETAILS.get(mission_id) or {}
+    gamertag = rec.get('gamertag') or 'Player'
+    char_name = gamertag
+    rank = 0
+    if STORE is not None:
+        try:
+            for ch in await STORE.list_characters(int(rec['player_id'])):
+                if int(ch['id']) == int(rec.get('char_id', 0) or 0):
+                    char_name = ch['name']
+                    rank = _rank_from_combat_xp(
+                        int(ch.get('combat_xp', 0) or 0))
+                    break
+        except Exception as e:
+            _log(f'      [DB] relogin rejoin char lookup failed: {e}')
+    game_connect = f'{PUBLIC_HOST}:{inst.get("port", 0)}'
+    pos = battlefield_pos(int(det.get('map_entity_id') or 0)
+                          or MISSION_MAP_ENTITY_ID)
+    await _push_kvcs(writer, view_cmd, b'PlayerMissionSession',
+                     _msg_player_mission_session(
+                         pms_id, int(rec['player_id']), gamertag,
+                         int(rec.get('char_id', 0) or 0),
+                         int(rec.get('faction', 3) or 3),
+                         char_name, rank, mission_id, _zulu_now(),
+                         game_connect,
+                         metrics_uid=rec.get('metrics_uid') or str(uuid.uuid4()),
+                         metrics_session_id=int(
+                             rec.get('metrics_session_id', 0) or 0),
+                         metrics_device_id=METRICS_DEVICE_ID,
+                         platform='HnG', connection_state=3,
+                         battle_session_id=int(
+                             rec.get('battle_session_id', 0) or 0)))
+    await _push_kvcs(writer, view_cmd, b'BattleInfo',
+                     _msg_battle_info(mission_id, pos[0], pos[1]))
+    _log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet (PlayerMissionSession '
+         f'id={pms_id}, player={rec.get("player_id")}, '
+         f'mission={mission_id}, state=3 Entered ★relogin rejoin)')
+    return True
 
 
 async def _handle_join(sess, writer, cmd_id, proto):
