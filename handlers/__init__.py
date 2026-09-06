@@ -12,6 +12,7 @@ from . import (
     career,
     characters,
     combat,
+    combat_join,
     economy,
     misc,
     mission,
@@ -27,7 +28,8 @@ from . import (
 from state import CURRENT_PID
 
 _EXACT = {}
-for _m in (acks, auth, battlereport, career, characters, combat, economy, misc,
+for _m in (acks, auth, battlereport, career, characters, combat, combat_join,
+           economy, misc,
            mission, shop, social, squad, uniforms, vehicles, views, war_at,
            weapons):
     _EXACT.update(_m.HANDLERS)
