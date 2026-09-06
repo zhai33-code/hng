@@ -157,7 +157,13 @@ def _earnings_value(raw):
 
 
 def _report_ribbon_end(br_players):
-    """(playerId, characterId) → {ribbonTemplateId: endValue}（f13 战后勋带 XP）。"""
+    """(playerId, characterId) → {ribbonTemplateId: endValue + xpBooster}。
+
+    f13 endValue = 战前值 + 基础经验（build_battle_report_spbc 0x1802C0350
+    反编译：fill_stat_requirements_spbc 不放大），勋带加成部分在 f5
+    xpBoosterBonus = (乘数-1)×基础经验 单独回报（sub_18038C790）——落库须
+    end + f5 才是放大后的战终值，与战报 UI 汇总口径一致（否则勋带加成
+    只在结算界面显示、士兵页实际进度不涨）。"""
     out = {}
     for p in br_players:
         pid = int(p.get('player_id', 0) or 0)
@@ -165,7 +171,8 @@ def _report_ribbon_end(br_players):
             ends = {}
             for rb in ch.get('ribbons') or []:
                 if isinstance(rb, dict) and rb.get('id'):
-                    ends[int(rb['id'])] = int(rb.get('end', 0) or 0)
+                    ends[int(rb['id'])] = int(rb.get('end', 0) or 0) + \
+                        max(0, int(rb.get('xpBooster', 0) or 0))
             if ends:
                 out[(pid, int(ch.get('characterId', 0) or 0))] = ends
     return out
@@ -890,9 +897,16 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
     BattleReportPlayer { f1 playerId, f4 score, f5 captures, f6 kills, f7 deaths,
       f8 squadName, f9 gamertag, f10 isBot, f11 repeated BattleReportCharacter }
     BattleReportCharacter { f1 characterId, f2 startXp, f3 endXp,
+      f4 xpVeteranBonus, f5 xpBoosterBonus, f6 xpCampaignBonus,
+      f7 xpUnderdogBonus, f8 xpSquadVetBonus, f9 xpDailyBonus,
       f10/f11 嵌套 BattleReportEarnings{f1 valueEarned, f2-f7 加成, f8 statValues,
       f9 anyFactionQuickplay}（warserver-battlefield-settings.md §8.2 实测：
-      顶层 181b22a036… 的 f10 是 0x08… 嵌套消息，非整数），f13 ribbons }
+      顶层 181b22a036… 的 f10 是 0x08… 嵌套消息，非整数），f12 xpStatValues,
+      f13 ribbons }。spbc 描述符 0x1807B4320（16 字段，player.dll）实锤：
+      f3 endXp = startXp + 基础经验（不含任何加成），f5 xpBoosterBonus =
+      BoosterTemplate(表51).multiplier × 基础经验（仅 PlayerSettings f35 下发
+      激活加成 id 时填写，build_battle_report_spbc 0x1802C0350）——入账时
+      必须把 f5 补加进 add_combat_xp，否则 XP 加成只显示不生效
     PlayerBattleResult { f1 playerId, f2 creditsEarned, f3 warfundsEarned,
       f4 skillScore, f5 playerScore, f6 repeated CharacterBattleResult{f1 characterId,
       f2 totalCharacterXp, f3 playerDamage, f4 vehicleDamage, f5 capturepointsCaptured,
@@ -1017,6 +1031,11 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                             'characterId': int(_get(c, 1, 0) or 0),
                             'startXp': int(_get(c, 2, 0) or 0),
                             'endXp': int(_get(c, 3, 0) or 0),
+                            # f5 xpBoosterBonus：客户端按 f35 下发的激活加成
+                            # 模板查乘数 × 基础经验算出（endXp 不含，须服务端
+                            # 补加入账）；f4/f6-f8 本服无对应机制、f9 每日首战
+                            # 由服务端自行计算（consume_daily_bonus），均不取
+                            'xpBoosterBonus': max(0, int(_get(c, 5, 0) or 0)),
                             'xpVetBonus': max(0, int(_get(c, 3, 0) or 0) -
                                               int(_get(c, 2, 0) or 0)) * 25 // 100,
                             'creditEarned': credit,
@@ -1282,10 +1301,15 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                         vet_xp = int(ch.get('xpVetBonus', 0) or 0)
                         # 每日首战 +50% XP（save 前已消费资格算好入库）
                         daily_xp = int(ch.get('xpDailyBonus', 0) or 0)
+                        # XP 加成：客户端战报 f5（endXp 不含，须在此补加；
+                        # 值来自 f35 下发模板的乘数 × 基础经验）
+                        booster_xp = int(ch.get('xpBoosterBonus', 0) or 0)
                         await STORE.add_combat_xp(pid, ch['characterId'],
-                                                  xp_delta + vet_xp + daily_xp)
+                                                  xp_delta + vet_xp + daily_xp +
+                                                  booster_xp)
                         log(f'      [DB] char {ch["characterId"]} '
-                            f'+{xp_delta} xp(+{vet_xp}vet+{daily_xp}daily)')
+                            f'+{xp_delta} xp(+{vet_xp}vet+{daily_xp}daily'
+                            f'+{booster_xp}booster)')
                 # 战斗通行证分数：计入玩家激活的赛季（客户端"激活"切换
                 # 语义：切到哪个赛季就涨哪个），未激活任何赛季回落当前
                 # 赛季（与官服一致：未购买也累计，奖励仅已购买行可领）

@@ -485,9 +485,10 @@ _RIBBON_UPGRADES = _build_ribbon_upgrades()
 
 # RibbonBoosterTemplate { id=1, ribbonTemplateId=2, durationInMinutes=3,
 #   multiplier=4(fixed32 float), forSale=5 }（HnG_States/RibbonBoosterTemplate.as）：
-# 勋带加成模板 → (目标勋带模板 id, 经验乘数)。charactersetting f5 ribbonBoosters
-# {f1 ribbonTemplateId, f2 boosterMultiplier(fixed32)} 的下发源；
-# 结算端 f13 ribbons endXp 由客户端按乘数放大后回报（服务端 set_ribbon_xp_floor 落库）
+# 勋带加成模板 → (目标勋带模板 id, 总乘数 1.5/3.0)。charactersetting f5
+# ribbonBoosters {f1 ribbonTemplateId, f2 boosterMultiplier(fixed32)} 的下发源；
+# 客户端结算端 f13 endValue 不放大，加成在 f5 xpBoosterBonus=(乘数-1)×基础
+# 经验单独回报（sub_18038C790），服务端 _report_ribbon_end 按 end+f5 落库
 _RIBBON_BOOSTERS = {}
 for _f in _parse_wardb_table('RibbonBoosterTemplate'):
     _rb_rid = int(_f.get(2, 0) or 0)
@@ -496,6 +497,24 @@ for _f in _parse_wardb_table('RibbonBoosterTemplate'):
         if isinstance(_rb_raw, bytes) and len(_rb_raw) == 4 else 0.0
     if _rb_rid and _rb_mul > 1.0:
         _RIBBON_BOOSTERS[int(_f.get(1, 0))] = (_rb_rid, _rb_mul)
+
+
+# BoosterTemplate { id=1, type=2, durationInMinutes=3, multiplier=4(fixed32),
+#   forSale=5, sortingIndex=6 }（HnG_States/BoosterTemplate.as / EBoosterType）：
+#   type 1=eSoldierXP 士兵XP加成、2=eAssaultTeamSpeed 行军加成。
+# 士兵XP加成模板 → 经验乘数。PlayerSettings f35 activeSoldierXPBoosterId 的
+# 下发源（客户端按模板 id 查本地 BoosterTemplate 得乘数——player.dll 实锤：
+# sub_18038C7E0 表51查模板读乘数，战报 BattleReportCharacter f5 xpBoosterBonus
+# 回报加成部分；此前 f35 恒 0 → 通用 XP 加成对战斗无效果）
+_XP_BOOSTERS = {}
+for _f in _parse_wardb_table('BoosterTemplate'):
+    if int(_f.get(2, 0) or 0) != 1:
+        continue
+    _xb_raw = _f.get(4, b'')
+    _xb_mul = struct.unpack('<f', _xb_raw)[0] \
+        if isinstance(_xb_raw, bytes) and len(_xb_raw) == 4 else 0.0
+    if _xb_mul > 1.0:
+        _XP_BOOSTERS[int(_f.get(1, 0))] = _xb_mul
 
 
 # progressionUnlock { uid=1, unlockMetaName=5, unlockMetaLevel=6, ... }：

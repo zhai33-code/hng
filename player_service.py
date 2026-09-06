@@ -32,6 +32,7 @@ from wardb import (
     _RANK_META_LEVEL,
     _RIBBON_BOOSTERS,
     _RIBBON_META_LEVEL,
+    _XP_BOOSTERS,
     _UNLOCK_BY_ITEM,
     _UNLOCK_UID_META,
     _VEHICLE_VARIANT_PARENT,
@@ -721,7 +722,7 @@ async def _load_db_loadout(player_id):
         u_vars = await STORE.list_uniform_variants(player_id)
         u_parts = await STORE.list_uniform_parts(player_id)
         tracers = await STORE.list_tracer_effects(player_id)
-        boosters = await STORE.list_active_boosters(player_id, ribbon_only=True)
+        boosters = await STORE.list_active_boosters(player_id)
     except Exception as e:
         log(f'[DB] load loadout failed: {e}')
         return None
@@ -729,7 +730,7 @@ async def _load_db_loadout(player_id):
                'v_ups': {}, 'v_ammo': {}, 'vv_tmpl': {},
                'wv_tmpl': {}, 'wv_owned': {}, 'tr_tmpl': {},
                'uv_tmpl': {}, 'u_parts': {}, 'up_tmpl': {},
-               'rboosters': {}}
+               'rboosters': {}, 'xp_booster_id': 0, 'xp_booster_mul': 0.0}
     for w in weapons:
         loadout['weapons'].setdefault(int(w['character_id'] or 0), []).append(w)
     for a in w_ammo:
@@ -768,11 +769,21 @@ async def _load_db_loadout(player_id):
     # 同发；同一勋带多个加成取最大乘数，不叠乘）。模板不在
     # RibbonBoosterTemplate 表 / 乘数<=1 的行跳过
     for b in boosters:
-        rb = _RIBBON_BOOSTERS.get(int(b['template_id']))
-        if not rb:
-            continue
-        rid, mul = rb
-        if mul > loadout['rboosters'].get(rid, 0):
-            loadout['rboosters'][rid] = mul
+        tmpl = int(b['template_id'])
+        if b.get('is_ribbon'):
+            rb = _RIBBON_BOOSTERS.get(tmpl)
+            if not rb:
+                continue
+            rid, mul = rb
+            if mul > loadout['rboosters'].get(rid, 0):
+                loadout['rboosters'][rid] = mul
+        else:
+            # xp_booster：通用加成里的士兵 XP（BoosterTemplate type=1）。
+            # PlayerSettings f35 只有一个槽 → 多个同时激活取乘数最大者，
+            # 客户端按模板 id 查本地 BoosterTemplate 得乘数
+            mul = _XP_BOOSTERS.get(tmpl, 0.0)
+            if mul > loadout['xp_booster_mul']:
+                loadout['xp_booster_id'] = tmpl
+                loadout['xp_booster_mul'] = mul
     return loadout
 

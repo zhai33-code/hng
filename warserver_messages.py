@@ -201,7 +201,16 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     m += pb_string(32, 'CN')                     # 32 countryCode
     m += pb_int64(33, int(time.time()))           # 33 lastLoginTimestampInSecond
     m += pb_int32(34, 0)                          # 34 playerPartnerId
-    m += pb_int64(35, 0)                          # 35 activeSoldierXPBoosterId
+    m += pb_int64(35, int((loadout or {}).get('xp_booster_id', 0) or 0))
+                                                # 35 activeSoldierXPBoosterId：
+                                                #    激活中的士兵XP加成模板 id
+                                                #    （player_service 按 BoosterTemplate
+                                                #    type=1 聚合）。客户端结算按模板
+                                                #    乘数算 f5 xpBoosterBonus=
+                                                #    乘数×基础经验（乘数是加成增量：
+                                                #    1.0=+100%即两倍经验，商店文案
+                                                #    "小时内+{乘数×100}"），服务端
+                                                #    add_combat_xp 补加入账；0=无加成
     m += pb_int32(36, 0)                         # 36 soldierWarBonusXPPercentage
     m += pb_string(37, weapon_unlocks)           # 37 careerOrderStatus (逗号串)
     m += pb_string(38, '3,1,2,8,18,22,')         # 38 (逗号串)
@@ -212,6 +221,7 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     log(f'      [FULL] PlayerSettings: field1(player_id)={player_id}, field15(char)={char_id}, '
         f'chars={len(char_entries)}, field22(metricsUid)={metrics_uid}, '
         f'field25(missionSession)={mission_session_id}, '
+        f'field35(xpBooster)={int((loadout or {}).get("xp_booster_id", 0) or 0)}, '
         f'field999(token)={len(eos_token)}B')
     return m
 
@@ -277,9 +287,10 @@ def _msg_character_entry(ch, loadout=None):
             loadout.get('vv_tmpl'))
 
     # f5 勋带加成（账号级激活中的 RibbonBooster，每个角色条目同发）：
-    # {f1 ribbonTemplateId, f2 boosterMultiplier(fixed32)}——战斗客户端按乘数
-    # 放大局内勋带经验并在结算 BattleReport f13 回报放大后的 endXp，
-    # 服务端 set_ribbon_xp_floor 落库（此前缺发 → 激活的加成对战斗无效果）
+    # {f1 ribbonTemplateId, f2 boosterMultiplier(fixed32)}——原样乘数（1.5/3.0）。
+    # 战斗客户端结算时 f13 endValue 只含基础经验，加成在 f5 xpBoosterBonus =
+    # (乘数-1)×基础经验 单独回报（sub_18038C790 返回 mul-1），服务端
+    # _report_ribbon_end 按 end+f5 落库放大后战终值
     for rb_rid, rb_mul in sorted(loadout.get('rboosters', {}).items()):
         bm = pb_int64(1, int(rb_rid))
         bm += pb_float(2, float(rb_mul))

@@ -626,6 +626,99 @@ def main():
     check('f12 不含将军角色 id=999（否则部署界面出现"将军当伞兵"）',
           999 not in f12_ids and set(f12_ids) == {1, 3})
 
+    print('== 15. 士兵XP加成下发（PlayerSettings f35 activeSoldierXPBoosterId）==')
+    # 2026-09-07：通用 XP 加成（BoosterTemplate type=1 eSoldierXP）此前 f35 恒 0
+    # → 客户端结算乘数恒 1.0，购买的加成对战斗无任何效果。链路：
+    # player_service._load_db_loadout 聚合激活行（f35 单槽 → 多个同时激活取
+    # 乘数最大者）→ f35 只发模板 id，客户端按 id 查本地 BoosterTemplate 得
+    # 乘数（player.dll sub_18038C7E0 表51），战报 f5 xpBoosterBonus 回报加成
+    # 部分，服务端 add_combat_xp 补加入账（endXp 不含）。
+    import player_service
+    from wardb import _XP_BOOSTERS as XPB
+    check('BoosterTemplate type=1 解析：#2 ×2.0 / #3 ×1.3',
+          XPB.get(2) == 2.0 and abs(XPB.get(3, 0) - 1.3) < 1e-6)
+    check('type=2 行军加成（#4/#5）与 ×1.0 无效果（#1）不入表',
+          1 not in XPB and 4 not in XPB and 5 not in XPB)
+
+    class _EmptyStore:
+        async def list_weapons(self, pid):
+            return []
+
+        async def list_weapon_variants(self, pid):
+            return []
+
+        async def list_weapon_ammo(self, pid):
+            return []
+
+        async def list_weapon_modifiers(self, pid):
+            return []
+
+        async def list_vehicles(self, pid):
+            return []
+
+        async def list_vehicle_variants(self, pid):
+            return []
+
+        async def list_vehicle_upgrades(self, pid):
+            return []
+
+        async def list_vehicle_ammo(self, pid):
+            return []
+
+        async def list_uniform_variants(self, pid):
+            return []
+
+        async def list_uniform_parts(self, pid):
+            return []
+
+        async def list_tracer_effects(self, pid):
+            return []
+
+        async def list_active_boosters(self, pid):
+            return self.boosters
+
+    st = _EmptyStore()
+    old_store = player_service.STORE
+    player_service.STORE = st
+    try:
+        # 勋带行进 rboosters、通用行进 xp_booster（归属按 is_ribbon 分流）
+        st.boosters = [
+            {'id': 1, 'template_id': 2, 'is_ribbon': False},   # ×2.0
+            {'id': 2, 'template_id': 3, 'is_ribbon': False},   # ×1.3
+            {'id': 3, 'template_id': 999, 'is_ribbon': False},  # 未知模板忽略
+        ]
+        lo = asyncio.run(player_service._load_db_loadout(42))
+        check('两个 XP 加成同时激活 → 取乘数最大者（#2 ×2.0）',
+              lo['xp_booster_id'] == 2 and lo['xp_booster_mul'] == 2.0)
+        check('未知模板通用行不影响 xp_booster（不崩溃不误发）',
+              lo['xp_booster_id'] == 2)
+        st.boosters = [{'id': 1, 'template_id': 3, 'is_ribbon': False}]
+        lo = asyncio.run(player_service._load_db_loadout(42))
+        check('仅 ×1.3 激活 → f35 发模板 #3',
+              lo['xp_booster_id'] == 3 and abs(lo['xp_booster_mul'] - 1.3) < 1e-6)
+        st.boosters = [{'id': 1, 'template_id': 4, 'is_ribbon': False}]  # type=2
+        lo = asyncio.run(player_service._load_db_loadout(42))
+        check('type=2 行军加成不下发 f35（非士兵 XP）',
+              lo['xp_booster_id'] == 0 and lo['xp_booster_mul'] == 0.0)
+    finally:
+        player_service.STORE = old_store
+
+    # f35 wire 下发：有加成 → 模板 id；无 → 0（与修复前恒 0 的 wire 形态一致）
+    xb_loadout = {
+        'weapons': {}, 'w_ammo': {}, 'w_mods': {}, 'vehicles': {},
+        'v_ups': {}, 'v_ammo': {}, 'uv_tmpl': {}, 'u_parts': {}, 'up_tmpl': {},
+        'rboosters': {}, 'xp_booster_id': 2, 'xp_booster_mul': 2.0}
+    full = _msg_player_settings(
+        player_id=1, pms_id=77, char_id=3, faction=3,
+        db_chars=chars, loadout=xb_loadout)
+    f = fields(full)
+    check('f35 activeSoldierXPBoosterId=2（模板 id 下发）', f[35][0] == 2)
+    full = _msg_player_settings(
+        player_id=1, pms_id=77, char_id=3, faction=3,
+        db_chars=chars, loadout=dict(rb_loadout))
+    f = fields(full)
+    check('无激活加成 → f35=0（缺省不误发）', f.get(35, [0])[0] == 0)
+
     print()
     print('ALL PASS' if ok else 'SOME CHECKS FAILED')
     return 0 if ok else 1
