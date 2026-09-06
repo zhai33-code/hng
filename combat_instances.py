@@ -308,7 +308,6 @@ async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
             _log(f'launch combat server FAILED (attempt {attempt}/2): {e}')
             if attempt == 1:
                 # 换端口重试一次（原端口可能被外部进程抢占）
-                _release_combat_port(int(port))
                 new_port = _alloc_combat_port()
                 if new_port is None:
                     break               # 端口池也空：走下方统一回收
