@@ -87,6 +87,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         #   f1 player_id / f2 gamertag 同步用本服账号库值 —— JWT sub 必须同源
         #   （客户端校验 f1 == sub）。
         mm_sess = matchmaking.PMS_TO_SESSION.get(pms_id)
+        pms_exact = mm_sess is not None   # 身份绑定只信任精确命中（见 if mm_sess 内）
         if mm_sess is None:
             # ★ pms 未精确命中（stale pms：rejoin/结算清理后 ZServer 仍持有）
             #   时兜底必须圈定本局：请求来自战斗服连接（握手已记
@@ -113,6 +114,17 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             player_id = int(mm_sess['player_id'])
             gamertag = mm_sess['gamertag']
             faction = int(mm_sess.get('faction', 3) or 3)
+            # ★ 2026-09-06：把玩家身份绑定到本游戏连接（hng.exe 单连接单玩家）。
+            #   局内举报（AddPlayerReportRequest）等社交类消息由 hng.exe 经本连接
+            #   直发（player.dll warcomm 注册表实证），此前不绑定 →
+            #   ensure_player() 查 'demo' 落空 → 举报被静默丢弃（后台 0 记录根因）。
+            #   仅 pms 精确命中时绑定：stale-pms 兜底会话可能是别的玩家，宁缺勿错。
+            if pms_exact:
+                try:
+                    sess.player_id = player_id
+                    sess.username = str(gamertag)
+                except AttributeError:
+                    pass
             # 每局动态 id 与 PMS 推送同源（matchmaking._handle_join 发号入会话），
             # 会话缺失时现场发号 —— 绝不回退他服回放值
             squad_id = int(mm_sess.get('squad_id', 0) or 0) or \

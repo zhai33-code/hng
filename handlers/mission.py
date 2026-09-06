@@ -398,6 +398,13 @@ async def handle_abandon_mission(sess, writer, cmd_id, req_type, proto):
             PMS_TO_MISSION.pop(_pms, None)
         if pid is not None:
             _MM_QUEUES.pop(int(pid), None)
+            # ★ 好友列表刷新：放弃战斗 missionId 归零（必须在上面 PMS 清理
+            #   之后，social.push_friend_rows 按 PMS_TO_SESSION 实时取值）
+            try:
+                from .social import notify_friends_of
+                await notify_friends_of(int(pid))
+            except Exception as e:
+                log(f'      [social] notify_friends_of({pid}) failed: {e}')
         # 多人局：从战局详情移除该玩家；全员离场 → 释放 combat server 实例
         # ★ pid 为 None（未登录会话/ensure_player 失败）时跳过清理：
         #   int(None) 抛 TypeError 会中断本 handler（response 已发但

@@ -76,6 +76,7 @@ from protocol import (
 from state import FLASH_SESSIONS, STORE, log
 
 from messages import _push_kvcs
+import matchmaking
 from matchmaking import FACTION_ROW_IDS
 
 # ResponseCodes（HnG_States.ResponseCodes 枚举）
@@ -119,7 +120,17 @@ async def push_friend_rows(sess, writer, pid):
     """推送好友列表 KVCS（friendinfo 表，FriendsListTable.xmlTag）。
 
     otherPlayerAlsoFriend=true → 正式好友；false → 待确认（pendingList）。
-    onlinestatus：0 离线 1 在线（按 FLASH_SESSIONS 注册表实时判断）。"""
+    onlinestatus：0 离线 1 在线（按 FLASH_SESSIONS 注册表实时判断）。
+
+    战斗/小队字段（客户端反编译，FriendListBaseItemRenderer.set data）：
+    - missionId != 0 且 missionFactionId 能在 FactionTable 查到行（客户端由
+      它反查 factiontemplateid → missionFactionTemplateId）才显示"跟随进入
+      战斗"按钮组（queueForFriendBattle / goToFriendBattleLocation）；
+      此前硬编码 0 → 按钮永不出现（2026-09-06 玩家反馈"没有跟随进入"根因）。
+    - missionFactionId = 好友本局所在阵营的 faction 行 id（FACTION_ROW_IDS）。
+    - mapEntityId/mapEntityTypeId(1=battlefield) → 战争图跳转到好友战场。
+    - squadSessionId = 好友真实小队行 id（SquadSession.f1 同源；solo 隐式
+      小队不算——官服好友列表"在小队中"仅真实小队）。"""
     if STORE is None or sess.playerview_cmd is None:
         return
     try:
@@ -130,13 +141,35 @@ async def push_friend_rows(sess, writer, pid):
     war_name = await _current_war_name()
     for r in rows:
         online = FLASH_SESSIONS.get(r['gamertag']) is not None
+        mission_id = mission_faction = 0
+        map_entity_id = map_entity_type_id = 0
+        squad_sid = 0
+        if online:
+            try:
+                sq = await STORE.get_squad_for_player(int(r['id']))
+                if sq is not None:
+                    squad_sid = int(sq['id'])
+            except Exception as e:
+                log(f'      [DB] get_squad_for_player failed: {e}')
+            # 好友当前存活战局（PMS_TO_SESSION/COMBAT_INSTANCES 实时口径，
+            # 与掉线 rejoin 同源）：进/出战斗由 matchmaking/combat 侧
+            # notify_friends_of 触发本函数重推刷新
+            _pms, rec, mid = matchmaking._find_player_live_pms(int(r['id']))
+            if mid:
+                det = matchmaking._MM_MISSION_DETAILS.get(mid) or {}
+                mission_id = int(mid)
+                mission_faction = FACTION_ROW_IDS.get(
+                    int((rec or {}).get('faction', 0) or 0), 0)
+                map_entity_id = int(det.get('map_entity_id') or 0)
+                if map_entity_id:
+                    map_entity_type_id = 1        # 1=battlefield（MissionInfo f6 同源）
         m = pb_int64(1, r['id'])                     # id
         m += pb_string(2, r['gamertag'])             # gamertag
         m += pb_uint32(3, 1 if online else 0)        # onlinestatus
         m += pb_int64(4, r['faction'])               # factionTemplateId
         m += pb_int64(5, FACTION_ROW_IDS.get(r['faction'], 0))  # factionId（行 id）
-        m += pb_int64(6, 0)                          # missionId
-        m += pb_int64(7, 0)                          # missionFactionId
+        m += pb_int64(6, mission_id)                 # missionId
+        m += pb_int64(7, mission_faction)            # missionFactionId（faction 行 id）
         # warId 必须与 war catalogue / player.war 的 id=1 一致：
         # 客户端邀请好友（小队/战斗）前本地校验 friend.warId == currentWar.id，
         # 不一致直接提示"不在同一服务器"（此前用 matchmaking._WAR_ID 随机大数）
@@ -144,9 +177,9 @@ async def push_friend_rows(sess, writer, pid):
         m += pb_string(9, war_name)                  # warName
         m += pb_bool(10, r['also_friend'])           # otherPlayerAlsoFriend
         m += pb_bool(11, r['initiated_by_me'])       # friendshipInitiatedByMe
-        m += pb_int64(12, 0)                         # squadSessionId
-        m += pb_int64(13, 0)                         # mapEntityId
-        m += pb_int64(14, 0)                         # mapEntityTypeId
+        m += pb_int64(12, squad_sid)                 # squadSessionId
+        m += pb_int64(13, map_entity_id)             # mapEntityId
+        m += pb_int64(14, map_entity_type_id)        # mapEntityTypeId
         await _push_kvcs(writer, sess.playerview_cmd, b'friendinfo', m)
     if rows:
         log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
@@ -429,12 +462,22 @@ async def handle_add_player_report(sess, writer, cmd_id, req_type, proto):
         log(f'      [social] AddPlayerReport parse error: {e}')
 
     pid = await sess.ensure_player()
-    if pid is not None and STORE is not None and reported:
+    # 举报人：客户端自带 reporter(f9，原生客户端填) 优先，否则用会话绑定的 pid。
+    # ★ 2026-09-06：此前 pid 为 None 就静默跳过落库但回 RC_OK —— 局内举报走
+    #   hng.exe 游戏连接（无 username，库无 demo 账号）→ ensure_player 恒 None
+    #   → 玩家"举报成功"而后台 0 记录。现改为：f9 或 pid 任一可解析即落库，
+    #   确实无法解析时显式记日志，绝不无声丢弃。
+    reporter_pid = int(reporter) if reporter else (int(pid) if pid is not None else 0)
+    if STORE is not None and reported and reporter_pid:
         try:
-            await STORE.save_player_report(reporter or int(pid), reported,
+            await STORE.save_player_report(reporter_pid, reported,
                                            category, session_id, chatlogs)
         except Exception as e:
             log(f'      [DB] save_player_report failed: {e}')
+    elif reported:
+        log(f'      [social] AddPlayerReport DROPPED: reporter unresolved '
+            f'(username={sess.username!r}, f9={reporter}, reported={reported}, '
+            f'category={category})')
 
     resp = build_response(cmd_id, 'AddPlayerReportResponse', pb_int32(1, RC_OK))
     writer.write(resp)

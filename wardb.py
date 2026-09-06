@@ -726,6 +726,21 @@ def charactertemplate_actionid(character_template_id):
     return _CHAR_TMPL_ACTIONID.get(int(character_template_id or 0), 0)
 
 
+# DailyBonusTemplate（WarDatabase 5 行）{f1 id / f2 characterTemplateId /
+# f3 percentageCreditsBonus / f4 percentageXpBonus}，实测全表 +50% XP：
+# id 1-5 ↔ 兵种模板 1/2/4/5/6（将军模板 7 无行 → 客户端回落
+# getBestDailyBonus used=true 不显示徽章，官方即如此）。
+# 客户端模板表由本地 WarDatabase 加载（HandleDownloadDataCommand
+# _staticTableNames），服务器只推 per-character 实例行（KVCS DailyBonus）。
+_DAILY_BONUS_TMPL = {int(f.get(2, 0)): int(f.get(1, 0))
+                     for f in _parse_wardb_table('DailyBonusTemplate')}
+
+
+def daily_bonus_template_for(character_template_id):
+    """兵种模板 → DailyBonusTemplate 行 id；无行（如将军）返回 0 = 无首胜加成。"""
+    return _DAILY_BONUS_TMPL.get(int(character_template_id or 0), 0)
+
+
 def _build_general_template_ids():
     """charactertemplate name='general' 的模板 id 集合（实测 id=7、cost=0）。"""
     ids = set()

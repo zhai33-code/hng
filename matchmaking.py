@@ -2151,6 +2151,15 @@ async def _push_player_into_mission(e, ctx, sess_rec, pms_id, mission_id,
     await _push_kvcs(w, vc, b'BattleInfo',
                      _msg_battle_info(mission_id, pos[0], pos[1]))
     _log(f'S->C cmd={vc:<4} KeyValueChangeSet (BattleInfo id={mission_id})')
+    # ★ 好友列表实时刷新：好友的"战斗中/跟随进入"状态来自 friendinfo 行
+    #   missionId/missionFactionId（social.push_friend_rows 读 PMS_TO_SESSION，
+    #   此刻已登记）。不通知则在线好友要等重登才看到我进战斗、按钮不出现。
+    #   成局分发与等待期中途加入共用本函数，一处覆盖两条路径。
+    try:
+        from handlers.social import notify_friends_of
+        await notify_friends_of(pid)
+    except Exception as ex:
+        _log(f'      [social] notify_friends_of({pid}) failed: {ex}')
     # ★ private_login.pcapng 复核：Admitted 数秒后再推 f14=3 (Armed)，
     #   KVCS 全走 Flash 连接（game 连接保持静默）。
     await asyncio.sleep(5)
@@ -2183,9 +2192,13 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
       将军部署 AT（真实语义不因个人装备改池）、显式指定战局（only_mission
       尊重玩家选择）均不过滤
     only_mission 非空时只考虑该 mission_id（JoinMatchMakingRequest f2
-    指定战局加入，战争地图点进行中战斗的路径）。
+    指定战局加入：战争地图点进行中战斗、好友列表"跟随进入"两条路径）。
+    ★ 指定战局跳过 gamemode/preset/JOIN_WINDOW 三过滤（同 f4=war 的 M2
+    路径口径）：跟随好友时 UI 勾选的模式/地图不必与好友那局一致、开打
+    多久都应能加入，否则会被筛掉转入普通撮合 → 落进另一场局（跟随失效）。
+    阵营/人数上限为硬约束，保留。
     """
-    if mm_config.JOIN_WINDOW <= 0:
+    if mm_config.JOIN_WINDOW <= 0 and not only_mission:
         return None
     now = time.monotonic()
     if only_mission:
@@ -2197,9 +2210,10 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
         det = _MM_MISSION_DETAILS.get(mission_id)
         if det is None or 'preset' not in det:
             continue
-        if int(det.get('gamemode', 0) or 0) != int(gamemode_id):
+        if not only_mission and int(det.get('gamemode', 0) or 0) != int(gamemode_id):
             continue
-        if presets and int(det.get('preset', 0) or 0) not in presets:
+        if (not only_mission and presets
+                and int(det.get('preset', 0) or 0) not in presets):
             continue
         # ★ 阵营边界（开局两阵营固定，第三方阵营禁入）：det 阵营字段
         #   缺失/非法时不放行——原 .get 默认 3 恰为 SU，字段未就绪会
@@ -2211,9 +2225,16 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
             continue
         if faction not in (atk, dfd):
             continue
-        if now - float(det.get('formed_at', 0) or 0) > mm_config.JOIN_WINDOW:
+        # JOIN_WINDOW 仅约束模糊 late join（按模式找局）；显式指定战局
+        # 随时可加入（好友跟随/战争图点战斗，官服口径同 M2 路径）
+        if (not only_mission
+                and now - float(det.get('formed_at', 0) or 0)
+                > mm_config.JOIN_WINDOW):
             continue
-        max_p = int(mm_config.gamemode_cfg(gamemode_id).get('max_players', 18))
+        # 人数上限按该局自身 gamemode 查（指定战局时请求侧 UI 模式
+        # 不必与该局一致）
+        max_p = int(mm_config.gamemode_cfg(
+            int(det.get('gamemode', 0) or gamemode_id)).get('max_players', 18))
         if len(det.get('players') or ()) >= max_p:
             continue
         # 载具覆盖过滤（staged 局；war 局/显式指定战局不过滤，见 docstring）

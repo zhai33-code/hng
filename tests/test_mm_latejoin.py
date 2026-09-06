@@ -7,7 +7,8 @@ _join_existing_mission 会话登记/推送序列（假 writer，无需服务器/
  3. 未选图（通配）→ 可加入
  4. formed_at 缺失（旧结构战局）→ 视为超窗不可加入
  5. JOIN_WINDOW=0 → 功能关闭
- 6. only_mission（f2 指定战局）→ 只匹配该局
+ 6. only_mission（f2 指定战局：战争图点战斗 / 好友列表"跟随进入"）
+    → 只匹配该局，且绕过 gamemode/preset/JOIN_WINDOW 过滤（阵营/满员仍挡）
  7. _join_existing_mission：登记 PMS_TO_MISSION/PMS_TO_SESSION、追加
     details['players']、推出 PMS Admitted/Armed + PMM delete + BattleInfo
 """
@@ -75,7 +76,8 @@ def main():
         check('返回的是运行实例', r is not None and r[1] is
               matchmaking.COMBAT_INSTANCES[900001])
 
-        # ---- 2. 各不兼容情形（only_mission 隔离，防被其它可加入局命中） ----
+        # ---- 2. 各不兼容情形（only_mission 不再隔离超窗/满员——改为
+        #      临时摘除池内其它可加入局做全局断言；指定局绕窗是新语义，见 5） ----
         check('不同 gamemode → 不可加入',
               matchmaking._find_joinable_mission(3, (10,), 3) is None)
         check('选图无交集 → 不可加入',
@@ -83,9 +85,11 @@ def main():
         check('第三方阵营 → 不可加入',
               matchmaking._find_joinable_mission(5, (10,), 1) is None)
         seed_mission(900002, gamemode=5, preset=10, players=1, age=200)
+        _pool_backup = {mid: matchmaking.COMBAT_INSTANCES.pop(mid)
+                        for mid in (900001,)}
         check('超窗（age=200s > 90s）→ 不可加入',
-              matchmaking._find_joinable_mission(5, (10,), 3,
-                                                  only_mission=900002) is None)
+              matchmaking._find_joinable_mission(5, (10,), 3) is None)
+        matchmaking.COMBAT_INSTANCES.update(_pool_backup)
         seed_mission(900003, gamemode=5, preset=10, players=1, age=5)
         mm_config.GAMEMODES[5] = dict(old_gm5, max_players=2)
         seed_mission(900004, gamemode=5, preset=10, players=2, age=5)
@@ -96,9 +100,11 @@ def main():
               matchmaking._find_joinable_mission(
                   5, (10,), 3, only_mission=999999) is None)
         seed_mission(900005, gamemode=5, preset=10, players=1, formed=False)
+        _pool_backup = {mid: matchmaking.COMBAT_INSTANCES.pop(mid)
+                        for mid in (900001, 900003)}
         check('formed_at 缺失（旧结构）→ 不可加入',
-              matchmaking._find_joinable_mission(5, (10,), 3,
-                                                  only_mission=900005) is None)
+              matchmaking._find_joinable_mission(5, (10,), 3) is None)
+        matchmaking.COMBAT_INSTANCES.update(_pool_backup)
 
         # ---- 3. 通配 / 防守方阵营 / 多实例择 earliest ----
         # 池内现有 900001(可加入) 900002(超窗) 900003(可加入) 900004(满员)
@@ -124,7 +130,15 @@ def main():
         r = matchmaking._find_joinable_mission(5, (10,), 3, only_mission=900004)
         check('only_mission 指向满员局 → 不可加入', r is None)
         r = matchmaking._find_joinable_mission(5, (26,), 3, only_mission=900001)
-        check('only_mission 但选图不含该局 preset → 不可加入', r is None)
+        check('only_mission 绕过选图过滤（好友跟随 UI 选图可不同）',
+              r is not None and r[0] == 900001)
+        r = matchmaking._find_joinable_mission(3, (10,), 3, only_mission=900001)
+        check('only_mission 绕过 gamemode 过滤（同上）',
+              r is not None and r[0] == 900001)
+        seed_mission(900007, gamemode=5, preset=10, players=1, age=200)
+        r = matchmaking._find_joinable_mission(5, (10,), 3, only_mission=900007)
+        check('only_mission 绕过 JOIN_WINDOW（好友跟随随时可进）',
+              r is not None and r[0] == 900007)
 
         # ---- 6. _join_existing_mission 全流程（假 writer） ----
         w = FakeWriter()

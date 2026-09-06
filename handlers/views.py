@@ -52,7 +52,7 @@ from .career import (
     push_career_order_row,
     push_season_templates,
     )
-from .characters import push_tutorial_row
+from .characters import push_daily_bonus_rows, push_tutorial_row
 from .economy import (
     push_economy_rows,
     push_player_offer_metrics_row,
@@ -296,6 +296,9 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
             # 经济道具行（PlayerMembershipItem / Booster / Ticket / TicketTimed）：
             # 会员/加成/修理票 UI 数据源，不推则购买记录重启后丢失。
             await push_economy_rows(sess, writer, int(pid))
+            # 每日首战 +50% XP 行（DailyBonus 表）：士兵卡片徽章唯一数据源，
+            # 不推则客户端走模板兜底分支 used 恒 false，首胜后徽章不消失。
+            await push_daily_bonus_rows(sess, writer, int(pid))
             # 每日签到（PlayerOfferMetrics 行）：客户端签到窗口/主界面 tile 的
             # 唯一数据源，不推则窗口永不弹出。连续登录天数已在上面 player 行
             # 推送前 touch（views.handle_subscribe 第一分支）。

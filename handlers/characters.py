@@ -7,6 +7,7 @@
 
 
 import struct
+import time
 
 from protocol import (
     Chunk,
@@ -37,6 +38,7 @@ from wardb import (
     _VEHICLE_VARIANT_PARENT,
     _WEAPON_RIBBONS,
     _rank_from_combat_xp,
+    daily_bonus_template_for,
     default_uniform_variant,
     )
 
@@ -1366,6 +1368,58 @@ async def push_tutorial_row(sess, writer, pid):
     await _push_kvcs(writer, sess.playerview_cmd, b'Tutorial', m)
     log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
         f'(Tutorial id={pid}, {len(triggered)} triggered templates)')
+
+
+def _zulu(dt):
+    """datetime → Zulu 串（YYYYMMDDHHmmssZ，客户端 TimeUtilities
+    .convertZuluTimeToMilliseconds 按 GMT+0000 定位解析）。"""
+    if dt is None:
+        return ''
+    return time.strftime('%Y%m%d%H%M%S', dt.utctimetuple()) + 'Z'
+
+
+async def push_daily_bonus_row(sess, writer, pid, character_id):
+    """推单角色 DailyBonus KVCS 行（结算消费首胜资格后重推）。
+
+    客户端士兵卡片 "+50% XP" 徽章唯一数据源（DailyBonusModel
+    .getDailyBonusObjectForCharacter）：行缺失时走模板兜底分支
+    dailyBonusUsed 恒 false → 徽章永显示。行 lastReceived 在
+    05:00 UTC 窗口内 → dailyBonusUsed=true 徽章隐藏。"""
+    if sess is None or sess.playerview_cmd is None or STORE is None:
+        return
+    try:
+        ch = await STORE.get_character(int(pid), int(character_id))
+    except Exception as e:
+        log(f'      [DB] get_character(daily bonus) failed: {e}')
+        return
+    if ch is None:
+        return
+    tmpl_id = daily_bonus_template_for(ch.get('template'))
+    if not tmpl_id:
+        return      # 无匹配模板（如将军）不推：客户端回落不显示，官方同款
+    m = pb_int64(1, int(ch['id']))          # id（派生行：行 id = characterId）
+    m += pb_int64(2, int(pid))              # playerId
+    m += pb_int64(3, int(ch['id']))         # characterId
+    m += pb_int64(4, tmpl_id)               # dailyBonusTemplateId
+    m += pb_string(5, _zulu(ch.get('last_daily_battle_at')))   # lastReceived
+    await _push_kvcs(writer, sess.playerview_cmd, b'DailyBonus', m)
+    log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+        f'(DailyBonus char={ch["id"]} tmpl={tmpl_id} '
+        f'lastReceived={_zulu(ch.get("last_daily_battle_at")) or "-"})')
+
+
+async def push_daily_bonus_rows(sess, writer, pid):
+    """subscribeplayerview 时推送全部角色 DailyBonus 行（登录 fill）。"""
+    if sess.playerview_cmd is None or STORE is None:
+        return
+    try:
+        chars = await STORE.list_characters(int(pid))
+    except Exception as e:
+        log(f'      [DB] list_characters(daily bonus) failed: {e}')
+        return
+    for ch in chars:
+        if daily_bonus_template_for(ch.get('template')):
+            await push_daily_bonus_row(sess, writer, pid, ch['id'])
 
 
 async def handle_marktutorialtriggeredrequest(sess, writer, cmd_id, req_type, proto):

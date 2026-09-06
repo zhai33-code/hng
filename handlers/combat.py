@@ -66,6 +66,7 @@ from warserver_messages import _accesspoint_layout, _msg_army_resource_list
 
 # career 只依赖 protocol/state/messages/player_service/wardb，无回指 combat
 from .career import _ACTIVE_SEASON as _BP_ACTIVE_SEASON
+from .characters import push_daily_bonus_row
 
 # 与 matchmaking 成局 game_connect 同源（PUBLIC_HOST；mission.py _GAME_CONNECT）
 _GAME_CONNECT = f'{PUBLIC_HOST}:5678'
@@ -1329,6 +1330,22 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                             f'player={p["player_id"]} '
                             f'char={ch["characterId"]} '
                             f'+{ch["xpDailyBonus"]} xp')
+                        # 消费成功即重推该角色 DailyBonus 行（Flash 连接），
+                        # 客户端士兵卡片 "+50% XP" 徽章即时消失（官方行为）；
+                        # hng.exe 游戏连接禁推 KVCS，须经 FLASH_SESSIONS 定位
+                        mm_sess = _session_by_player(
+                            p['player_id'],
+                            mission_id=report['mission_id'] or None)
+                        flash = FLASH_SESSIONS.get(
+                            (mm_sess or {}).get('gamertag') or '')
+                        if flash is not None:
+                            await push_daily_bonus_row(
+                                flash, flash.writer,
+                                p['player_id'], ch['characterId'])
+                        else:
+                            log(f'      [combat] daily bonus: no live '
+                                f'Flash session for player={p["player_id"]}; '
+                                f'DailyBonus row NOT pushed (relogin refills)')
                 except Exception as e:
                     log(f'      [DB] consume_daily_bonus failed: {e}')
         try:
@@ -1842,11 +1859,24 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
             log(f'      [combat] player level check failed '
                 f'(player={pid}): {e}')
     # 内部状态清理（无论 Flash 连接是否在线）
+    finished_pids = set()
     for pms_id in my_pms:
         s = matchmaking.PMS_TO_SESSION.pop(pms_id, None)
         matchmaking.PMS_TO_MISSION.pop(pms_id, None)
         if s is not None:
-            matchmaking._MM_QUEUES.pop(int(s.get('player_id', 0) or 0), None)
+            _pid = int(s.get('player_id', 0) or 0)
+            matchmaking._MM_QUEUES.pop(_pid, None)
+            if _pid:
+                finished_pids.add(_pid)
+    # ★ 好友列表刷新：战斗结束 missionId 归零（必须在上面 PMS 清理之后，
+    #   social.push_friend_rows 按 PMS_TO_SESSION 实时取值），否则在线好友
+    #   的"跟随进入"按钮残留到其重登
+    for _pid in finished_pids:
+        try:
+            from .social import notify_friends_of
+            await notify_friends_of(_pid)
+        except Exception as e:
+            log(f'      [social] notify_friends_of({_pid}) failed: {e}')
 
 
 # ---------------------------------------------------------------- 注册表

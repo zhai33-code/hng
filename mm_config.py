@@ -109,7 +109,7 @@ def gamemode_cfg(gamemode_id):
 # 另开新局。窗口从成局时刻起算（含专用服加载地图 + 客户端加载 + 开局倒计时
 # 的并行时间）。0 = 禁用中途加入（每人/每组固定撮合开新局）。
 # MM_JOIN_WINDOW 环境变量覆盖。
-JOIN_WINDOW = _int_env('MM_JOIN_WINDOW', 90)
+JOIN_WINDOW = _int_env('MM_JOIN_WINDOW', 900)
 if JOIN_WINDOW < 0:
     print(f'[mm_config] WARNING: MM_JOIN_WINDOW={JOIN_WINDOW} < 0, '
           f'using 0 (disabled)')

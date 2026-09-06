@@ -1991,11 +1991,27 @@ async def broadcast_war_events(events):
                 pass          # 单会话故障不影响其他订阅者
 
 
+async def _sweep_ended_war_leftovers(store):
+    """已结束战争残留兜底清理：关账孤儿会战（state=0）+ 释放会战中 AT
+    （state=2 → 0）。战争被强制结束/胜利结算时未关账的会战，automission
+    只看当前战争不会再结算，靠本函数每 tick 兜底（幂等）。"""
+    if store is None or getattr(store, 'pool', None) is None:
+        return
+    try:
+        closed, released = await store.sweep_ended_war_leftovers()
+        if closed or released:
+            log(f'[war] ended-war leftovers swept: '
+                f'battles {closed} closed, ATs {released} released')
+    except Exception as e:
+        log(f'[war] sweep_ended_war_leftovers failed: {e}')
+
+
 async def war_tick(store):
     """战争推进 tick（realtest_server 周期挂载）：移动推进 + automission
     超时结算 + 阵营资源生产 + 增援队列交付 + 补给队滞留清理 + 事件广播。"""
     events = await advance_movements(store)
     events.extend(await _cleanup_supply_columns(store))
+    await _sweep_ended_war_leftovers(store)
     await automission_tick(store)
     await production_tick(store)
     await supply_queue_tick(store)

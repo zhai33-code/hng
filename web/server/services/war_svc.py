@@ -198,18 +198,25 @@ async def list_movements(pool) -> dict:
     return {'rts_ready': True, 'items': items}
 
 
-async def list_battles(pool) -> dict:
-    """会战登记（war_battles，M1 桩）列表。"""
+async def list_battles(pool, war_id: int = 0) -> dict:
+    """会战登记（war_battles）列表（war_id 0=最新战争，与 AT/城市一致）。"""
     assert pool is not None
     async with pool.acquire() as conn:
         if not await _tables_ready(conn):
             return {'rts_ready': False, 'items': []}
+        if not war_id:
+            war_id = await conn.fetchval(
+                'SELECT id FROM wars ORDER BY id DESC LIMIT 1') or 0
+        if not war_id:
+            return {'rts_ready': True, 'war_id': 0, 'items': []}
         rows = await conn.fetch(
             'SELECT b.id, b.war_id, b.battlefield_id, b.factions_json, '
             'b.state, b.started_at, b.ended_at FROM war_battles b '
-            'ORDER BY b.started_at DESC LIMIT 100')
+            'WHERE b.war_id = $1 '
+            'ORDER BY b.started_at DESC LIMIT 100', war_id)
     return {
         'rts_ready': True,
+        'war_id': war_id,
         'items': [{
             'id': r['id'],
             'war_id': r['war_id'],

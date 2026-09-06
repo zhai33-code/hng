@@ -38,9 +38,9 @@ async def list_movements():
 
 
 @router.get('/battles')
-async def list_battles():
-    """会战登记（war_battles）列表。"""
-    return await war_svc.list_battles(db.pool)
+async def list_battles(war_id: int = Query(0)):
+    """会战登记（war_battles）列表（war_id 0=最新战争）。"""
+    return await war_svc.list_battles(db.pool, war_id)
 
 
 @router.get('/cities')

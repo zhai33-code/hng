@@ -21,6 +21,17 @@ import asyncpg
 
 DEFAULT_DSN = 'postgresql://hng:hng_password@127.0.0.1:5432/hng'
 
+# 每日首战 +50% XP 资格判定（布尔 SQL 表达式，SELECT/WHERE 两用）：
+# 资格可用 ⇔ last_daily_battle_at 早于最近一次 05:00 UTC 重置点
+# （客户端 DailyBonusModel.utcDailyResetHour=5 同窗口，见 swf 反编译；
+# 此前 CURRENT_DATE 按服务器本地午夜，与客户端窗口错位）。
+# timezone('utc', ...) 把无时区 timestamp 按 UTC 钉成 timestamptz——
+# 直接比较会被会话 TimeZone 重新解释，服务器非 UTC 时区时重置点漂移。
+_DAILY_BONUS_AVAILABLE_SQL = (
+    "COALESCE(last_daily_battle_at < timezone('utc', "
+    "date_trunc('day', now() AT TIME ZONE 'UTC' - interval '5 hours') "
+    "+ interval '5 hours'), TRUE)")
+
 
 def _rowcount(status):
     """asyncpg execute() 状态串（如 'DELETE 1'/'UPDATE 3'）→ 受影响行数。"""
@@ -263,7 +274,8 @@ ALTER TABLE characters ADD COLUMN IF NOT EXISTS squad_points INT NOT NULL DEFAUL
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS receive_daily_bonus BOOLEAN NOT NULL DEFAULT TRUE;
 -- 每日首战 +50% XP：真实资格源（结算 consume_daily_bonus 消费时写入）。
 -- receive_daily_bonus 列保留兼容旧库，SELECT 侧改由本列惰性推导
--- （COALESCE(last_daily_battle_at::date <> CURRENT_DATE, TRUE)，跨天自动回 TRUE）
+-- （_DAILY_BONUS_AVAILABLE_SQL：早于最近 05:00 UTC 重置点即 TRUE，
+-- 与客户端 DailyBonusModel 窗口一致，跨点自动回 TRUE）
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS last_daily_battle_at TIMESTAMPTZ;
 
 -- 玩家头盔/军装部件实例（PurchaseUniformPartRequest 购买；uniform_part_type 用 EUniformPartType
@@ -1106,15 +1118,19 @@ class PlayerStore:
 
     async def list_characters(self, player_id):
         """返回 [{id, name, faction, template, combat_xp, combat_badge_0, combat_badge_1,
-        uniform_variant_id, headgear_id, squad_points, receive_daily_bonus, is_on_leave,
-        previous_template, head_id}]，按创建顺序；软删角色（is_deleted）不返回。
-        军衔等级由 combat_xp 经 ExperienceLevels 阈值推导（单源）。"""
+        uniform_variant_id, headgear_id, squad_points, receive_daily_bonus,
+        last_daily_battle_at, is_on_leave, previous_template, head_id}]，按创建
+        顺序；软删角色（is_deleted）不返回。军衔等级由 combat_xp 经
+        ExperienceLevels 阈值推导（单源）。
+
+        last_daily_battle_at 原值随行返回：KVCS DailyBonus 行 lastReceived
+        的数据源（客户端 DailyBonusModel 按其 + 05:00 UTC 窗口自行判定）。"""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 'SELECT id, name, faction, template, combat_xp, combat_badge_0, combat_badge_1, '
                 'uniform_variant_id, headgear_id, squad_points, '
-                'COALESCE(last_daily_battle_at::date <> CURRENT_DATE, TRUE) '
-                'AS receive_daily_bonus, '
+                f'{_DAILY_BONUS_AVAILABLE_SQL} AS receive_daily_bonus, '
+                'last_daily_battle_at, '
                 'is_on_leave, previous_template, head_id '
                 'FROM characters WHERE player_id = $1 AND NOT is_deleted '
                 'ORDER BY id', player_id)
@@ -1126,8 +1142,8 @@ class PlayerStore:
             row = await conn.fetchrow(
                 'SELECT id, name, faction, template, combat_xp, combat_badge_0, combat_badge_1, '
                 'uniform_variant_id, headgear_id, squad_points, '
-                'COALESCE(last_daily_battle_at::date <> CURRENT_DATE, TRUE) '
-                'AS receive_daily_bonus, '
+                f'{_DAILY_BONUS_AVAILABLE_SQL} AS receive_daily_bonus, '
+                'last_daily_battle_at, '
                 'is_on_leave, previous_template, head_id '
                 'FROM characters WHERE id = $1 AND player_id = $2 AND NOT is_deleted',
                 character_id, player_id)
@@ -1136,15 +1152,15 @@ class PlayerStore:
     async def consume_daily_bonus(self, player_id, character_id):
         """每日首战 +50% XP 资格消费：当天未用则记账并返回 True。
 
-        单条 UPDATE 原子判定（WHERE 带资格条件 + RETURNING），当天已
-        消费（last_daily_battle_at 为今天）返回 False 不重复记账；
-        跨天后 SELECT 侧推导自动回 TRUE，无需定时任务。
+        单条 UPDATE 原子判定（WHERE 带资格条件 + RETURNING），当前窗口
+        已消费（last_daily_battle_at 晚于最近 05:00 UTC 重置点）返回 False
+        不重复记账；跨过重置点后推导自动回 TRUE，无需定时任务。
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 'UPDATE characters SET last_daily_battle_at = now() '
                 'WHERE id = $1 AND player_id = $2 AND NOT is_deleted '
-                'AND COALESCE(last_daily_battle_at::date <> CURRENT_DATE, TRUE) '
+                f'AND {_DAILY_BONUS_AVAILABLE_SQL} '
                 'RETURNING id',
                 int(character_id), int(player_id))
             return row is not None
@@ -4387,6 +4403,24 @@ class PlayerStore:
                 'winning_faction = $2 WHERE id = $1 AND state = 0',
                 int(battle_id), int(winning_faction))
         return _rowcount(n) > 0
+
+    async def sweep_ended_war_leftovers(self):
+        """已结束战争的残留清理（war_tick 兜底；强制结束/续战竞态遗留）：
+        ① state=0 会战所属战争已非 running → 关账（state=1，无胜方）；
+        ② state=2（会战中）AT 所属战争已非 running → 释放回待命（state=0）。
+        automission 只结算当前战争，旧战争孤儿会战靠此兜底。
+        返回 (closed_battle_ids, released_at_ids)。"""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                closed = [int(r['id']) for r in await conn.fetch(
+                    'UPDATE war_battles b SET state = 1, ended_at = now() '
+                    'FROM wars w WHERE w.id = b.war_id AND w.state <> 1 '
+                    'AND b.state = 0 RETURNING b.id')]
+                released = [int(r['id']) for r in await conn.fetch(
+                    'UPDATE command_nodes c SET state = 0 '
+                    'FROM wars w WHERE w.id = c.war_id AND w.state <> 1 '
+                    'AND c.state = 2 RETURNING c.id')]
+        return closed, released
 
     # ---- warfunds 流水 ----
 
