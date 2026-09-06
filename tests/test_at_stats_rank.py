@@ -94,8 +94,8 @@ wardb.morale_template = lambda: None
 wardb.armyresource_production = lambda: []
 # AssaultTeamLevel 档位（A 段再覆盖"缺表回退同值"分支）
 wardb.at_levels = lambda: [(1, 350), (2, 3450), (3, 9200)]
-war_campaign._ADJACENCY_CACHE = None
-war_campaign._BF_POS_CACHE = None
+war_campaign.common._ADJACENCY_CACHE = None
+war_campaign.common._BF_POS_CACHE = None
 
 mm_config.WAR_AUTO_CREATE = True
 

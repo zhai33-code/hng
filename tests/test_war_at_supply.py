@@ -120,13 +120,14 @@ wardb.battlefields = lambda: [
 ]
 wardb.capitals = lambda: [{'battlefield_id': 10, 'default_faction': 1}]
 # 部署官服语义（#4/#5）：11 为 10 的邻接己方城（首都 10 + 邻城 11 池）
-war_campaign.initial_city_owners = lambda: {10: 1, 11: 1}
+# （拆包后 monkeypatch 须打定义子模块 lifecycle，__init__ re-export 不回流）
+war_campaign.lifecycle.initial_city_owners = lambda: {10: 1, 11: 1}
 wardb.commandnode_templates = lambda: {k: dict(v) for k, v in _TPLS.items()}
 wardb.morale_template = lambda: None
 # M3 生产种子库存禁用（ensure_war 不落 war_start_value，队列用例自控库存）
 wardb.armyresource_production = lambda: []
-war_campaign._ADJACENCY_CACHE = None
-war_campaign._BF_POS_CACHE = None
+war_campaign.common._ADJACENCY_CACHE = None
+war_campaign.common._BF_POS_CACHE = None
 
 mm_config.WAR_AUTO_CREATE = True
 mm_config.WAR_AT_REQUIRE_COMMAND_POINTS = True
@@ -1012,11 +1013,11 @@ async def section_d():
     # D2d 周边无非交战己方城（11 中立）→ 221
     # （ensure_war 在 deploy 时才建 war：owners 须经 initial_city_owners 注入）
     st = _setup()
-    _orig_ico = war_campaign.initial_city_owners
-    war_campaign.initial_city_owners = lambda: {10: 1, 11: 0}
+    _orig_ico = war_campaign.lifecycle.initial_city_owners
+    war_campaign.lifecycle.initial_city_owners = lambda: {10: 1, 11: 0}
     _mk_at(st, 500, template=501)
     w, f = await _deploy(500)
-    war_campaign.initial_city_owners = _orig_ico
+    war_campaign.lifecycle.initial_city_owners = _orig_ico
     check('D2d 周边无己方非交战城 → 221 拒单',
           f.get(1) == war_campaign.RC_DEPLOY_LOCATION_NOT_FOUND
           and not st.ats[500]['is_deployed'], str(f))
@@ -1186,14 +1187,14 @@ async def section_r():
           and ab and ab[-1].get(3) == 11 and ab[-1].get(2) == 500, str(f))
 
     # R1b 候选池无机场 → 回退距主城最近机场（官服"主城附近的机场"）
-    orig_bf, orig_af = wardb.battlefields, war_campaign._AIRFIELD_CACHE
+    orig_bf, orig_af = wardb.battlefields, war_campaign.at_ops._AIRFIELD_CACHE
     wardb.battlefields = lambda: [
         {'id': 10, 'posx': 0, 'posy': 0, 'gamemap': 0},
         {'id': 11, 'posx': 100, 'posy': 0, 'gamemap': 0},
         {'id': 12, 'posx': 800, 'posy': 0, 'gamemap': 204},
         {'id': 14, 'posx': 2000, 'posy': 0, 'gamemap': 0}]
-    war_campaign._BF_POS_CACHE = None
-    war_campaign._AIRFIELD_CACHE = None
+    war_campaign.common._BF_POS_CACHE = None
+    war_campaign.at_ops._AIRFIELD_CACHE = None
     try:
         st = _setup()
         _mk_at(st, 500, template=505)
@@ -1202,8 +1203,8 @@ async def section_r():
               f.get(1) == 1 and st.ats[500]['map_entity_id'] == 12, str(f))
     finally:
         wardb.battlefields = orig_bf
-        war_campaign._BF_POS_CACHE = None
-        war_campaign._AIRFIELD_CACHE = orig_af
+        war_campaign.common._BF_POS_CACHE = None
+        war_campaign.at_ops._AIRFIELD_CACHE = orig_af
 
     # R1c 伞兵同规则（airborne 统一语义）
     st = _setup()

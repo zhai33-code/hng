@@ -53,8 +53,8 @@ wardb.capitals = lambda: [{'battlefield_id': 10, 'default_faction': 1}]
 wardb.commandnode_templates = lambda: {}
 wardb.morale_template = lambda: None
 wardb.armyresource_production = lambda: []
-war_campaign._ADJACENCY_CACHE = None
-war_campaign._BF_POS_CACHE = None
+war_campaign.common._ADJACENCY_CACHE = None
+war_campaign.common._BF_POS_CACHE = None
 
 mm_config.WAR_AUTO_CREATE = True
 

@@ -73,8 +73,8 @@ wardb.capitals = lambda: []
 wardb.commandnode_templates = lambda: {}
 wardb.morale_template = lambda: None
 wardb.armyresource_production = lambda: []   # 禁用 M3 种子库存（合成环境）
-war_campaign._ADJACENCY_CACHE = None
-war_campaign._BF_POS_CACHE = None
+war_campaign.common._ADJACENCY_CACHE = None
+war_campaign.common._BF_POS_CACHE = None
 
 SCALE = (mm_config.WAR_TIMESCALE or 1.0) * (mm_config.WAR_AT_MOVE_SCALE or 1.0)
 SEG_SEC = 500.0 / SCALE           # 10-20 与 20-30 距离均 = hypot(300,400)
@@ -477,8 +477,9 @@ async def main():
     async def _fake_broadcast(events):
         broadcast_calls.append(events)
 
-    _orig_bcast = war_campaign.broadcast_war_events
-    war_campaign.broadcast_war_events = _fake_broadcast
+    # 拆包后 monkeypatch 须打定义子模块 tick（__init__ re-export 不回流）
+    _orig_bcast = war_campaign.tick.broadcast_war_events
+    war_campaign.tick.broadcast_war_events = _fake_broadcast
     try:
         store5 = FakeStore()
         await war_campaign.ensure_war(store5)
@@ -493,7 +494,7 @@ async def main():
               and store5.ats[51]['map_entity_id'] == 20,
               f'{len(broadcast_calls)} calls')
     finally:
-        war_campaign.broadcast_war_events = _orig_bcast
+        war_campaign.tick.broadcast_war_events = _orig_bcast
 
     # ---- G. M3-3：fow 参数 + 空运 ----
     # G1 fow 网格参数：war f19-21 ← mm_config（非 0 激活客户端 FogOfWarLayer）
