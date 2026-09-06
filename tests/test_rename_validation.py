@@ -36,7 +36,7 @@ from player_service import (                         # noqa: E402
     SQUAD_NAME_MAX_LENGTH,
     _official_name_error,
     )
-from handlers import characters as chars_mod         # noqa: E402
+from handlers import characters_purchase as chars_mod   # noqa: E402
 from handlers import squad as squad_mod              # noqa: E402
 
 PASS = FAIL = 0

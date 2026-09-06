@@ -114,7 +114,7 @@ def test_starting_sight_purchase_waiver():
     购买校验却只认 uid 37（K98 Specialist 勋带 7 级），两套判定自相矛盾）。"""
     print('== 4. 起始瞄具购买豁免（STARTING_GEAR.sight_mod）==')
     import asyncio
-    import handlers.weapons as hw
+    import handlers.weapons_purchase as hw
     from protocol import Chunk
 
     class _Sess:

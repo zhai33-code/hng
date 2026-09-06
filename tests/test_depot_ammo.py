@@ -98,7 +98,7 @@ async def main():
 
     # ---------- 源码级 ----------
     print('== 4/5. 购买/指派 handler 重推 character（源码级）==')
-    import handlers.weapons as hw
+    import handlers.weapons_purchase as hw
     import handlers.characters as hc
 
     for fname in ('handle_createweaponvariantrequest',
