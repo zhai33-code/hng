@@ -2,7 +2,8 @@
 """随机下雪功能回归测试（2026-09-01，DB-free；2026-09-05 改 f22 编码）。
 
 功能链：成局时 roll_weather() 按 mm_config.SNOW_CHANCE（环境变量
-MM_SNOW_CHANCE 覆盖，默认 0.3=30%）独立抽签 snow 字段 → game_server
+MM_SNOW_CHANCE 覆盖，默认 1=常驻雪；web 管理端 /config 保存的
+server_config 'weather' 行优先级更高）独立抽签 snow 字段 → game_server
 战斗服握手套 snow_f22_condition() 把雪掩码（SNOW_MASK=0x30）OR 进
 BattleFieldSettings f22 高位（低 2 位天气列原样；补丁版 player.dll 于
 ZGameMode_CreateInstance 拆开，snow-unified-patch.md §3 方案一）。
@@ -21,16 +22,16 @@ import mm_weather          # noqa: E402
 
 # ---------- 1. 配置解析 ----------
 def test_snow_chance_default():
-    """默认概率 30%。"""
-    assert mm_config.SNOW_CHANCE == 0.3, mm_config.SNOW_CHANCE
+    """默认概率 100%（雪补丁验证期常驻雪；web /config 保存后由 DB 行接管）。"""
+    assert mm_config.SNOW_CHANCE == 1, mm_config.SNOW_CHANCE
 
 
 def test_snow_chance_env():
-    """MM_SNOW_CHANCE 覆盖；非法值（非数字/越界）回退 0.3。"""
+    """MM_SNOW_CHANCE 覆盖；非数字回退默认 1，越界回退 0.3。"""
     old = os.environ.pop('MM_SNOW_CHANCE', None)
     try:
         for val, want in (('0', 0.0), ('1', 1.0), ('0.55', 0.55),
-                          ('abc', 0.3), ('2.5', 0.3), ('-0.1', 0.3)):
+                          ('abc', 1), ('2.5', 0.3), ('-0.1', 0.3)):
             os.environ['MM_SNOW_CHANCE'] = val
             importlib.reload(mm_config)
             assert mm_config.SNOW_CHANCE == want, \
@@ -40,7 +41,7 @@ def test_snow_chance_env():
         if old is not None:
             os.environ['MM_SNOW_CHANCE'] = old
         importlib.reload(mm_config)
-    assert mm_config.SNOW_CHANCE == 0.3
+    assert mm_config.SNOW_CHANCE == 1
 
 
 # ---------- 2. roll_weather 抽签 ----------

@@ -1072,6 +1072,18 @@ async def _drop_squad_queue(squad_db_id, gone_pid):
     await _try_form_all()
 
 
+async def _weather_details():
+    """成局天气：优先读 DB 动态配置（web 管理端 /config 保存，即时生效）；
+    无行/读库异常回落内置默认（snow 仍走 mm_config.SNOW_CHANCE）。"""
+    try:
+        cfg = await state.STORE.get_config('weather')
+        if cfg:
+            return roll_weather(cfg)
+    except Exception as ex:
+        _log(f'[weather] dynamic config read failed, fallback to defaults: {ex}')
+    return roll_weather()
+
+
 async def _start_match(match):
     """成局落地：发号、登记会话、拉起 combat server、逐玩家推送进局序列。
 
@@ -1314,8 +1326,9 @@ async def _start_match(match):
         # 从此起算；release_match 随详情一并清理
         'formed_at': time.monotonic(),
         # 本局天气/时段（成局时随机抽取一次，简报 MissionInfo f12/f13 与
-        # 战斗服 BattleFieldSettings f9/f21/f22 同源取值）
-        **roll_weather(),
+        # 战斗服 BattleFieldSettings f9/f21/f22 同源取值；web 管理端
+        # /config 保存的动态配置即时生效）
+        **(await _weather_details()),
         # ★必须取 s['sess']（每人各自的登记行）：此处在 for e in
         #   match.players 循环之后，列表推导式里引用 e 会捕获循环残留
         #   变量 = 最后一名玩家 → 多人局所有条目 faction/char_id/player_id

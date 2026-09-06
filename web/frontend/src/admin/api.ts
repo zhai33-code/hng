@@ -25,7 +25,7 @@ export function setUnauthorizedHandler(fn: () => void) {
 }
 
 export async function http<T = unknown>(
-  method: 'GET' | 'POST' | 'DELETE',
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE',
   path: string,
   body?: unknown,
   timeoutMs = 15000,
@@ -81,3 +81,5 @@ export const get = <T = unknown>(path: string, timeoutMs?: number) =>
 export const post = <T = unknown>(path: string, body?: unknown,
                                   opts?: { isLogin?: boolean }) =>
   http<T>('POST', path, body, undefined, opts)
+export const put = <T = unknown>(path: string, body?: unknown) =>
+  http<T>('PUT', path, body)

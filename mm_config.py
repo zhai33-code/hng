@@ -20,7 +20,7 @@ gamemodeId 取值来源：客户端 MatchmakingDescription.as / GamemodesMediato
   MM_SIMULATE_COMBAT     =1 时用内嵌模拟器代替 hng.exe（macOS/Linux 等无
                           Windows 客户端环境跑集成测试用；实例登记/端口
                           占用/并发上限/释放逻辑全部照常真实运转）
-  MM_SNOW_CHANCE         随机下雪概率 0.0-1.0（默认 0.3；0=关，见 SNOW_CHANCE）
+  MM_SNOW_CHANCE         随机下雪概率 0.0-1.0（默认 1=常驻雪；0=关，见 SNOW_CHANCE）
 """
 import os
 
@@ -150,7 +150,10 @@ SIMULATE_COMBAT = bool(_int_env('MM_SIMULATE_COMBAT'))
 # BattleFieldSettings f22 高位 OR 雪掩码 0x30（低 2 位天气列原样；补丁版
 # player.dll 于 ZGameMode_CreateInstance 拆开 → 全员同雪，
 # snow-unified-patch.md §3 方案一）。
-# 0=永不下雪，1=每局都下。MM_SNOW_CHANCE 环境变量覆盖，非法值回退 0.3。
+# 0=永不下雪，1=每局都下。默认 1=常驻雪（雪补丁验证期口径）；
+# MM_SNOW_CHANCE 环境变量覆盖，非数字回退默认、越界回退 0.3。
+# 注意：web 管理端 /config 保存过天气配置后，server_config 'weather'
+# 行的 snow_chance 优先于此（matchmaking._weather_details 读库）。
 SNOW_CHANCE = _float_env('MM_SNOW_CHANCE', 1)
 if SNOW_CHANCE is None or not 0.0 <= SNOW_CHANCE <= 1.0:
     print(f'[mm_config] WARNING: MM_SNOW_CHANCE={os.environ.get("MM_SNOW_CHANCE")!r} '

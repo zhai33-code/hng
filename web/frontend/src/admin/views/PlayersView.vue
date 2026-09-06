@@ -12,8 +12,28 @@ interface PlayerRow {
   warfunds: number
   gold: number
   banned: boolean
+  ban_reason: string
+  ban_expires: string | null
   deleted_at: string | null
   created_at: string
+  last_login_ip: string | null
+  last_login_at: string | null
+}
+
+interface LoginEventRow {
+  id: number
+  username: string
+  ip: string | null
+  machine_id: string
+  machine_id_old: string
+  result: number
+  source: string
+  created_at: string
+}
+
+interface LoginProfile {
+  login_events: LoginEventRow[]
+  linked_accounts: { same_machine: string[]; same_ip: string[] }
 }
 
 const router = useRouter()
@@ -82,12 +102,14 @@ async function onDelete(hard: boolean) {
   }
 }
 
-// ---- 封禁/解封（列表行级）----
+// ---- 封禁/解封（列表行级：快速永久封禁；限时/原因/连带机器码进详情页）----
 async function onToggleBan(row: PlayerRow) {
   const banned = !row.banned
   try {
     await ElMessageBox.confirm(
-      `确认${banned ? '封禁' : '解封'}玩家 ${row.username}？`,
+      banned
+        ? `确认永久封禁玩家 ${row.username}？（限时封禁/原因/连带机器码请进玩家详情页操作）`
+        : `确认解封玩家 ${row.username}？`,
       banned ? '封禁玩家' : '解除封禁', { type: 'warning' })
   } catch {
     return
@@ -99,6 +121,45 @@ async function onToggleBan(row: PlayerRow) {
   } catch (e: unknown) {
     ElMessage.error((e as Error).message || '操作失败')
   }
+}
+
+/** 封禁状态标签（区分永久 / 限时未到期 / 限时已到期） */
+function banTag(row: PlayerRow): { text: string; type: 'danger' | 'warning' } {
+  if (row.ban_expires) {
+    const expired = new Date(row.ban_expires).getTime() <= Date.now()
+    return expired
+      ? { text: '封禁已到期', type: 'warning' }
+      : { text: `限时至 ${fmtTime(row.ban_expires)}`, type: 'danger' }
+  }
+  return { text: '永久封禁', type: 'danger' }
+}
+
+// ---- 展开行：登录记录懒加载（/players/{id}/logins，按行缓存）----
+const loginCache = ref<Record<number, LoginProfile>>({})
+const loginLoading = ref<Record<number, boolean>>({})
+
+async function onExpand(row: PlayerRow, expanded: PlayerRow[]) {
+  if (!expanded.some(r => r.id === row.id)) return   // 收起不加载
+  if (loginCache.value[row.id] || loginLoading.value[row.id]) return
+  loginLoading.value[row.id] = true
+  try {
+    loginCache.value[row.id] =
+      await get<LoginProfile>(`/players/${row.id}/logins`)
+  } catch (e: unknown) {
+    ElMessage.error((e as Error).message || '登录记录加载失败')
+  } finally {
+    loginLoading.value[row.id] = false
+  }
+}
+
+const loginResultText: Record<number, string> = { 97: '成功', 98: '密码错误' }
+const loginSourceText: Record<string, string> = {
+  game: '游戏登录', register: '注册', import: '迁移',
+}
+
+/** IP/机器码跳全局"登录记录"反查页 */
+function searchLogins(q: string) {
+  router.push({ name: 'login-events', query: { q } })
 }
 
 onMounted(load)
@@ -129,7 +190,70 @@ onMounted(load)
     </div>
 
     <el-table v-loading="loading" :data="items" size="small"
-              @selection-change="(rows: PlayerRow[]) => selected = rows">
+              @selection-change="(rows: PlayerRow[]) => selected = rows"
+              @expand-change="onExpand">
+      <el-table-column type="expand">
+        <template #default="{ row }">
+          <div v-loading="loginLoading[row.id]" class="expand-login">
+            <template v-if="loginCache[row.id]">
+              <div
+                v-if="loginCache[row.id].linked_accounts.same_machine.length ||
+                      loginCache[row.id].linked_accounts.same_ip.length"
+                class="linked-accounts">
+                <template
+                  v-if="loginCache[row.id].linked_accounts.same_machine.length">
+                  <strong>同机器码：</strong>
+                  <el-tag v-for="u in loginCache[row.id].linked_accounts.same_machine"
+                          :key="'m' + u" type="danger" size="small"
+                          style="margin-right: 6px">{{ u }}</el-tag>
+                </template>
+                <template v-if="loginCache[row.id].linked_accounts.same_ip.length">
+                  <strong>同 IP：</strong>
+                  <el-tag v-for="u in loginCache[row.id].linked_accounts.same_ip"
+                          :key="'i' + u" type="warning" size="small"
+                          style="margin-right: 6px">{{ u }}</el-tag>
+                </template>
+              </div>
+              <el-table v-if="loginCache[row.id].login_events.length"
+                        :data="loginCache[row.id].login_events" size="small">
+                <el-table-column label="时间" min-width="165">
+                  <template #default="{ row: ev }">{{ fmtTime(ev.created_at) }}</template>
+                </el-table-column>
+                <el-table-column label="结果" width="90">
+                  <template #default="{ row: ev }">
+                    <el-tag :type="ev.result === 97 ? 'success' : 'danger'" size="small">
+                      {{ loginResultText[ev.result] ?? ev.result }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="来源" width="90">
+                  <template #default="{ row: ev }">
+                    {{ loginSourceText[ev.source] ?? ev.source }}
+                  </template>
+                </el-table-column>
+                <el-table-column label="IP" min-width="130">
+                  <template #default="{ row: ev }">
+                    <el-link v-if="ev.ip" type="primary" @click="searchLogins(ev.ip)">
+                      {{ ev.ip }}
+                    </el-link>
+                    <span v-else>-</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="机器码" min-width="280">
+                  <template #default="{ row: ev }">
+                    <el-link v-if="ev.machine_id" type="primary"
+                             @click="searchLogins(ev.machine_id)">
+                      {{ ev.machine_id }}
+                    </el-link>
+                    <span v-else>-</span>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <el-empty v-else description="暂无登录记录" :image-size="50" />
+            </template>
+          </div>
+        </template>
+      </el-table-column>
       <el-table-column type="selection" width="42"
                        :selectable="(row: PlayerRow) => !row.deleted_at" />
       <el-table-column prop="id" label="ID" width="80" sortable />
@@ -149,11 +273,22 @@ onMounted(load)
       <el-table-column label="Gold" width="100" align="right">
         <template #default="{ row }">{{ fmtNum(row.gold) }}</template>
       </el-table-column>
-      <el-table-column label="状态" width="90">
+      <el-table-column label="状态" width="190">
         <template #default="{ row }">
           <el-tag v-if="row.deleted_at" type="info" size="small">已删除</el-tag>
-          <el-tag v-else-if="row.banned" type="danger" size="small">已封禁</el-tag>
+          <el-tag v-else-if="row.banned" :type="banTag(row).type" size="small">
+            {{ banTag(row).text }}
+          </el-tag>
           <el-tag v-else type="success" size="small">正常</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="最近登录" min-width="185">
+        <template #default="{ row }">
+          <div v-if="row.last_login_at" class="last-login">
+            <span>{{ fmtTime(row.last_login_at) }}</span>
+            <span class="ip">{{ row.last_login_ip || '-' }}</span>
+          </div>
+          <span v-else class="never">从未登录</span>
         </template>
       </el-table-column>
       <el-table-column label="注册时间" min-width="165">
@@ -193,5 +328,36 @@ onMounted(load)
   &:hover {
     text-decoration: underline;
   }
+}
+
+.expand-login {
+  padding: 6px 12px 10px 56px;
+  min-height: 40px;
+}
+
+.linked-accounts {
+  margin-bottom: 10px;
+  line-height: 2;
+
+  strong {
+    color: #c8a86b;
+    margin-right: 4px;
+  }
+}
+
+.last-login {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.5;
+
+  .ip {
+    font-family: monospace;
+    font-size: 12px;
+    color: #8fa3b8;
+  }
+}
+
+.never {
+  color: #6b6b6b;
 }
 </style>

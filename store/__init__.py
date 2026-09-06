@@ -30,6 +30,9 @@ from .squads import SquadsMixin
 from .companies import CompaniesMixin
 from .maintenance import MaintenanceMixin
 from .war import WarStoreMixin
+from .foreign_imports import ForeignImportsMixin
+from .login_events import LoginEventsMixin
+from .server_config import ServerConfigMixin
 
 
 class PlayerStore(
@@ -50,8 +53,11 @@ class PlayerStore(
         CompaniesMixin,
         MaintenanceMixin,
         WarStoreMixin,
+        ForeignImportsMixin,
+        LoginEventsMixin,
+        ServerConfigMixin,
 ):
-    """组装后的完整 PlayerStore（BaseStore + 17 域 mixin）。"""
+    """组装后的完整 PlayerStore（BaseStore + 18 域 mixin）。"""
 
     pass
 

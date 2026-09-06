@@ -430,11 +430,10 @@ async def revalidate_state_orders(pid):
             completed.add(16)    # 任意绶带到 3 级
         if _rank_from_combat_xp(c['combat_xp']) >= 12:
             completed.add(23)    # 任意士兵军衔 12
-        try:
-            st = await STORE.get_stats(c['id']) or {}
-            total_score += int(st.get('PlayerScore', st.get('score', 0)) or 0)
-        except Exception:
-            pass
+    try:
+        total_score = await STORE.get_total_score(pid)
+    except Exception:
+        pass
     if total_score >= _PLAYER_LEVEL10_SCORE:
         completed.add(17)    # 玩家等级 10
 

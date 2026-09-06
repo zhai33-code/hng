@@ -131,6 +131,9 @@ class Session:
         self.player_id = None         # 数据库 players.id（登录后惰性加载）
         self.pw = None                # 该账号的数据库密码（login2_begin 时加载）
         self.user_exists = True       # 账号是否存在于数据库（False 时直接拒登）
+        self.remote_ip = None         # TCP peer IP（handle_tcp 填充，登录事件记录用）
+        self.machine_id = None        # QueryBannedMachineRequest f1（客户端机器码）
+        self.machine_id_old = None    # QueryBannedMachineRequest f2
 
     async def ensure_player(self):
         """返回数据库 player_id；账号不存在 / DB 不可用返回 None（不自动建号）。"""
@@ -156,6 +159,10 @@ PLAYER_SELECTED_CHAR = {}
 # PlayerExitBatch 由游戏连接上报（playerview_cmd=None），但 PMS Admitted KVCS
 # 只能推给 Flash 连接——必须按玩家名跨连接查找（views.py 注册 / 连接断开注销）。
 FLASH_SESSIONS = {}
+
+# 全部在线 TCP 会话注册表（handle_tcp 进/finally 出）。封禁踢下线
+# （handlers/ban.py，NOTIFY hng_ban_player）按 player_id/username 匹配。
+TCP_SESSIONS = []
 
 
 LOG_FILE = os.path.join(_PKG_DIR, 'realtest_game.log')

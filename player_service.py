@@ -430,11 +430,10 @@ async def _msg_player_for(sess, gamertag=None):
         # ★ totalScore（player f36）：统计界面"分数"显示值 = 全角色 score 汇总
         #   （type-6 上报的 PlayerScore 优先，legacy 结算键 score 回落，二者
         #   同源不叠加）。此前恒发 0 → 统计页分数为 0（2026-09-01）。
+        #   2026-09-07 改单条聚合 SQL（STORE.get_total_score）：N+1 读法在
+        #   购买/推送热路径上每调用多花 N 次查询（29 角色玩家 ~30 次）。
         try:
-            for ch in await STORE.list_characters(pid):
-                st = await STORE.get_stats(ch['id']) or {}
-                v = st.get('PlayerScore', st.get('score', 0))
-                total_score += int(v or 0)
+            total_score = await STORE.get_total_score(pid)
         except Exception as e:
             log(f'[DB] totalScore sum failed: {e}')
     return msg_player(gamertag or sess.username or 'DemoPlayer',

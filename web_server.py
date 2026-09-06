@@ -669,6 +669,22 @@ def _handle_captcha_check(handler):
     _json_reply(handler, {'ok': True, 'token': token})
 
 
+def _record_web_login_event(player_id, username, ip, result, source):
+    """web 侧（注册/导入成功）写 login_events；失败仅日志不影响主流程。
+
+    HTTP handler 跑在线程池，须投递主 loop（与 create_player 同模式），
+    fire-and-forget 不等待结果。"""
+    if _MAIN_LOOP is None or STORE.pool is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(
+            STORE.record_login_event(player_id, username, ip, result,
+                                     source=source),
+            _MAIN_LOOP)
+    except Exception as e:
+        log(f'[{source}] record_login_event failed: {e}')
+
+
 def _handle_register_api(handler):
     """POST /api/register：JSON -> 蜜罐/令牌/限速 -> 投递 create_player。"""
     try:
@@ -736,7 +752,131 @@ def _handle_register_api(handler):
         _json_reply(handler, {'error': f'用户名 {username} 已存在，请换一个'}, 409)
     else:
         log(f'[register] user {username!r} created via web (id={pid})')
+        _record_web_login_event(pid, username, _client_ip(handler), 97, 'register')
         _json_reply(handler, {'ok': True, 'player_id': pid}, 201)
+
+
+def _foreign_server_addr():
+    """外服地址（.env / 环境变量 HNG_FOREIGN_SERVER=host:port）。"""
+    raw = os.environ.get('HNG_FOREIGN_SERVER', '51.68.235.145:15120').strip()
+    host, _, port = raw.rpartition(':')
+    if not host or not port.isdigit():
+        log(f'[import] HNG_FOREIGN_SERVER 配置无效: {raw!r}，用默认值')
+        return '51.68.235.145', 15120
+    return host, int(port)
+
+
+# 导入全流程（登录外服 + 采集 15s + 落库）在主 asyncio 循环上跑，
+# HTTP 线程只等待结果；120s 覆盖慢网络下的完整窗口
+_IMPORT_TIMEOUT_S = 120
+
+
+def _handle_import_api(handler):
+    """POST /api/import：外服账密 + 新本地账密 → 采集 → 建号导入。
+
+    校验口径与 /api/register 完全一致（蜜罐/人机令牌/限速/用户名规则），
+    之后在主循环跑 foreign_import.run_import（单事务，重复导入/用户名
+    冲突/外服密码错误均类型化拒绝）。"""
+    import foreign_import
+    try:
+        length = int(handler.headers.get('Content-Length') or 0)
+        if length > 65536:
+            _json_reply(handler, {'error': '请求过大'}, 413)
+            return
+        raw = handler.rfile.read(length) if length > 0 else b''
+        data = json.loads(raw or b'{}')
+        foreign_username = (data.get('foreign_username') or '').strip()
+        foreign_password = data.get('foreign_password') or ''
+        username = (data.get('username') or '').strip()
+        password = data.get('password') or ''
+    except Exception as e:
+        _json_reply(handler, {'error': '请求格式错误'}, 400)
+        log(f'[import] json parse failed: {e}')
+        return
+
+    if register_captcha.honeypot_hit(data):
+        log(f'[import] BLOCKED honeypot (username={username!r})')
+        _json_reply(handler, {'error': '无法迁移，请稍后重试'}, 400)
+        return
+    if not register_captcha.consume_token(data.get('token')):
+        _json_reply(handler, {'error': '请先完成人机验证'}, 403)
+        return
+    if not register_captcha.allow_register(_client_ip(handler)):
+        log(f'[import] rate-limited ip={_client_ip(handler)} username={username!r}')
+        _json_reply(handler, {'error': '操作过于频繁，请稍后再试'}, 429)
+        return
+
+    if not foreign_username or not foreign_password:
+        _json_reply(handler, {'error': '外服账号和密码不能为空'}, 400)
+        return
+    if len(foreign_username) > 64 or len(foreign_password) > 128:
+        _json_reply(handler, {'error': '外服账号或密码过长'}, 400)
+        return
+    if not username or not password:
+        _json_reply(handler, {'error': '用户名和密码不能为空'}, 400)
+        return
+    if not re.fullmatch(r'[A-Za-z0-9_\-.]{2,24}', username):
+        _json_reply(handler, {'error': '用户名需为 2-24 位字母/数字/_-. 组合'}, 400)
+        return
+    low = username.lower()
+    if low.startswith(('reto.', '[admin]')):
+        log(f'[import] BLOCKED reserved-prefix username {username!r}')
+        _json_reply(handler, {'error': '无法迁移，请稍后重试'}, 400)
+        return
+    if not (6 <= len(password) <= 64):
+        _json_reply(handler, {'error': '密码长度需为 6-64 位'}, 400)
+        return
+    if _MAIN_LOOP is None or STORE.pool is None:
+        _json_reply(handler, {'error': '数据库未连接，暂时无法迁移'}, 503)
+        return
+
+    host, port = _foreign_server_addr()
+    log(f'[import] start {foreign_username!r}@{host}:{port} -> local {username!r} '
+        f'ip={_client_ip(handler)}')
+    fut = asyncio.run_coroutine_threadsafe(
+        foreign_import.run_import(
+            STORE, host, port, foreign_username, foreign_password,
+            username, password, log=lambda m: log('[import] ' + str(m))),
+        _MAIN_LOOP)
+    try:
+        summary = fut.result(timeout=_IMPORT_TIMEOUT_S)
+    except foreign_import.AlreadyImportedError as e:
+        log(f'[import] rejected duplicate: {e}')
+        _json_reply(handler, {'error': str(e)}, 409)
+        return
+    except foreign_import.UsernameTakenError as e:
+        log(f'[import] rejected username taken: {e}')
+        _json_reply(handler, {'error': f'用户名 {username} 已存在，请换一个'}, 409)
+        return
+    except foreign_import.ForeignLoginError as e:
+        log(f'[import] foreign login failed code={e.code}')
+        msg = ('外服账号或密码错误' if e.code == 98
+               else f'外服登录被拒绝（code={e.code}），请确认账号状态')
+        _json_reply(handler, {'error': msg}, 401)
+        return
+    except foreign_import.ForeignCollectError as e:
+        log(f'[import] collect failed: {e}')
+        _json_reply(handler, {'error': f'外服数据采集失败：{e}'}, 502)
+        return
+    except asyncio.TimeoutError:
+        log('[import] timeout')
+        _json_reply(handler, {'error': '迁移超时，请稍后重试'}, 504)
+        return
+    except Exception as e:
+        log(f'[import] failed: {e!r}')
+        _json_reply(handler, {'error': '迁移失败，请稍后重试'}, 500)
+        return
+
+    counts = summary.get('counts', {})
+    _record_web_login_event(summary['local_player_id'], summary['username'],
+                            _client_ip(handler), 97, 'import')
+    _json_reply(handler, {
+        'ok': True, 'player_id': summary['local_player_id'],
+        'username': summary['username'],
+        'foreign_gamertag': summary['foreign_gamertag'],
+        'currencies': summary.get('currencies', {}),
+        'counts': counts,
+    }, 201)
 
 
 # 禁止经 HTTP 暴露的扩展名：IDA 分析库、运行日志、脚本/文档等非游戏运行文件。
@@ -829,6 +969,13 @@ class HttpHandler(SimpleHTTPRequestHandler):
                 return
             self.send_error(404, 'Not Found')
             log('[HTTP] 404 /register (web/dist 未构建？)')
+            return
+        if path in ('/import', '//import', '/import.html', '/migrate',
+                    '//migrate'):
+            if _serve_file(self, 'import.html'):
+                return
+            self.send_error(404, 'Not Found')
+            log('[HTTP] 404 /import (web/dist 未构建？)')
             return
         if path.startswith('/assets/') or path.startswith('//assets/'):
             # vite 构建产物（带内容哈希文件名，可缓存）
@@ -1103,6 +1250,12 @@ class HttpHandler(SimpleHTTPRequestHandler):
                 _json_reply(self, {'error': '非法请求'}, 403)
                 return
             _handle_register_api(self)
+            return
+        if path == '/api/import' or path == '//api/import':
+            if self.headers.get('X-Requested-With') != 'XMLHttpRequest':
+                _json_reply(self, {'error': '非法请求'}, 403)
+                return
+            _handle_import_api(self)
             return
         self.send_error(404, 'Not Found')
 

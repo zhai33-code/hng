@@ -133,6 +133,9 @@ class FakeStore:
     async def get_stats(self, cid):
         return {}
 
+    async def get_total_score(self, pid):
+        return 0
+
 
 class FakeSess:
     playerview_cmd = 555

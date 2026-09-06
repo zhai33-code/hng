@@ -300,8 +300,10 @@ def test_msg_player_total_score():
 
 
 async def test_msg_player_for_total_score():
-    """_msg_player_for 全角色 score 汇总（PlayerScore 优先、legacy score 回落，
-    同角色二者同时存在时不叠加）。"""
+    """_msg_player_for totalScore 走 STORE.get_total_score 单条聚合 SQL
+    （2026-09-07 起，替代 list_characters + N×get_stats N+1 读法）。
+    PlayerScore 优先 / legacy score 回落 / 同角色不叠加的 SQL 语义
+    由 test_realdb.py 的 get_total_score 语义段对真实库验证。"""
     import player_service
 
     class MenuFakeStore:
@@ -314,14 +316,8 @@ async def test_msg_player_for_total_score():
         async def get_player_faction(self, pid):
             return None
 
-        async def list_characters(self, pid):
-            return [{'id': 31}, {'id': 53}, {'id': 7}]
-
-        async def get_stats(self, cid):
-            return {31: {'PlayerScore': 900, 'score': 999},   # WIRE 优先不叠加
-                    53: {'score': 222},                        # legacy 回落
-                    7: {},                                     # 无统计 → 0
-                    }[cid]
+        async def get_total_score(self, pid):
+            return 1122  # 900 (PlayerScore 优先) + 222 (legacy 回落)
 
     class FakeSess:
         username = 'tester'
@@ -334,7 +330,7 @@ async def test_msg_player_for_total_score():
     try:
         m = await player_service._msg_player_for(FakeSess())
         f = _pb_multi(m)
-        check('_msg_player_for f36 totalScore=900+222=1122（不叠加 legacy）',
+        check('_msg_player_for f36 totalScore=STORE.get_total_score 原值',
               f.get(36, [0])[0] == 1122, f'f36={f.get(36)}')
     finally:
         player_service.STORE = old

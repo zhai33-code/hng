@@ -81,7 +81,9 @@ async def main():
         print(f'  character_extra_unlocks 迁入数据 = {unlock_rows} 行')
 
     print('== 3. 新 SELECT 查询（含新列）==')
-    pid = await st.get_player('DoubleBird')
+    # 用户名可能带 [admin] 前缀（管理端改名后），两级回落
+    pid = (await st.get_player('DoubleBird')
+           or await st.get_player('[admin]DoubleBird'))
     print(f'  DoubleBird player_id = {pid}')
     if pid is None:
         print('  FAIL: DoubleBird 账号不存在')
@@ -215,6 +217,33 @@ async def main():
          and abs(stats.get('kills', 0) - 8) < 1e-9
          and abs(stats.get('longest_kill_distance', 0) - 152.5) < 1e-9,
          f" kills={stats.get('kills')}")
+
+    # 5.2b get_total_score 聚合 SQL 语义（2026-09-07 N+1 改单条聚合后的
+    # 真库回归：PlayerScore 优先 / legacy score 回落 / 同角色不叠加 /
+    # 软删角色不计 / 无角色玩家=0）
+    print('== 5.2b get_total_score 语义 ==')
+    async with st.pool.acquire() as conn:
+        await conn.execute('DELETE FROM players WHERE username = $1', 'ts_tot')
+    tp = await st.create_player('ts_tot', 'pw')
+    cA = await st.create_character(tp, 'TotA', 1, 0)
+    cB = await st.create_character(tp, 'TotB', 1, 0)
+    cC = await st.create_character(tp, 'TotC', 1, 0)
+    cD = await st.create_character(tp, 'TotD', 1, 0)
+    await st.set_stat(cA['id'], 'PlayerScore', 900)
+    await st.set_stat(cA['id'], 'score', 999)      # 同角色双键 → 只取 PlayerScore
+    await st.set_stat(cB['id'], 'score', 222)      # legacy 回落
+    # cC 无统计 → 0
+    await st.set_stat(cD['id'], 'PlayerScore', 50)
+    async with st.pool.acquire() as conn:
+        await conn.execute('UPDATE characters SET is_deleted = TRUE WHERE id = $1',
+                           int(cD['id']))           # 软删不计
+    tot = await st.get_total_score(tp)
+    mark('totalScore 聚合语义', tot == 900 + 222,
+         f' got={tot} 期望=1122（不含软删 50、不叠加 999）')
+    async with st.pool.acquire() as conn:
+        await conn.execute('DELETE FROM players WHERE id = $1', int(tp))
+    tot2 = await st.get_total_score(tp)
+    mark('玩家删除后 totalScore=0', tot2 == 0, f' got={tot2}')
 
     # 5.3 生涯进度（upsert 累加 → 完成态）
     p1, s1 = await st.upsert_career_order_progress(ta, 999901, 1)

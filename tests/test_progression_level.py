@@ -88,6 +88,15 @@ class _FakeStore:
                 return c.get('stats')
         return None
 
+    async def get_total_score(self, pid):
+        # 与 store.PlayerStore.get_total_score SQL 语义一致
+        # （PlayerScore 优先 / legacy score 回落 / 同角色不叠加）
+        total = 0
+        for c in self.chars:
+            st = c.get('stats') or {}
+            total += int(st.get('PlayerScore', st.get('score', 0)) or 0)
+        return total
+
     async def get_level_granted(self, pid):
         return self.granted
 

@@ -32,6 +32,11 @@ export const router = createRouter({
       component: () => import('./views/PlayerDetailView.vue'),
     },
     {
+      path: '/login-events',
+      name: 'login-events',
+      component: () => import('./views/LoginEventsView.vue'),
+    },
+    {
       path: '/players/:id/characters/:cid',
       name: 'character-detail',
       component: () => import('./views/CharacterDetailView.vue'),
@@ -60,6 +65,11 @@ export const router = createRouter({
       path: '/vouchers',
       name: 'vouchers',
       component: () => import('./views/VouchersView.vue'),
+    },
+    {
+      path: '/config',
+      name: 'config',
+      component: () => import('./views/ConfigView.vue'),
     },
     {
       path: '/status',

@@ -30,12 +30,9 @@ _NT_MISSION_TYPE_UNLOCKED = 9
 
 async def _total_score(pid):
     """全角色 PlayerScore 汇总（与 player_service._msg_player_for 同源：
-    type-6 上报的 PlayerScore 优先，legacy 结算键 score 回落）。"""
-    total = 0
-    for ch in await STORE.list_characters(pid):
-        st = await STORE.get_stats(ch['id']) or {}
-        total += int(st.get('PlayerScore', st.get('score', 0)) or 0)
-    return total
+    type-6 上报的 PlayerScore 优先，legacy 结算键 score 回落；
+    单条聚合 SQL，见 STORE.get_total_score）。"""
+    return await STORE.get_total_score(pid)
 
 
 def _msg_notification(notif_id, player_id, ntype, type_id):

@@ -131,6 +131,9 @@ class FakeStore:
     async def get_stats(self, cid):
         return {}
 
+    async def get_total_score(self, pid):
+        return 0
+
     # ---- vehicles 皮肤 handler 依赖 ----
     async def list_vehicle_variants(self, pid):
         return [dict(vv) for vv in self.vehicle_variants.values()]

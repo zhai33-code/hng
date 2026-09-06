@@ -3,6 +3,8 @@
 
 SQL 与组装在 services/players_svc.py；本层只做参数解析、审计与响应。
 """
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 
@@ -48,6 +50,13 @@ async def batch_delete(body: BatchDeleteBody, request: Request,
 async def player_detail(player_id: int):
     """玩家账号级详情：账号信息 + 三货币 + 角色概览 + 该玩家最近参战记录。"""
     return await players_svc.player_detail(db.pool, player_id)
+
+
+@router.get('/{player_id}/logins')
+@api_errors
+async def player_logins(player_id: int):
+    """单个玩家登录档案（列表页展开行懒加载）：登录事件 + 关联账号。"""
+    return await players_svc.player_logins(db.pool, player_id)
 
 
 @router.get('/{player_id}/characters/{character_id}')
@@ -115,6 +124,9 @@ async def adjust_score(player_id: int, body: ScoreBody,
 
 class BanBody(BaseModel):
     banned: bool
+    reason: str = ''                       # 客户端登录弹窗展示（≤200 字）
+    expires_at: datetime | None = None     # 限时封禁到期（ISO 8601 带时区；空=永久）
+    ban_machines: bool = False             # 连带封禁该玩家登录过的机器码
 
 
 @router.post('/{player_id}/ban', dependencies=[Depends(auth.write_guard)])
@@ -122,7 +134,12 @@ class BanBody(BaseModel):
 async def set_ban(player_id: int, body: BanBody,
                   request: Request,
                   admin: auth.AdminUser = Depends(auth.current_admin)):
-    result = await players_svc.set_ban(db.pool, player_id, body.banned)
+    result = await players_svc.set_ban(
+        db.pool, player_id, body.banned, reason=body.reason,
+        expires_at=body.expires_at, ban_machines=body.ban_machines)
     await audit.record(admin, request, 'set_ban', result['username'],
-                       {'banned': body.banned})
+                       {'banned': body.banned, 'reason': body.reason,
+                        'expires_at': body.expires_at.isoformat()
+                        if body.expires_at else None,
+                        'ban_machines': body.ban_machines})
     return {'ok': True, 'banned': body.banned}

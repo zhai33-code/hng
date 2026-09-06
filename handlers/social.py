@@ -95,18 +95,30 @@ IGN_ALREADY = 1
 IGN_NOT_CURRENTLY = 2
 IGN_FAIL = 3
 
+async def _current_war():
+    """当前战争 (id, name)。
+
+    id 必须与 player 行 f10 同源（war_campaign.ensure_war → get_active_war 的
+    wars.id）：客户端 FriendListBaseItemRenderer 用
+    friend.warId(f8) == Global.currentPlayer.war(player f10) 校验，不一致 →
+    "friend_status_wrong_server"（好友不在同一个服务器）且小队邀请图标隐藏。
+    战争 id 随 sequel 递增（wars SERIAL），不能硬编码 1。
+    DB 不可用/无战争回退 (1, mm_config.WAR_NAME)（与旧行为一致）。"""
+    if STORE is not None:
+        try:
+            war = await STORE.get_active_war()
+            if war is not None:
+                return int(war['id'] or 0), (war.get('name') or mm_config.WAR_NAME)
+        except Exception as e:
+            log(f'      [DB] get_active_war failed: {e}')
+    return 1, mm_config.WAR_NAME
+
+
 async def _current_war_name():
     """当前战争名：wars 表动态名优先（与战争目录/登录 war KVCS 同源），
     DB 不可用/无战争回退 mm_config.WAR_NAME。
     （此前硬编码 'Demo War'，好友列表/玩家搜索 warName 与实际战争名不一致。）"""
-    if STORE is not None:
-        try:
-            war = await STORE.get_active_war()
-            if war is not None and war.get('name'):
-                return war['name']
-        except Exception as e:
-            log(f'      [DB] get_active_war failed: {e}')
-    return mm_config.WAR_NAME
+    return (await _current_war())[1]
 
 
 def _str(v):
@@ -139,7 +151,7 @@ async def push_friend_rows(sess, writer, pid):
     except Exception as e:
         log(f'      [DB] list_friend_rows failed: {e}')
         return
-    war_name = await _current_war_name()
+    war_id, war_name = await _current_war()
     for r in rows:
         online = FLASH_SESSIONS.get(r['gamertag']) is not None
         mission_id = mission_faction = 0
@@ -171,10 +183,11 @@ async def push_friend_rows(sess, writer, pid):
         m += pb_int64(5, FACTION_ROW_IDS.get(r['faction'], 0))  # factionId（行 id）
         m += pb_int64(6, mission_id)                 # missionId
         m += pb_int64(7, mission_faction)            # missionFactionId（faction 行 id）
-        # warId 必须与 war catalogue / player.war 的 id=1 一致：
-        # 客户端邀请好友（小队/战斗）前本地校验 friend.warId == currentWar.id，
-        # 不一致直接提示"不在同一服务器"（此前用 mm_state._WAR_ID 随机大数）
-        m += pb_int64(8, 1)                          # warId
+        # warId(f8) 与 player 行 f10（ensure_war 的 wars.id）同源：客户端校验
+        # friend.warId == Global.currentPlayer.war，不一致 →"不在同一服务器"
+        # 提示 + 小队邀请图标隐藏（此前硬编码 1，线上战争 sequel 递增到 2/3…
+        # 后恒不匹配 → 2026-09-06 玩家反馈"好友不在同一个服务器/图标消失"）
+        m += pb_int64(8, war_id)                     # warId
         m += pb_string(9, war_name)                  # warName
         m += pb_bool(10, r['also_friend'])           # otherPlayerAlsoFriend
         m += pb_bool(11, r['initiated_by_me'])       # friendshipInitiatedByMe

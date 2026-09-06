@@ -23,6 +23,10 @@
         <p class="subtitle">注册账号 · 即刻加入战斗</p>
       </header>
       <RegisterForm />
+      <div class="cross-nav">
+        <span>已有外服账号？</span>
+        <a href="/import">从外服迁移数据 →</a>
+      </div>
       <footer class="panel-foot">
         <span>私服社区 · 非官方服务 · 与官方服务器无关联</span>
       </footer>
@@ -177,6 +181,24 @@ import RegisterForm from './RegisterForm.vue'
   font-size: 11px;
   letter-spacing: 0.08em;
   opacity: 0.7;
+}
+
+.cross-nav {
+  margin-top: 18px;
+  text-align: center;
+  font-size: 12.5px;
+  color: $hng-text-dim;
+
+  a {
+    color: $hng-gold;
+    text-decoration: none;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+
+    &:hover {
+      text-shadow: 0 0 10px rgba(232, 212, 139, 0.45);
+    }
+  }
 }
 </style>
 

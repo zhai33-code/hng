@@ -42,6 +42,11 @@ ALTER TABLE players ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 -- 玩家等级奖励已发到的等级（进展 tab：PlayerLevelUnlock 每级 credits/gold/
 -- warfunds 奖励只发一次；默认 1 = 1 级起步无奖励，存量玩家下次检测时补发）
 ALTER TABLE players ADD COLUMN IF NOT EXISTS level_granted INT NOT NULL DEFAULT 1;
+-- 账号封禁（管理端写入；登录侧 login2 拦截回 91 永久 / 92 限时，见
+-- handlers/auth.py）。ban_expires 空 = 永久；到期由 get_ban_info 惰性解封。
+ALTER TABLE players ADD COLUMN IF NOT EXISTS banned BOOL NOT NULL DEFAULT FALSE;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS ban_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE players ADD COLUMN IF NOT EXISTS ban_expires TIMESTAMPTZ;
 -- 存量库兜底：players_id_seq 仍处撞号区（<1e6，如 BIGSERIAL 时代建的库）时
 -- 抬到 1e6（不低于已用 max id+1）；已迁移过的库不受影响
 DO $$
@@ -778,6 +783,69 @@ CREATE TABLE IF NOT EXISTS war_supply_queue (
     queue_number BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ===== 外服账号迁移（foreign_import.py，web /api/import）=====
+-- 同一外服账号只许导入一次：UNIQUE 约束在 DB 层兜底（并发防重）。
+-- foreign_player_id = 外服 player KVCS 行 f1（雪花 int64，外服侧稳定身份，
+-- 外服改名也不影响去重）；foreign_username 仅作展示/审计。
+CREATE TABLE IF NOT EXISTS foreign_imports (
+    id                BIGSERIAL PRIMARY KEY,
+    foreign_server    TEXT NOT NULL,          -- 'host:port'（多外服源扩展位）
+    foreign_player_id BIGINT NOT NULL,
+    foreign_username  TEXT NOT NULL,
+    local_player_id   BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    dump_path         TEXT NOT NULL DEFAULT '',   -- 采集 dump 目录（审计/复查）
+    characters        INT  NOT NULL DEFAULT 0,    -- 导入统计速览
+    weapons           INT  NOT NULL DEFAULT 0,
+    vehicles          INT  NOT NULL DEFAULT 0,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (foreign_server, foreign_player_id)
+);
+CREATE INDEX IF NOT EXISTS idx_foreign_imports_local ON foreign_imports(local_player_id);
+
+-- ===== 动态配置（web 管理端可写，游戏服运行时读取）=====
+-- key 为配置项标识（如 'weather'）；value 为该项 JSON 配置。
+-- 优先级：有行 > 代码内置默认（无行时环境变量兜底照旧生效）。
+-- 成局等低频路径直接读库（保存即生效）；未来热路径项迁入时再在
+-- get_config 内部加 TTL 缓存 + pg_notify 失效，接口不变。
+CREATE TABLE IF NOT EXISTS server_config (
+    key        TEXT PRIMARY KEY,
+    value      JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by TEXT NOT NULL DEFAULT ''
+);
+
+-- ===== 登录事件审计（IP / 机器码）=====
+-- 客户端每次启动登录前发 QueryBannedMachineRequest，携带 hngsync.exe 本机
+-- 生成的 machineIdentifier（36 字符类 GUID）；IP 取 TCP peer。成功与失败
+-- （97/98/91/92）都记录——撞库尝试与小号排查的依据。
+-- player_id 无外键：管理后台删号后审计记录保留（机器码连坐排查依据）。
+CREATE TABLE IF NOT EXISTS login_events (
+    id             BIGSERIAL PRIMARY KEY,
+    player_id      BIGINT,
+    username       TEXT NOT NULL DEFAULT '',
+    ip             TEXT,
+    machine_id     TEXT NOT NULL DEFAULT '',
+    machine_id_old TEXT NOT NULL DEFAULT '',
+    result         INT  NOT NULL,                 -- 97=成功 98=密码错 91/92=封禁拦截
+    source         TEXT NOT NULL DEFAULT 'game',  -- game / register / import
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_login_events_player  ON login_events(player_id);
+CREATE INDEX IF NOT EXISTS idx_login_events_ip      ON login_events(ip);
+CREATE INDEX IF NOT EXISTS idx_login_events_machine ON login_events(machine_id);
+
+-- ===== 机器码封禁（管理端"连带封禁"写入）=====
+-- 客户端启动时 QueryBannedMachineRequest 上报 machineIdentifier，命中则回
+-- isBanned=true，客户端直接弹封禁提示并中止同步（连登录界面都不出现）；
+-- login2 再查一次作纵深防御。banned_player_id 供解封时清理本玩家登记的机器。
+CREATE TABLE IF NOT EXISTS machine_bans (
+    machine_id       TEXT PRIMARY KEY,
+    reason           TEXT NOT NULL DEFAULT '',
+    banned_player_id BIGINT NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_machine_bans_player ON machine_bans(banned_player_id);
 """
 
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""玩家账号 / 密码 / 教学 / 等级授予 / 最新角色。
+"""玩家账号 / 密码 / 封禁 / 教学 / 等级授予 / 最新角色。
 拆分自 player_store.py（纯移动重构，方法体逐字保留）。
 """
 class PlayersMixin:
@@ -27,6 +27,41 @@ class PlayersMixin:
             return await conn.fetchval(
                 'SELECT password FROM players '
                 'WHERE username = $1 AND deleted_at IS NULL', username)
+
+    async def get_ban_info(self, username):
+        """登录封禁检查，返回 (active, ban_expires, ban_reason)。
+
+        active=False 表示未封禁；限时封禁到期时惰性解封（清 banned/
+        ban_expires/ban_reason 三列，管理端列表同步恢复"正常"）。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT banned, ban_expires, ban_reason, "
+                "(banned AND (ban_expires IS NULL OR ban_expires > now())) "
+                "  AS active, "
+                "(banned AND ban_expires IS NOT NULL AND ban_expires <= now()) "
+                "  AS expired "
+                "FROM players WHERE username = $1 AND deleted_at IS NULL",
+                username)
+        if row is None:
+            return False, None, ''
+        if row['expired']:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE players SET banned = false, ban_expires = NULL, "
+                    "ban_reason = '' WHERE username = $1 AND banned", username)
+            return False, None, ''
+        return bool(row['active']), \
+            row['ban_expires'] if row['active'] else None, \
+            (row['ban_reason'] or '') if row['active'] else ''
+
+    async def get_machine_ban(self, machine_id):
+        """机器码封禁原因；未登记返回 None（空机器码直接放行）。"""
+        if not machine_id:
+            return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                'SELECT reason FROM machine_bans WHERE machine_id = $1',
+                machine_id)
 
     async def get_extra_unlock_uids(self, player_id, character_id):
         """返回该角色勋带购买的额外解锁 uid 集合（character_extra_unlocks 行表）。"""

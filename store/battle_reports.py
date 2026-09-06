@@ -141,6 +141,28 @@ class BattleReportsMixin:
                 character_id)
         return {r['stat_key']: float(r['value']) for r in rows}
 
+    async def get_total_score(self, player_id):
+        """玩家 totalScore（全角色汇总，PlayerScore 优先 / legacy score 回落，
+        二者同源不叠加）。单条聚合 SQL 替代 list_characters + N 次 get_stats
+        的 N+1 读法（29 角色玩家 _msg_player_for 单调用省 ~29 次查询）。
+        软删角色（is_deleted）不计，与 list_characters 口径一致。"""
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval(
+                'SELECT COALESCE(SUM(t.v), 0) FROM ('
+                '  SELECT COALESCE('
+                "      MAX(cs.value) FILTER (WHERE cs.stat_key = 'PlayerScore'),"
+                "      MAX(cs.value) FILTER (WHERE cs.stat_key = 'score'),"
+                '      0) AS v'
+                '  FROM characters c'
+                '  LEFT JOIN character_stats cs'
+                '      ON cs.character_id = c.id'
+                "      AND cs.stat_key IN ('PlayerScore', 'score')"
+                '  WHERE c.player_id = $1 AND NOT c.is_deleted'
+                '  GROUP BY c.id'
+                ') t',
+                player_id)
+        return int(val or 0)
+
     async def upsert_career_order_progress(self, player_id, career_order_id, delta=1):
         """生涯军令进度累加（CareerOrderActionGameRequest 上报一次执行）。
 

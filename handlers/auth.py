@@ -45,12 +45,56 @@ async def handle_queryserverinfo(sess, writer, cmd_id, req_type, proto):
 
 
 
+async def _record_login_event(sess, result, pid=None):
+    """登录结果写 login_events（审计：IP/机器码，成功失败都记）。
+
+    失败仅记日志不影响登录流程。"""
+    if STORE is None or STORE.pool is None:
+        return
+    try:
+        await STORE.record_login_event(
+            player_id=pid, username=sess.username or '',
+            ip=sess.remote_ip, result=result,
+            machine_id=sess.machine_id or '',
+            machine_id_old=sess.machine_id_old or '')
+    except Exception as e:
+        log(f'[DB] record_login_event failed: {e}')
+
+
 async def handle_querybannedmachinerequest(sess, writer, cmd_id, req_type, proto):
-    resp_proto = pb_int32(1, 0) + pb_string(2, '')  # isBanned=false, banReason=""
+    # 客户端每次启动登录前上报本机机器码（hngsync.exe 生成的 36 字符类 GUID），
+    # 挂到 session 供 login2 结果一起落库（login_events.machine_id）。
+    # 机器码封禁（machine_bans 表，管理端"连带封禁"写入）：命中即回
+    # isBanned=true，客户端 FrontScreenMediator 直接弹封禁提示并中止同步。
+    try:
+        f = pb_parse(proto)
+        mid = (f.get(1, b'') or b'').decode('utf-8', 'replace')
+        mid_old = (f.get(2, b'') or b'').decode('utf-8', 'replace')
+        if mid:
+            sess.machine_id = mid
+        if mid_old:
+            sess.machine_id_old = mid_old
+        log(f'      machine id = {sess.machine_id!r} (old={sess.machine_id_old!r})')
+    except Exception as e:
+        log(f'      machine id parse error: {e}')
+    ban_reason = ''
+    if STORE is not None and (sess.machine_id or sess.machine_id_old):
+        try:
+            ban_reason = (await STORE.get_machine_ban(sess.machine_id)
+                          or await STORE.get_machine_ban(sess.machine_id_old)
+                          or '')
+        except Exception as e:
+            log(f'      [DB] get_machine_ban failed: {e}')
+    if ban_reason:
+        resp_proto = pb_int32(1, 1) + pb_string(2, ban_reason)
+        note = f'BANNED machine={sess.machine_id!r}'
+    else:
+        resp_proto = pb_int32(1, 0) + pb_string(2, '')  # isBanned=false
+        note = 'not banned'
     resp = build_response(cmd_id, 'QueryBannedMachineResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} QueryBannedMachineResponse (not banned)')
+    log(f'S->C cmd={cmd_id:<4} QueryBannedMachineResponse ({note})')
 
 
 
@@ -117,6 +161,7 @@ async def handle_login2_response(sess, writer, cmd_id, req_type, proto):
         resp_proto = msg_login2_result(sess.username or 'DemoPlayer', code)
         resp = build_response(cmd_id, 'login2_result', resp_proto)
         log(f'S->C cmd={cmd_id:<4} login2_result -- wrong_password=98 (user not found)')
+        await _record_login_event(sess, code, pid=None)
         writer.write(resp)
         await writer.drain()
         return
@@ -139,14 +184,46 @@ async def handle_login2_response(sess, writer, cmd_id, req_type, proto):
     else:
         code = RC['wrong_password']
         note = 'wrong_password=98'
+    # 封禁拦截（密码正确才查，密码错本身已拒登）：账号封禁回 91 永久 /
+    # 92 限时（客户端登录窗弹封禁文案 + 原因/到期时间）；机器码封禁回
+    # 91（纵深防御：QueryBannedMachineRequest 已拦一道，防改包跳过）。
+    ban_reason = None
+    ban_expires = None
+    if code == RC['login_success'] and STORE is not None:
+        try:
+            active, ban_expires, ban_reason = \
+                await STORE.get_ban_info(sess.username)
+        except Exception as e:
+            active = False
+            log(f'      [DB] get_ban_info failed ({e}), allowing login')
+        if active:
+            code = (RC['user_ban_temporary'] if ban_expires is not None
+                    else RC['user_ban_permanent'])
+            note = (f'ban temporary until {ban_expires}'
+                    if ban_expires is not None else 'ban permanent')
+        elif sess.machine_id or sess.machine_id_old:
+            try:
+                m_reason = (await STORE.get_machine_ban(sess.machine_id)
+                            or await STORE.get_machine_ban(sess.machine_id_old))
+            except Exception as e:
+                m_reason = None
+                log(f'      [DB] machine ban lookup failed ({e})')
+            if m_reason:
+                code = RC['user_ban_permanent']
+                ban_reason = m_reason
+                note = f'ban machine={sess.machine_id!r}'
     # currentplayer.id 用数据库真实 player_id（客户端战报界面按它
     # 匹配本局玩家行，恒 1 会让 DB id≥2 的玩家结算窗口不弹）；
     # f10/f11 官服口径：当前战争 id + 本场阵营选择（无选择发 0 →
     # 客户端弹 FactionSelectionWindow，join_war_request 落库后修正）
-    pid = await sess.ensure_player() if code == RC['login_success'] else None
+    # 封禁拦截也取 pid：login_events 落库要记是哪个账号被拦
+    pid = await sess.ensure_player() \
+        if code in (RC['login_success'], RC['user_ban_permanent'],
+                    RC['user_ban_temporary']) else None
+    await _record_login_event(sess, code, pid=pid)
     faction = None
     war = None
-    if pid:
+    if pid and code == RC['login_success']:
         try:
             import war_campaign
             war = await war_campaign.ensure_war(STORE)
@@ -157,7 +234,9 @@ async def handle_login2_response(sess, writer, cmd_id, req_type, proto):
             log(f'[DB] player war faction failed: {e}')
     resp_proto = msg_login2_result(sess.username or 'DemoPlayer', code,
                                    pid=pid or 1, faction=faction,
-                                   war=war['id'] if war is not None else 0)
+                                   war=war['id'] if war is not None else 0,
+                                   ban_reason=ban_reason or None,
+                                   ban_expires=ban_expires)
     resp = build_response(cmd_id, 'login2_result', resp_proto)
     log(f'S->C cmd={cmd_id:<4} login2_result -- {note}')
     log(f'      resp bytes ({len(resp)}B): {resp.hex()}')

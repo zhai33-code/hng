@@ -48,6 +48,7 @@ from protocol import (
 from state import (
     FLASH_SESSIONS,
     STORE,
+    TCP_SESSIONS,
     Session,
     log,
     )
@@ -59,8 +60,8 @@ from handlers.social import notify_friends_of
 
 # 客户端连接活性：MainLayoutMediator.pulseTimerTicks 每 5 秒检查一次，
 # 距上次收到服务器数据 >20s（SERVER_SLOW_LIMIT_SECONDS）就显示左上角 loading +
-# "server slow"，>40s 还会发 keepalive。因此登录后需定期推送 ViewHandlerPulse
-# （ServerPulseTable 数据），客户端收到即 resetTimeout() 重置计数器。
+# "server slow"，>40s 还会发 keepalive。计数器只被 ViewHandlerPulse 数据行清零
+# （普通请求/响应不重置），因此必须固定间隔推送，不能依赖连接空闲触发。
 async def _send_pulse(sess, writer):
     """向已登录会话推送 ViewHandlerPulse（id/lastTickTime/serverTime，单位毫秒）。
     ★ game server 连接是新 TCP 流，playerview_cmd 未设（客户端未在 game server 连接上
@@ -76,33 +77,44 @@ async def _send_pulse(sess, writer):
 PULSE_INTERVAL = 5  # 秒；私服 PMS→Pulse 间隔约 5s，客户端 SERVER_SLOW_LIMIT_SECONDS=20
 
 
+async def _pulse_loop(sess, writer, fd):
+    """固定 5s 推送 ViewHandlerPulse（不依赖连接空闲）。
+    ★ 不能用「reader.read 超时才推」的空闲触发：玩家连点（勋带解锁每 3-4s 一请求）
+      时 read 永不超时 → pulse 发不出去 → 客户端计数器 20s 越界 → 左上角
+      "server slow" loading 误报（remote-log 实测 39 个 >20s pulse 空档中
+      34 个发生在勋带连点期间，期间服务端响应全部秒回）。
+    ★ ZServer wardatacomm 连接（BFSettings 握手时打标 is_combat_server）不推：
+      官方 warserver 从不给专用服发 KVCS，ZServer 的 Unhandled 路径
+      疑似堆损坏源（崩溃 0x4AD46D / 0x269E2，时间与 pulse 逐条吻合）。
+      该连接建立后立即发握手，打标远早于本循环首次推送（sleep 5s 之后），
+      无「标记前误推一帧」窗口。"""
+    try:
+        while True:
+            await asyncio.sleep(PULSE_INTERVAL)
+            if getattr(sess, 'is_combat_server', False):
+                continue
+            await _send_pulse(sess, writer)
+    except asyncio.CancelledError:
+        pass
+    except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+        pass
+    except Exception as e:
+        log(f'[pulse] loop failed fd={fd}: {e}')
+
+
 async def handle_tcp(reader, writer):
     addr = writer.get_extra_info('peername')
     sock = writer.get_extra_info('socket')
     fd = sock.fileno() if sock else -1
     log(f'TCP CONNECT from {addr} (fd={fd})')
     sess = Session(writer)
+    sess.remote_ip = addr[0] if addr else None
+    TCP_SESSIONS.append(sess)   # 封禁踢下线（handlers/ban.py）按此匹配
+    pulse_task = asyncio.create_task(_pulse_loop(sess, writer, fd))
     buf = b''
     try:
         while True:
-            try:
-                data = await asyncio.wait_for(reader.read(65536), timeout=PULSE_INTERVAL)
-            except asyncio.TimeoutError:
-                # 空闲超过 10s：推送 ViewHandlerPulse 保持连接活性，防止客户端报 server slow
-                # ★ ZServer wardatacomm 连接（BFSettings 握手时打标）不推：
-                #   官方 warserver 从不给专用服发 KVCS，ZServer 的 Unhandled 路径
-                #   疑似堆损坏源（崩溃 0x4AD46D / 0x269E2，时间与 pulse 逐条吻合）
-                if getattr(sess, 'is_combat_server', False):
-                    continue
-                log(f'[pulse] timeout fired fd={fd} playerview_cmd={sess.playerview_cmd}')
-                try:
-                    await _send_pulse(sess, writer)
-                except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
-                    break
-                except Exception as e:
-                    log(f'[pulse] send failed: {e}')
-                    break
-                continue
+            data = await reader.read(65536)
             if not data:
                 break
             buf += data
@@ -117,6 +129,9 @@ async def handle_tcp(reader, writer):
     except Exception as e:
         log(f'[handle_tcp] UNEXPECTED {addr}: {type(e).__name__}: {e}')
     finally:
+        pulse_task.cancel()
+        if sess in TCP_SESSIONS:
+            TCP_SESSIONS.remove(sess)
         log(f'TCP DISCONNECT {addr} (fd={fd})')
         # Flash 连接注册表注销（仅当注册的就是本连接；重登录已被覆盖时不动）
         went_offline = False
@@ -313,6 +328,10 @@ async def main():
         # 游戏服零轮询实时推 MessageRecipient KVCS 给在线会话
         from handlers.social import start_mail_listener
         start_mail_listener()
+        # 封禁踢下线监听（LISTEN hng_ban_player）：管理端封禁落库后 NOTIFY，
+        # 游戏服关闭该玩家全部在线连接（登录拦截在 login2 封禁检查）
+        from handlers.ban import start_ban_listener
+        start_ban_listener()
     except Exception as e:
         log(f'[DB] PostgreSQL UNAVAILABLE ({e}) -- 持久化已禁用')
     # HTTP 线程模块注入主 loop（/register 经它投递 create_player 协程）

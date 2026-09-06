@@ -5,7 +5,9 @@
 （管理端重启不影响游戏服连接）。自建表：
   admin_users      管理员账号（scrypt 哈希）
   admin_audit_log  全操作审计（谁/何时/做了什么/目标/前后值/IP）
-另为 players 补充 banned 列（封禁标记，游戏登录侧生效见 README 说明）。
+另维护 players 封禁列（banned/ban_reason/ban_expires）与 machine_bans
+机器码封禁表：游戏服登录侧拦截（login2 回 91/92）+ 封禁时经 NOTIFY
+hng_ban_player 踢下线，见 services/players_svc.set_ban。
 """
 import asyncpg
 
@@ -40,8 +42,20 @@ CREATE TABLE IF NOT EXISTS admin_audit_log (
 CREATE INDEX IF NOT EXISTS idx_admin_audit_created
     ON admin_audit_log (created_at DESC);
 
--- 封禁标记（游戏登录侧配合检查后实时生效）
+-- 封禁体系：banned 标记 + 原因 + 限时到期（游戏登录侧 login2 拦截回
+-- 91 永久 / 92 限时；ban_expires 空 = 永久，到期游戏服惰性解封）
 ALTER TABLE players ADD COLUMN IF NOT EXISTS banned BOOL NOT NULL DEFAULT FALSE;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS ban_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE players ADD COLUMN IF NOT EXISTS ban_expires TIMESTAMPTZ;
+-- 机器码封禁（连带封禁）：客户端启动 QueryBannedMachineRequest 命中即
+-- isBanned=true 中止同步；banned_player_id 供解封时清理本玩家登记的机器
+CREATE TABLE IF NOT EXISTS machine_bans (
+    machine_id       TEXT PRIMARY KEY,
+    reason           TEXT NOT NULL DEFAULT '',
+    banned_player_id BIGINT NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_machine_bans_player ON machine_bans(banned_player_id);
 -- 软删除标记（游戏登录侧 get_password 排除已删除账号 → 拒登；置空即恢复）
 ALTER TABLE players ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
@@ -72,6 +86,23 @@ CREATE TABLE IF NOT EXISTS voucher_redemptions (
     granted_at TIMESTAMPTZ,
     UNIQUE (voucher_pack_id, player_id)
 );
+
+-- 登录事件审计（与游戏服 store/schema.py 同构；此处幂等建表保证管理端
+-- 先于游戏服更新时"登录记录"页可用——游戏服写入，管理端只读）
+CREATE TABLE IF NOT EXISTS login_events (
+    id             BIGSERIAL PRIMARY KEY,
+    player_id      BIGINT,
+    username       TEXT NOT NULL DEFAULT '',
+    ip             TEXT,
+    machine_id     TEXT NOT NULL DEFAULT '',
+    machine_id_old TEXT NOT NULL DEFAULT '',
+    result         INT  NOT NULL,
+    source         TEXT NOT NULL DEFAULT 'game',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_login_events_player  ON login_events(player_id);
+CREATE INDEX IF NOT EXISTS idx_login_events_ip      ON login_events(ip);
+CREATE INDEX IF NOT EXISTS idx_login_events_machine ON login_events(machine_id);
 """
 
 

@@ -3,37 +3,47 @@
 
 SQL 与响应组装都在本层；路由只做参数解析与审计。
 """
+from datetime import datetime, timezone
+
 from .. import wardb_meta
 from .battles_svc import battle_row_dict
 
 
 async def list_players(pool, *, page: int, page_size: int, q: str,
                        order: str, state: str) -> dict:
-    """玩家分页列表（q 按用户名包含匹配；state=active/deleted/all 软删除筛选）。"""
+    """玩家分页列表（q 按用户名包含匹配；state=active/deleted/all 软删除筛选）。
+    每行附最近一次登录 IP/时间（LATERAL，player_id 命中 idx_login_events_player；
+    失败登录 player_id 为 NULL，故摘要=最近一次成功登录）。"""
     assert pool is not None
     conds: list[str] = []
     args: list = []
     if q:
         args.append(f'%{q}%')
-        conds.append(f'username ILIKE ${len(args)}')
+        conds.append(f'p.username ILIKE ${len(args)}')
     if state == 'active':
-        conds.append('deleted_at IS NULL')
+        conds.append('p.deleted_at IS NULL')
     elif state == 'deleted':
-        conds.append('deleted_at IS NOT NULL')
+        conds.append('p.deleted_at IS NOT NULL')
     where = ('WHERE ' + ' AND '.join(conds)) if conds else ''
     order_sql = {
-        'created_desc': 'created_at DESC',
-        'created_asc': 'created_at ASC',
-        'name_asc': 'username ASC',
-        'name_desc': 'username DESC',
-    }.get(order, 'created_at DESC')
+        'created_desc': 'p.created_at DESC',
+        'created_asc': 'p.created_at ASC',
+        'name_asc': 'p.username ASC',
+        'name_desc': 'p.username DESC',
+    }.get(order, 'p.created_at DESC')
     async with pool.acquire() as conn:
         total = await conn.fetchval(
-            f'SELECT count(*) FROM players {where}', *args)
+            f'SELECT count(*) FROM players p {where}', *args)
         rows = await conn.fetch(
-            f'SELECT id, username, credits, warfunds, gold, banned, '
-            f'deleted_at, created_at '
-            f'FROM players {where} ORDER BY {order_sql} '
+            f'SELECT p.id, p.username, p.credits, p.warfunds, p.gold, '
+            f'p.banned, p.ban_reason, p.ban_expires, p.deleted_at, '
+            f'p.created_at, l.ip AS last_login_ip, l.created_at AS last_login_at '
+            f'FROM players p '
+            f'LEFT JOIN LATERAL ('
+            f'  SELECT ip, created_at FROM login_events '
+            f'  WHERE player_id = p.id ORDER BY id DESC LIMIT 1'
+            f') l ON true '
+            f'{where} ORDER BY {order_sql} '
             f'LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}',
             *args, page_size, (page - 1) * page_size)
     return {
@@ -115,16 +125,63 @@ async def _char_score_rows(conn, player_id: int) -> list[tuple]:
     return [(cid, kv[0], kv[1]) for cid, kv in sorted(by_char.items())]
 
 
+async def _login_profile(conn, player_id: int, username: str) -> dict:
+    """登录事件 + 关联账号（玩家详情页与列表展开行共用）。
+
+    关联账号 = 该玩家用过的机器码/IP 上还登过哪些其他账号（小号排查）；
+    排除空机器码与回环 IP（本机测试连接噪音）。"""
+    logins = await conn.fetch(
+        'SELECT id, username, ip, machine_id, machine_id_old, result, '
+        'source, created_at FROM login_events '
+        'WHERE player_id = $1 OR username = $2 ORDER BY id DESC LIMIT 15',
+        player_id, username)
+    linked_machines = await conn.fetch(
+        'SELECT DISTINCT l2.username FROM login_events l2 '
+        'WHERE l2.username <> $1 AND l2.machine_id <> $2 AND l2.machine_id IN ('
+        '  SELECT machine_id FROM login_events '
+        '  WHERE (player_id = $3 OR username = $1) AND machine_id <> $2)',
+        username, '', player_id)
+    linked_ips = await conn.fetch(
+        'SELECT DISTINCT l2.username FROM login_events l2 '
+        'WHERE l2.username <> $1 AND l2.ip IS NOT NULL AND l2.ip <> $2 '
+        'AND l2.ip IN (SELECT ip FROM login_events '
+        '  WHERE (player_id = $3 OR username = $1) '
+        '    AND ip IS NOT NULL AND ip <> $2)',
+        username, '127.0.0.1', player_id)
+    return {
+        'login_events': [dict(r) for r in logins],
+        'linked_accounts': {
+            'same_machine': sorted(r['username'] for r in linked_machines),
+            'same_ip': sorted(r['username'] for r in linked_ips),
+        },
+    }
+
+
+async def player_logins(pool, player_id: int) -> dict:
+    """单个玩家的登录档案（列表页展开行懒加载；轻量，不含详情页其他部分）。"""
+    assert pool is not None
+    async with pool.acquire() as conn:
+        p = await conn.fetchrow('SELECT username FROM players WHERE id = $1',
+                                player_id)
+        if p is None:
+            raise LookupError('玩家不存在')
+        return await _login_profile(conn, player_id, p['username'])
+
+
 async def player_detail(pool, player_id: int) -> dict:
     """玩家账号级详情：账号信息 + 三货币 + 账号经验/等级 + 角色概览 +
     该玩家最近参战记录。"""
     assert pool is not None
     async with pool.acquire() as conn:
         p = await conn.fetchrow(
-            'SELECT id, username, credits, warfunds, gold, banned, created_at '
+            'SELECT id, username, credits, warfunds, gold, banned, '
+            'ban_reason, ban_expires, created_at '
             'FROM players WHERE id = $1', player_id)
         if p is None:
             raise LookupError('玩家不存在')
+        machines = await conn.fetch(
+            'SELECT machine_id, reason, created_at FROM machine_bans '
+            'WHERE banned_player_id = $1 ORDER BY created_at', player_id)
         total_score = int(sum(v for _, _, v in
                               await _char_score_rows(conn, player_id)))
         chars = await conn.fetch(
@@ -142,6 +199,8 @@ async def player_detail(pool, player_id: int) -> dict:
             'JOIN battle_reports r ON r.id = p.report_id '
             'WHERE p.player_id = $1 AND NOT p.is_bot '
             'ORDER BY r.created_at DESC LIMIT 10', player_id)
+        # 登录事件 + 关联账号（与列表展开行共用 _login_profile）
+        login_profile = await _login_profile(conn, player_id, p['username'])
     recent = []
     for b in battles:
         d = battle_row_dict(b)
@@ -156,6 +215,9 @@ async def player_detail(pool, player_id: int) -> dict:
         'player': player,
         'characters': [character_dict(c) for c in chars],
         'recent_battles': recent,
+        'machine_bans': [dict(m) for m in machines],
+        'login_events': login_profile['login_events'],
+        'linked_accounts': login_profile['linked_accounts'],
     }
 
 
@@ -354,13 +416,53 @@ async def adjust_score(pool, player_id: int, delta: int) -> dict:
             'level': wardb_meta.player_level_from_score(new_total)}
 
 
-async def set_ban(pool, player_id: int, banned: bool) -> dict:
-    """封禁/解封，返回用户名（供审计）。"""
+async def set_ban(pool, player_id: int, banned: bool, reason: str = '',
+                  expires_at: datetime | None = None,
+                  ban_machines: bool = False) -> dict:
+    """封禁/解封，返回用户名（供审计）。
+
+    封禁：reason 展示在客户端登录弹窗（≤200 字）；expires_at 空 = 永久，
+    到期由游戏服登录时惰性解封（get_ban_info）；ban_machines=True 连带
+    把该玩家登录过的机器码登记进 machine_bans（客户端启动即拦截，防小号）。
+    事务内 NOTIFY hng_ban_player，游戏服（LISTEN）即时踢掉在线会话
+    （COMMIT 后送达，未提交不误踢）。解封：清三列 + 清理本玩家登记的
+    机器码封禁，不踢在线连接。"""
+    reason = (reason or '').strip()
+    if banned and len(reason) > 200:
+        raise ValueError('封禁原因最多 200 字')
+    if banned and expires_at is not None:
+        if expires_at.tzinfo is None:
+            raise ValueError('封禁到期时间需带时区（ISO 8601）')
+        if expires_at <= datetime.now(timezone.utc):
+            raise ValueError('封禁到期时间必须晚于当前时间')
     assert pool is not None
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            'UPDATE players SET banned = $1 WHERE id = $2 RETURNING username',
-            banned, player_id)
-    if row is None:
-        raise LookupError('玩家不存在')
+        async with conn.transaction():
+            if banned:
+                row = await conn.fetchrow(
+                    'UPDATE players SET banned = true, ban_reason = $1, '
+                    'ban_expires = $2 WHERE id = $3 RETURNING username',
+                    reason, expires_at, player_id)
+                if row is None:
+                    raise LookupError('玩家不存在')
+                if ban_machines:
+                    await conn.execute(
+                        'INSERT INTO machine_bans (machine_id, reason, '
+                        'banned_player_id) '
+                        'SELECT DISTINCT machine_id, $1, $2 FROM login_events '
+                        "WHERE player_id = $2 AND machine_id <> '' "
+                        'ON CONFLICT (machine_id) DO NOTHING',
+                        reason, player_id)
+                await conn.execute('SELECT pg_notify($1, $2)',
+                                   'hng_ban_player', str(player_id))
+            else:
+                row = await conn.fetchrow(
+                    "UPDATE players SET banned = false, ban_reason = '', "
+                    'ban_expires = NULL WHERE id = $1 RETURNING username',
+                    player_id)
+                if row is None:
+                    raise LookupError('玩家不存在')
+                await conn.execute(
+                    'DELETE FROM machine_bans WHERE banned_player_id = $1',
+                    player_id)
     return {'username': row['username'], 'banned': banned}

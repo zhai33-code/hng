@@ -310,7 +310,9 @@ def pb_field_payload(chunk):
 # ------------------------------------------------------------------ messages
 
 RC = {'fail': 0, 'ok': 1, 'redirect': 93, 'challenge': 96,
-      'login_success': 97, 'wrong_password': 98}
+      'login_success': 97, 'wrong_password': 98,
+      # 账号封禁（客户端 ResponseCodes：91 弹"永久封禁"、92 弹"限时封禁至 xx"）
+      'user_ban_permanent': 91, 'user_ban_temporary': 92}
 
 
 def msg_login2_challenge(salt_b64, temp_sid_b64, enc_key_b64):
@@ -405,11 +407,19 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     return m
 
 
-def msg_login2_result(username, code, pid=1, faction=None, war=None):
+def msg_login2_result(username, code, pid=1, faction=None, war=None,
+                      ban_reason=None, ban_expires=None):
     m = b''
     m += pb_string(1, username)
     m += pb_string(2, time.strftime('%Y-%m-%d %H:%M:%S'))
     m += pb_int32(3, code)
+    if code in (RC['user_ban_permanent'], RC['user_ban_temporary']):
+        # f4 banExpires / f5 banReason：客户端 StandaloneLoginCommand 消费，
+        # f4 是 epoch 毫秒字符串（TimeUtilities.TimeAsString 直接 Number() 解析）
+        if ban_expires is not None:
+            m += pb_string(4, str(int(ban_expires.timestamp() * 1000)))
+        if ban_reason:
+            m += pb_string(5, ban_reason)
     if code == RC['login_success']:
         m += pb_message(6, msg_player(username, pid=pid, faction=faction,
                                       war=war))

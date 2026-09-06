@@ -15,11 +15,13 @@ const titles: Record<string, string> = {
   players: '玩家管理',
   'player-detail': '玩家详情',
   'character-detail': '角色装备明细',
+  'login-events': '登录记录',
   battles: '战报',
   war: '战争（RTS）',
   reports: '举报处理',
   mail: '发送邮件',
   vouchers: '兑换码',
+  config: '服务器配置',
   status: '服务器状态',
   'audit-log': '审计日志',
 }
@@ -49,11 +51,13 @@ async function onLogout() {
       <el-menu class="admin-menu" :default-active="route.path" router>
         <el-menu-item index="/dashboard">仪表盘</el-menu-item>
         <el-menu-item index="/players">玩家管理</el-menu-item>
+        <el-menu-item index="/login-events">登录记录</el-menu-item>
         <el-menu-item index="/battles">战报</el-menu-item>
         <el-menu-item index="/war">战争（RTS）</el-menu-item>
         <el-menu-item index="/reports">举报处理</el-menu-item>
         <el-menu-item index="/mail">发送邮件</el-menu-item>
         <el-menu-item index="/vouchers">兑换码</el-menu-item>
+        <el-menu-item index="/config">服务器配置</el-menu-item>
         <el-menu-item index="/status">服务器状态</el-menu-item>
         <el-menu-item index="/audit-log">审计日志</el-menu-item>
       </el-menu>

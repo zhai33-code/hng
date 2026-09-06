@@ -14,6 +14,7 @@ from protocol import (
     pb_int64,
     pb_message,
     pb_parse,
+    pb_parse_multi,
     pb_string,
     )
 
@@ -60,13 +61,34 @@ from player_service import (
 
 
 async def handle_requestreadcharacterstats(sess, writer, cmd_id, req_type, proto):
+    # ★ 2026-09-06 对齐官服：RequestReadCharacterStats { f1 repeated uint64
+    #   characterids, f2 bool ignoreSessionId } —— 空 proto 回空 body、
+    #   按请求 id ∩ 本人角色过滤（交集天然防越权：请求别人的角色 id 拿不到
+    #   数据）。原实现忽略请求参数全量回发，宽松行为掩盖了 foreign_sync_probe
+    #   空 proto bug，导致官服采集勋带/经验为空。
     pid = await sess.ensure_player()
-    char_ids = [1]
-    if pid is not None:
+    req_ids = []
+    try:
+        req_ids = [int(v) for v in pb_parse_multi(proto).get(1, [])
+                   if isinstance(v, int)]
+    except Exception as e:
+        log(f'      ReadCharacterStats parse error: {e}')
+
+    char_ids = []
+    if req_ids and pid is not None:
         try:
-            char_ids = [ch['id'] for ch in await STORE.list_characters(pid)] or [1]
+            own = {int(ch['id']) for ch in await STORE.list_characters(pid)}
+            char_ids = [cid for cid in req_ids if cid in own]
         except Exception as e:
             log(f'[DB] list_characters failed: {e}')
+
+    if not char_ids:
+        resp = build_response(cmd_id, 'ResponseReadCharacterStats', b'')
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} ResponseReadCharacterStats '
+            f'(empty: req={req_ids}, 0 entries)')
+        return
 
     resp_proto = b''
     for cid in char_ids:

@@ -32,7 +32,8 @@ if _WEB_DIR not in sys.path:
     sys.path.insert(0, _WEB_DIR)
 
 from server import auth, config, db
-from server.routers import auth_router, mail, misc, players, reports, vouchers, war
+from server.routers import auth_router, logins, mail, misc, players, reports, vouchers, war
+from server.routers import config as config_router   # 避开 server.config 设置模块
 
 
 @asynccontextmanager
@@ -48,11 +49,13 @@ app = FastAPI(title='HnG 私服管理后端',
 
 app.include_router(auth_router.router)
 app.include_router(players.router)
+app.include_router(logins.router)
 app.include_router(misc.router)
 app.include_router(reports.router)
 app.include_router(mail.router)
 app.include_router(vouchers.router)
 app.include_router(war.router)
+app.include_router(config_router.router)
 
 
 @app.get('/')
