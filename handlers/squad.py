@@ -86,8 +86,8 @@ from player_service import (
     )
 
 from messages import _push_kvcs
-from matchmaking import (_MM_MISSION_SQUADS, _SOLO_SQUADS,
-                         _push_kvcs_delete)
+from matchmaking import _push_kvcs_delete
+from mm_state import _MM_MISSION_SQUADS, _SOLO_SQUADS
 from wardb import _rank_from_combat_xp, squad_template_for_character
 
 RC_OK = 1

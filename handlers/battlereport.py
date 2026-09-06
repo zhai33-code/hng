@@ -32,7 +32,7 @@ ClientBattleReport 嵌套（required 字段全给，空 repeated 完全省略）
 
 import json
 
-import matchmaking
+import mm_state
 from protocol import (
     build_response,
     pb_bool,
@@ -140,7 +140,7 @@ def _msg_client_battle_report(rep, players):
     m = b''
     m += pb_int64(1, int(rep['id']))                    # missionBattleReportId
     m += pb_int64(2, 1)                                 # mapEntityTypeId(1=battlefield)
-    m += pb_int64(3, matchmaking.MISSION_MAP_ENTITY_ID)  # mapEntityId（Benoit Village）
+    m += pb_int64(3, mm_state.MISSION_MAP_ENTITY_ID)  # mapEntityId（Benoit Village）
     m += pb_int64(4, int(rep['mission_preset_id']))
     m += pb_int64(6, int(rep['defender_faction_id']))
     m += pb_int64(7, int(rep['winner_faction_id']))

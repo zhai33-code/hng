@@ -28,6 +28,9 @@ import time
 import zlib
 
 import matchmaking
+import combat_instances
+import mm_state
+import mm_factions
 import war_campaign
 import force_pool
 from protocol import (
@@ -178,7 +181,7 @@ def _session_by_player(player_id, mission_id=None):
     可能与真实账号 id 撞号（实测 bot 3 ≠ 玩家 3），全局反查会把
     bot 的击杀记到真实账号名下；圈定本局后不在名单 = bot → None。"""
     found = None
-    for s in matchmaking.PMS_TO_SESSION.values():
+    for s in mm_state.PMS_TO_SESSION.values():
         if int(s.get('player_id', 0) or 0) != int(player_id):
             continue
         if mission_id and int(s.get('mission_id', 0) or 0) != int(mission_id):
@@ -193,7 +196,7 @@ def _session_by_msid(msid):
         msid = int(msid)
     except (TypeError, ValueError):
         return None
-    for s in matchmaking.PMS_TO_SESSION.values():
+    for s in mm_state.PMS_TO_SESSION.values():
         if msid in (int(s.get('pms_id', 0) or 0),
                     int(s.get('battle_session_id', 0) or 0)):
             return s
@@ -240,23 +243,23 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
     # 解析本局 mission id：proto f1 → PMS_TO_MISSION 反查 → 连接记录
     # （战斗服 combat_mission / 玩家游戏进程 game_mission，实测两者轮询均 f1=0）
     mid = int(mission_id or 0)
-    det = matchmaking._MM_MISSION_DETAILS.get(mid)
+    det = mm_state._MM_MISSION_DETAILS.get(mid)
     if not det and mid:
-        mid2 = int(matchmaking.PMS_TO_MISSION.get(mid, 0) or 0)
+        mid2 = int(mm_state.PMS_TO_MISSION.get(mid, 0) or 0)
         if mid2:
             mid = mid2
-            det = matchmaking._MM_MISSION_DETAILS.get(mid)
+            det = mm_state._MM_MISSION_DETAILS.get(mid)
     if not det:
         cm = int(getattr(sess, 'combat_mission', 0) or 0) or \
             int(getattr(sess, 'game_mission', 0) or 0)
         if cm:
             mid = cm
-            det = matchmaking._MM_MISSION_DETAILS.get(cm)
+            det = mm_state._MM_MISSION_DETAILS.get(cm)
     if det and 'preset' in det:
         # ★ 阵营字段无默认值：_faction_pair 校验（损坏 → None + ERROR 日志），
         #   不静默用 2/GE、3/SU 默认（曾致错阵营布局）。校验不过走
         #   builder 默认路径（与"det 缺失"同款降级）。
-        fp = matchmaking._faction_pair(det)
+        fp = mm_factions._faction_pair(det)
         if fp is None:
             mm_preset = None
             mm_defender = None
@@ -319,7 +322,7 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
         if o and (o not in home_by_fac or int(tmpl) < home_by_fac[o]):
             home_by_fac[o] = int(tmpl)
     home_ap_default = int(layout[0][0]) if layout else 0
-    for s in matchmaking.PMS_TO_SESSION.values():
+    for s in mm_state.PMS_TO_SESSION.values():
         fac = int(s.get('faction', 3) or 3)
         home_ap = home_by_fac.get(fac, home_ap_default)
         at = b''
@@ -328,7 +331,7 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
         at += pb_string(3, s.get('gamertag') or 'Player')           # ownerGamertag
         at += pb_int64(4, fac)                                      # factionId(runtime)
         at += pb_int64(5, commandnode_template(fac, 'infantry'))  # commandNodeTemplateId
-        at += pb_int64(6, matchmaking.MISSION_MAP_ENTITY_ID)        # mapEntityId
+        at += pb_int64(6, mm_state.MISSION_MAP_ENTITY_ID)        # mapEntityId
         at += pb_int64(7, 1)                                        # mapEntityTypeId(1=battlefield)
         at += pb_bool(8, False)                                     # inTransit
         at += pb_bool(14, True)                                     # inActiveMission
@@ -442,7 +445,7 @@ async def handle_report_mission_status(sess, writer, cmd_id, req_type, proto):
 
     # f2 资源消耗 → 扣每局资源池（mission：msid→会话→PMS 反查，回退连接记录）
     mm_sess = _session_by_msid(msid) if msid else None
-    mid = int(matchmaking.PMS_TO_MISSION.get(
+    mid = int(mm_state.PMS_TO_MISSION.get(
         int(mm_sess.get('pms_id', 0) or 0), 0) or 0) if mm_sess else 0
     if not mid:
         mid = int(getattr(sess, 'combat_mission', 0) or 0) or \
@@ -589,7 +592,7 @@ async def _push_pms_admitted(sess, writer, mm_sess):
     pms_id = int(mm_sess.get('pms_id', 0) or 0)
     pid = int(mm_sess.get('player_id', 0) or 0)
     char_id = int(mm_sess.get('char_id', 0) or 0)
-    mission_id = int(matchmaking.PMS_TO_MISSION.get(pms_id, 0) or 0)
+    mission_id = int(mm_state.PMS_TO_MISSION.get(pms_id, 0) or 0)
     gamertag = mm_sess.get('gamertag') or 'Player'
     faction = int(mm_sess.get('faction', 3) or 3)
     char_name, rank = gamertag, 0
@@ -607,7 +610,7 @@ async def _push_pms_admitted(sess, writer, mm_sess):
             mission_id, matchmaking._zulu_now(), _GAME_CONNECT,
             metrics_uid=mm_sess.get('metrics_uid', ''),
             metrics_session_id=int(mm_sess.get('metrics_session_id', 0) or 0),
-            metrics_device_id=matchmaking.METRICS_DEVICE_ID,
+            metrics_device_id=mm_state.METRICS_DEVICE_ID,
             platform='HnG', connection_state=2,
             battle_session_id=int(mm_sess.get('battle_session_id', 0) or 0))
         await matchmaking._push_kvcs(writer, sess.playerview_cmd,
@@ -1434,7 +1437,7 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 try:
                     from handlers.career import (
                         _missiontype_for_preset, complete_battle_orders)
-                    det = matchmaking._MM_MISSION_DETAILS.get(
+                    det = mm_state._MM_MISSION_DETAILS.get(
                         report['mission_id']) or {}
                     mt = _missiontype_for_preset(det.get('preset'))
                     await complete_battle_orders(
@@ -1517,7 +1520,7 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
         except Exception as e:
             log(f'      [combat] finish mission sessions failed: {e}')
         await _settle_war_mission(mission_id, report)
-        matchmaking.release_match(mission_id)
+        combat_instances.release_match(mission_id)
 
 
 async def _settle_war_mission(mission_id, report):
@@ -1526,7 +1529,7 @@ async def _settle_war_mission(mission_id, report):
     非 war 局无操作。胜负取 BattleReport f3 winnerFactionId（0 = 守方
     守住：攻方未能占领）。必须在 release_match 之前（det 尚未清理）。
     """
-    det = matchmaking._MM_MISSION_DETAILS.get(int(mission_id)) or {}
+    det = mm_state._MM_MISSION_DETAILS.get(int(mission_id)) or {}
     battle_id = int(det.get('battle_id') or 0)
     if not battle_id:
         return
@@ -1683,17 +1686,17 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
        客户端 GetBattleReport 查不到会静默跳过弹窗）；
     4. 清理 PMS_TO_SESSION / PMS_TO_MISSION / _MM_QUEUES 内部状态。
 
-    另一调用方：matchmaking._watch_proc_exit（战斗服未走 earnings 即退出，
+    另一调用方：combat_instances._watch_proc_exit（战斗服未走 earnings 即退出，
     report_id=None → 跳过通知推送，只做 1/2/4——否则客户端 closing 流程收
     不到会话结束信号，轮询 GetMissionDetails 到超时才自行 Abandon）。
     末尾统一清 PMS 映射，重复调用空转，天然幂等。
     """
-    my_pms = [pms for pms, mid in matchmaking.PMS_TO_MISSION.items()
+    my_pms = [pms for pms, mid in mm_state.PMS_TO_MISSION.items()
               if int(mid or 0) == int(mission_id)]
     # 真实小队整队重置必须先于 PMS DELETE（StatusMediator 在 PMS DELETE 的
     # lobbySignal 里读 squadSession.missionId，非 0 → LOCKED_IN_COMBAT）：
     # 先预扫描收集本局涉及的小队，重置后再逐玩家推 PMS DELETE
-    real_squads = sorted({int((matchmaking.PMS_TO_SESSION.get(p) or {})
+    real_squads = sorted({int((mm_state.PMS_TO_SESSION.get(p) or {})
                               .get('squad_db_id', 0) or 0)
                           for p in my_pms} - {0})
     for sid in real_squads:
@@ -1702,9 +1705,9 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
         except Exception as e:
             log(f'      [combat] squad reset failed (squad={sid}): {e}')
     for pms_id in my_pms:
-        mm_sess = matchmaking.PMS_TO_SESSION.get(pms_id)
+        mm_sess = mm_state.PMS_TO_SESSION.get(pms_id)
         if mm_sess is None:
-            matchmaking.PMS_TO_MISSION.pop(pms_id, None)
+            mm_state.PMS_TO_MISSION.pop(pms_id, None)
             continue
         pid = int(mm_sess.get('player_id', 0) or 0)
         gamertag = mm_sess.get('gamertag') or ''
@@ -1714,7 +1717,7 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
             log(f'      [combat] battle end: no live Flash session for '
                 f'{gamertag!r}; PMS delete/notification NOT pushed')
             continue
-        solo = matchmaking._SOLO_SQUADS.get(pid)
+        solo = mm_state._SOLO_SQUADS.get(pid)
         try:
             if solo is not None and not squad_db_id:
                 solo['mission_id'] = 0
@@ -1861,11 +1864,11 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
     # 内部状态清理（无论 Flash 连接是否在线）
     finished_pids = set()
     for pms_id in my_pms:
-        s = matchmaking.PMS_TO_SESSION.pop(pms_id, None)
-        matchmaking.PMS_TO_MISSION.pop(pms_id, None)
+        s = mm_state.PMS_TO_SESSION.pop(pms_id, None)
+        mm_state.PMS_TO_MISSION.pop(pms_id, None)
         if s is not None:
             _pid = int(s.get('player_id', 0) or 0)
-            matchmaking._MM_QUEUES.pop(_pid, None)
+            mm_state._MM_QUEUES.pop(_pid, None)
             if _pid:
                 finished_pids.add(_pid)
     # ★ 好友列表刷新：战斗结束 missionId 归零（必须在上面 PMS 清理之后，

@@ -21,6 +21,10 @@ import uuid
 from eos import oidc_issuer
 # matchmaking 的运行时状态（PMS 会话 / 动态 id 发号 / COMBAT_READY）
 import matchmaking
+import combat_instances
+import mm_state
+import mm_factions
+import mm_weather
 import mm_config
 
 from protocol import (
@@ -86,7 +90,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         #   （历史回放里的他服角色是 6360... 大 id，不在库内 → 列表全空没角色可选）。
         #   f1 player_id / f2 gamertag 同步用本服账号库值 —— JWT sub 必须同源
         #   （客户端校验 f1 == sub）。
-        mm_sess = matchmaking.PMS_TO_SESSION.get(pms_id)
+        mm_sess = mm_state.PMS_TO_SESSION.get(pms_id)
         pms_exact = mm_sess is not None   # 身份绑定只信任精确命中（见 if mm_sess 内）
         if mm_sess is None:
             # ★ pms 未精确命中（stale pms：rejoin/结算清理后 ZServer 仍持有）
@@ -95,12 +99,12 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             #   身份/阵营/角色错配（"进游戏人变成 bot"根因之一：ZServer
             #   建玩家失败 → AI 补位顶替）。
             cm = int(getattr(sess, 'combat_mission', 0) or 0)
-            for _s in matchmaking.PMS_TO_SESSION.values():
+            for _s in mm_state.PMS_TO_SESSION.values():
                 if cm and int(_s.get('mission_id', 0) or 0) != cm:
                     continue
                 mm_sess = _s          # dict 保序 → 本局最新进局会话
             if mm_sess is None and not cm:
-                for _s in matchmaking.PMS_TO_SESSION.values():
+                for _s in mm_state.PMS_TO_SESSION.values():
                     mm_sess = _s      # 无本局信息（理论不可达）→ 全局最新
                 if mm_sess is not None:
                     log(f'      [WARN] GetPlayerSettings: pms={pms_id} miss, '
@@ -128,13 +132,13 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             # 每局动态 id 与 PMS 推送同源（matchmaking._handle_join 发号入会话），
             # 会话缺失时现场发号 —— 绝不回退他服回放值
             squad_id = int(mm_sess.get('squad_id', 0) or 0) or \
-                matchmaking._next_match_id(matchmaking._MM_SQUAD_ID)
+                mm_state._next_match_id(mm_state._MM_SQUAD_ID)
             squad_slot = int(mm_sess.get('squad_slot', 0) or 0)
             metrics_uid = mm_sess.get('metrics_uid') or str(uuid.uuid4())
             metrics_session_id = int(mm_sess.get('metrics_session_id', 0) or 0) \
-                or matchmaking._next_match_id(matchmaking._MM_METRICS_SESSION_ID)
+                or mm_state._next_match_id(mm_state._MM_METRICS_SESSION_ID)
             mission_session_id = int(mm_sess.get('battle_session_id', 0) or 0) \
-                or matchmaking._next_match_id(matchmaking._MM_BATTLE_SESSION_ID)
+                or mm_state._next_match_id(mm_state._MM_BATTLE_SESSION_ID)
             if mm_sess.get('quickplay') is not None:
                 quickplay = bool(mm_sess['quickplay'])
             if STORE is not None:
@@ -163,21 +167,21 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             char_id = 0
             player_id = 0
             gamertag = 'Player'
-            squad_id = matchmaking._next_match_id(matchmaking._MM_SQUAD_ID)
+            squad_id = mm_state._next_match_id(mm_state._MM_SQUAD_ID)
             squad_slot = 0
             metrics_uid = str(uuid.uuid4())
-            metrics_session_id = matchmaking._next_match_id(
-                matchmaking._MM_METRICS_SESSION_ID)
-            mission_session_id = matchmaking._next_match_id(
-                matchmaking._MM_BATTLE_SESSION_ID)
+            metrics_session_id = mm_state._next_match_id(
+                mm_state._MM_METRICS_SESSION_ID)
+            mission_session_id = mm_state._next_match_id(
+                mm_state._MM_BATTLE_SESSION_ID)
             log(f'      [WARN] GetPlayerSettings: no PMS session '
                 f'(pms_id={pms_id}), ids generated, player fields zeroed')
         # missionId 必须与客户端启动参数 /M 一致（否则客户端校验失败挂起→20s 超时断开）
         # pms 命中时从映射取；未命中（兜底会话）用该会话的 mission；
         # 都没有才回退全局计数（旧行为）
-        mission_id = matchmaking.PMS_TO_MISSION.get(pms_id, 0) or \
+        mission_id = mm_state.PMS_TO_MISSION.get(pms_id, 0) or \
             (int(mm_sess.get('mission_id', 0) or 0) if mm_sess else 0) or \
-            matchmaking._MM_MISSION_ID[0]
+            mm_state._MM_MISSION_ID[0]
         # ★ 记在连接上：玩家游戏进程的 ActiveMissionRequestEventList 轮询
         #   实测不带 mission_id（f1=0，与战斗服同款），combat.py 用它定位
         #   本局资源池/布局（否则回退 Mill 模板 → 资源数字错局）。
@@ -279,7 +283,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         pid_by_char = {}
         stats_pid = None
         stats_cid = 0
-        for _s in matchmaking.PMS_TO_SESSION.values():
+        for _s in mm_state.PMS_TO_SESSION.values():
             stats_pid = _s['player_id']   # dict 保序 → 最后一条 = 最新进局会话
             stats_cid = int(_s.get('char_id', 0) or 0)
             if STORE is None:
@@ -346,7 +350,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         except Exception:
             pass
         if not req_pid:
-            for _s in matchmaking.PMS_TO_SESSION.values():
+            for _s in mm_state.PMS_TO_SESSION.values():
                 req_pid = _s['player_id']   # dict 保序 → 最新进局会话
         credits = gold = 0
         if req_pid and STORE is not None:
@@ -404,7 +408,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         #   4) 完全无会话 → found=0（真实 not-found 响应，不用回放 id）。
         uid_pid = None
         if nick:
-            for _s in matchmaking.PMS_TO_SESSION.values():
+            for _s in mm_state.PMS_TO_SESSION.values():
                 if _s.get('gamertag') == nick:
                     uid_pid = _s['player_id']
                     break
@@ -414,7 +418,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                 except Exception as e:
                     log(f'[DB] get_player({nick!r}) failed: {e}')
         if uid_pid is None:
-            for _s in matchmaking.PMS_TO_SESSION.values():
+            for _s in mm_state.PMS_TO_SESSION.values():
                 uid_pid = _s['player_id']
         found = 1 if uid_pid is not None else 0
         uid_str = str(uid_pid)[:10] if uid_pid is not None else ''  # ≤10 字符 SSO 安全区
@@ -473,13 +477,13 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         #   faction 最终以 _MM_MISSION_SQUADS 登记表为准（见下方 sq_info）。
         mm_sess = None
         if mission_session_id_req:
-            for _s in matchmaking.PMS_TO_SESSION.values():
+            for _s in mm_state.PMS_TO_SESSION.values():
                 if mission_session_id_req in (_s.get('pms_id'),
                                               _s.get('battle_session_id')):
                     mm_sess = _s
                     break
         if mm_sess is None and requested_squad_id:
-            for _s in matchmaking.PMS_TO_SESSION.values():
+            for _s in mm_state.PMS_TO_SESSION.values():
                 if int(requested_squad_id) == int(_s.get('squad_id', 0) or 0):
                     mm_sess = _s
                     break
@@ -490,12 +494,12 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             #   单槽默认 + 错误 faction（历史小队阵营错误同款路径）。
             #   请求来自战斗服自己的连接，用握手记录的 combat_mission 圈定。
             cm = int(getattr(sess, 'combat_mission', 0) or 0)
-            for _s in matchmaking.PMS_TO_SESSION.values():
+            for _s in mm_state.PMS_TO_SESSION.values():
                 if cm and int(_s.get('mission_id', 0) or 0) != cm:
                     continue
                 mm_sess = _s          # dict 保序 → 本局最新进局会话
             if mm_sess is None and not cm:
-                for _s in matchmaking.PMS_TO_SESSION.values():
+                for _s in mm_state.PMS_TO_SESSION.values():
                     mm_sess = _s      # 无本局信息（理论不可达）→ 全局最新
         if mm_sess is None:
             log('      [WARN] SquadRequest: no PMS session, char ids zeroed')
@@ -509,7 +513,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         #   squad_id（与 PlayerSettings f16 同源生成），最后现场发号。
         squad_runtime_id = int(requested_squad_id) if requested_squad_id else (
             int(mm_sess.get('squad_id', 0) or 0) if mm_sess else 0) or \
-            matchmaking._next_match_id(matchmaking._MM_SQUAD_ID)
+            mm_state._next_match_id(mm_state._MM_SQUAD_ID)
 
         # ★ 局内小队定义：成局时 matchmaking 按分组登记（真实小队用大厅
         #   传入的队名/队长；单人匹配自动凑队，rank 最高任队长）。
@@ -517,7 +521,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         #   playerSlot（index 与各自 PlayerSettings f17 squadSlotIndex 对齐）。
         #   会话不在登记表（理论不可达，如重启残留）→ 回退单人单槽定义。
         mission_id = int(mm_sess.get('mission_id', 0) or 0) if mm_sess else 0
-        sq_info = matchmaking._MM_MISSION_SQUADS.get(
+        sq_info = mm_state._MM_MISSION_SQUADS.get(
             mission_id, {}).get(squad_runtime_id) if mission_id else None
         if sq_info is not None:
             members = sq_info.get('members') or []
@@ -604,27 +608,27 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         # 每场战局地图/布局各不相同）；查不到（旧路径/异常）回退全局默认。
         # 防御：若 field1 实测为 pms_id（协议文档 §B.7 之外的备选情形），
         # 经 PMS_TO_MISSION 反查 mission_id 再取详情。
-        det = matchmaking._MM_MISSION_DETAILS.get(missionid)
+        det = mm_state._MM_MISSION_DETAILS.get(missionid)
         if not det and missionid:
-            mid2 = matchmaking.PMS_TO_MISSION.get(missionid)
+            mid2 = mm_state.PMS_TO_MISSION.get(missionid)
             if mid2:
-                det = matchmaking._MM_MISSION_DETAILS.get(mid2)
+                det = mm_state._MM_MISSION_DETAILS.get(mid2)
         if not det:
             # ★ 实测专用服本请求 proto 为空（无 field1，日志全量可证）：
             #   按启动顺序 FIFO 认领最早未握手实例，取其 preset/地图/阵营，
             #   否则回退默认 preset=10(Mill) → 专用服加载错图 + inst['ready']
             #   永不置位 → 120s 握手超时 → 客户端卡匹配 UI。
-            claimed = matchmaking.claim_pending_combat_instance()
+            claimed = combat_instances.claim_pending_combat_instance()
             if claimed:
                 missionid = claimed
-                det = matchmaking._MM_MISSION_DETAILS.get(missionid)
+                det = mm_state._MM_MISSION_DETAILS.get(missionid)
         if det and 'preset' in det:
             # ★ 阵营字段无默认值：_faction_pair 校验（缺失/非法/同侧 →
             #   None + ERROR 日志），不静默用 2/GE、3/SU 默认阵营配出生侧
             #   （曾致错阵营判负+观战）。校验不过按"无详情"走 legacy 回退。
             #   角色建号即写 faction、_start_match 恒写攻防字段，正常路径
             #   恒合法；此处仅拦结构损坏。
-            fp = matchmaking._faction_pair(det)
+            fp = mm_factions._faction_pair(det)
             if fp is None:
                 det = None
         if det and 'preset' in det:
@@ -637,7 +641,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             # f22 = 天气列 | 雪掩码（雪局 0x30 高位，snow-unified-patch.md §3：
             # 补丁版 dll 于 CreateInstance 拆开；details 的 weather_condition
             # 保持 0..2，简报 f13 同源不受污染）
-            weather_condition = matchmaking.snow_f22_condition(det)
+            weather_condition = mm_weather.snow_f22_condition(det)
             timeofday = det.get('timeofday')
             # ★ 记在连接上：战斗服后续 ActiveMissionRequestEventList 轮询
             #   请求同样不带 mission_id（实测 mission=0），combat.py 用它
@@ -681,7 +685,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         # 通知 matchmaking：该 missionid 的专用服握手完成，可推 Admitted
         ready_mid = missionid
         if not (det and 'preset' in det) and missionid:
-            ready_mid = matchmaking.PMS_TO_MISSION.get(missionid, missionid)
-        matchmaking.notify_combat_ready(ready_mid or None)
+            ready_mid = mm_state.PMS_TO_MISSION.get(missionid, missionid)
+        combat_instances.notify_combat_ready(ready_mid or None)
         return True
     return False

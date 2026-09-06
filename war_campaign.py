@@ -586,7 +586,7 @@ def msg_hq_resource_rows(war_id, hq_id, stock):
     FactionResourceOverviewMediator 库存列数据源）。
 
     stock={category_id: count}。id = (hq_id & ~0xFF) | cat：HQ id 是 63 位
-    随机数（matchmaking.FACTION_SUPREME_COMMANDS），*1000 惯例会溢出 int64；
+    随机数（mm_factions.FACTION_SUPREME_COMMANDS），*1000 惯例会溢出 int64；
     低 8 位塞 cat（1-21 < 255）保证 (hq,cat) 唯一且不越界。"""
     out = []
     base = int(hq_id) & ~0xFF
@@ -620,10 +620,10 @@ async def hq_stock_rows(store, war=None):
         for r in await store.list_war_faction_resources(war['id']):
             stock.setdefault(int(r['faction']), {})[
                 int(r['category_id'])] = int(r['count'])
-        import matchmaking          # 延迟 import（防循环依赖）
+        import mm_factions          # 延迟 import（防循环依赖）
         rows = []
         for fid, cats in stock.items():
-            hq = matchmaking.FACTION_SUPREME_COMMANDS.get(fid)
+            hq = mm_factions.FACTION_SUPREME_COMMANDS.get(fid)
             if hq:
                 rows.extend(msg_hq_resource_rows(war['id'], hq, cats))
         return rows
@@ -2196,8 +2196,8 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
             try:
                 await store.adjust_war_faction_resources(
                     war_id, winner, captured)
-                import matchmaking      # 延迟 import（防循环依赖）
-                hq = matchmaking.FACTION_SUPREME_COMMANDS.get(winner)
+                import mm_factions      # 延迟 import（防循环依赖）
+                hq = mm_factions.FACTION_SUPREME_COMMANDS.get(winner)
                 if hq:
                     for row in msg_hq_resource_rows(war_id, hq, captured):
                         events.append(('set', b'armyresource', row))
@@ -2245,7 +2245,7 @@ async def automission_tick(store):
         war = await ensure_war(store)
         if war is None:
             return
-        import matchmaking            # 延迟 import（防未来循环依赖）
+        import combat_instances       # 延迟 import（防未来循环依赖）
         now_s = time.time()
         timeout = max(60, mm_config.WAR_AUTOMISSION_NORMAL)
         for wb in await store.list_active_war_battles(war['id']):
@@ -2255,7 +2255,7 @@ async def automission_tick(store):
                 mrec = None
             r_state = int((mrec or {}).get('state', 0) or 0)
             if r_state == 1 and mrec is not None:
-                if int(mrec['id']) in matchmaking.COMBAT_INSTANCES:
+                if int(mrec['id']) in combat_instances.COMBAT_INSTANCES:
                     continue          # 成局且战斗会话存活
             started = _ts_ms(wb.get('started_at')) / 1000.0
             if started <= 0 or now_s - started < timeout:
@@ -2339,12 +2339,12 @@ async def production_tick(store):
         log(f'[war] production: war={war["id"]} runs={runs} '
             f'factions={sorted(deltas)}')
         # ---- 行重推（resourceview 订阅会话，与订阅时同函数同 warId 源）----
-        import matchmaking          # 延迟 import（防循环依赖）
+        import mm_factions           # 延迟 import（防循环依赖）
         from state import FLASH_SESSIONS
         from messages import _push_kvcs
         windows = await supply_windows(store, war)
-        prods, cons = matchmaking._msg_faction_resource_rows(windows)
-        queue_rows = matchmaking._msg_faction_queue_rows(windows)
+        prods, cons = mm_factions._msg_faction_resource_rows(windows)
+        queue_rows = mm_factions._msg_faction_queue_rows(windows)
         hq_rows = await hq_stock_rows(store, war)
         for sess in list(FLASH_SESSIONS.values()):
             cmd = getattr(sess, 'resource_view_cmd', None)
@@ -2411,7 +2411,7 @@ async def supply_queue_tick(store):
         war = await ensure_war(store)
         if war is None:
             return
-        import matchmaking          # 延迟 import（防循环依赖）
+        import mm_factions           # 延迟 import（防循环依赖）
         from state import FLASH_SESSIONS
         from messages import _push_kvcs
         delivered = []              # 交付过的 AT（重取后供推送）
@@ -2457,8 +2457,8 @@ async def supply_queue_tick(store):
                 events.append(('set', b'armyresource', p))
         await broadcast_war_events(events)
         windows = await supply_windows(store, war)
-        queue_rows = matchmaking._msg_faction_queue_rows(windows)
-        cons = matchmaking._msg_faction_resource_rows(windows)[1]
+        queue_rows = mm_factions._msg_faction_queue_rows(windows)
+        cons = mm_factions._msg_faction_resource_rows(windows)[1]
         hq_rows = await hq_stock_rows(store, war)
         from messages import _push_kvcs_delete
         for sess in list(FLASH_SESSIONS.values()):

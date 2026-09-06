@@ -116,7 +116,7 @@ class MatchPool:
         """war 会战撮合（M2，gamemode 10）：按 battle_id 分桶，桶内攻守
         双方阵营各≥1 即成局（官服口径：交战双方都有真人排队才开局）。
 
-        入池侧（matchmaking._handle_join war 路由）已保证只有该会战
+        入池侧（mm_handler._handle_join war 路由）已保证只有该会战
         攻/守两阵营的玩家能入桶，桶内凑齐两阵营即可。war 局无 AI 补位
         （gamemode 10 ai_fill_after=0，凑不齐继续等）。
         Match.preset_id 恒 0：地图/阵营来自 mission_records 行，

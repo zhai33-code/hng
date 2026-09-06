@@ -459,7 +459,7 @@ def _msg_ribbon_progress(ribbon_template_id, total_xp):
 #
 # 换图：改 MISSION_PRESET_ID + start_server.bat 的 /M（两者必须对应同一张图）。
 #   preset 10 → T01M08_Mill | preset 29 → T02M01_Mountain | preset 26 → T02M04_Airfield
-MISSION_PRESET_ID = 10        # 与 matchmaking.AI_MISSIONPRESET 同源（客户端简报一致）
+MISSION_PRESET_ID = 10        # 与 matchmaking.AI_MISSIONPRESET 同源（客户端简报一致；撮合核心仍在 matchmaking）
 BF_DEFENDER_FACTION_ID = 2    # 防守方 runtime factionId（必须在 battlefieldFactions 列表内）
 
 # f14 armyResourceList 资源类别（resourceCategoryId == WarDatabase/armyresourcecategory.f1）：

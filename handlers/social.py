@@ -77,7 +77,8 @@ from state import FLASH_SESSIONS, STORE, log
 
 from messages import _push_kvcs
 import matchmaking
-from matchmaking import FACTION_ROW_IDS
+import mm_state
+from mm_factions import FACTION_ROW_IDS
 
 # ResponseCodes（HnG_States.ResponseCodes 枚举）
 RC_OK = 1
@@ -156,7 +157,7 @@ async def push_friend_rows(sess, writer, pid):
             # notify_friends_of 触发本函数重推刷新
             _pms, rec, mid = matchmaking._find_player_live_pms(int(r['id']))
             if mid:
-                det = matchmaking._MM_MISSION_DETAILS.get(mid) or {}
+                det = mm_state._MM_MISSION_DETAILS.get(mid) or {}
                 mission_id = int(mid)
                 mission_faction = FACTION_ROW_IDS.get(
                     int((rec or {}).get('faction', 0) or 0), 0)
@@ -172,7 +173,7 @@ async def push_friend_rows(sess, writer, pid):
         m += pb_int64(7, mission_faction)            # missionFactionId（faction 行 id）
         # warId 必须与 war catalogue / player.war 的 id=1 一致：
         # 客户端邀请好友（小队/战斗）前本地校验 friend.warId == currentWar.id，
-        # 不一致直接提示"不在同一服务器"（此前用 matchmaking._WAR_ID 随机大数）
+        # 不一致直接提示"不在同一服务器"（此前用 mm_state._WAR_ID 随机大数）
         m += pb_int64(8, 1)                          # warId
         m += pb_string(9, war_name)                  # warName
         m += pb_bool(10, r['also_friend'])           # otherPlayerAlsoFriend

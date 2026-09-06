@@ -454,43 +454,44 @@ async def main():
     # --- 小队匹配 charId=0 解析（EnterMatchmakingCommand 整队分支）
     # 用例 5：小队成员点匹配（客户端发 characterId=0）→ 按成员行解析角色，
     #         JoinMatchMakingResponse 必须是 ok=1（修复前 rejected=0）
-    import matchmaking
+    import mm_handler
+    import state
     store4 = FakeStore()
     store4.chars.update(store.chars)
     store4.usernames.update(store.usernames)
     sid = await store4.create_squad(31, 2, 'Squad of zhai33')
     await store4.add_squad_member(sid, 49, status=ST_IN_LOBBY)  # B 已接受入队
-    old_store = matchmaking.STORE
-    matchmaking.STORE = store4
+    old_store = state.STORE
+    state.STORE = store4
     try:
         proto = pb_varint(1, 0) + pb_varint(7, 1)   # charId=0, gamemode=1
         wj = FakeWriter()
         # 成员均不在线（FLASH_SESSIONS 空）→ _enqueue_squad 空成员 no-op，
         # 不触碰 POOL；只验证响应与角色解析
-        await matchmaking._handle_join(sess_a, wj, 21, proto)
+        await mm_handler._handle_join(sess_a, wj, 21, proto)
         mainc, _ = Chunk.parse(wj.data, 0)
         body = mainc.subs[0].subs[0].data
         jres = body[1] if len(body) > 1 else 0    # f1 varint（值 1/0 单字节）
         check('小队匹配 charId=0 → 响应 ok（修复前 rejected）',
               jres == 1, f'got {jres}')
     finally:
-        matchmaking.STORE = old_store
+        state.STORE = old_store
 
     # 用例 6：无任何小队且 charId=0 → 仍拒绝（原兜底不回归）
     store5 = FakeStore()
     store5.chars.update(store.chars)
     store5.usernames.update(store.usernames)
-    matchmaking.STORE = store5
+    state.STORE = store5
     try:
         proto = pb_varint(1, 0) + pb_varint(7, 1)
         wj2 = FakeWriter()
-        await matchmaking._handle_join(sess_a, wj2, 22, proto)
+        await mm_handler._handle_join(sess_a, wj2, 22, proto)
         mainc, _ = Chunk.parse(wj2.data, 0)
         body = mainc.subs[0].subs[0].data
         jres2 = body[1] if len(body) > 1 else 0
         check('无小队 charId=0 → 仍拒绝', jres2 == 0, f'got {jres2}')
     finally:
-        matchmaking.STORE = old_store
+        state.STORE = old_store
 
     # 用例 7：混阵营小队 SquadSession.f4 按观察者下发（2026-08-27
     #   匹配界面 AB 都显示苏军：客户端 MatchmakingView 阵营图标绑

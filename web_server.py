@@ -51,6 +51,7 @@ from state import (
     )
 
 from wardb import WARDB_CAS_MAP, WARDB_SYNC_UNIQUE, WARDB_UNIQUE
+import mm_state
 
 # fs 同步 CAS 文件目录：改动过的客户端文件以 <sha256>-<size>_<flag> 为名放入，
 # 供 hngsync GET /<sha256>-<size>_<flag> 下载（见 do_GET 内 CAS 路由）
@@ -761,9 +762,7 @@ def _online_snapshot():
     供管理后台（独立进程 admin_main.py）经 127.0.0.1:80/online.json 拉取。
     HTTP 线程与主 asyncio 线程并发读写这些 dict——list() 拷贝期间撞上
     增删抛 RuntimeError 时按空表处理（下次轮询自会拿到一致快照）。
-    matchmaking 惰性 import：web_server 在 realtest_server 启动序里先于
-    matchmaking 就绪，也避免任何潜在循环依赖。"""
-    import matchmaking
+    mm_state registry 顶层已 import（无循环依赖：mm_state 仅依赖 mm_pool/wardb）。"""
 
     try:
         items = sorted(FLASH_SESSIONS.items())
@@ -773,7 +772,7 @@ def _online_snapshot():
                for name, sess in items]
 
     try:
-        det_items = list(matchmaking._MM_MISSION_DETAILS.items())
+        det_items = list(mm_state._MM_MISSION_DETAILS.items())
     except RuntimeError:
         det_items = []
     missions = [{
@@ -789,8 +788,8 @@ def _online_snapshot():
 
     return {
         'online': len(players),
-        'in_queue': len(matchmaking._MM_QUEUES),
-        'in_battle': len(matchmaking.PMS_TO_SESSION),
+        'in_queue': len(mm_state._MM_QUEUES),
+        'in_battle': len(mm_state.PMS_TO_SESSION),
         'players': players,
         'missions': missions,
         'server_time': int(time.time()),

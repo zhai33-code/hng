@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """匹配凑队（auto squad）解散回归测试（2026-09-02 "解散后没有退出小队"）。
 
-背景：野队匹配把 2+ 散人合并进临时凑队（matchmaking._MM_MISSION_SQUADS，
+背景：野队匹配把 2+ 散人合并进临时凑队（mm_state._MM_MISSION_SQUADS，
 仅存内存）后，客户端点"解散小队"发 RemoveSquadRequest：
   - 旧代码只查 solo 注册表与 DB：第一次点击被合并前残留的 solo 条目劫持
     （删早已不存在的旧 solo 行、返回"成功"，凑队行没动 → UI 没退出小队），
@@ -26,7 +26,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol import Chunk
-import matchmaking
+import mm_state
 import handlers.squad as squad_mod
 from handlers.squad import (
     RC_OK, RC_SQUAD_NOT_FOUND, RC_SQUAD_SLOT_NOT_FOUND,
@@ -124,10 +124,10 @@ async def _remove_squad(sess):
 
 def _seed_auto_squad():
     """凑队：A(pid=2, row 101) + B(pid=11, row 102)，mission 223287。"""
-    matchmaking._MM_MISSION_SQUADS.clear()
-    matchmaking._SOLO_SQUADS.clear()
+    mm_state._MM_MISSION_SQUADS.clear()
+    mm_state._SOLO_SQUADS.clear()
     sq_id = 8072128442240809119
-    matchmaking._MM_MISSION_SQUADS[223287] = {
+    mm_state._MM_MISSION_SQUADS[223287] = {
         sq_id: {
             'name': 'Infantry Squad 1', 'faction': 1, 'template': 1,
             'squad_db_id': 0,
@@ -140,7 +140,7 @@ def _seed_auto_squad():
         },
     }
     # 合并前残留的 solo 注册表条目（战斗结束恢复 solo 视图用）
-    matchmaking._SOLO_SQUADS[2] = {
+    mm_state._SOLO_SQUADS[2] = {
         'squad_row': 8072128442240809115, 'member_row': 9001,
         'template': 1, 'faction': 1, 'mission_id': 223287,
         'gamertag': 'DoubleBird', 'char_id': 25, 'char_name': 'DB',
@@ -171,7 +171,7 @@ async def main():
         check('队友连接只删除本人成员行(101)',
               b_dels == [('SquadMemberSession', 101)],
               f'BotSU1 deletes={b_dels}')
-        members = (matchmaking._MM_MISSION_SQUADS[223287][sq_id]
+        members = (mm_state._MM_MISSION_SQUADS[223287][sq_id]
                    ['members'])
         check('服务端凑队成员表移除本人',
               [int(m['player_id']) for m in members] == [11],
@@ -179,8 +179,8 @@ async def main():
 
         # --- 用例 2：solo 注册表残留条目未被消费 ★核心回归点 ---
         check('solo 注册表条目保留（战斗结束恢复 solo 视图）',
-              2 in matchmaking._SOLO_SQUADS
-              and matchmaking._SOLO_SQUADS[2]['squad_row']
+              2 in mm_state._SOLO_SQUADS
+              and mm_state._SOLO_SQUADS[2]['squad_row']
               == 8072128442240809115,
               '（旧代码第一次解散即被 solo 分支消费掉）')
     finally:
@@ -189,9 +189,9 @@ async def main():
 
     # --- 用例 3：squad_db_id≠0 的真小队条目不走凑队分支 ---
     _seed_auto_squad()
-    matchmaking._MM_MISSION_SQUADS[223287][
+    mm_state._MM_MISSION_SQUADS[223287][
         8072128442240809119]['squad_db_id'] = 123
-    matchmaking._SOLO_SQUADS.clear()     # 无 solo 条目 → 只能落到 DB 分支
+    mm_state._SOLO_SQUADS.clear()     # 无 solo 条目 → 只能落到 DB 分支
     sess_a = FakeSess(2, 'DoubleBird')
     code, w = await _remove_squad(sess_a)
     check('真小队条目(squad_db_id≠0)不走凑队分支',
@@ -199,9 +199,9 @@ async def main():
           f'got code={code}（凑队分支误入会返回 1 并推删除行）')
 
     # --- 用例 4：纯 solo 隐式小队路径不回归 ---
-    matchmaking._MM_MISSION_SQUADS.clear()
-    matchmaking._SOLO_SQUADS.clear()
-    matchmaking._SOLO_SQUADS[2] = {
+    mm_state._MM_MISSION_SQUADS.clear()
+    mm_state._SOLO_SQUADS.clear()
+    mm_state._SOLO_SQUADS[2] = {
         'squad_row': 7001, 'member_row': 7002, 'template': 1, 'faction': 1,
         'mission_id': 0, 'gamertag': 'DoubleBird', 'char_id': 25,
         'char_name': 'DB', 'rank': 5,
@@ -213,7 +213,7 @@ async def main():
           code == RC_OK
           and ('SquadSession', 7001) in dels
           and ('SquadMemberSession', 7002) in dels
-          and 2 not in matchmaking._SOLO_SQUADS,
+          and 2 not in mm_state._SOLO_SQUADS,
           f'code={code} deletes={dels}')
 
     # --- 用例 5：凑队成员离队（RemoveSquadMember）→ OK + 双端删行 ---
@@ -237,7 +237,7 @@ async def main():
               dels == [('SquadMemberSession', 102)]
               and a_dels == [('SquadMemberSession', 102)],
               f'B={dels} A={a_dels}')
-        members = (matchmaking._MM_MISSION_SQUADS[223287]
+        members = (mm_state._MM_MISSION_SQUADS[223287]
                    [8072128442240809119]['members'])
         check('成员离队后服务端只剩本人',
               [int(m['player_id']) for m in members] == [2],
@@ -277,8 +277,8 @@ async def main():
         squad_mod.STORE = old_store
         FLASH_SESSIONS.pop('DoubleBird', None)
         FLASH_SESSIONS.pop('BotSU1', None)
-        matchmaking._MM_MISSION_SQUADS.clear()
-        matchmaking._SOLO_SQUADS.clear()
+        mm_state._MM_MISSION_SQUADS.clear()
+        mm_state._SOLO_SQUADS.clear()
 
     ok = all(r[1] for r in RESULTS)
     print()
@@ -300,7 +300,7 @@ def _varint(v):
 
 
 def _seed_members():
-    return (matchmaking._MM_MISSION_SQUADS.get(223287, {})
+    return (mm_state._MM_MISSION_SQUADS.get(223287, {})
             .get(8072128442240809119, {})
             .get('members') or [])
 

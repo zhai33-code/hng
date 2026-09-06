@@ -36,12 +36,12 @@ from player_service import (
     _push_stored_soldier_data,
     )
 
-from matchmaking import (
+from matchmaking import push_relogin_rejoin
+from mm_factions import (
     _msg_faction_queue_rows,
     _msg_faction_resource_rows,
     _msg_faction_rows,
     _msg_supreme_command_rows,
-    push_relogin_rejoin,
     )
 
 import login_queue

@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol import pb_field_payload, pb_parse_loose, pb_split_top
 import matchmaking
+import mm_handler
+import mm_factions
 import warserver_messages
 from wardb import battlefield_entity_for_gamemap, battlefield_pos
 
@@ -114,7 +116,7 @@ from warserver_messages import _accesspoint_layout
 _det = {'preset': 10, 'attacker_faction': 3, 'defender_faction': 2,
         'players': [{'player_id': 1, 'gamertag': 'atk1', 'faction': 3}],
         'map_entity_id': 112741325}
-_mm = matchmaking._msg_mission_details_response_multi(990001, _det, 'zulu')
+_mm = mm_handler._msg_mission_details_response_multi(990001, _det, 'zulu')
 def _repeated_map(raw, fn, kf, vf):
     """顶层拆 repeated 子消息 → {kf 字段值: vf 字段值}（pb_parse_loose 单值
     覆盖语义收集不了 repeated，须 pb_split_top 保序拆块）。"""
@@ -202,7 +204,7 @@ else:
     _det26 = {'preset': 26, 'attacker_faction': 3, 'defender_faction': 2,
               'players': [{'player_id': 1, 'gamertag': 'atk1', 'faction': 3}],
               'map_entity_id': 112741325}
-    _mm26 = matchmaking._msg_mission_details_response_multi(_MID, _det26, 'zulu')
+    _mm26 = mm_handler._msg_mission_details_response_multi(_MID, _det26, 'zulu')
     # 展示层（大厅简报）：f6 只发攻方激活线（官方观感守方仅拥有 O 点，
     # 守方线/未激活线不进 f6/f7 → 客户端 auto 激活线判定不画该线）
     _atk26 = {int(t): int(o) for t, o in _lay26 if int(o) == 3}
@@ -237,7 +239,7 @@ else:
     # 客户端次选路径画地图中心=O 区域）；攻方锚=攻方激活线最小 id
     _f4a = _repeated_map(_mm26, 4, 3, 1)             # f3=锚点 f1=faction行id
     check('f4 守方 logo 锚=8（画中心）、攻方锚=攻方线最小 id',
-          matchmaking.ASSAULT_DEFENDER_LOGO_AP in _f4a and
+          mm_factions.ASSAULT_DEFENDER_LOGO_AP in _f4a and
           len(_f4a) == 2 and min(_atk26) in _f4a,
           f'f4={_f4a}')
 

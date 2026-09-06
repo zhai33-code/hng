@@ -31,6 +31,8 @@ import game_server
 import handlers
 import login_queue
 import matchmaking
+import mm_handler
+import mm_state
 import mm_config
 import statistics_server
 import war_campaign
@@ -163,7 +165,7 @@ async def dispatch(sess, chunk, writer):
         if req_type in ('JoinMatchMakingRequest', 'CancelJoinMatchMakingRequest',
                         'GetMissionDetailsRequest'):
             # 战斗匹配：匹配请求 / 取消匹配 / 战局详情（简报部署界面），独立模块实现
-            await matchmaking.handle_request(sess, writer, cmd_id, req_type, proto)
+            await mm_handler.handle_request(sess, writer, cmd_id, req_type, proto)
             return
         if await game_server.handle_request(sess, writer, cmd_id, req_type, proto):
             # 游戏进程(warserver)握手请求：GetPlayerSettings 等由独立模块处理
@@ -271,8 +273,8 @@ async def start_ping_responder():
 
 
 async def main():
-    # 匹配模块依赖注入（PostgreSQL 连接池 + 统一日志）
-    matchmaking.configure(STORE, log)
+    # 匹配模块日志注入（DB 统一走 state.STORE，无需再注入 store）
+    mm_state.configure_log(log)
     # 登录排队（容量 HNG_MAX_ONLINE，事件驱动 + 1s 周期 pump 放行）
     login_queue.start()
     # OpenID provider：audience = EOS client_id（私服抓包确认）

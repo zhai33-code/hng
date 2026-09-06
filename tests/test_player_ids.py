@@ -270,6 +270,8 @@ def test_settlement_bot_and_ghost_pids_filtered():
 # 简报我方不高亮、攻防角色恒"进攻"。官服语义（客户端三处调用点反编译实证）
 # 唯一解：faction 表行 id == factiontemplateid。
 import matchmaking  # noqa: E402
+import mm_handler  # noqa: E402
+import mm_factions  # noqa: E402
 from protocol import (  # noqa: E402
     pb_field_payload,
     pb_parse_loose,
@@ -285,16 +287,16 @@ def _split_factions(raw, fn):
 
 def test_faction_row_ids_identity_mapping():
     """faction 行 id 必须 == factiontemplateid（官服语义，见
-    matchmaking.FACTION_ROW_IDS 注释的反编译证据链）。"""
-    assert matchmaking.FACTION_ROW_IDS == {1: 1, 2: 2, 3: 3}, \
-        f'FACTION_ROW_IDS 应为恒等映射，实际 {matchmaking.FACTION_ROW_IDS}'
+    mm_factions.FACTION_ROW_IDS 注释的反编译证据链）。"""
+    assert mm_factions.FACTION_ROW_IDS == {1: 1, 2: 2, 3: 3}, \
+        f'FACTION_ROW_IDS 应为恒等映射，实际 {mm_factions.FACTION_ROW_IDS}'
 
 
 def test_faction_rows_id_equals_template():
     """KVS faction 行 f1(id) 与 f2(factiontemplateid) 同值——客户端
     getFromId(行id).factiontemplateid.Equals(currentPlayer.factionid)
     链路两端才在同一空间。"""
-    for row in matchmaking._msg_faction_rows():
+    for row in mm_factions._msg_faction_rows():
         f = pb_parse_loose(row)
         assert int(f[1]) == int(f[2]), \
             f'faction 行 id({f[1]}) != factiontemplateid({f[2]})'
@@ -304,13 +306,13 @@ def test_faction_rows_underdog_multipliers():
     """faction 行 f6/f7 underdog 倍率（#1 人数较少阵营加成）：无参默认
     1.0，传 mults 时按阵营下发（客户端 FactionOption.as 按 >1 显示
     "当前弱势阵营加成"组）。"""
-    for row in matchmaking._msg_faction_rows():
+    for row in mm_factions._msg_faction_rows():
         f = pb_parse_loose(row)
         assert abs(f[6] - 1.0) < 1e-6 and abs(f[7] - 1.0) < 1e-6, \
             f'默认应全 1.0：f6={f[6]} f7={f[7]}'
     rows = {int(f[2]): f for f in (
         pb_parse_loose(r)
-        for r in matchmaking._msg_faction_rows({1: (1.0, 1.0),
+        for r in mm_factions._msg_faction_rows({1: (1.0, 1.0),
                                                 2: (1.25, 1.15)}))}
     assert abs(rows[2][6] - 1.25) < 1e-6 and abs(rows[2][7] - 1.15) < 1e-6, \
         f'fac2 应带倍率：f6={rows[2][6]} f7={rows[2][7]}'
@@ -324,8 +326,8 @@ def test_multi_gmd_f3_uses_template_ids_and_groups_by_faction():
     """德军 A + 苏军 B 成局：GMD f3 每条的 factionId 必须落在模板 id 空间
     （客户端 updateMissionDetailsFactionCounts 拿它 Equals
     currentPlayer.factionid=1/2/3），且按阵营分组正确。"""
-    old_pos = matchmaking.battlefield_pos
-    matchmaking.battlefield_pos = lambda eid: (0.5, 0.5)   # macOS 无 WarDatabase
+    old_pos = mm_handler.battlefield_pos
+    mm_handler.battlefield_pos = lambda eid: (0.5, 0.5)   # macOS 无 WarDatabase
     try:
         det = {'preset': 10, 'attacker_faction': 2, 'defender_faction': 3,
                'players': [{'player_id': 101, 'gamertag': 'A_german',
@@ -333,10 +335,10 @@ def test_multi_gmd_f3_uses_template_ids_and_groups_by_faction():
                            {'player_id': 202, 'gamertag': 'B_soviet',
                             'faction': 3}],
                'map_entity_id': 112741325}
-        raw = matchmaking._msg_mission_details_response_multi(990002, det,
+        raw = mm_handler._msg_mission_details_response_multi(990002, det,
                                                               'zulu')
     finally:
-        matchmaking.battlefield_pos = old_pos
+        mm_handler.battlefield_pos = old_pos
 
     groups = {}
     for fac in _split_factions(raw, 3):
@@ -459,10 +461,10 @@ import time as _time  # noqa: E402
 def test_faction_resource_production_rows_use_official_template():
     """步兵（cat 1）三阵营：nextProductionValue=900 / warStartValue=850000 /
     nextRunTimeStamp≈now+600s / f6 模板 id 非 0；总行数=3 阵营×18 分类。"""
-    if not matchmaking.armyresource_production():
+    if not mm_factions.armyresource_production():
         print('  [skip] WarDatabase ArmyResourceProductionTemplate 不可用')
         return
-    prods, cons = matchmaking._msg_faction_resource_rows()
+    prods, cons = mm_factions._msg_faction_resource_rows()
     assert len(prods) == 54 and len(cons) == 54, \
         f'应 3 阵营×18 分类=54 行，实际 prods={len(prods)} cons={len(cons)}'
     infantry = {}
@@ -489,10 +491,10 @@ def test_faction_resource_production_rows_use_official_template():
 def test_faction_resource_production_rows_heavy_armor_anchor():
     """重坦（cat 17）锚点：产量 2/跳、开战库存 225——与步兵梯度拉开，
     确认没把全部分类填成同值（旧 bug 的速度×10 恰好会命中这种假象）。"""
-    if not matchmaking.armyresource_production():
+    if not mm_factions.armyresource_production():
         print('  [skip] WarDatabase ArmyResourceProductionTemplate 不可用')
         return
-    prods, _cons = matchmaking._msg_faction_resource_rows()
+    prods, _cons = mm_factions._msg_faction_resource_rows()
     for row in prods:
         f = pb_parse_loose(row)
         if int(f[5]) == 17 and int(f[2]) == 1:    # US 重坦

@@ -20,7 +20,8 @@ import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import matchmaking
+import combat_instances
+import mm_state
 from handlers import combat as combat_handlers
 from protocol import Chunk
 from state import FLASH_SESSIONS
@@ -54,17 +55,17 @@ def _setup(mid, pms, pid, tag):
     flash = types.SimpleNamespace(writer=writer, playerview_cmd=8,
                                   soldier_view_cmd=None)
     FLASH_SESSIONS[tag] = flash
-    matchmaking.PMS_TO_MISSION[pms] = mid
-    matchmaking.PMS_TO_SESSION[pms] = {
+    mm_state.PMS_TO_MISSION[pms] = mid
+    mm_state.PMS_TO_SESSION[pms] = {
         'player_id': pid, 'gamertag': tag, 'squad_db_id': 0}
     return writer
 
 
 def _cleanup(mid, pms, tag):
     FLASH_SESSIONS.pop(tag, None)
-    matchmaking.PMS_TO_MISSION.pop(pms, None)
-    matchmaking.PMS_TO_SESSION.pop(pms, None)
-    matchmaking.COMBAT_INSTANCES.pop(mid, None)
+    mm_state.PMS_TO_MISSION.pop(pms, None)
+    mm_state.PMS_TO_SESSION.pop(pms, None)
+    combat_instances.COMBAT_INSTANCES.pop(mid, None)
 
 
 def test_finish_sessions_without_report():
@@ -76,8 +77,8 @@ def test_finish_sessions_without_report():
             and b'delete' in writer.sent, '未推 PMS DELETE KVCS'
         assert b'Notification' not in writer.sent, \
             '无战报不应推 NewBattleReport 通知'
-        assert pms not in matchmaking.PMS_TO_MISSION, 'PMS_TO_MISSION 未清'
-        assert pms not in matchmaking.PMS_TO_SESSION, 'PMS_TO_SESSION 未清'
+        assert pms not in mm_state.PMS_TO_MISSION, 'PMS_TO_MISSION 未清'
+        assert pms not in mm_state.PMS_TO_SESSION, 'PMS_TO_SESSION 未清'
         # 幂等：PMS 映射已清，重复调用不再推送
         before = writer.sent
         asyncio.run(combat_handlers._finish_mission_sessions(mid, None))
@@ -90,24 +91,24 @@ def test_watch_proc_exit_finishes_sessions():
     mid, pms = 987002, 987102
     writer = _setup(mid, pms, 2, 'ExitGuyB')
     released = []
-    real_release = matchmaking.release_match
-    matchmaking.release_match = lambda m: released.append(m)  # 隔离副作用
+    real_release = combat_instances.release_match
+    combat_instances.release_match = lambda m: released.append(m)  # 隔离副作用
     try:
         inst = {'seq': 777, 'proc': _FakeProc(), 'port': 5678,
                 'mission_id': mid}
-        matchmaking.COMBAT_INSTANCES[mid] = inst
+        combat_instances.COMBAT_INSTANCES[mid] = inst
 
         async def _run():
-            await matchmaking._watch_proc_exit(inst, mid)
+            await combat_instances._watch_proc_exit(inst, mid)
             await asyncio.sleep(0.05)   # 让 _spawn 的收尾任务跑完
 
         asyncio.run(_run())
         assert released == [mid], '未回收坑位'
         assert b'PlayerMissionSession' in writer.sent \
             and b'delete' in writer.sent, '兜底未推 PMS DELETE（卡 closing 根因）'
-        assert pms not in matchmaking.PMS_TO_MISSION, '兜底未清 PMS 映射'
+        assert pms not in mm_state.PMS_TO_MISSION, '兜底未清 PMS 映射'
     finally:
-        matchmaking.release_match = real_release
+        combat_instances.release_match = real_release
         _cleanup(mid, pms, 'ExitGuyB')
 
 
@@ -116,23 +117,23 @@ def test_watch_proc_exit_normal_path_no_finish():
     mid, pms = 987003, 987103
     writer = _setup(mid, pms, 3, 'ExitGuyC')
     released = []
-    real_release = matchmaking.release_match
-    matchmaking.release_match = lambda m: released.append(m)
+    real_release = combat_instances.release_match
+    combat_instances.release_match = lambda m: released.append(m)
     try:
         inst = {'seq': 778, 'proc': _FakeProc(), 'port': 5679,
                 'mission_id': mid}
-        matchmaking.COMBAT_INSTANCES[mid] = inst
-        matchmaking.COMBAT_INSTANCES.pop(mid)   # 模拟 earnings 已 release
+        combat_instances.COMBAT_INSTANCES[mid] = inst
+        combat_instances.COMBAT_INSTANCES.pop(mid)   # 模拟 earnings 已 release
 
         async def _run():
-            await matchmaking._watch_proc_exit(inst, mid)
+            await combat_instances._watch_proc_exit(inst, mid)
             await asyncio.sleep(0.05)
 
         asyncio.run(_run())
         assert released == [], '已释放实例不应重复 release'
         assert writer.sent == b'', '正常路径不应触发兜底收尾'
     finally:
-        matchmaking.release_match = real_release
+        combat_instances.release_match = real_release
         _cleanup(mid, pms, 'ExitGuyC')
 
 
@@ -146,8 +147,8 @@ def test_finish_sessions_repush_earned_chars():
     flash = types.SimpleNamespace(writer=writer, playerview_cmd=8,
                                   soldier_view_cmd=9)
     FLASH_SESSIONS['ExitGuyD'] = flash
-    matchmaking.PMS_TO_MISSION[pms] = mid
-    matchmaking.PMS_TO_SESSION[pms] = {
+    mm_state.PMS_TO_MISSION[pms] = mid
+    mm_state.PMS_TO_SESSION[pms] = {
         'player_id': 1, 'gamertag': 'ExitGuyD', 'squad_db_id': 0,
         'char_id': 11}                       # 进队时角色（非实际参战）
 
@@ -240,8 +241,8 @@ def test_finish_sessions_pushes_maintenance_notification():
     flash = types.SimpleNamespace(writer=writer, playerview_cmd=8,
                                   soldier_view_cmd=None)
     FLASH_SESSIONS['ExitGuyE'] = flash
-    matchmaking.PMS_TO_MISSION[pms] = mid
-    matchmaking.PMS_TO_SESSION[pms] = {
+    mm_state.PMS_TO_MISSION[pms] = mid
+    mm_state.PMS_TO_SESSION[pms] = {
         'player_id': 4, 'gamertag': 'ExitGuyE', 'squad_db_id': 0}
     try:
         asyncio.run(combat_handlers._finish_mission_sessions(

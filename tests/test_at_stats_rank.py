@@ -707,7 +707,7 @@ async def section_e():
     events = await war_campaign.settle_war_battle(
         st, 0, 1, 2, captured={1: 40, 5: 7})
     stock = st.faction_stock.get((1, 2), {})
-    import matchmaking as _mm
+    import mm_factions as _mm
     hq = int(_mm.FACTION_SUPREME_COMMANDS[2])
     ids = set()                                       # HQ 行 f1 id 集合
     for kind, t, row in events:

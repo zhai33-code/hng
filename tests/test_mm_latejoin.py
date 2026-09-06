@@ -20,6 +20,11 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import matchmaking
+import mm_handler
+import state
+import combat_instances
+import mm_state
+import mm_factions
 import mm_config
 import mm_pool
 
@@ -50,7 +55,7 @@ def seed_mission(mid, *, gamemode=5, preset=10, attacker=3, defender=2,
             'ready': asyncio.Event(), 'seq': 1, 'ttd': False, 'udp': None}
     inst['ready'].set()
     det = {'preset': preset, 'gamemode': gamemode, 'ai_fill': False,
-           'map_entity_id': matchmaking.MISSION_MAP_ENTITY_ID,
+           'map_entity_id': mm_state.MISSION_MAP_ENTITY_ID,
            'attacker_faction': attacker, 'defender_faction': defender,
            'enable_bots': True,
            'weather_tod': 2, 'weather_condition': 0, 'timeofday': None,
@@ -59,8 +64,8 @@ def seed_mission(mid, *, gamemode=5, preset=10, attacker=3, defender=2,
                         'pms_id': 3000 + i} for i in range(players)]}
     if formed:
         det['formed_at'] = time.monotonic() - age
-    matchmaking.COMBAT_INSTANCES[mid] = inst
-    matchmaking._MM_MISSION_DETAILS[mid] = det
+    combat_instances.COMBAT_INSTANCES[mid] = inst
+    mm_state._MM_MISSION_DETAILS[mid] = det
     return inst, det
 
 
@@ -74,7 +79,7 @@ def main():
         r = matchmaking._find_joinable_mission(5, (10,), 3)
         check('窗口内同模式同图 → 可加入', r is not None and r[0] == 900001)
         check('返回的是运行实例', r is not None and r[1] is
-              matchmaking.COMBAT_INSTANCES[900001])
+              combat_instances.COMBAT_INSTANCES[900001])
 
         # ---- 2. 各不兼容情形（only_mission 不再隔离超窗/满员——改为
         #      临时摘除池内其它可加入局做全局断言；指定局绕窗是新语义，见 5） ----
@@ -85,11 +90,11 @@ def main():
         check('第三方阵营 → 不可加入',
               matchmaking._find_joinable_mission(5, (10,), 1) is None)
         seed_mission(900002, gamemode=5, preset=10, players=1, age=200)
-        _pool_backup = {mid: matchmaking.COMBAT_INSTANCES.pop(mid)
+        _pool_backup = {mid: combat_instances.COMBAT_INSTANCES.pop(mid)
                         for mid in (900001,)}
         check('超窗（age=200s > 90s）→ 不可加入',
               matchmaking._find_joinable_mission(5, (10,), 3) is None)
-        matchmaking.COMBAT_INSTANCES.update(_pool_backup)
+        combat_instances.COMBAT_INSTANCES.update(_pool_backup)
         seed_mission(900003, gamemode=5, preset=10, players=1, age=5)
         mm_config.GAMEMODES[5] = dict(old_gm5, max_players=2)
         seed_mission(900004, gamemode=5, preset=10, players=2, age=5)
@@ -100,11 +105,11 @@ def main():
               matchmaking._find_joinable_mission(
                   5, (10,), 3, only_mission=999999) is None)
         seed_mission(900005, gamemode=5, preset=10, players=1, formed=False)
-        _pool_backup = {mid: matchmaking.COMBAT_INSTANCES.pop(mid)
+        _pool_backup = {mid: combat_instances.COMBAT_INSTANCES.pop(mid)
                         for mid in (900001, 900003)}
         check('formed_at 缺失（旧结构）→ 不可加入',
               matchmaking._find_joinable_mission(5, (10,), 3) is None)
-        matchmaking.COMBAT_INSTANCES.update(_pool_backup)
+        combat_instances.COMBAT_INSTANCES.update(_pool_backup)
 
         # ---- 3. 通配 / 防守方阵营 / 多实例择 earliest ----
         # 池内现有 900001(可加入) 900002(超窗) 900003(可加入) 900004(满员)
@@ -146,23 +151,23 @@ def main():
         ctx = {'writer': w, 'view_cmd': 100, 'gamertag': 'LateJoiner',
                'char_name': 'LateJoiner', 'rank': 3, 'metrics_uid': 'uid-x',
                'metrics_session_id': 424242}
-        matchmaking._MM_QUEUES[pid] = {'pmm_id': 555001, 'mission_id': 0,
+        mm_state._MM_QUEUES[pid] = {'pmm_id': 555001, 'mission_id': 0,
                                        'gamemode': 5, 'ctx': ctx}
-        matchmaking._MATCH_PMM_IDS[pid] = 555001
+        mm_state._MATCH_PMM_IDS[pid] = 555001
         entry = mm_pool.QueueEntry(player_id=pid, char_id=char_id, faction=3,
                                    gamemode_id=5, presets=(10,))
-        det = matchmaking._MM_MISSION_DETAILS[900001]
+        det = mm_state._MM_MISSION_DETAILS[900001]
         n_before = len(det['players'])
-        pms_before = set(matchmaking.PMS_TO_SESSION)
+        pms_before = set(mm_state.PMS_TO_SESSION)
         asyncio.run(matchmaking._join_existing_mission(pid, 900001, entry,
                                                         ctx))
-        new_pms = set(matchmaking.PMS_TO_SESSION) - pms_before
+        new_pms = set(mm_state.PMS_TO_SESSION) - pms_before
         check('中途加入：登记了新 pms 会话', len(new_pms) == 1)
         if new_pms:
             pms_id = new_pms.pop()
             check('中途加入：pms 映射到目标战局',
-                  matchmaking.PMS_TO_MISSION.get(pms_id) == 900001)
-            rec = matchmaking.PMS_TO_SESSION[pms_id]
+                  mm_state.PMS_TO_MISSION.get(pms_id) == 900001)
+            rec = mm_state.PMS_TO_SESSION[pms_id]
             check('中途加入：会话字段正确',
                   rec['player_id'] == pid and rec['char_id'] == char_id
                   and rec['faction'] == 3
@@ -171,8 +176,8 @@ def main():
               len(det['players']) == n_before + 1 and
               det['players'][-1]['player_id'] == pid)
         check('中途加入：排队上下文已清理',
-              pid not in matchmaking._MM_QUEUES and
-              pid not in matchmaking._MATCH_PMM_IDS)
+              pid not in mm_state._MM_QUEUES and
+              pid not in mm_state._MATCH_PMM_IDS)
         # KVCS 序列：PMS(Admitted+Armed) + PMM delete + BattleInfo
         data = w.data
         check('推送序列：PlayerMissionSession ×2（Admitted+Armed）',
@@ -184,7 +189,7 @@ def main():
         # ---- 7. 阵营字段缺失 → 不放行（加固：原 .get 默认 3=SU 漏放） ----
         seed_mission(900006, gamemode=5, preset=10, players=1, age=5,
                      attacker=1, defender=2)
-        det6 = matchmaking._MM_MISSION_DETAILS[900006]
+        det6 = mm_state._MM_MISSION_DETAILS[900006]
         det6['attacker_faction'] = 0
         check('attacker_faction 为 0 → 不放行（不回退默认 3）',
               matchmaking._find_joinable_mission(5, (10,), 3,
@@ -205,32 +210,32 @@ def main():
         # ---- 8. rejoin：_find_player_active_mission 只找存活原局 ----
         rpid = 999
         pms_a, pms_b = 600001, 600002
-        matchmaking.PMS_TO_SESSION[pms_a] = {
+        mm_state.PMS_TO_SESSION[pms_a] = {
             'pms_id': pms_a, 'player_id': rpid, 'char_id': 42, 'faction': 3}
-        matchmaking.PMS_TO_MISSION[pms_a] = 900003
+        mm_state.PMS_TO_MISSION[pms_a] = 900003
         check('rejoin：有存活原局 → 命中该局',
               matchmaking._find_player_active_mission(rpid) == 900003)
-        matchmaking.PMS_TO_SESSION[pms_b] = {
+        mm_state.PMS_TO_SESSION[pms_b] = {
             'pms_id': pms_b, 'player_id': rpid, 'char_id': 42, 'faction': 3}
-        matchmaking.PMS_TO_MISSION[pms_b] = 900001
+        mm_state.PMS_TO_MISSION[pms_b] = 900001
         check('rejoin：多条会话 → 取最新成局（最大 mission_id）',
               matchmaking._find_player_active_mission(rpid) == 900003)
-        matchmaking.PMS_TO_MISSION[pms_a] = 999999
-        matchmaking.PMS_TO_MISSION[pms_b] = 999999
+        mm_state.PMS_TO_MISSION[pms_a] = 999999
+        mm_state.PMS_TO_MISSION[pms_b] = 999999
         check('rejoin：原局均已释放 → None（走正常匹配）',
               matchmaking._find_player_active_mission(rpid) is None)
         check('rejoin：无会话玩家 → None',
               matchmaking._find_player_active_mission(123456) is None)
 
         # ---- 9. _join_existing_mission 去重（rejoin 不残留旧痕迹） ----
-        matchmaking.PMS_TO_SESSION[pms_a] = {
+        mm_state.PMS_TO_SESSION[pms_a] = {
             'pms_id': pms_a, 'player_id': rpid, 'char_id': 42, 'faction': 3}
-        matchmaking.PMS_TO_MISSION[pms_a] = 900003
-        det3 = matchmaking._MM_MISSION_DETAILS[900003]
+        mm_state.PMS_TO_MISSION[pms_a] = 900003
+        det3 = mm_state._MM_MISSION_DETAILS[900003]
         det3['players'].append({'player_id': rpid, 'gamertag': 'Rejoiner',
                                 'char_id': 42, 'faction': 3,
                                 'pms_id': pms_a})
-        matchmaking._MM_MISSION_SQUADS.setdefault(900003, {})[777001] = {
+        mm_state._MM_MISSION_SQUADS.setdefault(900003, {})[777001] = {
             'name': 'Infantry Squad', 'leader_char_id': 42, 'faction': 3,
             'squad_db_id': 0, 'template': 1,
             'members': [{'player_id': rpid, 'char_id': 42,
@@ -241,19 +246,19 @@ def main():
                 'metrics_session_id': 434343}
         entry9 = mm_pool.QueueEntry(player_id=rpid, char_id=42, faction=3,
                                     gamemode_id=5, presets=(10,))
-        matchmaking._MM_QUEUES[rpid] = {'pmm_id': 555009, 'mission_id': 0,
+        mm_state._MM_QUEUES[rpid] = {'pmm_id': 555009, 'mission_id': 0,
                                         'gamemode': 5, 'ctx': ctx9}
         asyncio.run(matchmaking._join_existing_mission(rpid, 900003, entry9,
                                                         ctx9))
-        pms_of_rpid = [p for p, r in matchmaking.PMS_TO_SESSION.items()
+        pms_of_rpid = [p for p, r in mm_state.PMS_TO_SESSION.items()
                        if r.get('player_id') == rpid and
-                       matchmaking.PMS_TO_MISSION.get(p) == 900003]
+                       mm_state.PMS_TO_MISSION.get(p) == 900003]
         check('去重：同玩家同局 PMS 会话仅 1 条（旧会话已清）',
               len(pms_of_rpid) == 1 and pms_a not in pms_of_rpid)
         check('去重：det.players 该玩家仅 1 条',
               sum(1 for p in det3['players']
                   if p['player_id'] == rpid) == 1)
-        squads3 = matchmaking._MM_MISSION_SQUADS.get(900003) or {}
+        squads3 = mm_state._MM_MISSION_SQUADS.get(900003) or {}
         check('去重：小队 members 该玩家仅 1 条',
               sum(1 for s in squads3.values() for m in s['members']
                   if m['player_id'] == rpid) == 1)
@@ -292,17 +297,17 @@ def main():
 
         # ---- 11. _faction_pair / _rival_faction（去默认值加固） ----
         check('_faction_pair：合法攻防 → (atk, dfd)',
-              matchmaking._faction_pair({'attacker_faction': 1,
+              mm_factions._faction_pair({'attacker_faction': 1,
                                          'defender_faction': 2}) == (1, 2))
         check('_faction_pair：字段缺失 → None',
-              matchmaking._faction_pair({'attacker_faction': 1}) is None and
-              matchmaking._faction_pair({}) is None)
+              mm_factions._faction_pair({'attacker_faction': 1}) is None and
+              mm_factions._faction_pair({}) is None)
         check('_faction_pair：非法值/同侧 → None',
-              matchmaking._faction_pair({'attacker_faction': 0,
+              mm_factions._faction_pair({'attacker_faction': 0,
                                          'defender_faction': 2}) is None and
-              matchmaking._faction_pair({'attacker_faction': 2,
+              mm_factions._faction_pair({'attacker_faction': 2,
                                          'defender_faction': 2}) is None)
-        rivals = {f: matchmaking._rival_faction(f) for f in (1, 2, 3)}
+        rivals = {f: mm_factions._rival_faction(f) for f in (1, 2, 3)}
         check('_rival_faction：AI 方 ∈ 另外两阵营（等概率随机）',
               rivals[2] in (1, 3) and rivals[1] in (2, 3) and
               rivals[3] in (1, 2))
@@ -321,17 +326,17 @@ def main():
         # A(pid=888) 与 R(pid=777) 同在 DB 小队 555（局内登记行 888001，
         # R 掉线重连：去重移出 members 后必须放回原小队，而不是自建散人队
         seed_mission(900007, gamemode=5, preset=10, players=2)
-        det7 = matchmaking._MM_MISSION_DETAILS[900007]
+        det7 = mm_state._MM_MISSION_DETAILS[900007]
         rpid2 = 777
         pms_r = 600777
-        matchmaking.PMS_TO_SESSION[pms_r] = {
+        mm_state.PMS_TO_SESSION[pms_r] = {
             'pms_id': pms_r, 'player_id': rpid2, 'char_id': 42,
             'gamertag': 'Rejoiner2', 'faction': 3, 'squad_db_id': 555,
             'squad_id': 888001, 'squad_slot': 1, 'mission_id': 900007}
-        matchmaking.PMS_TO_MISSION[pms_r] = 900007
+        mm_state.PMS_TO_MISSION[pms_r] = 900007
         det7['players'].append({'player_id': rpid2, 'gamertag': 'Rejoiner2',
                                 'char_id': 42, 'faction': 3, 'pms_id': pms_r})
-        matchmaking._MM_MISSION_SQUADS.setdefault(900007, {})[888001] = {
+        mm_state._MM_MISSION_SQUADS.setdefault(900007, {})[888001] = {
             'name': 'RealSquad', 'leader_char_id': 488, 'faction': 3,
             'squad_db_id': 555, 'template': 1,
             'members': [{'player_id': 888, 'char_id': 488,
@@ -345,10 +350,10 @@ def main():
                                      gamemode_id=5, presets=(10,))
         asyncio.run(matchmaking._join_existing_mission(rpid2, 900007, entry9b,
                                                        ctx9b))
-        new_sess9b = [r for r in matchmaking.PMS_TO_SESSION.values()
+        new_sess9b = [r for r in mm_state.PMS_TO_SESSION.values()
                       if r.get('player_id') == rpid2 and
-                      matchmaking.PMS_TO_MISSION.get(r.get('pms_id')) == 900007]
-        sq9b = matchmaking._MM_MISSION_SQUADS[900007][888001]
+                      mm_state.PMS_TO_MISSION.get(r.get('pms_id')) == 900007]
+        sq9b = mm_state._MM_MISSION_SQUADS[900007][888001]
         check('小队 rejoin 归队：放回原小队行（squad_id 888001）',
               len(new_sess9b) == 1 and
               new_sess9b[0].get('squad_id') == 888001 and
@@ -359,18 +364,18 @@ def main():
         check('小队 rejoin 归队：members 含队友+归队者各一次',
               [m['player_id'] for m in sq9b['members']] == [888, 777])
         check('小队 rejoin 归队：未自建散人队',
-              len(matchmaking._MM_MISSION_SQUADS[900007]) == 1)
+              len(mm_state._MM_MISSION_SQUADS[900007]) == 1)
         # 原小队行不在本局（被裁/解散）→ 降级散人凑队，squad_db_id 清零
-        matchmaking._MM_MISSION_SQUADS[900007].pop(888001, None)
+        mm_state._MM_MISSION_SQUADS[900007].pop(888001, None)
         asyncio.run(matchmaking._join_existing_mission(rpid2, 900007, entry9b,
                                                        ctx9b))
-        sess9c = [r for r in matchmaking.PMS_TO_SESSION.values()
+        sess9c = [r for r in mm_state.PMS_TO_SESSION.values()
                   if r.get('player_id') == rpid2 and
-                  matchmaking.PMS_TO_MISSION.get(r.get('pms_id')) == 900007]
+                  mm_state.PMS_TO_MISSION.get(r.get('pms_id')) == 900007]
         check('小队行缺失 → 降级散人队且 squad_db_id=0',
               len(sess9c) == 1 and sess9c[0].get('squad_db_id') == 0)
         # 散人自建队默认名按本局 (阵营, 兵种) 从 1 编号（faction=3, tmpl=1）
-        auto9c = list(matchmaking._MM_MISSION_SQUADS[900007].values())
+        auto9c = list(mm_state._MM_MISSION_SQUADS[900007].values())
         check('散人自建队默认名 → "Infantry Squad 1"（按阵营编号）',
               len(auto9c) == 1 and auto9c[0]['name'] == 'Infantry Squad 1',
               f'name={auto9c[0]["name"]!r}' if auto9c else 'no squad row')
@@ -394,11 +399,11 @@ def main():
         async def fake_enqueue(squad, members, gm, presets, req_mid):
             calls['enqueue'].append((squad, members))
 
-        old_eligible = matchmaking._squad_eligible_members
-        old_active = matchmaking._find_player_active_mission
-        old_rejoin = matchmaking._join_existing_mission
-        old_enqueue = matchmaking._enqueue_squad
-        old_store = matchmaking.STORE
+        old_eligible = mm_handler._squad_eligible_members
+        old_active = mm_handler._find_player_active_mission
+        old_rejoin = mm_handler._join_existing_mission
+        old_enqueue = mm_handler._enqueue_squad
+        old_store = state.STORE
 
         class Store12:
             async def list_characters(self, p):
@@ -413,15 +418,15 @@ def main():
             async def ensure_player(self):
                 return rpid2
 
-        matchmaking._squad_eligible_members = fake_eligible
-        matchmaking._find_player_active_mission = fake_active
-        matchmaking._join_existing_mission = fake_rejoin
-        matchmaking._enqueue_squad = fake_enqueue
-        matchmaking.STORE = Store12()
+        mm_handler._squad_eligible_members = fake_eligible
+        mm_handler._find_player_active_mission = fake_active
+        mm_handler._join_existing_mission = fake_rejoin
+        mm_handler._enqueue_squad = fake_enqueue
+        state.STORE = Store12()
         try:
             proto12 = pb_varint(1, 42)      # f1 charId（f7 gamemode 缺省=0）
             w12 = FakeWriter()
-            asyncio.run(matchmaking._handle_join(
+            asyncio.run(mm_handler._handle_join(
                 Sess12(), w12, 30, proto12))
             check('小队 InBattle 重连：路由到 rejoin 回原局（900007）',
                   calls['rejoin'] and calls['rejoin'][0][:2] == (rpid2, 900007)
@@ -432,19 +437,19 @@ def main():
                   calls['rejoin'][0][2].get('squad_db_id') == 555)
             # 无存活原局（局已结束/会话清理）→ 维持旧行为：仅整队入池路径
             calls['rejoin'].clear()
-            matchmaking._find_player_active_mission = lambda p: None
+            mm_handler._find_player_active_mission = lambda p: None
             w12b = FakeWriter()
-            asyncio.run(matchmaking._handle_join(
+            asyncio.run(mm_handler._handle_join(
                 Sess12(), w12b, 30, proto12))
             check('无存活原局 → 不 rejoin，空成员入池（原行为）',
                   not calls['rejoin'] and
                   calls['enqueue'] and calls['enqueue'][0][1] == [])
         finally:
-            matchmaking._squad_eligible_members = old_eligible
-            matchmaking._find_player_active_mission = old_active
-            matchmaking._join_existing_mission = old_rejoin
-            matchmaking._enqueue_squad = old_enqueue
-            matchmaking.STORE = old_store
+            mm_handler._squad_eligible_members = old_eligible
+            mm_handler._find_player_active_mission = old_active
+            mm_handler._join_existing_mission = old_rejoin
+            mm_handler._enqueue_squad = old_enqueue
+            state.STORE = old_store
 
         # ---- 13. 将军不参战（官方设计：General 只在大地图指挥）----
         # 修复前：general（actionid=7 与伞兵同）不挡 → 混进战斗当伞兵。
@@ -479,30 +484,30 @@ def main():
         async def fake_eligible13(p):
             return ({'id': 556}, [])       # 即便可达小队路径也应先被拒
 
-        old13 = (matchmaking.STORE, matchmaking._join_existing_mission,
-                 matchmaking._enqueue_squad, matchmaking._squad_eligible_members)
-        matchmaking.STORE = Store13()
-        matchmaking._join_existing_mission = fake_rejoin13
-        matchmaking._enqueue_squad = fake_enqueue13
-        matchmaking._squad_eligible_members = fake_eligible13
+        old13 = (state.STORE, mm_handler._join_existing_mission,
+                 mm_handler._enqueue_squad, mm_handler._squad_eligible_members)
+        state.STORE = Store13()
+        mm_handler._join_existing_mission = fake_rejoin13
+        mm_handler._enqueue_squad = fake_enqueue13
+        mm_handler._squad_eligible_members = fake_eligible13
         try:
             w13 = FakeWriter()
-            asyncio.run(matchmaking._handle_join(
+            asyncio.run(mm_handler._handle_join(
                 Sess13(), w13, 30, pb_varint(1, 501)))
             check('将军 join → 拒绝（JoinMatchMakingResponse f1=0）',
                   w13.data.endswith(b'\x08\x00'),
                   f'data={w13.data!r}')
             check('将军 join → 不入池不回局不进小队路径',
                   not calls13['rejoin'] and not calls13['enqueue']
-                  and gpid not in matchmaking._MM_QUEUES
-                  and gpid not in matchmaking.PLAYER_SELECTED_CHAR,
+                  and gpid not in mm_state._MM_QUEUES
+                  and gpid not in state.PLAYER_SELECTED_CHAR,
                   f'calls={calls13}')
         finally:
-            matchmaking.STORE = old13[0]
-            matchmaking._join_existing_mission = old13[1]
-            matchmaking._enqueue_squad = old13[2]
-            matchmaking._squad_eligible_members = old13[3]
-        matchmaking.PLAYER_SELECTED_CHAR.pop(gpid, None)
+            state.STORE = old13[0]
+            mm_handler._join_existing_mission = old13[1]
+            mm_handler._enqueue_squad = old13[2]
+            mm_handler._squad_eligible_members = old13[3]
+        state.PLAYER_SELECTED_CHAR.pop(gpid, None)
 
         # 小队成员含将军 → 整队入池时被过滤（成员行无 template，走 DB 反查）
         from state import FLASH_SESSIONS
@@ -536,15 +541,15 @@ def main():
 
         FLASH_SESSIONS['GenMate'] = Flash13()
         FLASH_SESSIONS['RifleMate'] = Flash13()
-        old13b = matchmaking.STORE
-        matchmaking.STORE = Store13b()
+        old13b = state.STORE
+        state.STORE = Store13b()
         try:
             _, elig13 = asyncio.run(matchmaking._squad_eligible_members(991))
             check('小队整队入池：将军成员被过滤、步兵保留',
                   [m['player_id'] for m in (elig13 or [])] == [991],
                   f'eligible={[m["player_id"] for m in (elig13 or [])]}')
         finally:
-            matchmaking.STORE = old13b
+            state.STORE = old13b
             FLASH_SESSIONS.pop('GenMate', None)
             FLASH_SESSIONS.pop('RifleMate', None)
 
@@ -556,12 +561,12 @@ def main():
         rpid3 = 555
         pms_c = 600100
         seed_mission(900008, gamemode=5, preset=10, players=1)
-        matchmaking.PMS_TO_SESSION[pms_c] = {
+        mm_state.PMS_TO_SESSION[pms_c] = {
             'pms_id': pms_c, 'player_id': rpid3, 'char_id': 42,
             'gamertag': 'CrashTest', 'faction': 3,
             'battle_session_id': 778899, 'metrics_uid': 'uid-crash',
             'metrics_session_id': 123456}
-        matchmaking.PMS_TO_MISSION[pms_c] = 900008
+        mm_state.PMS_TO_MISSION[pms_c] = 900008
         w14 = FakeWriter()
         ok14 = asyncio.run(matchmaking.push_relogin_rejoin(w14, 105, rpid3))
         data14 = w14.data
@@ -579,39 +584,39 @@ def main():
         check('重登 rejoin：无存活战局 → 不推送（正常登录）',
               asyncio.run(matchmaking.push_relogin_rejoin(
                   w14n, 105, 424242)) is False and w14n.data == b'')
-        matchmaking.COMBAT_INSTANCES.pop(900008, None)   # 模拟战局已结束
+        combat_instances.COMBAT_INSTANCES.pop(900008, None)   # 模拟战局已结束
         w14b = FakeWriter()
         check('重登 rejoin：战局已释放 → 不推送',
               asyncio.run(matchmaking.push_relogin_rejoin(
                   w14b, 105, rpid3)) is False and w14b.data == b'')
-        matchmaking.PMS_TO_SESSION.pop(pms_c, None)
-        matchmaking.PMS_TO_MISSION.pop(pms_c, None)
-        matchmaking._MM_QUEUES.pop(rpid3, None)
-        matchmaking._SOLO_SQUADS.pop(rpid3, None)
+        mm_state.PMS_TO_SESSION.pop(pms_c, None)
+        mm_state.PMS_TO_MISSION.pop(pms_c, None)
+        mm_state._MM_QUEUES.pop(rpid3, None)
+        mm_state._SOLO_SQUADS.pop(rpid3, None)
 
         # ---- 清理（模块级全局，防污染其它测试） ----
         for mid in (900001, 900002, 900003, 900004, 900005, 900006, 900007,
                     900008):
-            matchmaking.COMBAT_INSTANCES.pop(mid, None)
-            matchmaking._MM_MISSION_DETAILS.pop(mid, None)
-            matchmaking._MM_MISSION_SQUADS.pop(mid, None)
-        for pms_id in list(matchmaking.PMS_TO_SESSION):
-            if matchmaking.PMS_TO_MISSION.get(pms_id) in (
+            combat_instances.COMBAT_INSTANCES.pop(mid, None)
+            mm_state._MM_MISSION_DETAILS.pop(mid, None)
+            mm_state._MM_MISSION_SQUADS.pop(mid, None)
+        for pms_id in list(mm_state.PMS_TO_SESSION):
+            if mm_state.PMS_TO_MISSION.get(pms_id) in (
                     900001, 900002, 900003, 900004, 900005, 900006, 900007,
                     999999):
-                matchmaking.PMS_TO_MISSION.pop(pms_id, None)
-                matchmaking.PMS_TO_SESSION.pop(pms_id, None)
-        matchmaking.PMS_TO_SESSION.pop(600777, None)
-        matchmaking.PMS_TO_MISSION.pop(600777, None)
-        matchmaking._MM_QUEUES.pop(pid, None)
-        matchmaking._MM_QUEUES.pop(rpid, None)
-        matchmaking._MM_QUEUES.pop(rpid2, None)
-        matchmaking._MATCH_PMM_IDS.pop(pid, None)
-        matchmaking._MATCH_PMM_IDS.pop(rpid, None)
-        matchmaking._MATCH_PMM_IDS.pop(rpid2, None)
-        matchmaking._SOLO_SQUADS.pop(pid, None)
-        matchmaking._SOLO_SQUADS.pop(rpid, None)
-        matchmaking._SOLO_SQUADS.pop(rpid2, None)
+                mm_state.PMS_TO_MISSION.pop(pms_id, None)
+                mm_state.PMS_TO_SESSION.pop(pms_id, None)
+        mm_state.PMS_TO_SESSION.pop(600777, None)
+        mm_state.PMS_TO_MISSION.pop(600777, None)
+        mm_state._MM_QUEUES.pop(pid, None)
+        mm_state._MM_QUEUES.pop(rpid, None)
+        mm_state._MM_QUEUES.pop(rpid2, None)
+        mm_state._MATCH_PMM_IDS.pop(pid, None)
+        mm_state._MATCH_PMM_IDS.pop(rpid, None)
+        mm_state._MATCH_PMM_IDS.pop(rpid2, None)
+        mm_state._SOLO_SQUADS.pop(pid, None)
+        mm_state._SOLO_SQUADS.pop(rpid, None)
+        mm_state._SOLO_SQUADS.pop(rpid2, None)
     finally:
         mm_config.JOIN_WINDOW = old_window
         mm_config.GAMEMODES[5] = old_gm5

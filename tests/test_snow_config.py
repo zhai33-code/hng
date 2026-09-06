@@ -16,7 +16,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mm_config            # noqa: E402
-import matchmaking          # noqa: E402
+import mm_weather          # noqa: E402
 
 
 # ---------- 1. 配置解析 ----------
@@ -49,20 +49,20 @@ def test_roll_weather_snow_boundaries():
     old = mm_config.SNOW_CHANCE
     try:
         mm_config.SNOW_CHANCE = 1.0
-        w = matchmaking.roll_weather()
+        w = mm_weather.roll_weather()
         assert w['snow'] is True, w
         assert (w['weather_tod'], w['weather_condition'],
-                w['timeofday']) in matchmaking.WEATHER_PRESETS, w
+                w['timeofday']) in mm_weather.WEATHER_PRESETS, w
         # 雪局编码后：低 2 位天气列不变 + 高位雪掩码
-        f22 = matchmaking.snow_f22_condition(w)
-        assert f22 & 0x30 == matchmaking.SNOW_MASK, hex(f22)
+        f22 = mm_weather.snow_f22_condition(w)
+        assert f22 & 0x30 == mm_weather.SNOW_MASK, hex(f22)
         assert f22 & 3 == w['weather_condition'], hex(f22)
 
         mm_config.SNOW_CHANCE = 0.0
-        w = matchmaking.roll_weather()
+        w = mm_weather.roll_weather()
         assert w['snow'] is False, w
         assert w['weather_condition'] in (0, 1, 2), w
-        assert matchmaking.snow_f22_condition(w) == w['weather_condition']
+        assert mm_weather.snow_f22_condition(w) == w['weather_condition']
     finally:
         mm_config.SNOW_CHANCE = old
 
@@ -76,4 +76,4 @@ def test_snow_f22_condition():
                       ({'weather_condition': 2, 'snow': False}, 2),
                       ({'snow': False}, 0),
                       ({}, 0)):
-        assert matchmaking.snow_f22_condition(det) == want, (det, want)
+        assert mm_weather.snow_f22_condition(det) == want, (det, want)
