@@ -4,6 +4,23 @@
 > 目标：在不改变任何线上行为的前提下，拆解服务端巨型模块，降低导航/修改/评审成本。
 > 参照先例：web 管理端 routers→services 拆分（commit 8e5a0a1）；force_pool.py 从 matchmaking 拆出（2026-08-26）。
 > **文中行号以 2026-09-06 工作区快照（commit 7e741bc）为准，执行时以符号名为准。**
+> **2026-09-06 执行完毕**：阶段 0-3.5 全部落地并逐阶段回归零回归（见下"执行记录"）；阶段 4 未执行。
+
+## 执行记录（2026-09-06 收尾更新）
+
+| 阶段 | 内容 | commit | 阶段回归 |
+| --- | --- | --- | --- |
+| 0 | 基线固化（50 项结果 + 环境修正记录入 baseline 文档） | `90a65fb`（tag `pre-refactor`） | — |
+| 1 | player_store.py(4557) → store/ 包（19 文件，BaseStore + 17 域 mixin） | `d682b1e` | 与基线一致 |
+| 2 | matchmaking.py(3138) → combat_instances/mm_state/mm_factions/mm_weather/mm_handler + 撮合核心 | `6d99ca2` | 与基线一致 |
+| 3a | combat.py(1902) → combat + combat_join | `c29259e` | 与基线一致 |
+| 3b | squad.py(1632) → squad + squad_match + company | `52fd46f` | 与基线一致 |
+| 3c | characters/weapons/vehicles → 各拆 `*_purchase.py` | `47ec785` | 与基线一致 |
+| 3.5 | war_campaign.py(2603) → war_campaign/ 包（12 文件，153 符号 re-export） | `1b10fb5` | 与基线一致 |
+
+- **收尾全量复跑**（HEAD=1b10fb5）：50 项中 5 项与基线"既有失败"完全一致，另 test_admin_adjust_score 因 SSH 隧道（127.0.0.1:15432）未开环境性失败——**零回归**，明细见 baseline 文档"重构后复跑结果"。
+- **阶段 3 其余文件**（economy/social/shop/career，第三节条件句）：评估后**不拆**——四文件消息族各自内聚、边界清晰，拆分收益低于引入新文件的导航成本；后续膨胀再按同法处理。
+- **阶段 4（可选）**：未执行，wardb/player_service/web_server 维持现状。
 
 ## 〇、环境说明（09-06 修订新增）
 
@@ -200,6 +217,11 @@ war_campaign/
 
 - **循环依赖边界**：war_campaign 内 5 处 `import matchmaking`（L623/2199/2248/2342/2414）与 `messages._push_kvcs`/`state.FLASH_SESSIONS` 反向依赖——阶段 2 的 mm_state 落地后优先经它中转，否则各子模块保留函数内延迟 import（现状语义不变）；
 - 调用方（matchmaking、handlers/{war_at,combat,views,auth}、player_service L413 延迟、realtest_server、6 个 test_war_*）import 路径改为 `war_campaign` 包名不变（`__init__.py` re-export 属包内组装，不算兼容层）。
+- **实际落地差异**（依符号真实引用关系微调，纯移动原则不变）：
+  - 地理工具群（`_bf_pos`/`_BF_POS_CACHE`/`supplyline_adjacency`/`_ADJACENCY_CACHE`/`find_supplyline_path`）从 at_movement 下沉 `common.py`（warmap_view/supply/tick 共用）；
+  - `_faction_capital_bf` 归 `lifecycle.py`（与 capital_battlefield_ids 同域）；单位分类群（`is_reserve`/`is_aircraft`/`airfield_bfs`/`nearest_airfield` 等 + `_AIRFIELD_CACHE`）归 `at_ops.py`，at_movement 仅保留移动引擎；
+  - 包内新引入的函数内延迟 import 实际 4 处：warmap_view→at_movement、supply→tick、tick→production、production→tick（tick↔production 互环只能延迟压制）；对 matchmaking/messages/state 的既有延迟依赖全部原样保留；
+  - `__init__.py` re-export 全部 153 个顶层符号并配 `__all__`，调用方 import 零改动；tests 的 monkeypatch 同步改打定义子模块（lifecycle/tick/common/at_ops）——from-import 快照不回流子模块，patch 必须打定义处（详见 `1b10fb5` 的 tests diff）。
 
 ### 阶段 4（可选，视前几阶段体感决定）
 
@@ -208,6 +230,8 @@ war_campaign/
 - `web_server.py`(1121)：独立进程、风险小收益也小，优先级最低。
 
 ## 四、每阶段验收清单
+
+> 2026-09-06 收尾：阶段 0-3.5 各阶段均已按本清单逐项验收通过，执行明细见文首"执行记录"。
 
 - [ ] 全量离线测试与阶段 0 基线逐项一致（对照 `docs/baseline-2026-09.md`；集成类测试在 DB 可用时同跑）；
 - [ ] 冒烟启动正常：`$env:MM_SIMULATE_COMBAT='1'; .venv\Scripts\python.exe realtest_server.py`（PowerShell 语法）；

@@ -5,7 +5,7 @@
 
 ## 运行环境
 
-- venv：`..\..\.venv\Scripts\python.exe`（仓库根，非 server\ 下）
+- venv：`..\.venv\Scripts\python.exe`（位于 server\ 上一级 hng-server-re\.venv，不在 git 仓库内；本文档相对路径均以 server\ 为 cwd）
 - 必须 `$env:PYTHONIOENCODING='utf-8'`（否则 GBK 编码崩溃）
 - DB：Docker Desktop `hng-postgres`，PlayerStore 自动探测 WSL IP（172.25.164.25:5432）
 - e2e 类（7 项）：需先起服务器
@@ -72,6 +72,22 @@ e2e 类通过（5 项）：
 - 上表"通过"列：重构后必须全部保持通过
 - "既有失败"列：重构后失败项**集合与数量完全一致**（含 test_mm_latejoin_e2e 的 8 项明细）
 - 重构期间不修这些历史失败（如需修复，重构完成后独立 commit 并同步更新本表）
+
+## 重构后复跑结果（2026-09-06，HEAD=1b10fb5，阶段 1-3.5 全部完成后）
+
+50 项全量复跑：非零退出 6 项，其余 44 项与上表"通过"记录一致。非零 6 项中 5 项与
+"既有失败"逐项一致（test_matchmaking 11/13、test_mm_latejoin_e2e 18/26、
+test_mm_multiplayer 28/29、test_rts_war_db 3 项、test_e2e 尾部 TypeError；
+test_realdb 主体 PASS exit 0 同基线），另 1 项差异：
+
+| 测试 | 结果 | 判定 |
+|---|---|---|
+| test_admin_adjust_score | ConnectionRefusedError（20 项全挂） | **环境性，非回归**：该测试 DSN 为 `127.0.0.1:15432`（SSH 隧道直连线上库，与 test_realdb 同款模式，见文件头注释）。基线录制时隧道开启故 20/20；复跑时隧道未开（`Test-NetConnection 127.0.0.1 -Port 15432` = False）。重构全程未触碰 admin/score 代码路径，开隧道后应恢复 20/20 |
+
+e2e（realtest_server 加载阶段 3.5 代码运行）：test_regression 39/39、test_auth /
+test_autorepair 通过、test_e2e 协议主体 PASS（尾部 docker exec 输出问题同基线）。
+
+**结论：阶段 1-3.5 共 6 个 refactor commit 零回归。**
 
 ## 复跑命令
 
