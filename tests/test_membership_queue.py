@@ -45,8 +45,8 @@ DAYS = {9001: 30, 9002: 90}
 
 
 async def main():
-    import player_store
-    st = player_store.PlayerStore()
+    import store
+    st = store.PlayerStore()
     await st.start()
     print('== 0. 建测试账号 ==')
     uname = f'test_mship_{int(time.time())}'

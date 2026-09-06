@@ -381,8 +381,8 @@ def test_handler():
 # ------------------------------------------------------------ C. DB 级
 
 async def _db_main():
-    import player_store
-    st = player_store.PlayerStore()
+    import store
+    st = store.PlayerStore()
     await st.start()
 
     print('== 8. 迁移：players 新列 ==')

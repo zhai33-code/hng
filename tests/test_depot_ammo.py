@@ -35,9 +35,9 @@ def mark(label, good, extra=''):
 
 
 async def main():
-    import player_store
+    import store
 
-    st = player_store.PlayerStore()
+    st = store.PlayerStore()
     await st.start()
 
     # ---------- DB 级 ----------

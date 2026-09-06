@@ -8,7 +8,7 @@ import os
 import sys
 import time
 
-from player_store import PlayerStore
+from store import PlayerStore
 
 STORE = PlayerStore()
 

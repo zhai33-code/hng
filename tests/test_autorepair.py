@@ -147,7 +147,7 @@ def weapon_pushes(msgs):
 
 
 async def main():
-    from player_store import PlayerStore
+    from store import PlayerStore
     store = PlayerStore()
     await store.start()
 

@@ -29,10 +29,10 @@ RENAME_TABLES = ['weapons', 'weapon_modifiers', 'weapon_ammo', 'vehicles',
 
 
 async def main():
-    import player_store
+    import store
     import player_service
     import state
-    st = player_store.PlayerStore()          # 默认 DSN → 自动探测 WSL docker IP
+    st = store.PlayerStore()          # 默认 DSN → 自动探测 WSL docker IP
     await st.start()
     print('== 1. 迁移应用（start() OK）==')
     ok = fail = 0

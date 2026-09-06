@@ -31,7 +31,7 @@ for _cand in (os.environ.get('HNG_GAME_DIR'),
         break
 
 from protocol import Chunk, pb_parse          # noqa: E402
-import player_store                           # noqa: E402
+import store                           # noqa: E402
 import wardb                                  # noqa: E402
 from handlers import economy                  # noqa: E402
 
@@ -162,13 +162,13 @@ def test_table_classification():
 
 def test_schema_migration():
     print('== 3. schema 迁移与历史行回填 ==')
-    s = player_store._SCHEMA
+    s = store._SCHEMA
     check('_SCHEMA 含 is_ribbon 加列迁移',
           'ALTER TABLE player_boosters ADD COLUMN IF NOT EXISTS is_ribbon' in s)
     check('_SCHEMA 含历史行回填（模板不在通用表内 → 勋带）',
           'UPDATE player_boosters SET is_ribbon = TRUE' in s)
     check('add_booster 写入 is_ribbon 参数',
-          'is_ribbon' in player_store.PlayerStore.add_booster.__doc__ or True)
+          'is_ribbon' in store.PlayerStore.add_booster.__doc__ or True)
     # 购买入口归属：AddBoosterRequest（勋带）标记 True
     import inspect
     src = inspect.getsource(economy.handle_add_booster)

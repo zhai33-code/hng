@@ -457,8 +457,8 @@ def main():
     import asyncio
 
     async def _badge_db():
-        import player_store
-        st = player_store.PlayerStore()
+        import store
+        st = store.PlayerStore()
         await st.start()
         pid = cid = None
         try:
@@ -528,8 +528,8 @@ def main():
     # 修复：装备时传入 vehicleId，行内 vehicle_id 不同（库存件/跨载具转移）
     # 则先校验归属并绑定 vehicle_id + character_id，互斥清理也用绑定后的载具。
     async def _vu_db():
-        import player_store
-        st = player_store.PlayerStore()
+        import store
+        st = store.PlayerStore()
         await st.start()
         pid = None
         try:

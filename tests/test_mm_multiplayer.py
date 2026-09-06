@@ -27,7 +27,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from protocol import Chunk, build_response
-from player_store import PlayerStore
+from store import PlayerStore
 
 
 def pb_varint(field, value):

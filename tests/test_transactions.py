@@ -39,8 +39,8 @@ class Boom(Exception):
 
 
 async def main():
-    import player_store
-    st = player_store.PlayerStore()
+    import store
+    st = store.PlayerStore()
     await st.start()
     print('== 0. 建测试账号 ==')
     uname = f'test_txn_{int(time.time())}'

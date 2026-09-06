@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import wardb
 from handlers import combat as combat_handlers
-from player_store import PlayerStore
+from store import PlayerStore
 
 # ---- wardb 模板锚点（WarDatabase 实测分布，2026-08-31 dump）----
 # 载具满耐久集合；未知模板回退 100.0
@@ -573,10 +573,10 @@ def test_db_normalize_create_and_wear():
     DB 不可达时打印 SKIP 并通过（本地无 Docker 环境不阻塞回归）。"""
     import re
     import asyncpg
-    import player_store
+    import store
 
-    dsn = player_store.DEFAULT_DSN
-    ip = player_store._wsl_docker_ip()
+    dsn = store.DEFAULT_DSN
+    ip = store._wsl_docker_ip()
     if ip:
         dsn = re.sub(r'@(127\.0\.0\.1|localhost):', f'@{ip}:', dsn)
 

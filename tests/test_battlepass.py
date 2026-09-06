@@ -83,7 +83,7 @@ class _NullStore:
     """乱字节回归专用的空 STORE：吞掉一切 DB 调用，绝不写真实库。
 
     2026-08-27 事故：乱字节测试带真实 STORE 跑，msid=0 命中真实战报行
-    把玩家数据擦了（后已在 player_store.save_battle_report 加空玩家保护）。"""
+    把玩家数据擦了（后已在 store.save_battle_report 加空玩家保护）。"""
 
     def __getattr__(self, name):
         async def _noop(*_a, **_kw):
@@ -234,10 +234,10 @@ def _earnings_request(pid, char_id, score):
 
 
 async def db_tests():
-    import player_store
+    import store
     import state
 
-    st = player_store.PlayerStore()
+    st = store.PlayerStore()
     await st.start()
     uname = f'test_bpfix_{int(time.time())}'
     pid = await st.create_player(uname, 'bp-fix')

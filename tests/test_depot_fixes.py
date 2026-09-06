@@ -60,9 +60,9 @@ async def cleanup(st, pid):
 
 
 async def main():
-    import player_store
+    import store
 
-    st = player_store.PlayerStore()
+    st = store.PlayerStore()
     await st.start()
 
     # ---------- DB 级 ----------
@@ -369,9 +369,9 @@ async def main():
     mark('重推器：tid=42 推 TracerEffect 行（指派/退仓后 UI 收敛）',
          "tid == 42" in src and 'TracerEffect' in src)
 
-    # player_store：挂靠件指派脱离容器（官方容器归属不变式；字典定义在
-    # 类属性上，取类级源码校验）
-    src = inspect.getsource(player_store.PlayerStore)
+    # 持久层（store.maintenance）：挂靠件指派脱离容器（官方容器归属不变式；
+    # 字典定义在类属性上，取类级源码校验。2026-09 拆分后为 MaintenanceMixin）
+    src = inspect.getsource(store.maintenance.MaintenanceMixin)
     mark('store：挂靠件指派同步清 weapon_id/vehicle_id（_ITEM_DETACH_SETS）',
          '_ITEM_DETACH_SETS' in src and 'weapon_id = 0' in src
          and 'vehicle_id = 0' in src)
@@ -386,7 +386,7 @@ async def main():
     mark('player_service: 登录回放推 DepotNewItem KVCS 行',
          'DepotNewItem' in src and '_msg_depot_new_item' in src)
 
-    schema = player_store._SCHEMA
+    schema = store._SCHEMA
     mark('schema: depot_items 唯一索引 uq_depot_items(player,item_type,item_id)',
          'uq_depot_items' in schema)
 

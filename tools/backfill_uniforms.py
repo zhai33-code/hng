@@ -15,12 +15,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # server/
 
-import player_store  # noqa: E402
+import store  # noqa: E402
 from wardb import default_uniform_variant  # noqa: E402
 
 
 async def main():
-    st = player_store.PlayerStore()
+    st = store.PlayerStore()
     await st.start()
     async with st.pool.acquire() as conn:
         rows = await conn.fetch(

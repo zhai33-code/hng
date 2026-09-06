@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""RTS 战争域持久层回归（player_store.py U8 迁移 + war 域方法）。
+"""RTS 战争域持久层回归（store.py U8 迁移 + war 域方法）。
 
 覆盖：
   A. 迁移存在性（wars/war_cities/commandnode_movements/war_battles/
@@ -33,9 +33,9 @@ def check(label, ok, detail=''):
 
 
 async def main():
-    import player_store
+    import store
 
-    st = player_store.PlayerStore()
+    st = store.PlayerStore()
     try:
         await st.start()
     except Exception as e:

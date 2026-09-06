@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import wardb
-from player_store import PlayerStore
+from store import PlayerStore
 
 
 async def main():

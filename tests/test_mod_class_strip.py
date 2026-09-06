@@ -192,9 +192,9 @@ async def main():
          bytes(writer2.buf).count(b'WeaponModifier') == 0)
 
     print('== 3. PlayerStore.detach_weapon_modifiers（DB 级）==')
-    import player_store
+    import store
 
-    st = player_store.PlayerStore()
+    st = store.PlayerStore()
     await st.start()
 
     async def cleanup(_st, _pid):
@@ -252,7 +252,7 @@ async def main():
     mark('handler：_weapon_template_id import 在位（2026-09-04 复发事故：'
          'import 丢失 → NameError 被吞 → 剥离静默失效）',
          hasattr(hc, '_weapon_template_id'))
-    src = inspect.getsource(player_store.PlayerStore)
+    src = inspect.getsource(store.maintenance.MaintenanceMixin)  # 拆分后驻留 maintenance 域
     mark('store：detach_weapon_modifiers 批量卸件方法存在',
          'async def detach_weapon_modifiers' in src)
 

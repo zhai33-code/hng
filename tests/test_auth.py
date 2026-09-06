@@ -109,7 +109,7 @@ async def main():
     await login('nobody', b'whatever')  # ensure no auto-create
     # add tester via DB directly (simulates add_user.py)
     import sys as _s
-    from player_store import PlayerStore
+    from store import PlayerStore
     store = PlayerStore()
     await store.start()
     pid = await store.create_player('tester', 'secret123')
