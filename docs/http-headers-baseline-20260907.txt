@@ -1,0 +1,37 @@
+﻿HTTP response header baseline (2026-09-07, server=127.0.0.1:80, HEAD requests)
+/settings.js                                                           404  CT=text/html;charset=utf-8 CL=335 CACHE=
+//settings.js                                                          404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/wardb_sync                                                            404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/wardb_sync.bz2                                                        404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/wardb_unique                                                          404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/hng_unique_v173293                                                    404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/hng_unique_v173293.bz2                                                404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/flashres_unique                                                       404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/gce64_unique                                                          404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/WarDatabase/accesspoint                                               200  CT=application/octet-stream CL=234803 CACHE=
+/HnG_Strategy_en.xml                                                   404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/undefined                                                             404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/e3237437bac22516f604aa66fec5a5381c3c485f360c0df0e7e52c19fbbec17c-1632_0 404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/e3237437bac22516f604aa66fec5a5381c3c485f360c0df0e7e52c19fbbec17c-1632_0.bz2 404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/e3237437bac22516f604aa66fec5a5381c3c485f360c0df0e7e52c19fbbec17c-1632_0_2026.sgn 404  CT=text/html;charset=utf-8 CL=335 CACHE=
+/online.json                                                           404  CT=text/html;charset=utf-8 CL=335 CACHE=
+
+HTTP GET response header baseline (2026-09-07, server=127.0.0.1:80)
+/settings.js                                                           200  CT=application/javascript CL= CACHE=
+//settings.js                                                          200  CT=application/javascript CL= CACHE=
+/wardb_sync                                                            200  CT=application/octet-stream CL=9319 CACHE=
+/wardb_sync.bz2                                                        200  CT=application/octet-stream CL=4708 CACHE=
+/wardb_unique                                                          200  CT=application/octet-stream CL=7375 CACHE=
+/hng_unique_v173293                                                    200  CT=application/xml CL=1632 CACHE=
+/hng_unique_v173293.bz2                                                200  CT=application/octet-stream CL=600 CACHE=
+/flashres_unique                                                       200  CT=application/octet-stream CL=20589 CACHE=
+/gce64_unique                                                          200  CT=application/octet-stream CL=83 CACHE=
+/WarDatabase/accesspoint                                               200  CT=application/octet-stream CL= CACHE=
+/HnG_Strategy_en.xml                                                   200  CT=application/xml CL=1171268 CACHE=
+/undefined                                                             200  CT=application/xml CL= CACHE=
+/e3237437bac22516f604aa66fec5a5381c3c485f360c0df0e7e52c19fbbec17c-1632_0 200  CT=application/octet-stream CL=1632 CACHE=
+/e3237437bac22516f604aa66fec5a5381c3c485f360c0df0e7e52c19fbbec17c-1632_0.bz2 200  CT=application/octet-stream CL=600 CACHE=
+/e3237437bac22516f604aa66fec5a5381c3c485f360c0df0e7e52c19fbbec17c-1632_0_2026.sgn 200  CT=application/octet-stream CL=256 CACHE=
+/online.json                                                           200  CT=application/json; charset=utf-8 CL=102 CACHE=
+/status                                                                404  CT=text/plain CL= CACHE=
+/register                                                              200  CT=text/html CL=1462 CACHE=no-cache
