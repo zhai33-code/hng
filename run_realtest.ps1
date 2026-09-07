@@ -54,11 +54,14 @@ if (-not $isAdmin) {
 
 # 2. Start server (background)
 # stdout 不重定向 → 服务器窗口实时显示日志（-u 无缓冲）；
-# 全量日志由 state.py 写 realtest_game.log（行缓冲），stderr 仅留崩溃诊断
+# 全量日志由 state.py 写 logs\realtest_game.log（行缓冲），stderr 仅留崩溃诊断
 Write-Host '[*] Starting realtest_server...' -ForegroundColor Cyan
+$hng_logs = Join-Path $hng_server_dir 'logs'
+New-Item -ItemType Directory -Force -Path $hng_logs | Out-Null
+Move-Item (Join-Path $hng_server_dir 'realtest_stderr.log') $hng_logs -ErrorAction SilentlyContinue
 $hng_srv = Start-Process -FilePath $hng_py -ArgumentList "-u `"$hng_server_dir\realtest_server.py`"" `
     -PassThru -WindowStyle Normal `
-    -RedirectStandardError "$hng_server_dir\realtest_stderr.log"
+    -RedirectStandardError "$hng_logs\realtest_stderr.log"
 
 # 2b. (removed) action_replay UDP 15110 重放服已退役：
 #     战斗流量改由专用服 combat-server\start_server.bat（hng.exe /D, UDP 5678）承载
@@ -67,7 +70,7 @@ Start-Sleep -Seconds 3
 
 if ($hng_srv.HasExited) {
     Write-Host '[!] Server failed to start:' -ForegroundColor Red
-    Get-Content "$hng_server_dir\realtest_stderr.log" -ErrorAction SilentlyContinue | Select-Object -First 10
+    Get-Content "$hng_logs\realtest_stderr.log" -ErrorAction SilentlyContinue | Select-Object -First 10
     exit 1
 }
 Write-Host '[+] Server started (PID:' $hng_srv.Id ')' -ForegroundColor Green
@@ -104,4 +107,4 @@ Write-Host '=== Done ===' -ForegroundColor Green
 # Show server log
 Write-Host ''
 Write-Host '--- Server log ---' -ForegroundColor Cyan
-Get-Content "$hng_server_dir\realtest_game.log" -ErrorAction SilentlyContinue | Select-Object -Last 20
+Get-Content "$hng_server_dir\logs\realtest_game.log" -ErrorAction SilentlyContinue | Select-Object -Last 20

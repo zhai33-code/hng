@@ -640,8 +640,8 @@ _PLAYER_LEVEL_UNLOCK_MAX = (max(_PLAYER_LEVEL_UNLOCK_META)
                             if _PLAYER_LEVEL_UNLOCK_META else 0)
 
 
-def player_unlock_bits_for_level(level):
-    """按玩家等级生成 player unlockBits（位索引 = PlayerLevelUnlock.id）。
+def player_unlock_bits_for_level(level, granted_ids=()):
+    """按玩家等级生成 player unlockBits（位索引 = 解锁条目 id）。
 
     客户端 PlayerUtilities.hasPlayerLevelUnlock 读该位图门控 War 模式
     （eWar lv10）/匹配模式（eMissionType）/武器组（eWeaponGroup）等——
@@ -649,12 +649,23 @@ def player_unlock_bits_for_level(level):
     位 true = 条目 available 且 unlockMetaLevel <= level；
     兵种（坦克兵 lv5/伞兵 lv6/飞行员 lv8/侦察 lv9/将军 lv12）按等级置位
     → SoldierShop 兵种页签解锁可招募（CreateCharacterRequest）。将军位
-    置位不产生士兵栏 fake 卡：PlayerModel 将军不入 characterTemplateUnlocks。"""
+    置位不产生士兵栏 fake 卡：PlayerModel 将军不入 characterTemplateUnlocks。
+
+    granted_ids：非等级来源的永久解锁（player_unlocks 表，通行证奖励的
+    progressionUnlock，如面部迷彩 2387-2395）——外观窗口按
+    progressionUnlock.id 直接索引位图，数组长度必须覆盖这些 id，
+    否则客户端 unlockBits.Count <= id 判越界恒 false。"""
     lvl = int(level)
-    return [uid in _PLAYER_LEVEL_UNLOCK_META
-            and _PLAYER_LEVEL_UNLOCK_META[uid][1] != 0
-            and _PLAYER_LEVEL_UNLOCK_META[uid][0] <= lvl
-            for uid in range(_PLAYER_LEVEL_UNLOCK_MAX + 1)]
+    granted = {int(g) for g in granted_ids if int(g) > 0}
+    size = max(_PLAYER_LEVEL_UNLOCK_MAX, max(granted) if granted else 0) + 1
+    bits = [False] * size
+    for uid in range(_PLAYER_LEVEL_UNLOCK_MAX + 1):
+        meta = _PLAYER_LEVEL_UNLOCK_META.get(uid)
+        if meta is not None and meta[1] != 0 and meta[0] <= lvl:
+            bits[uid] = True
+    for g in granted:
+        bits[g] = True
+    return bits
 
 
 # ribbonlevel { id=1(等级), value=2(该级经验阈值) }：勋带单源 = total_xp 经阈值推导等级

@@ -4,7 +4,9 @@
 （注册 / 静态资源下发 / WarDatabase 表服务），独立成模块便于审计。
 
 职责：
-  /register /account  注册页（Vite/Vue SPA，web/dist，HnG 官方风格）
+  /join /join/veteran 入伍 SPA（Vite/Vue，web/dist，HnG 官方风格：
+                     /join 新兵报到注册、/join/veteran 老兵归队外服迁移；
+                     客户端登录界面 account_url 指向 /join）
   /api/register       账号注册 JSON API（经主 loop 投递 STORE.create_player）
   /api/captcha/get    滑动验证码出题（register_captcha.py，pi-captcha 出图）
   /api/captcha/check  验证码校验 → 签发一次性注册令牌
@@ -51,6 +53,8 @@ from state import (
     )
 
 from wardb import WARDB_CAS_MAP, WARDB_SYNC_UNIQUE, WARDB_UNIQUE
+import combat_hosts
+import combat_instances
 import mm_state
 
 # fs 同步 CAS 文件目录：改动过的客户端文件以 <sha256>-<size>_<flag> 为名放入，
@@ -115,167 +119,19 @@ def _sgn_body(cas_name, plain_body):
     return hit
 
 
-# ---- 本地化文件补全 ----
-# 客户端 HnG_Strategy_en.xml 的 ErrorMessages/StrategyGame 段缺少部分 ResponseCodes
-# 常量对应的 key（如 server_error），购买/操作失败后 Texts.getText 查找失败会显示
-# '"ErrorMessages/StrategyGame/xxx" not found' 之类乱码。这里在服务器提供该文件时
-# 动态注入缺失 key（不改原始文件）。ok/fail 等已存在，无需注入。
-# 另：texts/ 新版（EAC 文案）删掉了全部 StrategyGUI/AntiCheat/battleye_* key，
-# 但客户端登录流程（FrontScreenMediator 检测/安装 BattlEye、AntiCheatInformationMediator
-# 弹窗）仍会引用，缺失时显示 '"StrategyGUI/AntiCheat/battleye_install_info" not found'，
-# 因此从旧版 BattlEyeTlm/HnG_Strategy_en.xml 补回。
-LOCALIZATION_EXTRA = """  <data name="ErrorMessages/StrategyGame/server_error">
-    <value>An error occurred on the server</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/character_template_not_found">
-    <value>Character type not found</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/not_for_sale">
-    <value>This item is not for sale</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/price_not_found">
-    <value>Price not found</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/invalid_currency">
-    <value>Invalid currency</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/variant_not_found">
-    <value>Variant not found</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/variant_not_owned_by_player">
-    <value>You don't own this variant</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/variant_template_not_found">
-    <value>Variant type not found</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/weapon_ammo_not_found">
-    <value>Ammunition not found</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/weapon_ammo_not_owned_by_player">
-    <value>You don't own this ammunition</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/store_bundle_not_found">
-    <value>Bundle not found</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/store_discount_not_found">
-    <value>Discount not found</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/account_locked">
-    <value>Account locked</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/character_already_added">
-    <value>Character already added</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/operation_not_permitted">
-    <value>Operation not permitted</value>
-  </data>
-  <data name="ErrorMessages/StrategyGame/pricing_mismatch">
-    <value>Pricing mismatch</value>
-  </data>
-  <data name="StrategyGUI/AntiCheat/battleye_install_check">
-    <value>Checking for battlEye anti-cheat</value>
-  </data>
-  <data name="StrategyGUI/AntiCheat/battleye_install_info">
-    <value>Installing BattlEye anti-cheat</value>
-  </data>
-  <data name="StrategyGUI/AntiCheat/battleye_install_failure">
-    <value>BattlEye anti-cheat was not installed</value>
-  </data>
-  <data name="StrategyGUI/AntiCheat/battleye_accept_header">
-    <value>HEROES &amp; GENERALS USES BATTLEYE</value>
-  </data>
-  <data name="StrategyGUI/AntiCheat/battleye_accept_calltoaction">
-    <value>I HAVE READ THE INFORMATION ABOVE ABOUT ANTI-CHEAT TECHNOLOGIES, \nAND I AGREE TO THE USE OF THESE.</value>
-  </data>
-  <data name="StrategyGUI/AntiCheat/battleye_information_header">
-    <value>1. HEROES &amp; GENERALS USES BATTLEYE
-2. BATTLEYE EULA</value>
-  </data>
-  <data name="StrategyGUI/AntiCheat/battleye_accept_body">
-    <value>1. HEROES &amp; GENERALS USES BATTLEYE.
-You asked, we listened: New Anti-Cheat system, BattlEye, is now implemented to make Heroes &amp; Generals fun and fair for everyone and provide an effective shield against cheats and hacks. Enjoy!
-Please click button below to get started.
-
-AS A FURTHER CONDITION FOR USING HEROES &amp; GENERALS®, YOU AGREE THAT WE MAY USE OUR OWN OR PARTNERS’ ANTI-CHEAT TECHNOLOGIES IN CONNECTION WITH ANY OF OUR GAME SERVICES AND IN PARTICULAR WITH HEROES &amp; GENERALS® ("THE GAME SERVICE").
-
-WHEN PLAYERS CONNECT TO GAME SERVERS, THESE TECHNOLOGIES WILL ACTIVATE AND MONITOR GAME PLAY, THE GAME FILES ASSOCIATED WITH THE GAME SERVICE AND RAM OF THE PLAYER'S COMPUTER. THESE TECHNOLOGIES DETECT CHEATING AND ANY UNAUTHORIZED THIRD-PARTY PROGRAMS RUNNING CONCURRENTLY WITH THE GAME SERVICE AND ANY MODIFICATIONS TO THE GAME SERVICE FILES ENABLING OR FACILITATING CHEATING. AN UNAUTHORIZED THIRD-PARTY PROGRAM IS ANY THIRD-PARTY PROGRAM OR FILE (SUCH AS AN “ADDON”, “MOD”, “HACK”, “TRAINER”, “AIMBOT”, “ESP” OR “CHEAT”) THAT WE BELIEVE ENABLES OR FACILITATES CHEATING OF ANY TYPE, ALLOWS USERS TO MODIFY OR HACK THE GAME SERVICE INTERFACE, ENVIRONMENT, OR EXPERIENCE IN ANY WAY NOT EXPRESSLY AUTHORIZED BY TLM Partners Inc., OR INTERCEPTS, “MINES”, OR OTHERWISE COLLECTS INFORMATION FROM OR THROUGH THE GAME SERVICE. WHEN PLAYERS DISCONNECT FROM THE GAME SERVICE, THESE ANTI-CHEAT TECHNOLOGIES WILL BE AUTOMATICALLY DEACTIVATED.
-
-IF OUR ANTI-CHEAT TECHNOLOGIES SUSPECT CHEATING, WE MAY COLLECT RELEVANT INFORMATION, INCLUDING BUT NOT LIMITED TO YOUR TLM AND/OR HEROES &amp; GENERALS® ACCOUNT NAME, DETAILS ABOUT ANY UNAUTHORIZED THIRD-PARTY PROGRAMS, THE GAME SERVICE FILES MODIFICATION DETECTED, AND THE TIME AND DATE THE CHEATING WAS SUSPECTED TO OCCUR. IF WE DETERMINE A PLAYER HAS BEEN CHEATING, WE MAY ALSO, AT OUR DISCRETION, DECIDE TO TERMINATE THE TARGETED ACCOUNT, EITHER TEMPORARILY OR PERMANENTLY, DEPENDING ON THE OFFENSE BASED ON SUCH FACTORS AS RECURRENCES, SEVERITY OF THE CHEAT, AND IMPACT TO OTHER PLAYERS. IN ADDITION TO TERMINATION OF A PLAYER'S ACCOUNTS, LEGAL ACTION MAY BE TAKEN AGAINST PERSONS OR ENTITIES INFRINGING ON OUR RIGHTS.</value>
-  </data>
-  <data name="StrategyGUI/AntiCheat/battleye_eula">
-    <value>2. BATTLEYE EULA
-
-
-****** End-User License Agreement ******
-
-
-This License Agreement ("Agreement") is made between you (the "Licensee") and BattlEye Innovations e.K. (the "Licensor" and the "Data Processor") on behalf of TLM Partners Inc. (the "Data Controller"). The terms of this Agreement apply to all current and future versions and updates of BattlEye anti-cheat software ("BattlEye").
-
-
-By installing, enabling or using BattlEye, Licensee agrees with all the terms of this Agreement. Licensor reserves all rights not specifically granted and transferred to Licensee.
-
-
-Licensee understands, acknowledges and agrees with the following:
-
-- Licensor grants Licensee a non-exclusive and non-transferable license to use BattlEye for non-commercial purposes only. Licensee therefore does not own BattlEye, Licensor remains the owner of BattlEye.
-
-- Licensor provides BattlEye on an "as is" basis without warranty of any kind. Licensor neither guarantees the correct, error-free functioning of BattlEye nor is Licensor responsible for any damage caused by the use of BattlEye.
-
-- Licensee may not decompile, disassemble, reverse-engineer, modify or redistribute BattlEye in any way.
-
-- BattlEye will automatically, without notice to Licensee, download and install updates from time to time.
-
-- BattlEye may scan Licensee's entire random access memory (RAM), and any game-related and system-related files and folders on Licensee's system using cheat-program-identifying algorithms, transmit results of such algorithms to other connected computers and/or to Licensor and process such information for the sole purpose of preventing and detecting the use of cheat programs. BattlEye only scans and/or processes data which is reasonably necessary to be scanned and/or processed to meet this purpose.
-
-- BattlEye may collect and process Licensee's Internet Protocol address, game account name and identifier, in-game nickname, and system-related and hardware-related information including, but not limited to, device identifiers and hardware serial numbers.
-
-- Licensor processes all information collected by BattlEye on servers located in the European Union. Licensor may share the information with its partners and/or affiliates.
-
-- Licensee acknowledges that the invasive nature of BattlEye is necessary to meet its purpose and goal of preventing and detecting cheat programs.
-
-- Licensor is allowed to terminate the license at any time for any reason and without notice to Licensee.
-
-
-This License Agreement constitutes the entire agreement between Licensor and Licensee and supersedes any prior statements.</value>
-  </data>
-"""
-
-_LOCALIZATION_CACHE = None
+# 本地化文件补全（2026-09-07 起）：客户端引用而 texts/ 新版（EAC 文案）缺失的
+# key 已全部固化进 combat-server\texts\HnG_Strategy_<lang>.xml 源文件——
+#   ① StrategyGUI/AntiCheat/battleye_* 8 项 + ExternalText/Legal/BattlEyeInfo，
+#     从旧版官方 BattlEyeTlm/HnG_Strategy_<lang>.xml 原样合并（12 语言）；
+#   ② ErrorMessages/StrategyGame/* 16 项（server_error/not_for_sale 等私服
+#      ResponseCodes 文案），en 沿用原运行时注入文本，其余语言补充翻译。
+# 此前仅英语走 LOCALIZATION_EXTRA 运行时注入，其余语言缺 key；现所有语言
+# 统一直接下发源文件，语言路由无特判。
 
 # 客户端支持的全部语言（HnGGUIGameVariables.supportedLanguages，与
 # combat-server\texts\HnG_Strategy_<lang>.xml 一一对应）
 SUPPORTED_LOCALES = ('cs', 'de', 'en', 'es', 'fr', 'ja',
                      'ko', 'pl', 'pt', 'ru', 'tr', 'zh')
-
-
-def _localization_body():
-    """读取原始本地化文件并在 StrategyGame 段后追加缺失 key（结果缓存）。"""
-    global _LOCALIZATION_CACHE
-    if _LOCALIZATION_CACHE is not None:
-        return _LOCALIZATION_CACHE
-    # 源 = state.TEXTS_DIR（combat-server\texts，服务器权威副本，含私服
-    # 补充 key 如 BackgroundSelector）；hngsync wardb_sync 清单同源。
-    # 旧源 BattlEyeTlm/ 是 TLM Partners 时代官方原始版
-    lang_file = os.path.join(TEXTS_DIR, 'HnG_Strategy_en.xml')
-    try:
-        with open(lang_file, 'rb') as f:
-            body = f.read()
-        # 逐条注入缺失 key：每条 data 条目单独判断 name 是否已存在
-        inject = b''
-        for name in re.findall(rb'name="([^"]+)"', LOCALIZATION_EXTRA.encode('utf-8')):
-            if b'name="' + name + b'"' not in body:
-                idx = LOCALIZATION_EXTRA.index(name.decode('utf-8'))
-                entry_start = LOCALIZATION_EXTRA.rfind('<data', 0, idx)
-                entry_end = LOCALIZATION_EXTRA.find('</data>', idx) + len('</data>')
-                inject += LOCALIZATION_EXTRA[entry_start:entry_end].encode('utf-8') + b'\n'
-        if inject:
-            # 追加到文件末尾 </root> 之前
-            body = body.replace(b'</root>', inject + b'</root>', 1)
-        _LOCALIZATION_CACHE = body
-    except Exception as e:
-        log(f'[HTTP] localization patch failed: {e}')
-        _LOCALIZATION_CACHE = body
-    return _LOCALIZATION_CACHE
 
 
 # 对外地址统一取 state.PUBLIC_HOST（HNG_PUBLIC_HOST 环境变量 / .env）：
@@ -306,7 +162,7 @@ SETTINGS_JS = (f"flash_dynhttp=\"{PUBLIC_HOST}:15110\";\n"
                # （swf 将 settings.js 变量转发进 hngsync CMD_RUN_HNG -> hng.exe /R）
                f"statserver=\"{PUBLIC_HOST}\";\n"
                "statserverport=\"15115\";\n"
-               f"account_url=\"http://{PUBLIC_HOST}/account\";\n"
+               f"account_url=\"http://{PUBLIC_HOST}/join\";\n"
                "uniqueversionfilename=\"hng_unique_v173293\";\n"
                "siteonly=\"false\";\n").encode()
 
@@ -348,8 +204,8 @@ GCE64_UNIQUE_BZ2 = bz2.compress(GCE64_UNIQUE)
 # 官方 currentfiles.txt L17514+ 同样登记 texts/HnG_Strategy_*.xml。
 # 推送源 = state.TEXTS_DIR（combat-server\texts，服务器权威副本），逐文件原样
 # 登记——客户端本地旧文件哈希/大小不匹配 → hngsync 走 CAS 拉新版写回客户端。
-# 注意：HTTP /HnG_Strategy_en.xml 路由读的是 GAME_DIR\texts（客户端侧副本）
-# + LOCALIZATION_EXTRA 运行时注入，与本清单互不影响。
+# HTTP /HnG_Strategy_<lang>.xml 路由与 CAS 回源（TEXTS_CAS_MAP）读同一份
+# 源文件，两条通道字节一致（缺失 key 已固化进源文件，无运行时注入）。
 def _generate_texts_sync():
     lines = []
     cas = {}
@@ -536,13 +392,13 @@ def _cas_source_body(cas_name):
     return FLASHRES_CAS_MAP.get(cas_name)
 
 
-# ================================================================ 注册页（Vue SPA）
-# 前端源码在仓库内 web/frontend（Vite + Vue3 + TS，MPA 双入口），
+# ================================================================ 入伍页（Vue SPA）
+# 前端源码在仓库内 web/frontend（Vite + Vue3 + TS，MPA 双入口：join + admin），
 # 构建产物 web/frontend/dist 由本模块下发：
-#   /register /account      -> dist/register.html
-#   /assets/*               -> dist/assets/*（vite 构建的 js/css）
-#   /icons/* /soldier.png   -> dist 根下复制的客户端素材（frontend/public 随 build 并入）
-# POST /api/register        -> JSON 建号，经主 loop 投递 STORE.create_player。
+#   /join /join/veteran    -> dist/join.html（history 路由：注册 / 外服迁移）
+#   /assets/*              -> dist/assets/*（vite 构建的 js/css）
+#   /icons/* /soldier.png  -> dist 根下复制的客户端素材（frontend/public 随 build 并入）
+# POST /api/register       -> JSON 建号，经主 loop 投递 STORE.create_player。
 # HTTP 跑在独立线程，STORE 是主线程 asyncio loop 里的 asyncpg 池，
 # 因此经 run_coroutine_threadsafe 把建号协程投递回主 loop 执行。
 
@@ -767,8 +623,9 @@ def _foreign_server_addr():
 
 
 # 导入全流程（登录外服 + 采集 15s + 落库）在主 asyncio 循环上跑，
-# HTTP 线程只等待结果；120s 覆盖慢网络下的完整窗口
-_IMPORT_TIMEOUT_S = 120
+# HTTP 线程只等待结果；采集失败自动重试一次（订阅超时 60s ×2 + 采集窗口），
+# 210s 覆盖最坏情况：首次 62s 失败 + 2s 退避 + 重试完整 ~100s + 落库
+_IMPORT_TIMEOUT_S = 210
 
 
 def _handle_import_api(handler):
@@ -859,6 +716,7 @@ def _handle_import_api(handler):
         _json_reply(handler, {'error': f'外服数据采集失败：{e}'}, 502)
         return
     except asyncio.TimeoutError:
+        fut.cancel()   # 取消主循环上仍在跑的导入任务，防止 504 后迟到落库
         log('[import] timeout')
         _json_reply(handler, {'error': '迁移超时，请稍后重试'}, 504)
         return
@@ -915,13 +773,22 @@ def _online_snapshot():
         det_items = list(mm_state._MM_MISSION_DETAILS.items())
     except RuntimeError:
         det_items = []
+    try:
+        inst_items = dict(combat_instances.COMBAT_INSTANCES.items())
+    except RuntimeError:
+        inst_items = {}
     missions = [{
         'mission_id': mid,
         'preset': det.get('preset'),
         'gamemode': det.get('gamemode'),
         'attacker_faction': det.get('attacker_faction'),
         'defender_faction': det.get('defender_faction'),
+        # 实例归属（多机部署：面板/排障显示该局跑在哪台机哪个端口；
+        # 实例已释放（战局结束）时为 None，不影响旧面板消费）
+        'host': ((inst_items.get(mid) or {}).get('host') or {}).get('name'),
+        'port': (inst_items.get(mid) or {}).get('port'),
         'players': [{'gamertag': p.get('gamertag'),
+                     'player_id': p.get('player_id'),
                      'faction': p.get('faction')}
                     for p in det.get('players', [])],
     } for mid, det in sorted(det_items)]
@@ -932,6 +799,8 @@ def _online_snapshot():
         'in_battle': len(mm_state.PMS_TO_SESSION),
         'players': players,
         'missions': missions,
+        # 战斗服主机实时状态（多机部署：各机运行数/容量/agent 健康）
+        'combat_hosts': combat_hosts.snapshot_hosts(),
         'server_time': int(time.time()),
     }
 
@@ -943,6 +812,9 @@ def _handle_online_api(handler):
         _json_reply(handler, {'error': 'forbidden'}, 403)
         log(f'[HTTP] BLOCKED /online.json from {ip} (非本机)')
         return
+    # 管理后台 30s 轮询借此防抖刷新 combat_hosts 缓存（成局前也能反映
+    # 库里已保存的主机配置，而非启动时 env 回退值）
+    combat_hosts.refresh_hosts_soon()
     _json_reply(handler, _online_snapshot())
 
 
@@ -962,20 +834,13 @@ class HttpHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split('?')[0]
         self._log_client_request('GET')
-        # ---- 注册页 SPA（web/dist）----
-        if path in ('/register', '//register', '/account', '//account',
-                    '/register.html'):
-            if _serve_file(self, 'register.html'):
+        # ---- 入伍页 SPA（web/dist，history 路由两个入口路径）----
+        if path in ('/join', '//join', '/join/', '/join/veteran',
+                    '//join/veteran', '/join/veteran/', '/join.html'):
+            if _serve_file(self, 'join.html'):
                 return
             self.send_error(404, 'Not Found')
-            log('[HTTP] 404 /register (web/dist 未构建？)')
-            return
-        if path in ('/import', '//import', '/import.html', '/migrate',
-                    '//migrate'):
-            if _serve_file(self, 'import.html'):
-                return
-            self.send_error(404, 'Not Found')
-            log('[HTTP] 404 /import (web/dist 未构建？)')
+            log('[HTTP] 404 /join (web/dist 未构建？)')
             return
         if path.startswith('/assets/') or path.startswith('//assets/'):
             # vite 构建产物（带内容哈希文件名，可缓存）
@@ -1125,31 +990,33 @@ class HttpHandler(SimpleHTTPRequestHandler):
         if path == '/undefined':
             # Client didn't parse localizerFile from settings.js;
             # serve the language file directly so it can proceed.
-            body = _localization_body()
+            try:
+                with open(os.path.join(TEXTS_DIR,
+                                       'HnG_Strategy_en.xml'), 'rb') as f:
+                    body = f.read()
+            except OSError:
+                body = None
             if body:
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/xml')
                 self.end_headers()
                 self.wfile.write(body)
-                log(f'[HTTP] served /undefined -> patched HnG_Strategy_en.xml ({len(body)}B)')
+                log(f'[HTTP] served /undefined -> HnG_Strategy_en.xml ({len(body)}B)')
                 return
         # 本地化文件：官方 locale_xx 下发的是裸文件名，客户端请求 file server
         # 根路径 /HnG_Strategy_<lang>.xml（可能带 ?resetCache=N），GAME_DIR 根目录
         # 下没有该文件 → 404 → 客户端重试失败后闪退，必须返回服务器版。
-        # en 走 _localization_body（TEXTS_DIR 版 + LOCALIZATION_EXTRA 注入）；
-        # 其余语言直接下发 TEXTS_DIR 原文件（含私服补充 key）。
+        # 全部语言统一直接下发 TEXTS_DIR 源文件（缺失 key 已固化进源文件，
+        # 见文件头"本地化文件补全"注释；hngsync 清单同源）。
         m = re.fullmatch(r'/+HnG_Strategy_([a-z]{2})\.xml', path)
         if m and m.group(1) in SUPPORTED_LOCALES:
             lang = m.group(1)
-            if lang == 'en':
-                body = _localization_body()
-            else:
-                try:
-                    with open(os.path.join(TEXTS_DIR,
-                                           f'HnG_Strategy_{lang}.xml'), 'rb') as f:
-                        body = f.read()
-                except OSError:
-                    body = None
+            try:
+                with open(os.path.join(TEXTS_DIR,
+                                       f'HnG_Strategy_{lang}.xml'), 'rb') as f:
+                    body = f.read()
+            except OSError:
+                body = None
             if body:
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/xml')

@@ -21,6 +21,7 @@ from wardb import (
     _AMMO_MAXCOND,
     _CUR_NAME,
     _VEHICLE_UPGRADE_MAXCOND,
+    _VEHICLE_VARIANT_PARENT,
     vehicle_full_condition,
     )
 
@@ -28,6 +29,7 @@ from messages import (
     _msg_vehicle,
     _msg_vehicle_ammo,
     _msg_vehicle_upgrade,
+    _msg_vehicle_variant,
     _push_kvcs,
     )
 
@@ -54,19 +56,41 @@ async def handle_setvehiclevariantrequest(sess, writer, cmd_id, req_type, proto)
     except Exception as e:
         log(f'      SetVehicleVariant parse error: {e}')
 
-    # 装备校验：非卸下时皮肤实例必须属于该玩家且指向该载具
+    # 装备校验：非卸下时皮肤实例必须属于该玩家，且满足其一：
+    #   a) 已绑定到该载具（购买路径：皮肤随载具/单买后绑定）
+    #   b) vehicle_id=0 的仓库/角色行（通行证/军令奖励发放模型，
+    #      client VehicleDepotViewMediator SkinMod 页签 + 指派到角色），
+    #      且皮肤模板与该载具同 parent 载具模板（客户端 getVehicleVariantId
+    #      对 vehicleless 行同样按 parent 匹配）
     valid = False
+    depot_row = None
     pid = await sess.ensure_player()
+    v = None
+    if pid is not None:
+        try:
+            v = await STORE.get_vehicle(pid, int(sv_vehicle_id))
+        except Exception as e:
+            log(f'[DB] get_vehicle failed: {e}')
     if pid is not None:
         try:
             if int(sv_variant_id) == 0:
                 valid = True
             else:
                 for vv in await STORE.list_vehicle_variants(pid):
-                    if (int(vv['id']) == int(sv_variant_id)
-                            and int(vv['vehicle_id']) == int(sv_vehicle_id)):
+                    if int(vv['id']) != int(sv_variant_id):
+                        continue
+                    if int(vv['vehicle_id']) == int(sv_vehicle_id):
                         valid = True
-                        break
+                    elif int(vv['vehicle_id']) == 0 and v is not None:
+                        # 仓库/角色行：校验皮肤模板与载具同 parent
+                        skin_parent = _VEHICLE_VARIANT_PARENT.get(
+                            int(vv['vehicle_variant_template_id']))
+                        veh_parent = _VEHICLE_VARIANT_PARENT.get(
+                            int(v['vehicle_variant_template_id']))
+                        if skin_parent is not None and skin_parent == veh_parent:
+                            valid = True
+                            depot_row = vv
+                    break
         except Exception as e:
             log(f'[DB] vehicle variant ownership check failed: {e}')
     if not valid:
@@ -84,6 +108,26 @@ async def handle_setvehiclevariantrequest(sess, writer, cmd_id, req_type, proto)
             await STORE.set_vehicle_variant(pid, int(sv_vehicle_id), int(sv_variant_id))
         except Exception as e:
             log(f'[DB] set_vehicle_variant failed: {e}')
+
+    # 官方装备语义：仓库/角色皮肤行绑定到该载具（vehicleId + characterId
+    # 跟随载具），客户端 isVehicleVariantOwned 要求 characterId==选中角色
+    # （与 SetWeaponVariantRequest 的 bind_weapon_variant 同款）
+    if depot_row is not None and pid is not None:
+        try:
+            bound = await STORE.bind_vehicle_variant(
+                pid, int(sv_variant_id), int(sv_vehicle_id),
+                int((v or {}).get('character_id') or 0))
+            if bound is not None and sess.soldier_view_cmd is not None:
+                await _push_kvcs(
+                    writer, sess.soldier_view_cmd, b'VehicleVariant',
+                    _msg_vehicle_variant(bound['id'], bound['character_id'],
+                                         bound['vehicle_id'],
+                                         bound['vehicle_variant_template_id']))
+                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                    f'(VehicleVariant id={bound["id"]} bound to vehicle '
+                    f'{sv_vehicle_id}, char={bound["character_id"]})')
+        except Exception as e:
+            log(f'[DB] bind_vehicle_variant failed: {e}')
 
     # 响应字段号是 2（SetVehicleVariantResponse.response = 2），response=1 表示 ok
     resp_proto = pb_int32(2, 1)

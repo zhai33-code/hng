@@ -1,5 +1,5 @@
 <template>
-  <div class="register-page">
+  <div class="join-page">
     <!-- 顶部标题带 -->
     <div class="top-bar" aria-hidden="true">
       <div class="top-bar-inner">
@@ -16,32 +16,14 @@
       <i class="us"></i><i class="ge"></i><i class="su"></i>
     </div>
 
-    <div class="register-panel">
-      <div class="panel-accent" aria-hidden="true"></div>
-      <header class="panel-head">
-        <h1 class="hng-stencil">新兵报到</h1>
-        <p class="subtitle">注册账号 · 即刻加入战斗</p>
-      </header>
-      <RegisterForm />
-      <div class="cross-nav">
-        <span>已有外服账号？</span>
-        <a href="/import">从外服迁移数据 →</a>
-      </div>
-      <footer class="panel-foot">
-        <span>私服社区 · 非官方服务 · 与官方服务器无关联</span>
-      </footer>
-    </div>
+    <RouterView />
   </div>
 </template>
-
-<script setup lang="ts">
-import RegisterForm from './RegisterForm.vue'
-</script>
 
 <style scoped lang="scss">
 @use '@/styles/vars' as *;
 
-.register-page {
+.join-page {
   @include battlefield-bg;
   min-height: 100vh;
   display: flex;
@@ -129,27 +111,6 @@ import RegisterForm from './RegisterForm.vue'
   }
 }
 
-// ---- 注册卡片 ----
-.register-panel {
-  @include military-card;
-  width: min(430px, 92vw);
-  margin: 24px auto;
-  padding: 38px 42px 26px;
-  position: relative;
-  z-index: 1;
-
-  // 卡片左缘金色强调线
-  .panel-accent {
-    position: absolute;
-    left: 0;
-    top: 18%;
-    bottom: 18%;
-    width: 3px;
-    background: linear-gradient(to bottom, transparent, $hng-gold, transparent);
-    opacity: 0.8;
-  }
-}
-
 @media (max-width: 860px) {
   .soldier-visual {
     display: none;
@@ -157,76 +118,5 @@ import RegisterForm from './RegisterForm.vue'
   .top-sub {
     display: none;
   }
-}
-
-.panel-head {
-  .subtitle {
-    color: $hng-text-dim;
-    margin: 10px 0 26px;
-    font-size: 13px;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-  }
-  h1 {
-    margin: 0;
-    font-size: 30px;
-    line-height: 1.2;
-  }
-}
-
-.panel-foot {
-  margin-top: 22px;
-  text-align: center;
-  color: $hng-text-dim;
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  opacity: 0.7;
-}
-
-.cross-nav {
-  margin-top: 18px;
-  text-align: center;
-  font-size: 12.5px;
-  color: $hng-text-dim;
-
-  a {
-    color: $hng-gold;
-    text-decoration: none;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-
-    &:hover {
-      text-shadow: 0 0 10px rgba(232, 212, 139, 0.45);
-    }
-  }
-}
-</style>
-
-<style lang="scss">
-@use '@/styles/vars' as *;
-
-// 注册页全局：暗色化 Element Plus 输入（非 scoped，作用于表单内组件）
-.register-panel .el-input__wrapper,
-.register-panel .el-textarea__inner {
-  background: rgba(14, 16, 10, 0.85);
-  box-shadow: 0 0 0 1px #3a3e2e inset;
-  border-radius: 2px;
-  transition: box-shadow 0.2s;
-}
-.register-panel .el-input__wrapper:hover {
-  box-shadow: 0 0 0 1px rgba(200, 185, 138, 0.5) inset;
-}
-.register-panel .el-input__wrapper.is-focus {
-  box-shadow: 0 0 0 1px $hng-olive inset, 0 0 14px rgba(138, 122, 46, 0.22);
-}
-.register-panel .el-input__inner {
-  color: $hng-text;
-  letter-spacing: 0.04em;
-}
-.register-panel .el-input__inner::placeholder {
-  color: #6a6d5a;
-}
-.register-panel .el-form-item__error {
-  color: #d97a6c;
 }
 </style>

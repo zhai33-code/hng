@@ -1,4 +1,4 @@
-// 注册应用 fetch 封装：JSON 序列化 + 超时 + 统一错误结构
+// 入伍应用 fetch 封装：JSON 序列化 + 超时 + 统一错误结构
 export interface ApiError {
   status: number
   message: string

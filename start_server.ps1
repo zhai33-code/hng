@@ -7,7 +7,10 @@ $hng_py = Join-Path $hng_root '.venv\Scripts\python.exe'
 if (-not (Test-Path $hng_py)) { $hng_py = Join-Path (Split-Path $hng_root -Parent) '.venv\Scripts\python.exe' }
 if (-not (Test-Path $hng_py)) { $hng_py = 'python' }
 $hng_server_py = Join-Path $hng_root 'realtest_server.py'
-$hng_stderr = Join-Path $hng_root 'realtest_stderr.log'
+$hng_logs = Join-Path $hng_root 'logs'
+New-Item -ItemType Directory -Force -Path $hng_logs | Out-Null
+Move-Item (Join-Path $hng_root 'realtest_stderr.log') $hng_logs -ErrorAction SilentlyContinue
+$hng_stderr = Join-Path $hng_logs 'realtest_stderr.log'
 Start-Process -FilePath $hng_py -ArgumentList "-u `"$hng_server_py`"" `
     -WindowStyle Normal `
     -RedirectStandardError $hng_stderr

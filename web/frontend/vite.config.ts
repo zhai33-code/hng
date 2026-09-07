@@ -5,11 +5,10 @@ import AutoImport from 'unplugin-auto-import/vite'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 
-// MPA 三入口：
-//   /register -> register.html（部署到游戏服 80 端口 web_server.py）
-//   /import   -> import.html（外服账号迁移页，同 80 端口 web_server.py）
-//   /admin    -> admin.html（部署到管理端 FastAPI 独立进程）
-// 开发期代理：/api -> 游戏服(注册 API)；/admin/api -> 管理端 FastAPI
+// MPA 双入口：
+//   /join -> join.html（入伍 SPA：/join 注册 + /join/veteran 外服迁移，部署到游戏服 80 端口 web_server.py）
+//   /admin -> admin.html（部署到管理端 FastAPI 独立进程）
+// 开发期代理：/api -> 游戏服(注册/迁移 API)；/admin/api -> 管理端 FastAPI
 export default defineConfig({
   resolve: {
     alias: { '@': resolve(__dirname, 'src') },
@@ -31,8 +30,7 @@ export default defineConfig({
   build: {
     rollupOptions: {
       input: {
-        register: resolve(__dirname, 'register.html'),
-        import: resolve(__dirname, 'import.html'),
+        join: resolve(__dirname, 'join.html'),
         admin: resolve(__dirname, 'admin.html'),
       },
     },

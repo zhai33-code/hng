@@ -7,7 +7,7 @@ ConfigView 加 tab + views/config/ 加 Panel 组件，路由层不动。
 """
 import json
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ---- weather 默认值：与游戏服 mm_weather.py 同步（跨进程不 import，改一处记得改另一处）----
@@ -52,9 +52,73 @@ class WeatherConfig(BaseModel):
         return pairs
 
 
+# ---- combat_hosts 默认值：单机形态，与游戏服 env 回退（MM_MAX_COMBAT_SERVERS
+#      / MM_COMBAT_PORT_* 缺省值）对齐；仅作面板展示，未保存配置行时游戏服
+#      按各自 env 实际值回退（跨进程不 import，改一处记得改另一处）----
+COMBAT_HOSTS_DEFAULTS = {
+    'hosts': [{
+        'name': 'local', 'addr': '127.0.0.1', 'public_addr': '',
+        'max': 4, 'port_base': 5678, 'port_max': 5699,
+        'agent': '', 'warserver': '',
+    }],
+}
+
+
+class CombatHostEntry(BaseModel):
+    """单台战斗服主机（校验规则与游戏服 combat_hosts._parse_hosts 同步）。
+
+    addr          该机在 warserver 网络中的地址（握手来源 IP 匹配）
+    public_addr   客户端 game_connect 用地址（缺省 = addr）
+    max           本机最大并发实例数（0 = 不限，端口池自然封顶）
+    port_base/max 本机独立 UDP 端口池（各机互不挤占，可用同号段）
+    agent         空 = 本机直接 spawn；http://ip:port = 远端 combat_agent
+    warserver     该机 combat server 回连地址（空 = 游戏服 env）
+    """
+    name: str = Field(min_length=1, max_length=32)
+    addr: str = Field(min_length=1, max_length=64)
+    public_addr: str = Field(default='', max_length=64)
+    max: int = Field(default=0, ge=0, le=64)
+    port_base: int = Field(ge=1024, le=65535)
+    port_max: int = Field(ge=1024, le=65535)
+    agent: str = Field(default='', max_length=128)
+    warserver: str = Field(default='', max_length=64)
+
+    @field_validator('name', 'addr', 'public_addr', 'agent', 'warserver')
+    @classmethod
+    def _strip(cls, v):
+        return v.strip()
+
+    @model_validator(mode='after')
+    def _entry_ok(self):
+        if self.port_base > self.port_max:
+            raise ValueError(f'{self.name}: 端口池 {self.port_base}-'
+                             f'{self.port_max} 非法（base > max）')
+        ports = self.port_max - self.port_base + 1
+        if self.max and ports < self.max:
+            raise ValueError(f'{self.name}: 端口池({ports} 个) < 容量'
+                             f'({self.max})')
+        if self.agent and not self.agent.startswith('http://'):
+            raise ValueError(f'{self.name}: agent 须为 http:// URL')
+        return self
+
+
+class CombatHostsConfig(BaseModel):
+    """战斗服主机列表：成局时按各机剩余容量/端口池选机，保存即生效。"""
+    hosts: list[CombatHostEntry] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode='after')
+    def _names_unique(self):
+        names = [h.name for h in self.hosts]
+        if len(names) != len(set(names)):
+            raise ValueError('主机名重复：' + ', '.join(names))
+        return self
+
+
 CONFIG_REGISTRY = {
     'weather': {'label': '战局天气', 'model': WeatherConfig,
                 'defaults': WEATHER_DEFAULTS},
+    'combat_hosts': {'label': '战斗服主机', 'model': CombatHostsConfig,
+                     'defaults': COMBAT_HOSTS_DEFAULTS},
 }
 
 

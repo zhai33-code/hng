@@ -115,6 +115,20 @@ class EquipmentVehiclesMixin:
                 'UPDATE vehicles SET variant_id = $1 '
                 'WHERE id = $2 AND player_id = $3', variant_id, vehicle_id, player_id)
 
+    async def bind_vehicle_variant(self, player_id, variant_id, vehicle_id,
+                                   character_id):
+        """绑定载具皮肤仓库行到载具（SetVehicleVariantRequest 装备仓库皮肤）。
+        行必须属于该玩家且 vehicle_id=0（仓库/角色行）；绑定后 character_id
+        跟随载具，客户端 isVehicleVariantOwned 要求 characterId==选中角色
+        （与 bind_weapon_variant 同款语义）。返回更新后行或 None。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'UPDATE vehicle_variants SET vehicle_id = $3, character_id = $4 '
+                'WHERE id = $1 AND player_id = $2 AND vehicle_id = 0 '
+                'RETURNING id, vehicle_id, character_id, vehicle_variant_template_id',
+                int(variant_id), int(player_id), int(vehicle_id), int(character_id))
+            return dict(row) if row else None
+
     # ---- vehicle upgrades（载具升级/补给箱）----
 
     async def list_vehicle_upgrades(self, player_id):

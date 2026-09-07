@@ -34,6 +34,8 @@ import matchmaking
 import mm_handler
 import mm_state
 import mm_config
+import combat_instances
+import state
 import statistics_server
 import war_campaign
 import web_server
@@ -158,6 +160,15 @@ async def handle_tcp(reader, writer):
             matchmaking.drop_player(sess.player_id)
         except Exception as e:
             log(f'[drop_player] {type(e).__name__}: {e}')
+        # 战斗服（ZServer wardatacomm）连接断开兜底：远端实例的主要退出
+        # 监视（确认 agent pid 已死才回收坑位；本机实例另有
+        # _watch_proc_exit，幂等）。进程仍活（网络抖动）不回收，防误杀活局。
+        cm = int(getattr(sess, 'combat_mission', 0) or 0)
+        if getattr(sess, 'is_combat_server', False) and cm:
+            try:
+                combat_instances.on_combat_conn_closed(cm)
+            except Exception as e:
+                log(f'[combat] conn-closed hook failed: {type(e).__name__}: {e}')
         writer.close()
 
 
@@ -334,7 +345,9 @@ async def main():
         start_ban_listener()
     except Exception as e:
         log(f'[DB] PostgreSQL UNAVAILABLE ({e}) -- 持久化已禁用')
-    # HTTP 线程模块注入主 loop（/register 经它投递 create_player 协程）
+    # HTTP 线程模块注入主 loop（/register 经它投递 create_player 协程；
+    # /online.json 经它防抖刷新 combat_hosts 缓存 → 存 state 供各模块取）
+    state.MAIN_LOOP = asyncio.get_running_loop()
     web_server.init(asyncio.get_running_loop())
     http_thread = threading.Thread(target=web_server.start_http, daemon=True)
     http_thread.start()

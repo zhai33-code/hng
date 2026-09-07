@@ -57,9 +57,11 @@ from mm_state import (
     _MM_SQUAD_ID, _MM_SQUAD_MEMBER_ROW, _SOLO_SQUADS,
     _WAR_ID, _auto_squad_numbered_name, _log, _next_match_id, _spawn,
 )
+import combat_hosts
+import combat_instances
 from combat_instances import (
-    COMBAT_INSTANCES, PENDING_MATCHES, _alloc_combat_port,
-    _ensure_combat_server,
+    COMBAT_INSTANCES, PENDING_MATCHES, _ensure_combat_server,
+    reserve_combat_instance,
 )
 from mm_factions import (
     ASSAULT_DEFENDER_LOGO_AP, FACTION_ROW_IDS, _msg_faction_rows,
@@ -749,16 +751,39 @@ def _prune_match_factions(match, attacker, defender, gamemode_id):
     return dropped
 
 
-def _dispatch_match(match):
-    """成局分发：并发上限内立即拉起，超限进 PENDING_MATCHES FIFO 排队。"""
-    if (mm_config.MAX_CONCURRENT_COMBAT_SERVERS and
-            len(COMBAT_INSTANCES) >= mm_config.MAX_CONCURRENT_COMBAT_SERVERS):
-        PENDING_MATCHES.append(match)
-        _log(f'match queued (combat servers busy: {len(COMBAT_INSTANCES)}/'
-             f'{mm_config.MAX_CONCURRENT_COMBAT_SERVERS}, players='
-             f'{len(match.players)}, pending={len(PENDING_MATCHES)})')
+def _game_connect_for(inst):
+    """实例 → 客户端连接地址：所在主机 public_addr:实际端口。
+
+    多机部署下远端实例用该机 public_addr（客户端经公网/内网直连该机）；
+    单机回退 host.public_addr 本就是 PUBLIC_HOST。本机 spawn 重试可能换
+    端口，须取 inst['port'] 实时值。inst=None/缺 host（测试桩）回退
+    PUBLIC_HOST:port（与旧单机行为一致）。"""
+    host = (inst or {}).get('host') or {}
+    addr = host.get('public_addr') or PUBLIC_HOST
+    return f'{addr}:{int((inst or {}).get("port", 0) or 0)}'
+
+
+def _arm_pending_drain(hosts):
+    """整局排队后的重派兜底：满员场景 release_match 会触发 drain，但
+    「全部主机都在 agent 冷却」没有自然触发点——冷却到期后无人重派，
+    排队局会滞留到下一次战局结束。此处安排到期重派（幂等，队列空
+    则 no-op）。"""
+    if not any(combat_hosts.in_cooldown(h) for h in hosts):
         return
-    _spawn(_start_match(match), f'start_match#{match.mission_id}')
+
+    async def _later():
+        await asyncio.sleep(combat_hosts.AGENT_COOLDOWN_SECONDS + 1)
+        combat_instances._drain_pending_matches()
+
+    _spawn(_later(), 'pending_drain_retry')
+
+
+def _dispatch_match(match):
+    """成局分发：直接交 _start_match 选机（多机容量/端口池/agent 冷却
+    综合判定须读库热配置，无法同步预检）；全满则其内部排队
+    PENDING_MATCHES FIFO，坑位释放（release_match）后重派。"""
+    _spawn(_start_match(match),
+           f'start_match#{getattr(match, "mission_id", 0)}')
 
 
 async def _try_form_all():
@@ -1176,20 +1201,32 @@ async def _start_match(match):
         map_entity_id = battlefield_entity_for_gamemap(gamemap_id)
     combat_map = preset_scene(preset)
 
-    port = _alloc_combat_port()
-    if port is None:
-        # 端口池耗尽：不能丢局——玩家已被 try_form 移出池但 _MM_QUEUES 还在，
-        # 回池重排（不立即重试撮合：端口未释放前再撮还会失败；
-        # release_match 释放端口后会调 _try_form_all 重新撮合，
-        # 超时后 AI 补位计时兜底），避免玩家永久卡在匹配界面。
-        _log(f'ERROR: combat port pool exhausted, match returned to pool '
-             f'(mission would be {mission_id}, {len(match.players)} players)')
-        for e in match.players:
-            pid = int(e.player_id)
-            if _MM_QUEUES.get(pid, {}).get('mission_id', 0) == 0:
-                POOL.enqueue(e)
-                _arm_ai_fill(pid, e.gamemode_id)
+    # ★ 选机 + 占坑（多机部署，2026-09-08）：热配置（server_config
+    #   'combat_hosts'，管理后台保存即生效）按各机剩余容量/端口池/agent
+    #   冷却选机，选机→登记间无 await，并发成局不会双占同机同端口。
+    #   全满/全冷却 → 整局排队 PENDING_MATCHES（玩家 _MM_QUEUES 尚在，
+    #   停留匹配界面），坑位释放后 _drain_pending_matches 重派——不再走
+    #   旧「端口耗尽回池重撮」路径：整局排队保住已成的队伍，语义与容量
+    #   排队（旧 _dispatch_match 预检）统一。
+    hosts = await combat_hosts.load_hosts()
+    host = combat_hosts.pick_host(hosts)
+    if host is None:
+        PENDING_MATCHES.append(match)
+        _log(f'match queued (combat hosts busy: '
+             f'{combat_hosts.describe_hosts(hosts)}, players='
+             f'{len(match.players)}, pending={len(PENDING_MATCHES)})')
+        _arm_pending_drain(hosts)
         return
+    port = combat_hosts.alloc_port(host, COMBAT_INSTANCES)
+    if port is None:
+        # pick_host 已校验端口池，理论不可达（同机实例端口恰在选机→登记
+        # 间隙被外部进程占用的竞态兜底）：按全满同路径排队
+        PENDING_MATCHES.append(match)
+        _log(f'ERROR: combat port pool exhausted on {host.get("name")}, '
+             f'match queued (mission would be {mission_id}, '
+             f'{len(match.players)} players, pending={len(PENDING_MATCHES)})')
+        return
+    inst = reserve_combat_instance(mission_id, host, port)
 
     # 每名玩家发号登记（发号规则与改造前单人路径一致：PMS f17/f18/f9 与
     # PlayerSettings f22/f23/f25 同源；solo squad 行 id 复用）
@@ -1356,15 +1393,18 @@ async def _start_match(match):
     _log(f'match formed: mission={mission_id}, preset={preset}, map='
          f'{combat_map}, players={len(match.players)}, ai_fill={match.ai_fill}, '
          f'bots={enable_bots}, sa_bots={enable_sa_bots}, '
-         f'attacker={attacker}, defender={defender}, udp/{port}, '
+         f'attacker={attacker}, defender={defender}, '
+         f'host={host["name"]} udp/{port}, '
          f'weather tod={_MM_MISSION_DETAILS[mission_id]["weather_tod"]}/'
          f'cond={_MM_MISSION_DETAILS[mission_id]["weather_condition"]}'
          f'{" SNOW" if _MM_MISSION_DETAILS[mission_id].get("snow") else ""}')
 
-    # 拉起本场专用服（/P 取第一名玩家 pms，仅 boot 参数）
+    # 拉起本场专用服（/P 取第一名玩家 pms，仅 boot 参数）；实例已由
+    # reserve_combat_instance 占坑，本函数补进程（本机 spawn / 远端 agent）
     first_pms = sessions[0]['pms_id'] if sessions else 0
-    await _ensure_combat_server(mission_id, port, first_pms, combat_map)
-    game_connect = f'{PUBLIC_HOST}:{port}'   # 客户端 hng.exe 连战斗服的地址
+    await _ensure_combat_server(mission_id, first_pms, combat_map)
+    inst = COMBAT_INSTANCES.get(mission_id) or inst   # 本机重试换端口取实际值
+    game_connect = _game_connect_for(inst)   # 客户端 hng.exe 连战斗服的地址
     if battle_id:
         # war 局：record state 0(组队中) → 1(运行中)（GetMissionList status）
         try:
@@ -1702,7 +1742,7 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
     except asyncio.TimeoutError:
         _log(f'late join: mission={mission_id} combat server not ready '
              f'after 30s - pushing Admitted anyway (client will retry UDP)')
-    game_connect = f'{PUBLIC_HOST}:{inst["port"]}'
+    game_connect = _game_connect_for(inst)   # 该局所在主机对外地址:端口
     pos = battlefield_pos(int(det.get('map_entity_id') or 0)
                           or MISSION_MAP_ENTITY_ID)
     try:
@@ -1805,10 +1845,19 @@ async def push_relogin_rejoin(writer, view_cmd, pid):
     """掉线/崩溃重登 rejoin 恢复：登录订阅时重推存活的 PlayerMissionSession 行。
 
     根因（2026-09-06 排查）：客户端整端崩溃重开后 ActionGameStatusModel 是
-    全新的，playerMissionSessionId=null；而登录表同步（views.handle_subscribe）
-    不带回流局 PMS 行 → StatusMediator.onRegister 判 BASE_STATE，主按钮是
-    普通"进入战斗"，没有"恢复战斗"（REJOIN）——用户只能再点一次匹配，
-    靠 1c-0 rejoin 路径静默回局。
+    全新的，playerMissionSessionId=null；登录同步不带回流局 PMS 行 →
+    StatusMediator.onRegister 判 BASE_STATE，主按钮是普通"进入战斗"，
+    没有"恢复战斗"（REJOIN）——用户只能再点一次匹配，靠 1c-0 rejoin
+    路径静默回局。
+    ★ 二次根因（2026-09-08 remote-log + SWF 反编译实锤）：推了也没用的
+    时机问题——最初实现在 subscribeplayerview 响应里推，但客户端登录
+    顺序是 subscribeplayerview → login2_postlogin（成功才置
+    settingsModel.loggedIn=true）→ subscribesoldierview →
+    SubscribePlayerMissionViewRequest，且 ActionGameService.
+    onPlayerMissionSessionChanges 对 loggedIn==false 期间到达的 PMS 行
+    整段丢弃（playerMissionSessionId 不设置），故行必须在
+    subscribeplayermissionview 订阅时推（views.handle_subscribe 对应
+    分支），此时 loggedIn 已为 true，ADD 分支生效。
 
     官方行为：登录时服务器把仍在进行的 PMS 行重新下发。此处复刻：
     - 同一 pms 行 id / battle_session_id / metrics id（hng.exe 重拉后
@@ -1842,7 +1891,7 @@ async def push_relogin_rejoin(writer, view_cmd, pid):
                     break
         except Exception as e:
             _log(f'      [DB] relogin rejoin char lookup failed: {e}')
-    game_connect = f'{PUBLIC_HOST}:{inst.get("port", 0)}'
+    game_connect = _game_connect_for(inst)   # 该局所在主机对外地址:端口
     pos = battlefield_pos(int(det.get('map_entity_id') or 0)
                           or MISSION_MAP_ENTITY_ID)
     await _push_kvcs(writer, view_cmd, b'PlayerMissionSession',

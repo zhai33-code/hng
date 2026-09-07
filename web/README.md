@@ -7,8 +7,8 @@ Vite + Vue 3 + TypeScript + Pinia + Element Plus + SCSS（pnpm 管理，依赖�
 ```
 web/
   frontend/                     # 前端工程（Vite + Vue3 + TS + Pinia + Element Plus + SCSS）
-    register.html / admin.html    # MPA 双入口
-    src/register/                 # 注册页（部署到游戏服 80 端口，hng-re/web_server.py 托管 dist）
+    join.html / admin.html       # MPA 双入口
+    src/join/                    # 入伍 SPA（history 路由：/join 注册 + /join/veteran 外服迁移；部署到游戏服 80 端口，hng-re/web_server.py 托管 dist）
     src/admin/                    # 管理后台 SPA（hash 路由；FastAPI 同域托管，API_BASE=/api）
     src/styles/                   # HnG 主题（SCSS 变量 + Element Plus 变量覆盖）
     public/icons/                 # 客户端素材（Rank 军衔 / Vehicles 载具 / Ribbons 勋带 / CombatBadges 徽章）
@@ -22,7 +22,7 @@ web/
 ```powershell
 cd web/frontend
 pnpm install
-pnpm dev          # /register.html、/admin.html；/api -> 127.0.0.1:80，/admin/api -> 127.0.0.1:8080
+pnpm dev          # /join.html、/admin.html；/api -> 127.0.0.1:80，/admin/api -> 127.0.0.1:8080
 pnpm build        # vue-tsc 类型检查 + vite build -> dist/
 ```
 

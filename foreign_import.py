@@ -231,32 +231,44 @@ def _parse_stats(cli):
 
 # ---------------------------------------------------------------- 采集
 async def collect_foreign(host, port, username, password, duration=15,
-                          dump_base=None, log=None):
-    """连外服采集全量数据并 dump 落盘，返回 ForeignClient（tables/responses）。"""
+                          dump_base=None, log=None, retries=1, backoff=2.0):
+    """连外服采集全量数据并 dump 落盘，返回 ForeignClient（tables/responses）。
+
+    网络类失败（超时/断连，登录凭据错误除外）自动整体重试 retries 次；
+    每次尝试独立连接、独立 dump 目录（重试目录带 _retryN 后缀）。"""
     log = log or (lambda *a: None)
     if not dump_base:
         dump_base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  'tmp', 'foreign_dump')
-    stamp = time.strftime('%Y%m%d_%H%M%S')
-    out_dir = os.path.join(dump_base, '%s_%s' % (username, stamp))
-    cli = ForeignClient(host, port, username, password, out_dir, log=log)
-    try:
-        await cli.login()
-        await cli.subscribe()
-        await cli.pull()
-        await cli.collect(duration)
-    except LoginError as e:
-        raise ForeignLoginError(e.code, str(e))
-    except (ConnectionError, TimeoutError, OSError) as e:
-        raise ForeignCollectError('外服连接失败: %s' % e)
-    finally:
+    attempts = max(1, retries + 1)
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        stamp = time.strftime('%Y%m%d_%H%M%S')
+        if attempt > 1:
+            stamp += '_retry%d' % attempt
+        out_dir = os.path.join(dump_base, '%s_%s' % (username, stamp))
+        cli = ForeignClient(host, port, username, password, out_dir, log=log)
         try:
-            cli.dump()
-        except Exception as e:             # dump 失败不影响主流程
-            log('[import] dump 落盘失败（忽略）: %s' % e)
-        if cli.w:
-            cli.w.close()
-    return cli, out_dir
+            await cli.login()
+            await cli.subscribe()
+            await cli.pull()
+            await cli.collect(duration)
+            return cli, out_dir
+        except LoginError as e:
+            raise ForeignLoginError(e.code, str(e))
+        except (ConnectionError, TimeoutError, OSError) as e:
+            last_err = e
+            log('[import] 第 %d/%d 次采集失败: %s' % (attempt, attempts, e))
+            if attempt < attempts:
+                await asyncio.sleep(backoff)
+        finally:
+            try:
+                cli.dump()
+            except Exception as e:             # dump 失败不影响主流程
+                log('[import] dump 落盘失败（忽略）: %s' % e)
+            if cli.w:
+                cli.w.close()
+    raise ForeignCollectError('外服连接失败: %s' % last_err)
 
 
 # ---------------------------------------------------------------- 导入（单事务）
@@ -510,7 +522,12 @@ async def run_import(store, host, port, foreign_username, foreign_password,
     log = log or (lambda *a: None)
     server_key = '%s:%d' % (host, int(port))
 
-    # 1. 采集（网络阶段，不占数据库）
+    # 0. 用户名预检：采集前快速失败（外服采集要 20s+，别白跑完才报占用；
+    #    并发窗口仍由建号事务的 ON CONFLICT 兜底）
+    if await store.get_player(local_username):
+        raise UsernameTakenError('用户名 %s 已存在' % local_username)
+
+    # 1. 采集（网络阶段，不占数据库；网络类失败自动重试一次）
     cli, dump_dir = await collect_foreign(
         host, port, foreign_username, foreign_password,
         duration=collect_duration, dump_base=dump_base, log=log)

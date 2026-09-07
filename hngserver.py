@@ -273,7 +273,11 @@ def msg_login2_result(username, code):
 # -------------------------------------------------------------------- server
 
 DEMO_PASSWORD = b''  # 旧演示密码已移除：digest 由 session_key 派生，不再依赖固定密码
-LOG = open(os.path.join(os.path.dirname(__file__), 'requests.log'), 'a', encoding='utf-8')
+
+# 日志集中 server/logs/（2026-09-08）；不 import state（本模块零第三方依赖）
+_LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(_LOG_DIR, exist_ok=True)
+LOG = open(os.path.join(_LOG_DIR, 'requests.log'), 'a', encoding='utf-8')
 
 def log(msg):
     line = f'[{time.strftime("%H:%M:%S")}] {msg}'

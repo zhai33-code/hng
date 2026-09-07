@@ -4,6 +4,7 @@
 // 必须显式指定默认选中项，否则进页面无 tab 激活、面板内容不显示
 import { ref } from 'vue'
 import WeatherPanel from './config/WeatherPanel.vue'
+import CombatHostsPanel from './config/CombatHostsPanel.vue'
 
 const activeTab = ref('weather')
 </script>
@@ -13,6 +14,9 @@ const activeTab = ref('weather')
     <el-tabs v-model="activeTab">
       <el-tab-pane label="战局天气" name="weather">
         <WeatherPanel />
+      </el-tab-pane>
+      <el-tab-pane label="战斗服主机" name="combat_hosts">
+        <CombatHostsPanel />
       </el-tab-pane>
     </el-tabs>
   </div>

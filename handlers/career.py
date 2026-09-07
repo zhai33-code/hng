@@ -59,6 +59,7 @@ from messages import (
     _msg_uniform_part,
     _msg_uniform_variant,
     _msg_vehicle_upgrade,
+    _msg_vehicle_variant,
     _msg_weapon_variant,
     )
 from player_service import _push_player_refresh
@@ -168,14 +169,16 @@ _UNIFORM_PART_TYPE = None
 
 
 def _uniform_part_type(template_id):
-    """UniformPartTemplate f4 → EUniformPartType（部件类型，eHelmet=1）。
-    缓存全表；模板缺失回退 1（通行证奖励全为头盔/面罩类）。"""
+    """UniformPartTemplate f4 → EUniformPartType（0=eHead 头模型、
+    1=eHelmet 头盔/口罩/面纱、5=eHand 手模型）。缓存全表；模板缺失
+    回退 1。注意 f4=0（eHead）是合法值，不能 `or 1` 回退。"""
     global _UNIFORM_PART_TYPE
     if _UNIFORM_PART_TYPE is None:
-        _UNIFORM_PART_TYPE = {
-            int(f.get(1, 0)): int(f.get(4, 1) or 1)
-            for f in _parse_wardb_table('UniformPartTemplate')
-        }
+        _t = {}
+        for f in _parse_wardb_table('UniformPartTemplate'):
+            raw = f.get(4)
+            _t[int(f.get(1, 0))] = int(raw) if raw not in (None, b'', '') else 1
+        _UNIFORM_PART_TYPE = _t
     return _UNIFORM_PART_TYPE.get(int(template_id), 1)
 
 
@@ -192,12 +195,16 @@ async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
       .getUniformObjectsInDepot / VehicleDepotViewMediator.setupVehiclesInDepot
       / TracerEffectUtilities.getTracerEffectsInDepot）：
       · weaponvarianttemplate  → WeaponVariant depot 行（weaponId=0）
-      · vehiclevarianttemplate → Vehicle 整车入仓 + 默认载具弹药
+      · vehiclevarianttemplate → VehicleVariant depot 行（vehicleId=0，
+        皮肤本体不创建整车；2026-09-08 修复：此前误发整车+默认弹药）
       · uniformvarianttemplate → UniformVariant depot 行
       · uniformparttemplate    → UniformPart depot 行（类型取模板 f4）
       · tracereffecttemplate   → TracerEffect depot 行（weaponId=0）
       · vehicleupgradetemplate → VehicleUpgrade depot 行（vehicleId=0）
-      · progressionunlock      → 全角色 add_extra_unlock_uids（幂等登记）
+      · progressionunlock      → player_unlocks 登记玩家 f37 位图位 +
+        全角色 add_extra_unlock_uids（均幂等；2026-09-08 面部迷彩修复：
+        客户端 hasPlayerLevelUnlock 按 progressionUnlock id 索引 f37，
+        等级推导只覆盖 PlayerLevelUnlock id 1-40，不登记则永远未解锁）
     返回入账摘要列表。
     """
     granted = []
@@ -264,11 +271,18 @@ async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
                         _msg_weapon_variant(vv['id'], 0, 0, tid))
                 granted.append(f'weaponvariant#{tid}')
             elif obj == 'vehiclevarianttemplate':
-                # 官方语义：载具奖励=整车入仓（Vehicle 行 char=0）
-                from handlers.shop import _bundle_deliver_vehicle
-                await _bundle_deliver_vehicle(
-                    sess, writer, pid, 0, tid, equip_slot1=False)
-                granted.append(f'vehicle#{tid}')
+                # 载具皮肤入仓（VehicleVariant 行 char=0/vehicle=0，与武器
+                # 皮肤同款仓库语义）：客户端 SkinMod 页签列 char-0 行，玩家
+                # 经 SetInventoryItemToCharacter 指派角色后
+                # SetVehicleVariantRequest 装备（装备 handler 支持仓库行
+                # 绑定）。2026-09-08 修复：此前走 _bundle_deliver_vehicle
+                # 误发整车 + 默认弹药（奖励 45 条皮肤条目全中招）
+                vv = await STORE.create_vehicle_variant(pid, 0, 0, tid)
+                if depot_view_cmd is not None:
+                    await _push_kvcs(
+                        writer, depot_view_cmd, b'VehicleVariant',
+                        _msg_vehicle_variant(vv['id'], 0, 0, tid))
+                granted.append(f'vehicleskin#{tid}')
             elif obj == 'uniformvarianttemplate':
                 uv = await STORE.create_uniform_variant(pid, tid, 0)
                 if sess.soldier_view_cmd is not None:
@@ -302,9 +316,14 @@ async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
                                              u.get('condition', 100.0)))
                 granted.append(f'vehicleupgrade#{tid}')
             elif obj == 'progressionunlock':
-                # 角色解锁（如三阵营头部外观）：全角色幂等登记
-                # （当前奖励 uid 已被 level0/rank 默认路径授予，此处
-                # 防御未来 metaLevel>0 条目漏发）
+                # 玩家级解锁：登记 player_unlocks（player f37 位图源）。
+                # 通行证面部迷彩 2387-2395（eHeadSwap）客户端只认
+                # hasPlayerLevelUnlock——按 progressionUnlock id 直接索引
+                # f37 位图，PlayerLevelUnlock 等级推导（id 1-40）永远不含
+                # 这些 id → 不登记则外观窗口永远判定未解锁
+                await STORE.add_player_unlocks(pid, [tid])
+                # 角色登记保留（防御未来 character unlock bits 级条目：
+                # 当前奖励 uid 已被 level0/rank 默认路径授予）
                 for ch in await STORE.list_characters(pid):
                     await STORE.add_extra_unlock_uids(pid, ch['id'], [tid])
                 granted.append(f'progressionunlock#{tid}')

@@ -4,14 +4,23 @@
 hng.exe /D 专用服、握手认领（FIFO）、进程退出监视兜底回收、端口池分配、
 战局结束释放与并发上限排队消费。从 matchmaking.py 拆出
 （2026-09-06 重构，纯移动行为不变）。
+
+多机部署（2026-09-08）：主机列表/各机容量/端口池由 server_config
+'combat_hosts' 热配置（combat_hosts.py，管理后台保存即生效）；成局时
+matchmaking._start_match 选机（pick_host）→ reserve_combat_instance 同步
+占坑 → 本函数补进程：本机 spawn 或远端 combat_agent HTTP 拉起。未配置时
+单机回退与改造前 env 行为一致。
 """
 import asyncio
+import json
 import os
 import random
 import socket
 import subprocess
 import time
 
+import combat_agent
+import combat_hosts
 from state import PUBLIC_HOST
 import mm_config
 from mm_state import _MM_MISSION_DETAILS, _MM_MISSION_SQUADS, _log, _spawn
@@ -51,6 +60,12 @@ COMBAT_UDP_PORT = 5678                 # 兼容保留：旧单实例端口 = 端
 # combat server 分离部署时用 HNG_COMBAT_WARSERVER 指向 warserver 对外地址。
 COMBAT_WARSERVER = (os.environ.get('HNG_COMBAT_WARSERVER')
                     or '127.0.0.1:15110')
+# 远端 combat_agent 的 HMAC 共享密钥（combat_agent.py --token 同值；跨公网
+# 明文 HTTP 下密钥只进签名不出链路，抓包抓不到凭证）。拉起/停止/查询的每个
+# 请求带 X-Agent-Timestamp/Nonce/Signature 签名三头（combat_agent.sign_request）。
+# 不设则 agent 端也须不设 = 开放，仅限本机调试。模块级读取，改 .env 须重启。
+AGENT_TOKEN = os.environ.get('HNG_AGENT_TOKEN', '')
+AGENT_HTTP_TIMEOUT = 10
 # 战局开局等待（热身）时间覆盖，单位【秒】；None = 不覆盖（player.dll 默认）。
 # 依据 work/hng-server-re/warserver-serversystemevents.md 4.3 节：
 #   开局倒计时由 battlefield 实体(class 5) block+4 驱动，服务端默认 7200s 硬编码
@@ -78,12 +93,33 @@ COMBAT_READY = asyncio.Event()  # 兼容回退：无法按 missionid 定位实�
 _PENDING_HANDSHAKE = []        # 已拉起、等待握手认领的 mission_id（启动顺序）
 
 
-def claim_pending_combat_instance():
+def claim_pending_combat_instance(remote_ip=None):
     """空 proto 握手认领：返回最早一个「已拉起且未 ready」实例的 mission_id。
 
     跳过已就绪/已释放的陈旧条目（懒清理）；全部无效返回 None。
     每个专用服连接只发一次 RequestBattleFieldSettings，认领即出队。
+
+    多机部署（remote_ip 给定）：只在来源主机（combat_hosts.host_matches_ip
+    匹配 addr/public_addr/agent 主机名；127.0.0.1 视为本机 spawn 条目）的
+    pending 实例中 FIFO——不同机实例握手到达顺序 ≠ 启动顺序，全局 FIFO 会
+    把 A 机的图错配给 B 机的专用服。来源 IP 不匹配任何主机（NAT 配错等）
+    → 记日志回退全局 FIFO（兼容旧手动分离部署）。
     """
+    if remote_ip:
+        names = {h['name'] for h in combat_hosts.last_hosts()
+                 if combat_hosts.host_matches_ip(h, remote_ip)}
+        if names:
+            for mid in list(_PENDING_HANDSHAKE):
+                inst = COMBAT_INSTANCES.get(mid)
+                if inst is None or inst['ready'].is_set():
+                    _PENDING_HANDSHAKE.remove(mid)   # 陈旧条目懒清理（按值删）
+                    continue
+                if (inst.get('host') or {}).get('name') in names:
+                    _PENDING_HANDSHAKE.remove(mid)
+                    return mid
+            return None          # 该机无待认领实例：绝不认领他机实例（防错配）
+        _log(f'combat handshake from unknown host ip={remote_ip} - '
+             f'falling back to global FIFO claim（检查 combat_hosts addr 配置）')
     while _PENDING_HANDSHAKE:
         mid = _PENDING_HANDSHAKE[0]
         inst = COMBAT_INSTANCES.get(mid)
@@ -112,33 +148,107 @@ def _combat_alive():
                for i in COMBAT_INSTANCES.values())
 
 
+def _reclaim_dead_instance(inst, mission_id, reason):
+    """实例死亡（崩溃/被杀/未走 earnings 即退出）兜底回收，幂等（实例已
+    出队则 no-op）。必须补 _finish_mission_sessions（squad 重置 + PMS
+    DELETE KVCS）：客户端 closing 流程等的就是这个会话结束信号；不推则
+    只能每秒轮询 GetMissionDetails 拿 mission_not_found，直到超时自行
+    Abandon（2026-08-27 卡 closing 56s 根因）。延迟 import 防环。"""
+    if COMBAT_INSTANCES.get(int(mission_id)) is not inst:
+        return
+    _log(f'combat server #{inst["seq"]} exited without release '
+         f'(mission={mission_id}, {reason}) - reclaiming slot')
+    from handlers import combat as _combat_mod
+    _spawn(_combat_mod._finish_mission_sessions(int(mission_id), None),
+           f'finish_sessions#{inst["seq"]}')
+    release_match(int(mission_id))
+
+
 async def _watch_proc_exit(inst, mission_id):
-    """combat server 进程退出监视：退出而坑位未释放（崩溃/被杀/earnings
+    """本机 combat server 进程退出监视：退出而坑位未释放（崩溃/被杀/earnings
     处理中途异常，正常倒计时关服路径 release_match 已先到则 no-op）时
     兜底回收，保证「进程关了 = 坑位必释放」。"""
     try:
         await inst['proc'].wait()
     except Exception:
         pass
-    if COMBAT_INSTANCES.get(int(mission_id)) is inst:
-        _log(f'combat server #{inst["seq"]} exited without release '
-             f'(mission={mission_id}, code={inst["proc"].returncode}) - '
-             f'reclaiming slot')
-        # ★ 未走 earnings 即退出（玩家中途退出 code=10016 / 崩溃）：必须补
-        #   _finish_mission_sessions（squad 重置 + PMS DELETE KVCS），客户端
-        #   closing 流程等的就是这个会话结束信号；不推则只能每秒轮询
-        #   GetMissionDetails 拿 mission_not_found，直到超时自行 Abandon
-        #   （2026-08-27 卡 closing 56s 根因）。earnings 正常路径已先
-        #   release_match（实例出队），这里不会重复触发；且函数末尾统一
-        #   清 PMS 映射，天然幂等。延迟 import 防 combat→matchmaking 循环。
-        from handlers import combat as _combat_mod
-        _spawn(_combat_mod._finish_mission_sessions(int(mission_id), None),
-               f'finish_sessions#{inst["seq"]}')
-        release_match(int(mission_id))
+    _reclaim_dead_instance(inst, mission_id, f'code={inst["proc"].returncode}')
 
 
-def _alloc_combat_port():
-    """从端口池分配空闲 UDP 端口（跳过运行中实例已占用的）。"""
+async def _agent_pid_alive(host, pid):
+    """查 agent：pid 是否仍在运行实例列表（agent 不可达抛异常由调用方定夺）。"""
+    if not pid:
+        return False
+    data = await _agent_request(host, 'GET', '/status')
+    return any(int(it.get('pid') or 0) == int(pid)
+               for it in data.get('instances', []))
+
+
+async def _watch_agent_instance(inst, mission_id):
+    """远端 agent 实例看门狗（对齐本机 _watch_proc_exit）：轮询 agent pid
+    存活，确认死亡即回收。覆盖「拉起后即崩溃、握手都没发生」的坑位泄漏
+    （该场景无 TCP 连接，断连钩子收不到）。agent 不可达继续等（网络抖动/
+    agent 重启不误杀活局），连接断开钩子另有兜底。"""
+    host = inst.get('host') or {}
+    pid = inst.get('agent_pid')
+    while COMBAT_INSTANCES.get(int(mission_id)) is inst:
+        await asyncio.sleep(15)
+        try:
+            alive = await _agent_pid_alive(host, pid)
+        except Exception as e:
+            _log(f'agent status poll failed (host={host.get("name")}, '
+                 f'pid={pid}): {type(e).__name__}: {e}')
+            continue
+        if not alive:
+            break
+    _reclaim_dead_instance(inst, mission_id, f'agent pid={pid} gone')
+
+
+def on_combat_conn_closed(mission_id):
+    """战斗服 TCP 连接断开（进程退出/崩溃）兜底：确认死亡才回收坑位。
+
+    realtest_server.handle_tcp finally 调用（sess.is_combat_server 且
+    combat_mission 已登记）。远端实例的主要退出监视；本机实例
+    _watch_proc_exit 已覆盖，此处幂等。网络抖动/临时断开（进程仍活）不
+    回收，防误杀活局。"""
+    _spawn(_on_combat_conn_closed(int(mission_id)),
+           f'combat_conn_closed#{mission_id}')
+
+
+async def _on_combat_conn_closed(mission_id):
+    inst = COMBAT_INSTANCES.get(int(mission_id))
+    if inst is None:
+        return                      # 已正常释放（release_match 先到）
+    host = inst.get('host') or {}
+    if host.get('agent'):
+        try:
+            alive = await _agent_pid_alive(host, inst.get('agent_pid'))
+        except Exception as e:
+            # agent 不可达 = 该机进程已失管（整机下线/防火墙变动），
+            # 坑位留着也永远无法释放 → 按死亡回收（战斗服随之失联会被
+            # 客户端超时兜底；日志留痕供排查）
+            _log(f'agent unreachable on conn-close (host={host.get("name")}, '
+                 f'mission={mission_id}): {type(e).__name__}: {e} - '
+                 f'reclaiming slot')
+            alive = False
+    else:
+        proc = inst.get('proc')
+        alive = proc is not None and proc.returncode is None
+    if alive:
+        _log(f'combat server #{inst["seq"]} connection dropped but process '
+             f'alive (mission={mission_id}) - keep slot')
+        return
+    _reclaim_dead_instance(inst, mission_id, 'connection closed')
+
+
+def _alloc_combat_port(host=None):
+    """从端口池分配空闲 UDP 端口。
+
+    host 给定 → 该机独立端口池（只避开同机实例端口，多机互不挤占）；
+    host=None → 旧全局口径（env 端口池、避开所有实例端口，兼容未迁移调用）。
+    """
+    if host is not None:
+        return combat_hosts.alloc_port(host, COMBAT_INSTANCES)
     used = {i['port'] for i in COMBAT_INSTANCES.values()}
     for p in range(mm_config.COMBAT_PORT_BASE, mm_config.COMBAT_PORT_MAX + 1):
         if p not in used:
@@ -146,8 +256,34 @@ def _alloc_combat_port():
     return None
 
 
+def reserve_combat_instance(mission_id, host, port):
+    """成局选机后同步登记实例（占坑 + 占端口，防并发成局双占同端口：
+    select 与 spawn 间存在 await 间隙，先登记后拉起即无竞态窗口）。
+
+    进程参数由 _ensure_combat_server 补齐（本机 spawn / 远端 agent）。
+    """
+    global _combat_seq
+    _combat_seq += 1
+    inst = {'mission_id': int(mission_id), 'port': int(port), 'proc': None,
+            'ready': asyncio.Event(), 'seq': _combat_seq, 'ttd': False,
+            'udp': None, 'host': host, 'agent_pid': None}
+    COMBAT_INSTANCES[int(mission_id)] = inst
+    return inst
+
+
 async def _stop_instance(inst):
-    """停掉单个战局实例（TTD 包裹时杀进程树防 hng.exe 孤儿；模拟实例关 UDP）。"""
+    """停掉单个战局实例（远端经 agent taskkill；本机 TTD 包裹时杀进程树
+    防 hng.exe 孤儿；模拟实例关 UDP）。"""
+    host = inst.get('host') or {}
+    if host.get('agent') and inst.get('agent_pid'):
+        try:
+            await _agent_stop(host, int(inst['agent_pid']))
+        except Exception as e:
+            # 失败仅记日志：连接断开钩子/看门狗会兜底回收坑位
+            _log(f'stop remote combat server FAILED (host={host.get("name")}, '
+                 f'pid={inst["agent_pid"]}, mission={inst["mission_id"]}): '
+                 f'{type(e).__name__}: {e}')
+        return
     udp = inst.get('udp')
     if udp is not None:
         try:
@@ -190,14 +326,17 @@ def release_match(mission_id):
 
 
 def _drain_pending_matches():
-    """并发上限释放后，按成局先后顺序拉起排队战局。"""
+    """坑位释放后重派排队战局：全部重新分发（容量判定在 _start_match 内
+    ——选机需读库热配置；仍满的局自行重新排队到队尾，顺序保持 FIFO）。
+
+    无容量检查即 pop-all 是刻意的：同步上下文（release_match）无法读库，
+    而「容量误判滞留队列直到下次释放」是饥饿 bug（调大容量/下线主机后
+    排队局永不起动），重派一次的成本只是几条日志。"""
     import matchmaking  # 延迟 import：撮合核心在 matchmaking（防环）
     while PENDING_MATCHES:
-        if (mm_config.MAX_CONCURRENT_COMBAT_SERVERS and
-                len(COMBAT_INSTANCES) >= mm_config.MAX_CONCURRENT_COMBAT_SERVERS):
-            break
         match = PENDING_MATCHES.pop(0)
-        _log(f'pending match launching (mission players='
+        _log(f'pending match re-dispatch (mission~'
+             f'{getattr(match, "mission_id", 0)}, players='
              f'{len(match.players)}, queued={len(PENDING_MATCHES)})')
         matchmaking._dispatch_match(match)
 
@@ -237,27 +376,116 @@ async def _log_udp_bound_bg(seq, port):
              f'(map load slow or failed) - check combat-server\\combat-server-{seq}.log')
 
 
-async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
-                                timeout=120):
+def _host_statserver(host):
+    """统计服地址 = 该机可达 warserver 的地址 host 部分（15115 统计服与
+    warserver 同机）：combat server 能连 warserver 就必能连同机统计服。
+    单机回退场景 = 127.0.0.1（原 PUBLIC_HOST 写法在公网部署时绕外网回环，
+    现统一走内网最稳路径）。"""
+    ws = (host.get('warserver') or COMBAT_WARSERVER).strip()
+    return ws.split(':')[0] or PUBLIC_HOST
+
+
+async def _agent_request(host, method, path, body=None):
+    """warserver → combat_agent 裸 HTTP/1.1 客户端（零第三方依赖；自家
+    agent、固定 API 形状，无重定向/chunked，裸实现足够）。
+    每请求 HMAC 签名（combat_agent.sign_request，密钥不上链路 + 防重放）。
+    非 200 抛 RuntimeError（调用方记日志 + 主机冷却）。"""
+    url = host['agent']
+    rest = url[7:] if url.startswith('http://') else url
+    hp, _, path_prefix = rest.partition('/')
+    h, _, p = hp.partition(':')
+    port = int(p or 80)
+    prefix = ('/' + path_prefix).rstrip('/') if path_prefix else ''
+    payload = json.dumps(body).encode() if body is not None else None
+    lines = [f'{method} {prefix}{path} HTTP/1.1', f'Host: {h}']
+    if AGENT_TOKEN:
+        for k, v in combat_agent.sign_request(
+                method, prefix + path, payload or b'', AGENT_TOKEN).items():
+            lines.append(f'{k}: {v}')
+    lines.append('Connection: close')
+    headers = '\r\n'.join(lines) + '\r\n'
+    if payload is not None:
+        headers += (f'Content-Type: application/json\r\n'
+                    f'Content-Length: {len(payload)}\r\n')
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(h, port), AGENT_HTTP_TIMEOUT)
+    try:
+        writer.write(headers.encode() + b'\r\n' + (payload or b''))
+        await writer.drain()
+        raw = b''
+        while True:
+            chunk = await asyncio.wait_for(reader.read(65536),
+                                           AGENT_HTTP_TIMEOUT)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    head, _, body_bytes = raw.partition(b'\r\n\r\n')
+    parts = head.split(b' ', 2)
+    status = int(parts[1]) if len(parts) >= 2 else 0
+    try:
+        data = json.loads(body_bytes) if body_bytes else {}
+    except Exception:
+        data = {}
+    if status != 200:
+        raise RuntimeError(f'agent {host.get("name")} {method} {path} '
+                           f'HTTP {status}: {data.get("error", data)}')
+    return data
+
+
+async def _agent_launch(host, inst, pms_id, combat_map):
+    """经 agent 拉起远端 combat server；返回 (ok, pid)。"""
+    body = {'port': int(inst['port']), 'pms_id': int(pms_id),
+            'mission_id': int(inst['mission_id']), 'map': combat_map,
+            'warserver': host.get('warserver') or COMBAT_WARSERVER,
+            'statserver_host': _host_statserver(host),
+            'seq': int(inst['seq']),
+            'countdown': COMBAT_START_COUNTDOWN_OVERRIDE}
+    try:
+        data = await _agent_request(host, 'POST', '/launch', body)
+        return True, int(data.get('pid') or 0)
+    except Exception as e:
+        _log(f'agent launch FAILED (host={host.get("name")}, '
+             f'mission={inst["mission_id"]}, udp/{inst["port"]}): '
+             f'{type(e).__name__}: {e}')
+        return False, None
+
+
+async def _agent_stop(host, pid):
+    await _agent_request(host, 'POST', '/stop', {'pid': int(pid)})
+
+
+async def _ensure_combat_server(mission_id, pms_id, combat_map, timeout=120):
     """拉起本场战局的专用战斗服并等待 BattleFieldSettings 握手完成。
+
+    实例登记由 reserve_combat_instance 先行完成（matchmaking._start_match
+    选机即占坑）；本函数补进程：本机 spawn / 远端 agent 拉起（host['agent']）。
+    未预留（旧调用路径）→ 按 env 单机回退就地登记。
 
     多实例并行：/D 端口按局分配；不再杀旧实例（战局生命周期由
     release_match 管理）。超时也放行（返回 False）：客户端 hng.exe
     连不上 UDP 会重试，且日志有记录便于排查。
     """
-    global _combat_seq
-    _combat_seq += 1
-    inst = {'mission_id': int(mission_id), 'port': int(port), 'proc': None,
-            'ready': asyncio.Event(), 'seq': _combat_seq, 'ttd': False,
-            'udp': None}
+    inst = COMBAT_INSTANCES.get(int(mission_id))
+    if inst is None:
+        # 旧路径兜底：未预留就地登记（env 单机行为）
+        inst = reserve_combat_instance(
+            mission_id, combat_hosts.fallback_host(),
+            _alloc_combat_port() or 0)
+    host = inst['host']
+    seq = inst['seq']
+    port = inst['port']
 
     # macOS/Linux 等无 hng.exe 环境（MM_SIMULATE_COMBAT=1）：内嵌模拟——
     # bind UDP 端口（占坑 + 让 _wait_udp_bound 探测判定 READY）+ 直接完成
     # 握手。实例登记/并发上限/释放与真实路径完全一致。
     if mm_config.SIMULATE_COMBAT:
-        COMBAT_INSTANCES[int(mission_id)] = inst
-        _log(f'combat server #{_combat_seq} SIMULATED (mission={mission_id}, '
-             f'udp/{port}, map={combat_map})')
+        _log(f'combat server #{seq} SIMULATED (mission={mission_id}, '
+             f'udp/{port}, map={combat_map}, host={host.get("name")})')
         try:
             _transport, _proto = await asyncio.get_event_loop() \
                 .create_datagram_endpoint(asyncio.DatagramProtocol,
@@ -268,7 +496,35 @@ async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
         inst['ready'].set()
         return True
 
-    COMBAT_INSTANCES[int(mission_id)] = inst
+    # ★ 远端 agent 拉起（多机部署）
+    if host.get('agent'):
+        ok, pid = await _agent_launch(host, inst, pms_id, combat_map)
+        if not ok:
+            # 与本机「两次 spawn 失败」同路径：回收登记 + 主机冷却 + 消费
+            # 排队局；PMS 推送照旧放行（客户端连不上会重试）
+            COMBAT_INSTANCES.pop(int(mission_id), None)
+            combat_hosts.mark_host_failed(host['name'])
+            _drain_pending_matches()
+            return False
+        inst['agent_pid'] = pid
+        _log(f'combat server #{seq} launched via agent {host["name"]} '
+             f'(pid={pid}, mission={mission_id}, udp/{port})')
+        _PENDING_HANDSHAKE.append(int(mission_id))
+        _spawn(_watch_agent_instance(inst, mission_id),
+               f'watch_agent#{seq}')
+        try:
+            await asyncio.wait_for(inst['ready'].wait(), timeout)
+            _log(f'combat server #{seq} handshake ok (agent pid={pid}, '
+                 f'mission={mission_id})')
+            _spawn(_log_udp_bound_bg(seq, port), f'udp_probe#{seq}')
+            return True
+        except asyncio.TimeoutError:
+            _log(f'combat server handshake TIMEOUT after {timeout}s '
+                 f'(agent {host["name"]}, pid={pid}) - 推 Admitted 继续，'
+                 f'查 {host["name"]} combat-server-{seq}.log')
+            return False
+
+    # ---- 本机 spawn（原路径；host['warserver'] 可按机覆盖 /W 回连地址）----
     exe = os.path.join(COMBAT_SERVER_DIR, 'hng.exe')
     args = [exe,
             '/D', str(port),
@@ -276,14 +532,14 @@ async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
             '/P', str(pms_id),                # boot.playersessionid = MissionSession ID
             '/PS', f'login-{pms_id}',
             '/M', combat_map,
-            '/W', COMBAT_WARSERVER,
+            '/W', host.get('warserver') or COMBAT_WARSERVER,
             # /R 选项必须用完整注册名（组.选项）：ZOptionSet 按全名查找，
             # 无组前缀的名字会落入未注册选项桶，游戏代码不会读取
             '/R', 'boot.disable_eac=1',
-            '/R', f'boot.logfile=combat-server-{_combat_seq}.log',
+            '/R', f'boot.logfile=combat-server-{seq}.log',
             # 战斗服进程 player.dll 进图时 GetTotals 初始化勋带状态（a2[7]），
             # 失败→整局无 XP 累加→无 Statistics_Update→客户端无升级弹窗
-            '/R', f'boot.statserver={PUBLIC_HOST}',
+            '/R', f'boot.statserver={_host_statserver(host)}',
             '/R', 'boot.statserverport=15115']
     if COMBAT_START_COUNTDOWN_OVERRIDE is not None:
         # 开局等待时间覆盖（秒），见文件头 COMBAT_START_COUNTDOWN_OVERRIDE 注释
@@ -308,7 +564,7 @@ async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
             _log(f'launch combat server FAILED (attempt {attempt}/2): {e}')
             if attempt == 1:
                 # 换端口重试一次（原端口可能被外部进程抢占）
-                new_port = _alloc_combat_port()
+                new_port = _alloc_combat_port(host)
                 if new_port is None:
                     break               # 端口池也空：走下方统一回收
                 port = new_port
@@ -328,25 +584,24 @@ async def _ensure_combat_server(mission_id, port, pms_id, combat_map,
         return False
     # 进程退出监视（崩溃/被杀兜底回收坑位；正常关服路径幂等 no-op）
     _spawn(_watch_proc_exit(inst, mission_id),
-           f'watch_proc#{inst["seq"]}')
+           f'watch_proc#{seq}')
     # 登记待认领队列：专用服回连握手 proto 为空（无 field1），
-    # game_server 按 FIFO 认领本实例并回正确的 preset/地图。
+    # game_server 按来源主机（FIFO）认领本实例并回正确的 preset/地图。
     _PENDING_HANDSHAKE.append(int(mission_id))
 
     try:
         await asyncio.wait_for(inst['ready'].wait(), timeout)
-        _log(f'combat server #{_combat_seq} handshake ok '
+        _log(f'combat server #{seq} handshake ok '
              f'(pid={inst["proc"].pid}, mission={mission_id})')
         # ★ 地图加载等待不再阻塞 Admitted：握手成功即返回，让客户端 hng.exe
         #   的地图加载与专用服地图加载【并行】（客户端连不上 UDP 会自动重试，
         #   此前串行等待 = 30-45s ZServer 加载 + 20-30s 客户端加载 ≈ 60-75s）。
         #   bind 探测改为后台任务，仅记日志便于排查"地图加载慢 vs 启动失败"。
-        _spawn(_log_udp_bound_bg(_combat_seq, port),
-               f'udp_probe#{_combat_seq}')
+        _spawn(_log_udp_bound_bg(seq, port), f'udp_probe#{seq}')
         return True
     except asyncio.TimeoutError:
         alive = inst['proc'].returncode is None
         _log(f'combat server handshake TIMEOUT after {timeout}s '
              f'(alive={alive}, exit={inst["proc"].returncode}) - 推 Admitted 继续，'
-             f'查 combat-server\\combat-server-{_combat_seq}.log')
+             f'查 combat-server\\combat-server-{seq}.log')
         return False

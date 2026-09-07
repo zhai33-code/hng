@@ -333,6 +333,47 @@ async def main():
             and after3[w_b['id']]['container_slot'] == 0)
     mark('武器卸下归库', good)
 
+    # 5.8 通行证修复的 store 层真库语义（2026-09-08）
+    #    player_unlocks：登记/读回/幂等/CASCADE；bind_vehicle_variant：
+    #    仓库皮肤行绑定到载具 + 非 0 vehicle_id 行拒绝（防重绑）
+    print('== 5.8 player_unlocks + bind_vehicle_variant ==')
+    await st.add_player_unlocks(ta, [2387, 2390])
+    await st.add_player_unlocks(ta, [2387, 2391])   # 幂等重放
+    uids = await st.get_player_unlock_ids(ta)
+    mark('player_unlocks 登记/读回/幂等', uids == {2387, 2390, 2391},
+         f' uids={sorted(uids)}')
+    await st.add_player_unlocks(tb, [2388])
+    mark('player_unlocks 玩家隔离', 2388 not in uids
+         and 2388 in await st.get_player_unlock_ids(tb))
+    tp = await st.create_player('ts_unlocks', 'pw')
+    await st.add_player_unlocks(tp, [2392])
+    async with st.pool.acquire() as conn:
+        await conn.execute('DELETE FROM players WHERE id = $1', int(tp))
+    gone = await st.get_player_unlock_ids(tp)
+    mark('player_unlocks 随玩家删除级联清空', gone == set(),
+         f' got={sorted(gone)}')
+
+    veh = await st.create_vehicle(ta, 44, ca['id'])          # 同 parent 44 型号变体
+    skin = await st.create_vehicle_variant(ta, 0, 0, 470)    # 通行证皮肤仓库行
+    bound = await st.bind_vehicle_variant(ta, skin['id'], veh['id'],
+                                          ca['id'])
+    vv = next(v for v in await st.list_vehicle_variants(ta)
+              if v['id'] == skin['id'])
+    mark('bind_vehicle_variant 仓库行绑定', bound is not None
+         and bound['vehicle_id'] == veh['id']
+         and bound['character_id'] == ca['id']
+         and vv['vehicle_id'] == veh['id'] and vv['character_id'] == ca['id'],
+         f' vv={vv}')
+    # 已绑定行（vehicle_id != 0）不可重绑到另一载具
+    veh2 = await st.create_vehicle(ta, 44, ca['id'])
+    rebound = await st.bind_vehicle_variant(ta, skin['id'], veh2['id'],
+                                            ca['id'])
+    mark('bind_vehicle_variant 已绑定行拒绝重绑', rebound is None)
+    # 他人仓库行不可绑（防越权）
+    foreign = await st.bind_vehicle_variant(tb, skin['id'], veh2['id'],
+                                            ca['id'])
+    mark('bind_vehicle_variant 越权行拒绝', foreign is None)
+
     # 收尾清理（测试账号保留，行数据清除）
     async with st.pool.acquire() as conn:
         await conn.execute('DELETE FROM mail_messages WHERE sender_id IN ($1,$2) '
@@ -344,6 +385,12 @@ async def main():
         await conn.execute('DELETE FROM career_orders WHERE player_id = $1', int(ta))
         await conn.execute("DELETE FROM weapons WHERE player_id = $1 "
                            "AND name IN ('U9GunA','U9GunB')", int(ta))
+        await conn.execute('DELETE FROM player_unlocks WHERE player_id IN ($1,$2)',
+                           int(ta), int(tb))
+        await conn.execute('DELETE FROM vehicle_variants WHERE player_id = $1 '
+                           'AND vehicle_variant_template_id = 470', int(ta))
+        await conn.execute('DELETE FROM vehicles WHERE player_id = $1 '
+                           'AND vehicle_variant_template_id = 44', int(ta))
     print('  [cleanup] U9 测试行已清理')
 
     await st.close()

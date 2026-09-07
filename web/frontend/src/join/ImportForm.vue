@@ -158,25 +158,13 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from 'vue'
 import {
-  ElForm, ElInput, ElButton, ElAlert, ElDialog, ElMessage,
+  ElForm, ElInput, ElButton, ElAlert, ElDialog,
   FormRules, FormInstance,
 } from 'element-plus'
 import { Slide } from 'go-captcha-vue'
 import 'go-captcha-vue/dist/style.css'
-import { apiGet, apiPost, ApiError } from '../register/api'
-
-interface SlideData {
-  thumbX: number
-  thumbY: number
-  thumbWidth: number
-  thumbHeight: number
-  image: string
-  thumb: string
-}
-
-interface CaptchaChallenge extends SlideData {
-  captcha_id: string
-}
+import { apiPost, ApiError } from './api'
+import { useSlideCaptcha } from './useSlideCaptcha'
 
 interface ImportSummary {
   player_id: number
@@ -186,8 +174,8 @@ interface ImportSummary {
   counts: Record<string, number>
 }
 
-// 导入全流程（外服登录 + 15s 采集 + 落库）服务端上限 120s，前端超时放宽到 150s
-const IMPORT_TIMEOUT_MS = 150000
+// 服务端全流程上限 210s（含失败自动重试一次），前端超时放宽到 220s
+const IMPORT_TIMEOUT_MS = 220000
 
 const COUNT_LABELS: Record<string, string> = {
   characters: '士兵',
@@ -258,78 +246,23 @@ function fmt(v?: number) {
   return (v ?? 0).toLocaleString('zh-CN')
 }
 
-// ---- 验证码（与注册页同一套后端接口） ----
-
-const captchaVisible = ref(false)
-const capLoading = ref(false)
-const capChecking = ref(false)
-const capRef = ref<{ reset: () => void; clear: () => void }>()
-const captchaId = ref('')
-const slideData = reactive<SlideData>({
-  thumbX: 0, thumbY: 0, thumbWidth: 0, thumbHeight: 0, image: '', thumb: '',
-})
-
-async function loadCaptcha() {
-  capLoading.value = true
-  slideData.image = ''
-  try {
-    const data = await apiGet<CaptchaChallenge>('/api/captcha/get')
-    captchaId.value = data.captcha_id
-    slideData.thumbX = data.thumbX
-    slideData.thumbY = data.thumbY
-    slideData.thumbWidth = data.thumbWidth
-    slideData.thumbHeight = data.thumbHeight
-    slideData.image = data.image
-    slideData.thumb = data.thumb
-  } catch (e) {
-    const err = e as ApiError
-    ElMessage.error(err.message || '验证码加载失败，请稍后再试')
-    captchaVisible.value = false
-  } finally {
-    capLoading.value = false
-  }
-}
-
-const capEvents = {
-  refresh: () => loadCaptcha(),
-  confirm: (point: { x: number; y: number }, reset: () => void) => {
-    void onCaptchaConfirm(point, reset)
-  },
-}
-
-async function onCaptchaConfirm(point: { x: number; y: number }, reset: () => void) {
-  if (capChecking.value || !captchaId.value) return
-  capChecking.value = true
-  try {
-    const r = await apiPost<{ ok: boolean; token: string }>('/api/captcha/check', {
-      captcha_id: captchaId.value,
-      x: point.x,
-      y: point.y,
-    })
-    captchaVisible.value = false
-    await doImport(r.token)
-  } catch (e) {
-    const err = e as ApiError
-    ElMessage.error(err.message || '验证失败，请重试')
-    reset()
-    loadCaptcha()
-  } finally {
-    capChecking.value = false
-  }
-}
+const { captchaVisible, capLoading, capRef, slideData, capEvents, loadCaptcha, openCaptcha } =
+  useSlideCaptcha(doImport)
 
 async function submit() {
   if (loading.value) return
   const ok = await formRef.value?.validate().catch(() => false)
   if (!ok) return
-  captchaVisible.value = true   // @open 触发 loadCaptcha
+  openCaptcha()
 }
 
-// 采集阶段进度文案轮换：过程不透明（单次长请求），给用户阶段感
+// 采集阶段进度文案轮换：过程不透明（单次长请求），给用户阶段感；
+// 全流程最坏 ~210s（外服卡顿时服务端会自动重试一次），末段文案预告重试
 const PROGRESS_STEPS = [
   '正在登录外服服务器…',
   '正在采集士兵与装备数据…',
   '正在写入本服数据库…',
+  '外服响应缓慢，仍在处理（失败会自动重试，请勿关闭页面）…',
 ]
 let progressTimer: ReturnType<typeof setInterval> | undefined
 
@@ -343,7 +276,7 @@ async function doImport(token: string) {
   progressTimer = setInterval(() => {
     step = Math.min(step + 1, PROGRESS_STEPS.length - 1)
     loadingText.value = PROGRESS_STEPS[step]
-  }, 12000)
+  }, 30000)
   try {
     const data = await apiPost<ImportSummary>('/api/import', {
       foreign_username: form.foreign_username,
@@ -373,66 +306,6 @@ async function doImport(token: string) {
 
 <style scoped lang="scss">
 @use '@/styles/vars' as *;
-
-:deep(.el-form-item__label) {
-  color: $hng-khaki;
-  font-size: 12px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  font-weight: 700;
-  padding-bottom: 4px;
-}
-
-.section-title {
-  color: $hng-gold;
-  font-size: 12px;
-  font-weight: 800;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  margin: 6px 0 12px;
-  padding-bottom: 6px;
-  border-bottom: 1px dashed rgba(200, 185, 138, 0.25);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-
-  &::before {
-    content: '';
-    width: 8px;
-    height: 8px;
-    background: $hng-gold;
-    clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
-  }
-}
-
-.submit-btn {
-  width: 100%;
-  margin-top: 8px;
-  height: 46px;
-  font-size: 16px;
-  letter-spacing: 0.2em;
-}
-
-.result-alert {
-  margin-top: 18px;
-}
-
-// 蜜罐字段：移出视口
-.hp-field {
-  position: absolute;
-  left: -9999px;
-  top: -9999px;
-  width: 0;
-  height: 0;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.captcha-box {
-  display: flex;
-  justify-content: center;
-  min-height: 260px;
-}
 
 // ---- 迁移结果卡 ----
 .summary-card {

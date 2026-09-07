@@ -25,11 +25,24 @@ interface OnlineSnapshot {
   players: { username: string; player_id: number | null }[]
   missions: {
     mission_id: number
-    preset: string | null
+    preset: number | null
+    mode_name: string
+    map_name: string
     gamemode: number | null
     attacker_faction: number | null
     defender_faction: number | null
-    players: { gamertag: string | null; faction: number | null }[]
+    host: string | null
+    port: number | null
+    players: { gamertag: string | null; player_id: number | null; faction: number | null }[]
+  }[]
+  combat_hosts: {
+    name: string
+    addr: string
+    public_addr: string
+    max: number
+    running: number
+    agent: string | null
+    agent_up: boolean
   }[]
   server_time: number
 }
@@ -131,7 +144,14 @@ const maxCount = () =>
         排队 {{ online?.in_queue ?? 0 }}，每 30 秒自动刷新）
       </div>
       <el-table v-if="online?.players.length" :data="online.players" size="small">
-        <el-table-column prop="username" label="用户名" min-width="160" />
+        <el-table-column label="用户名" min-width="160">
+          <template #default="{ row }">
+            <RouterLink v-if="row.player_id" :to="`/players/${row.player_id}`" class="player-link">
+              {{ row.username }}
+            </RouterLink>
+            <span v-else>{{ row.username }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="玩家 ID" width="110">
           <template #default="{ row }">{{ row.player_id ?? '-' }}</template>
         </el-table-column>
@@ -141,17 +161,52 @@ const maxCount = () =>
         <div style="font-weight: 700; margin: 16px 0 8px">活跃战局</div>
         <el-table :data="online.missions" size="small">
           <el-table-column prop="mission_id" label="战局 ID" width="100" />
-          <el-table-column prop="preset" label="预设" min-width="120" />
+          <el-table-column label="模式" min-width="120">
+            <template #default="{ row }">
+              {{ row.mode_name || `预设 #${row.preset ?? '-'}` }}
+            </template>
+          </el-table-column>
+          <el-table-column label="地图" min-width="120">
+            <template #default="{ row }">{{ row.map_name || '-' }}</template>
+          </el-table-column>
           <el-table-column label="攻/守阵营" width="110">
             <template #default="{ row }">
               {{ factionName(row.attacker_faction) }} / {{ factionName(row.defender_faction) }}
             </template>
           </el-table-column>
+          <el-table-column label="主机" width="110">
+            <template #default="{ row }">
+              {{ row.host || '-' }}<span v-if="row.host && row.port" class="host-port">:{{ row.port }}</span>
+            </template>
+          </el-table-column>
           <el-table-column label="参战玩家" min-width="220">
             <template #default="{ row }">
               <span v-for="p in row.players" :key="p.gamertag" class="mission-player">
-                {{ p.gamertag }}（{{ factionName(p.faction) }}）
+                <RouterLink v-if="p.player_id" :to="`/players/${p.player_id}`" class="player-link">
+                  {{ p.gamertag }}
+                </RouterLink>
+                <span v-else>{{ p.gamertag }}</span>（{{ factionName(p.faction) }}）
               </span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+      <template v-if="online?.combat_hosts?.length">
+        <div style="font-weight: 700; margin: 16px 0 8px">战斗服主机</div>
+        <el-table :data="online.combat_hosts" size="small">
+          <el-table-column prop="name" label="主机" width="120" />
+          <el-table-column prop="addr" label="地址" min-width="130" />
+          <el-table-column label="运行 / 容量" width="110">
+            <template #default="{ row }">
+              {{ row.running }} / {{ row.max || '∞' }}
+            </template>
+          </el-table-column>
+          <el-table-column label="Agent" min-width="180">
+            <template #default="{ row }">
+              <el-tag v-if="!row.agent" type="info" size="small">本机直接启动</el-tag>
+              <el-tag v-else :type="row.agent_up ? 'success' : 'danger'" size="small">
+                {{ row.agent_up ? '正常' : '冷却中（拉起失败）' }}
+              </el-tag>
             </template>
           </el-table-column>
         </el-table>
@@ -174,7 +229,13 @@ const maxCount = () =>
       <div style="font-weight: 700; margin-bottom: 12px">最近注册玩家</div>
       <el-table :data="data?.recent_players ?? []" size="small">
         <el-table-column prop="id" label="ID" width="80" />
-        <el-table-column prop="username" label="用户名" min-width="160" />
+        <el-table-column label="用户名" min-width="160">
+          <template #default="{ row }">
+            <RouterLink :to="`/players/${row.id}`" class="player-link">
+              {{ row.username }}
+            </RouterLink>
+          </template>
+        </el-table-column>
         <el-table-column label="注册时间" min-width="170">
           <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
         </el-table-column>
@@ -188,10 +249,25 @@ const maxCount = () =>
   color: #a7c070;
 }
 
+.player-link {
+  color: #c9b96a;
+  text-decoration: none;
+  font-weight: 600;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+
 .mission-player {
   display: inline-block;
   margin: 0 8px 2px 0;
   white-space: nowrap;
+}
+
+.host-port {
+  color: #7a7561;
+  font-size: 12px;
 }
 
 .chart {

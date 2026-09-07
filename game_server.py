@@ -466,7 +466,11 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             #   按启动顺序 FIFO 认领最早未握手实例，取其 preset/地图/阵营，
             #   否则回退默认 preset=10(Mill) → 专用服加载错图 + inst['ready']
             #   永不置位 → 120s 握手超时 → 客户端卡匹配 UI。
-            claimed = combat_instances.claim_pending_combat_instance()
+            #   多机部署：按来源 IP 只在该机（combat_hosts addr/public_addr/
+            #   agent 主机名匹配）的待认领实例中 FIFO——不同机实例握手到达
+            #   顺序 ≠ 启动顺序，全局 FIFO 会错配地图。
+            claimed = combat_instances.claim_pending_combat_instance(
+                getattr(sess, 'remote_ip', None))
             if claimed:
                 missionid = claimed
                 det = mm_state._MM_MISSION_DETAILS.get(missionid)

@@ -49,6 +49,7 @@ from state import PUBLIC_HOST, STORE, log
 
 from matchmaking import (
     AI_MISSIONPRESET,
+    _game_connect_for,
     _msg_solo_squad_member_session,
     _msg_solo_squad_session,
     _push_kvcs,
@@ -66,7 +67,7 @@ from mm_state import (
     _MM_QUEUES,
     _SOLO_SQUADS,
     )
-from combat_instances import release_match
+from combat_instances import COMBAT_INSTANCES, release_match
 from mm_factions import FACTION_ROW_IDS
 from mm_weather import WEATHER_PRESETS
 
@@ -273,16 +274,22 @@ async def handle_join_mission(sess, writer, cmd_id, req_type, proto):
         if live is not None:
             session_id = int(live['pms_id'])
 
+    # 多机部署：实例存活 → 该机对外地址:实际端口；无实例（战局未开/已
+    # 结束）回退 legacy 常量（客户端随后的 PMS Admitted 推送才真正驱动
+    # 进战斗，此响应值仅作占位回显）
+    inst = COMBAT_INSTANCES.get(int(mission_id)) if mission_id else None
+    game_connect = (_game_connect_for(inst) if inst is not None
+                    else _GAME_CONNECT)
     resp_proto = pb_int32(1, RC_OK)
     resp_proto += pb_int64(2, mission_id)
     resp_proto += pb_int64(3, session_id)
-    resp_proto += pb_string(4, _GAME_CONNECT)
+    resp_proto += pb_string(4, game_connect)
 
     resp = build_response(cmd_id, 'JoinMissionResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} JoinMissionResponse (response=1, '
-        f'mission={mission_id}, session={session_id}, connect={_GAME_CONNECT})')
+        f'mission={mission_id}, session={session_id}, connect={game_connect})')
 
 
 async def handle_cancel_join_mission(sess, writer, cmd_id, req_type, proto):

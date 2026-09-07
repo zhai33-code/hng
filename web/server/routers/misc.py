@@ -8,7 +8,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .. import auth, db
+from .. import auth, db, wardb_meta
 from ..services import audit_svc, battles_svc, status_svc
 from . import api_errors
 
@@ -63,10 +63,16 @@ async def online():
     """实时在线统计：转发游戏服 web_server 的 /online.json。
 
     数据源是游戏服进程内存（FLASH_SESSIONS + 匹配/战局注册表），
-    零延迟无落库；游戏服不可达 / 未更新到含 /online.json 的版本 → 502。"""
+    零延迟无落库；游戏服不可达 / 未更新到含 /online.json 的版本 → 502。
+    转发时把战局 preset id 补成官方模式/地图名（与战报页同源
+    wardb_meta.preset_info，游戏服快照保持纯数字不动）。"""
     data = await asyncio.to_thread(status_svc.fetch_online_snapshot)
     if data is None:
         raise HTTPException(502, '游戏服在线统计不可达（服务未启动或版本过旧）')
+    for m in data.get('missions', []):
+        info = wardb_meta.preset_info(int(m.get('preset') or 0))
+        m['mode_name'] = info['mode_name']
+        m['map_name'] = info['map']
     return data
 
 

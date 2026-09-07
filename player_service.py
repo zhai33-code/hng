@@ -399,6 +399,7 @@ async def _msg_player_for(sess, gamertag=None):
     war = None
     total_score = 0
     first_action_date = ''
+    unlock_ids = ()
     pid = await sess.ensure_player()
     if pid is not None:
         try:
@@ -437,12 +438,20 @@ async def _msg_player_for(sess, gamertag=None):
             total_score = await STORE.get_total_score(pid)
         except Exception as e:
             log(f'[DB] totalScore sum failed: {e}')
+        # ★ f37 unlockBits 补充位：player_unlocks 永久解锁（通行证奖励的
+        #   progressionUnlock，如面部迷彩 2387-2395）。等级推导只覆盖
+        #   PlayerLevelUnlock id 1-40，这些 id 不并入则外观窗口恒未解锁
+        try:
+            unlock_ids = await STORE.get_player_unlock_ids(pid)
+        except Exception as e:
+            log(f'[DB] get_player_unlock_ids failed: {e}')
+            unlock_ids = ()
     return msg_player(gamertag or sess.username or 'DemoPlayer',
                       tutorials_completed=tutorials_completed,
                       pid=pid or 1, faction=faction, total_score=total_score,
                       first_action_date=first_action_date,
                       war=war['id'] if war is not None else 0,
-                      **cur)
+                      unlock_ids=unlock_ids, **cur)
 
 
 

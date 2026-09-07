@@ -17,11 +17,13 @@ import mm_state
 from state import FLASH_SESSIONS, PUBLIC_HOST, STORE, log
 from wardb import _rank_from_combat_xp
 
+from combat_instances import COMBAT_INSTANCES
 from .combat import (
     _ack_error, _as_str, _all, _get, _session_by_msid, _split_fields,
 )
 
 # 与 matchmaking 成局 game_connect 同源（PUBLIC_HOST；mission.py _GAME_CONNECT）
+# 实例无存活的回退占位值；实例存活时用其所在主机对外地址:实际端口
 _GAME_CONNECT = f'{PUBLIC_HOST}:5678'
 
 
@@ -122,10 +124,14 @@ async def _push_pms_admitted(sess, writer, mm_sess):
                 rank = _rank_from_combat_xp(int(ch.get('combat_xp', 0) or 0))
         except Exception as e:
             log(f'      [DB] get_character for PMS push failed: {e}')
+    # 多机部署：实例存活 → 该机对外地址:实际端口（与成局/迟到加入推送同源）
+    inst = COMBAT_INSTANCES.get(int(mission_id))
+    game_connect = (matchmaking._game_connect_for(inst)
+                    if inst is not None else _GAME_CONNECT)
     try:
         msg = matchmaking._msg_player_mission_session(
             pms_id, pid, gamertag, char_id, faction, char_name, rank,
-            mission_id, matchmaking._zulu_now(), _GAME_CONNECT,
+            mission_id, matchmaking._zulu_now(), game_connect,
             metrics_uid=mm_sess.get('metrics_uid', ''),
             metrics_session_id=int(mm_sess.get('metrics_session_id', 0) or 0),
             metrics_device_id=mm_state.METRICS_DEVICE_ID,

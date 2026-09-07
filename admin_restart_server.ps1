@@ -16,9 +16,13 @@ foreach ($hng_p in $hng_pids) {
 }
 Start-Sleep -Seconds 2
 
-# 2. 启动新服务器（stdout 不重定向 → 服务器窗口实时显示日志；文件日志由 state.py 写 realtest_game.log）
+# 2. 启动新服务器（stdout 不重定向 → 服务器窗口实时显示日志；文件日志由 state.py 写 logs\realtest_game.log）
+#    日志统一收进 logs\ 目录；旧版散落在包目录的 stderr 在此迁移（此刻旧进程已停、句柄已释放）
 $hng_server_py = Join-Path $hng_root 'realtest_server.py'
-$hng_stderr = Join-Path $hng_root 'realtest_stderr.log'
+$hng_logs = Join-Path $hng_root 'logs'
+New-Item -ItemType Directory -Force -Path $hng_logs | Out-Null
+Move-Item (Join-Path $hng_root 'realtest_stderr.log') $hng_logs -ErrorAction SilentlyContinue
+$hng_stderr = Join-Path $hng_logs 'realtest_stderr.log'
 Start-Process -FilePath $hng_py `
     -ArgumentList "-u `"$hng_server_py`"" `
     -WindowStyle Normal `

@@ -91,10 +91,10 @@ else:
     WARDDB_DIR = os.path.join(GAME_DIR, 'WarDatabase')
 
 # texts 语言文件目录（hngsync desktop_client 清单/CAS 推送源）：
-# 与 WARDDB_DIR 同源逻辑——combat-server 副本优先（服务器权威版本）。
-# 注意区分：HTTP /HnG_Strategy_en.xml 路由仍读 GAME_DIR\texts（客户端侧
-# 副本，_localization_body）。更新流验证：清单哈希取 combat-server 版 →
-# 客户端本地旧文件哈希不匹配 → hngsync 下载新版写回客户端本地。
+# 与 WARDDB_DIR 同源逻辑——combat-server 副本优先（服务器权威版本，
+# 含固化的 battleye_*/ErrorMessages 补充 key）。HTTP /HnG_Strategy_<lang>.xml
+# 路由与此同源；更新流验证：清单哈希取 combat-server 版 → 客户端本地旧文件
+# 哈希不匹配 → hngsync 下载新版写回客户端本地。
 if os.path.isdir(os.path.join(GAME_DIR, 'combat-server', 'texts')):
     TEXTS_DIR = os.path.join(GAME_DIR, 'combat-server', 'texts')
 else:
@@ -164,8 +164,39 @@ FLASH_SESSIONS = {}
 # （handlers/ban.py，NOTIFY hng_ban_player）按 player_id/username 匹配。
 TCP_SESSIONS = []
 
+# 主 asyncio loop（main() 启动时赋值）。HTTP 线程经它把协程投递回主 loop
+# 执行（web_server._MAIN_LOOP 同源；combat_hosts.refresh_hosts_soon 也走它）。
+MAIN_LOOP = None
 
-LOG_FILE = os.path.join(_PKG_DIR, 'realtest_game.log')
+
+# 日志统一目录（2026-09-08）：此前散落在包目录（realtest_game.log /
+# requests.log / realtest_stderr.log / web\admin_*.log），现全部集中
+# server/logs/。历史文件由 _adopt_legacy_logs 启动时自动收拢；stderr /
+# admin 日志由启动脚本迁移（Python 进程启动瞬间句柄已在，这里迁不动）。
+LOG_DIR = os.path.join(_PKG_DIR, 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def _adopt_legacy_logs():
+    """把包目录下散落的旧日志一次性迁入 LOG_DIR。
+
+    目标已存在时跳过（保留新位置版本）；源被其他进程占用（Windows
+    跨进程句柄）时静默跳过，留待下次启动再迁。"""
+    import glob
+    for pattern in ('realtest_game.log*', 'requests.log'):
+        for src in glob.glob(os.path.join(_PKG_DIR, pattern)):
+            dst = os.path.join(LOG_DIR, os.path.basename(src))
+            if os.path.exists(dst):
+                continue
+            try:
+                os.replace(src, dst)
+            except OSError:
+                pass
+
+
+_adopt_legacy_logs()
+
+LOG_FILE = os.path.join(LOG_DIR, 'realtest_game.log')
 
 
 def _env_int(name, default, minimum=1):
@@ -188,17 +219,24 @@ def _date_tag(t=None):
 
 def _rotate_daily(fh, path, today):
     """按天滚动：当前文件 mtime 不是今天 → 改名为带日期的历史文件，
-    重开新句柄继续写。返回新句柄；任何 OSError 吞掉（不影响主流程）。"""
+    重开新句柄继续写。返回新句柄；任何 OSError 吞掉（不影响主流程）。
+
+    2026-09-08：Windows 上 CPython open() 句柄不含 FILE_SHARE_DELETE，
+    句柄开着时 os.replace 必报 WinError 32——旧实现先 replace 后 close，
+    每天跨天滚动都被静默吞掉，日志从不拆分。必须先 close 再 rename。"""
     try:
         if os.path.exists(path):
             mtime_tag = _date_tag(os.path.getmtime(path))
             if mtime_tag == today:
                 return fh                  # 还在今天，不滚
-            os.replace(path, f'{path}.{mtime_tag}.log')
-        try:
-            fh.close()
-        except OSError:
-            pass
+            try:
+                fh.close()                 # 先关句柄，Windows 才允许改名
+            except OSError:
+                pass
+            try:
+                os.replace(path, f'{path}.{mtime_tag}.log')
+            except OSError:
+                pass                       # 仍被其他进程占用：放弃滚动，继续写原文件
         return open(path, 'a', encoding='utf-8', buffering=1)
     except OSError:
         return fh

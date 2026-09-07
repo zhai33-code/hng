@@ -234,6 +234,30 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (warmap snapshot: '
             f'{len(snapshot)} rows / {n_tables} tables) ★warmapview fill')
 
+    # 客户端 ServiceHandler.PLAYER_MISSION_VIEW 请求名带 Request 后缀
+    # （"SubscribePlayerMissionViewRequest"，其余 subscribe* 均不带），两种都收
+    if req_type.lower() in ('subscribeplayermissionview',
+                            'subscribeplayermissionviewrequest'):
+        # 掉线/崩溃重登 rejoin：玩家仍在存活战局 → 重推该局
+        # PlayerMissionSession 行（同 pms id，state=3）+ BattleInfo，
+        # 客户端 StatusMediator 据此回 REJOIN 态显示"恢复战斗"按钮
+        # （点击重拉 hng.exe 回原局）；无存活战局时不推（正常登录）。
+        # ★ 必须在本订阅推、不能在 subscribeplayerview 推（2026-09-08
+        # remote-log 实锤）：客户端 ActionGameService.onPlayerMissionSessionChanges
+        # 对 loggedIn==false 期间到达的行整段丢弃（playerMissionSessionId
+        # 不设置），而 loggedIn 要到 login2_postlogin_result 成功才置 true。
+        # 登录请求顺序 = subscribeplayerview → login2_postlogin →
+        # subscribesoldierview → subscribeplayermissionview，故 PMS 行只有
+        # 在本订阅（postlogin 之后）推才会被采纳；且若先在 playerview 推过
+        # 同 id 行（表已收录、被丢弃），此处再推会命中 UPDATE 分支同样不
+        # 设置 playerMissionSessionId——所以 playerview 处绝不能再推。
+        try:
+            pid = await sess.ensure_player()
+            if pid is not None:
+                await push_relogin_rejoin(writer, cmd_id, int(pid))
+        except Exception as e:
+            log(f'      [views] relogin rejoin push failed: {e}')
+
     # 跟踪 PLAYER_VIEW 的 cmd_id，用于购买后推送 player 更新
     if req_type.lower() == 'subscribeplayerview':
         sess.playerview_cmd = cmd_id
@@ -285,14 +309,6 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
                     squad = None
                 if squad is not None:
                     await push_squad_rows(sess, writer, squad['id'])
-            # 掉线/崩溃重登 rejoin：玩家仍在存活战局 → 重推该局
-            # PlayerMissionSession 行（同 pms id，state=3）+ BattleInfo，
-            # 客户端 StatusMediator 据此回 REJOIN 态显示"恢复战斗"按钮
-            # （点击重拉 hng.exe 回原局）；无存活战局时不推（正常登录）。
-            try:
-                await push_relogin_rejoin(writer, cmd_id, int(pid))
-            except Exception as e:
-                log(f'      [views] relogin rejoin push failed: {e}')
             # 经济道具行（PlayerMembershipItem / Booster / Ticket / TicketTimed）：
             # 会员/加成/修理票 UI 数据源，不推则购买记录重启后丢失。
             await push_economy_rows(sess, writer, int(pid))

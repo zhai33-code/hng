@@ -11,8 +11,13 @@ if (-not (Test-Path $hng_py)) { $hng_py = 'python' }
 # 日志查看（相当于 tail -f，随时开新窗口看，不影响服务）：
 #   Get-Content -Wait <日志文件>
 $log_stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$hng_stdout = Join-Path $web_dir "admin_stdout_$log_stamp.log"
-$hng_stderr = Join-Path $web_dir "admin_stderr_$log_stamp.log"
+# logs centralized under server\logs (2026-09-08); migrate old ones from web dir
+$hng_logs = Join-Path $repo_root 'logs'
+New-Item -ItemType Directory -Force -Path $hng_logs | Out-Null
+Get-ChildItem -Path $web_dir -Filter 'admin_*.log' -File -ErrorAction SilentlyContinue |
+    Move-Item -Destination $hng_logs -Force -ErrorAction SilentlyContinue
+$hng_stdout = Join-Path $hng_logs "admin_stdout_$log_stamp.log"
+$hng_stderr = Join-Path $hng_logs "admin_stderr_$log_stamp.log"
 Start-Process -FilePath $hng_py -ArgumentList "-m server.main" `
     -WorkingDirectory $web_dir `
     -WindowStyle Hidden `

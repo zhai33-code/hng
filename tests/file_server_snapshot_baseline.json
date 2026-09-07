@@ -1,5 +1,5 @@
 {
-  "game_dir": "D:\\HnG-test",
+  "game_dir": "d:\\HnG-test",
   "note": "web_server 重构基线，生成后勿手工编辑；内容变化需先确认来源（改表/加 cas 文件属正常变化）再 --update",
   "public_host": "127.0.0.1",
   "subjects": {
@@ -1043,9 +1043,9 @@
           7375
         ],
         [
-          "64f78f0c79982e82469713f7d6f5263bc311a73866d8d3139e00a59123b3e8b4-9319_0",
-          "64f78f0c79982e82469713f7d6f5263bc311a73866d8d3139e00a59123b3e8b4",
-          9319
+          "5062e89a35b19ee2d9ed90a1ed9b89132a4f10b2db293113c6b730eef2592c18-1632_0",
+          "5062e89a35b19ee2d9ed90a1ed9b89132a4f10b2db293113c6b730eef2592c18",
+          1632
         ],
         [
           "a6cb8bf399d35d02946d842b74759339d6cdd64e85cadae2693b7220343dc458-20589_0",
@@ -1058,106 +1058,106 @@
           83
         ],
         [
-          "e3237437bac22516f604aa66fec5a5381c3c485f360c0df0e7e52c19fbbec17c-1632_0",
-          "e3237437bac22516f604aa66fec5a5381c3c485f360c0df0e7e52c19fbbec17c",
-          1632
+          "c2bd062af5a772d61b060045b244dd533ca7c76695d21c5d84e83a8de392fa7d-9319_0",
+          "c2bd062af5a772d61b060045b244dd533ca7c76695d21c5d84e83a8de392fa7d",
+          9319
         ]
       ],
       "kind": "map"
     },
     "SETTINGS_JS": {
       "kind": "bytes",
-      "sha256": "10082a16bb5b26539c138136946a394489f322b5d3c9a10a634f132b7b528555",
-      "size": 791
+      "sha256": "2575a30c8165d262133c6ec5dd643242ccd30f92c2bb8a0aa6c4a086e1296878",
+      "size": 788
     },
     "TEXTS_CAS_MAP": {
       "entries": 12,
       "items": [
         [
-          "17dafe2e43346fd8a6425b52d0abc5c361a8b855d44c0cab1d2732a0e0d270fe-1163633_0",
-          "17dafe2e43346fd8a6425b52d0abc5c361a8b855d44c0cab1d2732a0e0d270fe",
-          1163633
+          "32c5776c82c53f435825b1d14de8d05b337e5bde560590c5e9bd56f84637e57b-1200258_0",
+          "32c5776c82c53f435825b1d14de8d05b337e5bde560590c5e9bd56f84637e57b",
+          1200258
         ],
         [
-          "34b5c4fb1841c1e174c8047a113cc061b256b8e0b31f918baf2e79022b68de93-1179903_0",
-          "34b5c4fb1841c1e174c8047a113cc061b256b8e0b31f918baf2e79022b68de93",
-          1179903
+          "3f8b439974a6861b04c6f478ed7dbb39f730aad823c5a398505dda0f01a0a6f2-1199279_0",
+          "3f8b439974a6861b04c6f478ed7dbb39f730aad823c5a398505dda0f01a0a6f2",
+          1199279
         ],
         [
-          "36bfb81b1279a9002734c47ec1f4af0e9edba7b41d3b7c3881cd02eac8e9a607-1194305_0",
-          "36bfb81b1279a9002734c47ec1f4af0e9edba7b41d3b7c3881cd02eac8e9a607",
-          1194305
+          "62b4ae8e9454866337b24a5cec1bd4ac72e50acb030f052d6948989441db3483-1175167_0",
+          "62b4ae8e9454866337b24a5cec1bd4ac72e50acb030f052d6948989441db3483",
+          1175167
         ],
         [
-          "3bf97ad69f7b1f67ce23b5243459b0c24a9d5e802058e4077517e510edfef79b-1189485_0",
-          "3bf97ad69f7b1f67ce23b5243459b0c24a9d5e802058e4077517e510edfef79b",
-          1189485
+          "77ca60cab4463736fdc8cc7f2259150875f20c3377e63b4e5678072b7bb34a61-1205195_0",
+          "77ca60cab4463736fdc8cc7f2259150875f20c3377e63b4e5678072b7bb34a61",
+          1205195
         ],
         [
-          "7394740de5378bbb7d43f505dcc88a7bef5038a90d587e0c4cce8ee1781ccd83-1201325_0",
-          "7394740de5378bbb7d43f505dcc88a7bef5038a90d587e0c4cce8ee1781ccd83",
-          1201325
+          "8d58a6f0fe73b124adbda88934bfd5d7293fc28e27bbd93f1f5f477868178f54-1208997_0",
+          "8d58a6f0fe73b124adbda88934bfd5d7293fc28e27bbd93f1f5f477868178f54",
+          1208997
         ],
         [
-          "9689be9bc45e59592379c9b1bb894a6538cea9157ff34b122ce73f7536747f87-1184982_0",
-          "9689be9bc45e59592379c9b1bb894a6538cea9157ff34b122ce73f7536747f87",
-          1184982
+          "aabfd1dea8920b7bc612b928b8f4579b14ae27e29104e13b9cc85af9912c1dc1-1190296_0",
+          "aabfd1dea8920b7bc612b928b8f4579b14ae27e29104e13b9cc85af9912c1dc1",
+          1190296
         ],
         [
-          "bd731292fbef5892c3229307e3f0dfef2d100481957e8c95b9f195a1b39aebae-1531845_0",
-          "bd731292fbef5892c3229307e3f0dfef2d100481957e8c95b9f195a1b39aebae",
-          1531845
+          "bbf9f619349d9e15c2526c46df815f71f4dfe9175efbbd2772df58d834ada9ae-1195603_0",
+          "bbf9f619349d9e15c2526c46df815f71f4dfe9175efbbd2772df58d834ada9ae",
+          1195603
         ],
         [
-          "cb6df06d6ae891c9a0cec6149451dbd6b12004487d41541dcd2451bb1029b5c8-1250242_0",
-          "cb6df06d6ae891c9a0cec6149451dbd6b12004487d41541dcd2451bb1029b5c8",
-          1250242
+          "cb967df1e444dc005e336112e18aee201c8fad60954496e87851b5514effb134-1194649_0",
+          "cb967df1e444dc005e336112e18aee201c8fad60954496e87851b5514effb134",
+          1194649
         ],
         [
-          "d29cd372651f865ba11168bc81c4e75a68edb5194d0aabfe7ee588e4d3253982-1198070_0",
-          "d29cd372651f865ba11168bc81c4e75a68edb5194d0aabfe7ee588e4d3253982",
-          1198070
+          "cc8209da5754806bafae6976f9a6dad2a74be59d959ce20c63ac072fd303ce20-1212284_0",
+          "cc8209da5754806bafae6976f9a6dad2a74be59d959ce20c63ac072fd303ce20",
+          1212284
         ],
         [
-          "f71e92304b450ee14bfeb7976b0f5f300e2a240812eb27f25dcef19a1b113c17-1077096_0",
-          "f71e92304b450ee14bfeb7976b0f5f300e2a240812eb27f25dcef19a1b113c17",
-          1077096
+          "d8cc49b995fc117a2e00fd1aaf59b863bfae691016bbb8333c4acc51b17ea9e9-1546446_0",
+          "d8cc49b995fc117a2e00fd1aaf59b863bfae691016bbb8333c4acc51b17ea9e9",
+          1546446
         ],
         [
-          "f9d4b65f8856ed43f38e8506bdc783db9b1dc540917dcaa0eb50ba3356a7c388-1182722_0",
-          "f9d4b65f8856ed43f38e8506bdc783db9b1dc540917dcaa0eb50ba3356a7c388",
-          1182722
+          "defd98c47698a3122ee6abcee12b9d7b690011e25539fc49a40084a012707502-1263986_0",
+          "defd98c47698a3122ee6abcee12b9d7b690011e25539fc49a40084a012707502",
+          1263986
         ],
         [
-          "f9e5ceba7d78aa11f634afae935ae21dd0fa7011a82cf9963252de2d62c08777-1188474_0",
-          "f9e5ceba7d78aa11f634afae935ae21dd0fa7011a82cf9963252de2d62c08777",
-          1188474
+          "f299c96c6e3a7e90b603a61139949da2b67d22bb90751527f9a15cffbb671c7d-1086301_0",
+          "f299c96c6e3a7e90b603a61139949da2b67d22bb90751527f9a15cffbb671c7d",
+          1086301
         ]
       ],
       "kind": "map"
     },
     "UNIQUE_FILE_XML": {
       "kind": "bytes",
-      "sha256": "e3237437bac22516f604aa66fec5a5381c3c485f360c0df0e7e52c19fbbec17c",
+      "sha256": "5062e89a35b19ee2d9ed90a1ed9b89132a4f10b2db293113c6b730eef2592c18",
       "size": 1632
     },
     "UNIQUE_FILE_XML_BZ2": {
       "kind": "bytes",
-      "sha256": "d2621c807f2d83ef9fb976e5a988585b5f9340af297553184cdfba6feb3e8391",
-      "size": 600
+      "sha256": "3c064a8c7b1020f14ab3e4c7593d0322f2f8b6cbbf5758462be05aa7a5447798",
+      "size": 594
     },
     "UNIQUE_VERSION_FILENAME": {
       "kind": "str",
-      "value": "e3237437bac22516f604aa66fec5a5381c3c485f360c0df0e7e52c19fbbec17c-1632_0"
+      "value": "5062e89a35b19ee2d9ed90a1ed9b89132a4f10b2db293113c6b730eef2592c18-1632_0"
     },
     "WARDB_SYNC_BZ2": {
       "kind": "bytes",
-      "sha256": "651d70c1933fb19d0e3581d1a0a110144c1818117ed59a28f3e47e77bbeb6bf1",
-      "size": 4708
+      "sha256": "10b532a4b33275d9b01557ea4f27e58b6b24acd4ec3adddbad5937259c2de61d",
+      "size": 4711
     },
     "WARDB_SYNC_FULL": {
       "kind": "bytes",
-      "sha256": "64f78f0c79982e82469713f7d6f5263bc311a73866d8d3139e00a59123b3e8b4",
+      "sha256": "c2bd062af5a772d61b060045b244dd533ca7c76695d21c5d84e83a8de392fa7d",
       "size": 9319
     },
     "WARDB_UNIQUE_BZ2": {

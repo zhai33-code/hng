@@ -269,12 +269,14 @@ class ForeignClient:
         self.log('登录成功')
         self.record('event', msg='login_success')
 
-    async def subscribe(self):
+    async def subscribe(self, timeout=60):
+        # 订阅超时给足（外服高峰期 login2 握手快但订阅推送可能滞后很久，
+        # 30s 会误杀——2026-09-07 china... 导入 502 事故）
         await self.send(CMD['playerview'], 'subscribeplayerview')
-        await self.read_until('subscriberesponse')
+        await self.read_until('subscriberesponse', timeout=timeout)
         self.log('playerview 已订阅')
         await self.send(CMD['soldierview'], 'subscribesoldierview')
-        await self.read_until('subscriberesponse')
+        await self.read_until('subscriberesponse', timeout=timeout)
         self.log('soldierview 已订阅')
         self.record('event', msg='subscribed')
 

@@ -846,6 +846,17 @@ CREATE TABLE IF NOT EXISTS machine_bans (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_machine_bans_player ON machine_bans(banned_player_id);
+
+-- ===== 玩家永久解锁（player f37 位图源）=====
+-- 非 PlayerLevelUnlock 来源的永久解锁（通行证奖励 progressionUnlock，
+-- 如赛季1满级面部迷彩 2387-2395 eHeadSwap）。客户端 hasPlayerLevelUnlock
+-- 按 progressionUnlock.id 直接索引玩家 f37 位图，而等级推导只覆盖
+-- PlayerLevelUnlock 表 id 1-40——这些 id 不登记则外观窗口永远未解锁。
+CREATE TABLE IF NOT EXISTS player_unlocks (
+    player_id BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    unlock_id BIGINT NOT NULL,
+    PRIMARY KEY (player_id, unlock_id)
+);
 """
 
 

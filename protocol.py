@@ -326,7 +326,7 @@ def msg_login2_challenge(salt_b64, temp_sid_b64, enc_key_b64):
 
 def msg_player(gamertag, credits=None, warfunds=None, gold=None,
                tutorials_completed=0, pid=1, faction=None, total_score=0,
-               first_action_date='', level=None, war=None):
+               first_action_date='', level=None, war=None, unlock_ids=()):
     m = b''
     # 货币默认与数据库新账号默认值一致（新账号给默认货币）
     if credits is None:
@@ -392,13 +392,16 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     if level is None:
         from wardb import player_level_from_score
         level = player_level_from_score(int(total_score or 0))
-    # unlockBits (field 37): repeated bool, 位索引 = PlayerLevelUnlock.id。
+    # unlockBits (field 37): repeated bool, 位索引 = 解锁条目 id。
     # 客户端 hasPlayerLevelUnlock 用它门控 War 模式（eWar lv10）/匹配模式
     # （eMissionType）/武器组等——必须按等级置位，全 true 会让低级玩家
     # 也解锁全部模式（进展限制失效）；兵种模板位按等级置位（将军 lv12，
-    # 客户端士兵栏不生成将军 fake 卡，仅 SoldierShop 页签解锁）
+    # 客户端士兵栏不生成将军 fake 卡，仅 SoldierShop 页签解锁）。
+    # unlock_ids：player_unlocks 永久解锁（通行证面部迷彩 2387-2395 等，
+    # 按 progressionUnlock id 索引位图，等级推导不含这些 id）
     from wardb import player_unlock_bits_for_level
-    m += pb_packed_bool(37, player_unlock_bits_for_level(int(level)))
+    m += pb_packed_bool(37, player_unlock_bits_for_level(int(level),
+                                                         unlock_ids))
     m += pb_int32(38, int(level))     # level
     m += pb_varint(40, 0)               # isDeleted (required bool=false)
     m += pb_string(41, 'EUR')          # currencyCode

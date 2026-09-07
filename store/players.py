@@ -85,6 +85,26 @@ class PlayersMixin:
                 'ON CONFLICT DO NOTHING',
                 character_id, player_id, [int(u) for u in uids])
 
+    async def get_player_unlock_ids(self, player_id):
+        """返回玩家永久解锁 uid 集合（player_unlocks 行表，player f37 位图源）。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT unlock_id FROM player_unlocks WHERE player_id = $1',
+                player_id)
+        return {int(r['unlock_id']) for r in rows}
+
+    async def add_player_unlocks(self, player_id, uids):
+        """追加玩家永久解锁 uid（progressionUnlock.id，通行证奖励等非等级
+        来源），幂等。"""
+        if not uids:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'INSERT INTO player_unlocks (player_id, unlock_id) '
+                'SELECT $1, x FROM unnest($2::bigint[]) AS x '
+                'ON CONFLICT DO NOTHING',
+                int(player_id), [int(u) for u in uids])
+
     async def get_combat_xp(self, player_id, character_id):
         """返回角色战斗经验（characters.combat_xp），未找到返回 0。"""
         async with self.pool.acquire() as conn:
