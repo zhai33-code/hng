@@ -94,11 +94,12 @@ _TPLS = {
           'general_character_template_id': 0, 'level': 1,
           'attackradius': 1850, 'transportradius': 3600, 'actionid': 13,
           'convert_to': 507, 'speed': 2.7},
-    # 507 伞兵落地变体（半径 -1=无限 → 非 radius 单位，地面速度）
-    507: {'id': 507, 'name': 'Paratroopers On Ground', 'faction': 1,
+    # 507 伞兵落地变体（半径 -1=无限 → 非 radius 单位，地面速度；
+    # 真实表 paratroopers_on_ground f11 convertTo 指回原型 108）
+    507: {'id': 507, 'name': 'paratroopers_on_ground', 'faction': 1,
           'resources': {1: 16}, 'vehicle_cats': set(), 'size': 2,
           'general_character_template_id': 0, 'level': 1,
-          'attackradius': -1, 'transportradius': -1, 'convert_to': 0,
+          'attackradius': -1, 'transportradius': -1, 'convert_to': 506,
           'speed': 0.48},
 }
 
@@ -1010,7 +1011,9 @@ async def section_d():
           f.get(1) == war_campaign.RC_DEPLOY_LOCATION_NOT_FOUND
           and not st.ats[500]['is_deployed'], str(f))
 
-    # D2d 周边无非交战己方城（11 中立）→ 221
+    # D2d 周边无己方非交战城（11 中立）→ 落主城（2026-09-08 修正：
+    # 官服开局仅首都 owned，周边全中立必须可部署——war1「就近原则」
+    # 是出生点分布池而非部署门槛）
     # （ensure_war 在 deploy 时才建 war：owners 须经 initial_city_owners 注入）
     st = _setup()
     _orig_ico = war_campaign.lifecycle.initial_city_owners
@@ -1018,17 +1021,17 @@ async def section_d():
     _mk_at(st, 500, template=501)
     w, f = await _deploy(500)
     war_campaign.lifecycle.initial_city_owners = _orig_ico
-    check('D2d 周边无己方非交战城 → 221 拒单',
-          f.get(1) == war_campaign.RC_DEPLOY_LOCATION_NOT_FOUND
-          and not st.ats[500]['is_deployed'], str(f))
+    check('D2d 周边中立 → 落主城部署成功',
+          f.get(1) == 1 and st.ats[500]['is_deployed'] is True
+          and st.ats[500]['map_entity_id'] == 10, str(f))
 
-    # D2e 唯一邻城交战 → 候选池仅剩主城（周边无非交战己方城）→ 221
+    # D2e 唯一邻城交战 → 候选池仅剩主城 → 落主城（同 D2d 修正）
     st = _setup()
     st.battles.append({'war_id': 1, 'battlefield_id': 11})
     _mk_at(st, 500, template=501)
     w, f = await _deploy(500)
-    check('D2e 唯一邻城交战 → 221 拒单',
-          f.get(1) == war_campaign.RC_DEPLOY_LOCATION_NOT_FOUND, str(f))
+    check('D2e 唯一邻城交战 → 落主城部署成功',
+          f.get(1) == 1 and st.ats[500]['map_entity_id'] == 10, str(f))
 
     # D3 重复部署 → 150（先成功部署一次）
     st = _setup()
@@ -1343,6 +1346,30 @@ async def section_r():
     await war_at._push_at_delete(FakeSess(), w, st.ats[521])
     check('R4c 解散 → airbase 删行',
           521 in _dels(w, 'air_commandnode_base'))
+
+    # R4d 落地变体撤退 → 转回伞兵原型（官服 convertTo 双向字段
+    # paratroopers_on_ground.f11=108 指回 paratroopers；war2.md
+    # 「伞兵机飞回」——待命=仓库，重新部署须恢复空降能力）
+    _mk_at(st, 522, template=507, deployed=True, map_entity_id=13)
+    w = FakeWriter()
+    await war_at.handle_retreat_command_node_request(
+        FakeSess(), w, 900, b'RetreatCommandNodeRequest', pb_int64(1, 522))
+    fr4 = _resp(w, 'RetreatCommandNodeResponse')
+    check('R4d 落地变体撤退 → template 转回 506 + Definition 行推送',
+          fr4.get(1) == 1 and st.ats[522]['template_id'] == 506
+          and not st.ats[522]['is_deployed']
+          and war_campaign.is_radius_unit(st.ats[522])
+          and _rows(w, 'CommandNodeDefinition'), str(fr4))
+
+    # R4e upgrade_allowed 不再放行落地变体（客户端 getUpgradeOption
+    # AS3 L37 显式排除 PARATROOPERS_ON_GROUND；原 convert_to 分支
+    # 曾放行伞兵→on_ground 步行变体 = 伞兵永远步行 bug 根因）
+    check('R4e 升级链：伞兵→落地变体拒 / parent 链放行 / 特例放行',
+          not war_campaign.upgrade_allowed(_TPLS[506], _TPLS[507])
+          and not war_campaign.upgrade_allowed(_TPLS[507], _TPLS[506])
+          and war_campaign.upgrade_allowed(_TPLS[501], _TPLS[503])
+          and not war_campaign.upgrade_allowed(_TPLS[503], _TPLS[501])
+          and not war_campaign.upgrade_allowed(_TPLS[501], _TPLS[501]))
 
 
 async def main():

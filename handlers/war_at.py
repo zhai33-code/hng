@@ -453,8 +453,24 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
             at, code = await _load_at(pid, node_id, war)
             if not code:
                 try:
-                    await STORE.update_command_node(
-                        at['id'], is_deployed=False, map_entity_id=0)
+                    # 落地变体转回原型（war2.md §伞兵「伞兵机飞回」+ 官服
+                    # convertTo 双向字段实锤 paratroopers_on_ground.f11=108
+                    # 指回 paratroopers）：待命=仓库，重新部署须为完整伞兵
+                    # 恢复空降能力；否则空降落地后永远步行
+                    tpl = commandnode_templates().get(
+                        int(at.get('template_id') or 0)) or {}
+                    rtpl = int(tpl.get('convert_to') or 0)
+                    if (str(tpl.get('name') or '').endswith('_on_ground')
+                            and rtpl
+                            and commandnode_templates().get(rtpl)):
+                        await STORE.update_command_node(
+                            at['id'], is_deployed=False, map_entity_id=0,
+                            template_id=rtpl)
+                        log(f'      [war] 落地变体撤退转回原型 '
+                            f'node={node_id} tpl={tpl.get("id")} -> {rtpl}')
+                    else:
+                        await STORE.update_command_node(
+                            at['id'], is_deployed=False, map_entity_id=0)
                     at = await STORE.get_command_node(at['id'])
                     log(f'      [war] AT 撤退 node={node_id} -> 待命')
                 except Exception as e:

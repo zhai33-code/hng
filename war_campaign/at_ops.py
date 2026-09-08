@@ -239,9 +239,13 @@ def dissolve_refund(tpl):
 
 
 def upgrade_allowed(cur_tpl, target_tpl):
-    """升级链校验（对齐客户端 AssaultTeamUpgradeOptions.getUpgradeOption）：
-    同阵营，且目标模板 parent_template_id == 当前模板 id（或当前模板
-    convert_to == 目标 id，两方向任一命中即官服升级关系）。
+    """升级链校验（对齐客户端 AssaultTeamUpgradeOptions.getUpgradeOption
+    AS3 L33-49 实锤）：同阵营 + 目标模板 parent_template_id == 当前模板 id
+    （升级选项 = 挂我为 parent 的下一级；**不是 convertTo**——f11 在官服
+    数据里是伞兵空降⇄落地变体互转字段，108⇄114/111⇄112，绝非升级路径，
+    2026-09-08 修正：原 convert_to 分支曾放行伞兵升级成 *_on_ground 步行
+    变体）+ 客户端显式排除落地变体（L37 locTemplateId ==
+    AT_TEMPLATE_PARATROOPERS_ON_GROUND）+ motorized_guard 特例。
 
     特例：motorized_guard → motorized_infantry 无 parent 链也合法
     （客户端 HnGGUIGameVariables 模板特例；wardb 三阵营同名，
@@ -253,9 +257,11 @@ def upgrade_allowed(cur_tpl, target_tpl):
         return False
     if int(cur_tpl.get('faction') or 0) != int(target_tpl.get('faction') or 0):
         return False
+    # 客户端排除落地变体（paratroopers_on_ground 114/214/314：
+    # name 后缀判定，与 AT_TEMPLATE_PARATROOPERS_ON_GROUND 同口径）
+    if str(target_tpl.get('name') or '').endswith('_on_ground'):
+        return False
     if int(target_tpl.get('parent_template_id') or 0) == cur_id:
-        return True
-    if int(cur_tpl.get('convert_to') or 0) == tgt:
         return True
     return (str(cur_tpl.get('name') or '') == 'motorized_guard'
             and str(target_tpl.get('name') or '') == 'motorized_infantry')
@@ -291,13 +297,14 @@ async def _battling_battlefields(store, war_id):
 
 
 async def resolve_deploy_battlefield(store, war, at, near_capital_bf=0):
-    """官服部署落位（§10.2 #4/#5）：主城非交战，且周边至少一座
-    非交战己方城市 → random.choice(主城 ∪ 周边非交战己方城)。
+    """官服部署落位（§10.2 #4/#5）：主城非交战 → random.choice(
+    主城 ∪ 周边非交战己方城)（war1.md「就近原则」= 出生点分布池，
+    非部署门槛——官服开局仅首都 owned，周边全中立必须可部署，
+    2026-09-08 修正：周边无己方城时 AT 落主城本身）。
 
     near_capital_bf（请求 f4 玩家所选首都）为本阵营首都时优先生效，
     否则回退阵营默认主城。返回 (battlefield, 0)=成功；失败
-    (0, 221)=主城交战/周边无己方非交战城（官服 deploy_location_not_
-    found）、(0, 7)=无主城。"""
+    (0, 221)=主城交战（官服 deploy_location_not_found）、(0, 7)=无主城。"""
     fac = int(at.get('faction') or 0)
     capital = int(near_capital_bf or 0)
     if capital not in faction_capital_bfs(fac):
@@ -322,9 +329,6 @@ async def resolve_deploy_battlefield(store, war, at, near_capital_bf=0):
         except (TypeError, ValueError):
             continue
         cands.append(nb)
-    if len(cands) < 2:
-        # 官服口径：周边须有一座非交战己方城市（含落位随机池来源）
-        return 0, RC_DEPLOY_LOCATION_NOT_FOUND
     if is_radius_unit(at):
         # §10.2 #7：飞机/伞兵（airborne）只出生在机场——候选池 ∩ 机场；
         # 空池回退距主城最近的机场（官服"主城附近的机场"口径，不查归属，
