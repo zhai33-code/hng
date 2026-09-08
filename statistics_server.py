@@ -331,6 +331,9 @@ async def wait_battle_usage(mission_id, timeout=3.0):
         if mission_id in _BATTLE_USAGE:
             return pop_battle_usage(mission_id)
         if loop.time() >= deadline:
+            # 超时只发生在有可结算角色的局（纯 bot 局不等待）→ 必然异常
+            log(f'[stats] battle usage wait timeout ({timeout}s) '
+                f'mission={mission_id} -- treat as no data')
             return None
         await asyncio.sleep(0.1)
 
