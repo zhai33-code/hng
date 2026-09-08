@@ -762,6 +762,30 @@ async def section_e():
           and (200, 200, 'war_battle 1 win') in st.funds_log,
           f'xp={st.ats[19]["xp"]} funds={st.funds_log}')
 
+    # E8：is_auto 系统判定（automission）不提供经验——battles/won/xp/rank
+    #     保持原值 + warfunds 不发放；编制损耗/士气/终态照常（war1.md）
+    st = _setup()
+    _mk_at(st, 9, owner=100, faction=1, state=2, rank=1, xp=400,
+           battles=7, battles_won=3, morale=100, resources={1: 100})
+    _mk_battle(st, 1, ats=[(9, 1)])
+    await war_campaign.settle_war_battle(st, 0, 1, 1, is_auto=True)
+    a = st.ats[9]
+    check('E8 系统判定不发经验（battles/xp/rank 原值 + 无 warfunds）',
+          a['battles'] == 7 and a['battles_won'] == 3 and a['xp'] == 400
+          and a['rank'] == 1 and st.funds_log == []
+          and a['morale'] == 100,        # 胜方 +moraleGainedPerWin 照常
+          f'b={a["battles"]} xp={a["xp"]} funds={st.funds_log}')
+    st = _setup()
+    _mk_at(st, 9, owner=100, faction=1, state=2, morale=100,
+           resources={1: 100}, battles=0, battles_won=0, xp=0)
+    _mk_battle(st, 1, ats=[(9, 1)])
+    await war_campaign.settle_war_battle(st, 0, 1, 2, is_auto=True)  # 败方
+    a = st.ats[9]
+    check('E8c is_auto 败方 morale 100→80 + 编制 100→40（60% 损耗）不涨经验',
+          a['morale'] == 80 and a['resources'] == {1: 40}
+          and a['battles'] == 0 and a['xp'] == 0 and st.funds_log == [],
+          f'morale={a["morale"]} res={a["resources"]}')
+
 
 # ------------------------------------------------------------- main
 

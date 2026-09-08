@@ -386,20 +386,30 @@ class EconomyMixin:
 
     async def activate_booster(self, player_id, booster_row_id, duration_minutes=240):
         """激活已购加成（ActivateBooster/ActivateVariousBoosterRequest）。
-        返回 ResponseCodes：1 ok / 208 booster_not_found / 209 already_activated。"""
+        返回 ResponseCodes：1 ok / 208 booster_not_found / 209 already_activated。
+        时长按行模板分表解析：勋带行查 RibbonBoosterTemplate、通用行查
+        BoosterTemplate（两表 id 有重叠但时长不同，如 #3001 勋带 2880min），
+        模板查不到回退 duration_minutes 参数。"""
+        # 循环依赖约定：wardb 延迟导入（上提会成 store→wardb→state→store 环，
+        # 见 store/__init__.py 头注释）
+        from wardb import BOOSTER_MINUTES_BY_ID, XP_BOOSTER_MINUTES_BY_ID
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                'SELECT id, activated_at FROM player_boosters '
+                'SELECT id, activated_at, booster_template_id, is_ribbon '
+                'FROM player_boosters '
                 'WHERE id = $1 AND player_id = $2',
                 int(booster_row_id), int(player_id))
             if row is None:
                 return 208
             if row['activated_at'] is not None:
                 return 209
+            minutes = ((BOOSTER_MINUTES_BY_ID if row['is_ribbon']
+                        else XP_BOOSTER_MINUTES_BY_ID).get(
+                            row['booster_template_id'], duration_minutes))
             await conn.execute(
                 'UPDATE player_boosters SET activated_at = now(), '
                 'expires_at = now() + make_interval(mins => $2) WHERE id = $1',
-                int(booster_row_id), int(duration_minutes))
+                int(booster_row_id), int(minutes))
         return 1
 
     async def add_ticket(self, player_id, template_id, is_timed=False,

@@ -201,11 +201,48 @@ def test_ms_str_epoch():
     check('None → "0"', economy._ms_str(None) == '0')
 
 
+def test_duration_from_template():
+    print('== 5. 购买/激活时长按模板表分表解析（Battle#3001 修复回归） ==')
+    import inspect
+    # 前提：模板时长数据（本机无 WarDatabase 时跳过数据对拍）
+    if wardb.BOOSTER_MINUTES_BY_ID:
+        check('Battle 勋带加成 #3001 官方时长 2880min（48h）',
+              wardb.BOOSTER_MINUTES_BY_ID.get(3001) == 2880,
+              f'got={wardb.BOOSTER_MINUTES_BY_ID.get(3001)}')
+        check('通用加成 #4 官方时长 60min（两表同 id 不同时长前提）',
+              wardb.XP_BOOSTER_MINUTES_BY_ID.get(4) == 60,
+              f'got={wardb.XP_BOOSTER_MINUTES_BY_ID.get(4)}')
+    else:
+        print('[SKIP] 本机无 WarDatabase，跳过模板时长对拍')
+    # 购买/签到入口：分表查时长（旧代码一律 240min → #3001 只发 1/12，
+    # 玩家买 48h 加成 4h 就没了，表现为"不生效"）
+    src = inspect.getsource(economy.handle_add_booster)
+    check('handle_add_booster（勋带购买）按 BOOSTER_MINUTES_BY_ID 发时长',
+          'BOOSTER_MINUTES_BY_ID.get' in src)
+    src = inspect.getsource(economy.handle_add_various_booster)
+    check('handle_add_various_booster（通用购买）按 XP_BOOSTER_MINUTES_BY_ID 发时长',
+          'XP_BOOSTER_MINUTES_BY_ID.get' in src)
+    src = inspect.getsource(economy._grant_daily_reward)
+    check('_grant_daily_reward（签到随机勋带加成）按模板表发时长',
+          'BOOSTER_MINUTES_BY_ID.get' in src)
+    # 激活入口：时长在 store 侧按行模板 + is_ribbon 分表解析
+    src = inspect.getsource(store.PlayerStore.activate_booster)
+    check('store.activate_booster 按行 is_ribbon 分表解析时长',
+          'BOOSTER_MINUTES_BY_ID' in src and 'XP_BOOSTER_MINUTES_BY_ID' in src)
+    src = inspect.getsource(economy.handle_activate_booster)
+    check('handle_activate_booster 不再传死时长（由 store 按行解析）',
+          'duration_minutes' not in src)
+    src = inspect.getsource(economy.handle_activate_various_booster)
+    check('handle_activate_various_booster 不再传死时长',
+          'duration_minutes' not in src)
+
+
 def main():
     test_template_id_overlap()
     test_table_classification()
     test_schema_migration()
     test_ms_str_epoch()
+    test_duration_from_template()
     print(f'\n结果: PASS={PASS} FAIL={FAIL}')
     return 1 if FAIL else 0
 

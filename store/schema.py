@@ -748,6 +748,12 @@ CREATE TABLE IF NOT EXISTS war_battles (
     ended_at TIMESTAMPTZ,
     winning_faction INT NOT NULL DEFAULT 0
 );
+-- 交战类型建模（war-gameplay-fix-plan §2）：battle_type 存官方 missiontype
+-- （1=assault 城战 / 3=skirmish 补给线·步侦装 / 5=encounter 补给线·纯步兵）；
+-- position = 补给线会战位置（0-1，ap1→ap2 方向）；factioncount/excludedFactionId
+-- 由 factions_json 渲染时派生（battle_msgs.msg_battle_row，恒一致）
+ALTER TABLE war_battles ADD COLUMN IF NOT EXISTS battle_type INT NOT NULL DEFAULT 1;
+ALTER TABLE war_battles ADD COLUMN IF NOT EXISTS position FLOAT NOT NULL DEFAULT 0;
 ALTER TABLE wars ADD COLUMN IF NOT EXISTS production_ms BIGINT NOT NULL DEFAULT 0;
 
 -- warfunds 流水（余额仍在 players.warfunds）

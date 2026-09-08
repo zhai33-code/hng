@@ -136,20 +136,31 @@ def _msg_catalogue(war, city_owners, ats, capitals):
     return m
 
 
-async def build_war_catalogue_protos(store):
+async def build_war_catalogue_protos(store, include_war_id=0):
     """全量目录行 proto 列表（每场战争一条，新→旧）。
 
-    返回 [bytes, ...]；DB 不可用返回 []（调用方回退静态 mock）。"""
+    include_war_id != 0（客户端 WarIsOver 终局链带的 f1）：把该战争行
+    置首——客户端 LoginCheckPlayerWarStatusCommand 取
+    warcataloguedata[0] 存 lastWarPlayerParticipatedInCatalogues，若按
+    默认序返回（新续战在前）→ 结算界面 getWarInformation(结束id)=null
+    早退，阵营统计全空。返回 [bytes, ...]；DB 不可用返回 []。"""
     if store is None or getattr(store, 'pool', None) is None:
         return []
     try:
         wars = await _list_wars(store)
         capitals = capital_battlefield_ids()
+        first = None
         out = []
         for war in wars:
             city_owners = await store.get_war_cities(war['id'])
             ats = await store.list_war_command_nodes(war['id'])
-            out.append(_msg_catalogue(war, city_owners, ats, capitals))
+            row = _msg_catalogue(war, city_owners, ats, capitals)
+            if int(include_war_id or 0) and war['id'] == int(include_war_id):
+                first = row
+            else:
+                out.append(row)
+        if first is not None:
+            out.insert(0, first)
         return out
     except Exception as e:
         log(f'[war] build_war_catalogue failed: {e}')

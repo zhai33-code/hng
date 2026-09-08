@@ -277,6 +277,12 @@ async def build_warmap_snapshot(store, war=None):
                              msg_air_commandnode_base_row(
                                  at, war_id,
                                  at_current_battlefield(at))))
+        # 活跃会战 battle 行（2026-09-08 补：成局后新登录/重订阅的客户端
+        # 才能看到战斗标记；此前快照缺 battle 段 → 该城 BattleTable 无行
+        # → 点击走"城市详情"分支而非"战局详情"分支，且战斗标记不显示）
+        from .battle_msgs import msg_battle_row
+        for wb in await store.list_active_war_battles(war_id):
+            rows.append((b'battle', msg_battle_row(wb)))
         # 在途空运行（订阅时已起飞的 AT；§3.14 air_transport）
         for mv in await store.list_active_movements(war_id):
             segs = movement_segments(mv)
@@ -284,8 +290,7 @@ async def build_warmap_snapshot(store, war=None):
                 mvat = await store.get_command_node(mv['commandnode_id'])
                 if mvat:
                     rows.append((b'air_transport',
-                                 msg_air_transport_row(mvat, war_id, mv,
-                                                       segs[0])))
+                                 msg_air_transport_row(mvat, war_id, mv,                                                       segs[0])))
         return rows
     except Exception as e:
         log(f'[war] build_warmap_snapshot failed: {e}')

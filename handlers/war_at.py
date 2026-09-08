@@ -113,6 +113,44 @@ async def _push_at_rows(sess, writer, at, war_id):
         await _push_kvcs(writer, cmd, b'armyresource', p)
 
 
+async def _push_at_deploy_rows(sess, writer, at, war_id):
+    """部署专用行推送：CommandNodeWarInstance 行 DELETE → ADD，其余表
+    UPDATE（Morale/armyresource；Definition 不推——部署不改定义数据，
+    且客户端 definitionUpdated 依赖的 _warInstancesByDefinitionId 映射
+    会被 DELETE 清掉，推了也会被跳过）。
+
+    ★ 为什么部署不能像其他路径推 WarInstance UPDATE（2026-09-08 玩家
+    实报"部署第二个 AT 后主城出现两个一样的图标"根因）：
+    客户端 CommandnodeLayer.updatedWarInstance 的 UPDATE 分支
+    handleDeployChanges（isDeployed 0→1 → addWarMapSprite）**没有
+    checkLocationForStack 堆叠检查**；而 ADD 分支 addAssaultTeamToMap
+    尾部有（checkLocationForStack → inMultipleMarker() 把图标收进
+    MultiMarker 堆叠标记）。部署走 UPDATE 时：城上已有 AT#1（独立
+    图标）→ AT#2 的 WarInstance UPDATE 先触发 AssaultTeamLocationMapping
+    → MultipleMarkerLayer 创建 MultiMarker（把 AT#1 图标收进堆叠），
+    随后 handleDeployChanges 把 AT#2 图标独立上图（无堆叠检查）→
+    主城位置 MultiMarker + AT#2 独立图标两个图标叠加。
+    DELETE+ADD 序列让部署走 ADD 分支（官服口径）：先 removeWarInstanceById
+    （清理 joined schema / mapping / unit collection，无副作用——待命
+    unit 本就不在地图层），再 addInstance → join（CommandNodeDefinition
+    原子表行未删，直接复用）→ ADD 分支含堆叠检查，图标正确收编。
+    移动到达路径无需此处理：到达 AT 的 unit 已存在，stack 创建时
+    MultiMarker.setupMarker 直接对成员 inMultipleMarker()。"""
+    cmd = _view_cmd(sess)
+    if not cmd:
+        return
+    caps = war_campaign._faction_capital_bf()
+    await _push_kvcs_delete(writer, cmd, b'CommandNodeWarInstance',
+                            at['id'])
+    await _push_kvcs(writer, cmd, b'CommandNodeWarInstance',
+                     war_campaign.msg_commandnode_instance_row(
+                         at, war_id, caps))
+    await _push_kvcs(writer, cmd, b'CommandNodeMorale',
+                     war_campaign.msg_commandnode_morale_row(at, war_id))
+    for p in war_campaign.msg_armyresource_rows(at, war_id):
+        await _push_kvcs(writer, cmd, b'armyresource', p)
+
+
 async def _push_at_delete(sess, writer, at):
     """解散后删除行推送（与快照同表集合）。"""
     cmd = _view_cmd(sess)
@@ -415,7 +453,10 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
             1, war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES):
         # 响应先于行推送（客户端先收 ack 关窗/解绑监听器，再应用行变更，
         # 避免行应用链上的窗口监听器抛异常卡死客户端请求管线）
-        await _push_at_rows(sess, writer, at, at['war_id'])
+        # 部署走 _push_at_deploy_rows（WarInstance DELETE+ADD，官服口径）：
+        # UPDATE 推送会绕过客户端 ADD 分支的堆叠检查 → 主城多 AT 时
+        # 图标不进 MultiMarker 叠放、出现两个独立图标（2026-09-08 实报）
+        await _push_at_deploy_rows(sess, writer, at, at['war_id'])
         # §10.2 #7：空中半径单位部署落机场 → airbase 行（isAirborneUnit）
         cmd = _view_cmd(sess)
         if cmd and war_campaign.is_radius_unit(at):
@@ -431,8 +472,15 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
     """RetreatCommandNodeRequest {f1 instance, f2 serverInitiated?}
     → RetreatCommandNodeResponse{f1 msg}。
 
-    M1 语义：撤回己方首都待命（is_deployed=0, map_entity_id=0）；
-    移动中折返由 Phase 6 移动系统接管。"""
+    交战撤退（state==2，war1.md §撤退）：
+    - 惩罚：损 WAR_RETREAT_LOSS(25%) 编制 + 扣 20 士气，无经验无战争币
+      （撤退本无发放路径）；编制扣空 = 撤退途中溃散（state=3 软删）
+    - 落点：方向随机沿友方路线 → 友方邻城落位（保持部署、模板不变——
+      伞兵落地变体撤到友方城仍是步兵，war2.md「空投友方区域落地变步兵」）
+    - 包围：四周补给线邻城全部驻有敌军 AT（WAR_ENCIRCLE_CHECK）→
+      拒绝撤退（战败时由 automission 结算全歼）
+    非交战撤退维持 M1 语义：撤回待命（落地变体转回伞兵原型，
+    war2.md「伞兵机飞回」）；移动中撤退中止在途行军。"""
     node_id = 0
     try:
         f = pb_parse(proto)
@@ -443,6 +491,7 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
     pid = await sess.ensure_player()
     code = war_campaign.RC_OK
     at = None
+    wiped = False
     if pid is None or STORE is None:
         code = war_campaign.RC_CHARACTER_NOT_FOUND
     else:
@@ -453,26 +502,110 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
             at, code = await _load_at(pid, node_id, war)
             if not code:
                 try:
-                    # 落地变体转回原型（war2.md §伞兵「伞兵机飞回」+ 官服
-                    # convertTo 双向字段实锤 paratroopers_on_ground.f11=108
-                    # 指回 paratroopers）：待命=仓库，重新部署须为完整伞兵
-                    # 恢复空降能力；否则空降落地后永远步行
-                    tpl = commandnode_templates().get(
-                        int(at.get('template_id') or 0)) or {}
-                    rtpl = int(tpl.get('convert_to') or 0)
-                    if (str(tpl.get('name') or '').endswith('_on_ground')
-                            and rtpl
-                            and commandnode_templates().get(rtpl)):
-                        await STORE.update_command_node(
-                            at['id'], is_deployed=False, map_entity_id=0,
-                            template_id=rtpl)
-                        log(f'      [war] 落地变体撤退转回原型 '
-                            f'node={node_id} tpl={tpl.get("id")} -> {rtpl}')
-                    else:
-                        await STORE.update_command_node(
-                            at['id'], is_deployed=False, map_entity_id=0)
-                    at = await STORE.get_command_node(at['id'])
-                    log(f'      [war] AT 撤退 node={node_id} -> 待命')
+                    was_in_battle = int(at.get('state') or 0) == 2
+                    fields = {}
+                    dest_bf = 0
+                    if was_in_battle:
+                        # ---- 交战强撤惩罚（war1.md）：损 25% 编制 +
+                        #      扣 20 士气 ----
+                        new_res = war_campaign._scale_resources(
+                            war_campaign._as_resources(
+                                at.get('resources')),
+                            mm_config.WAR_RETREAT_LOSS)
+                        morale = max(
+                            0, min(int(at.get('max_morale') or 100),
+                                   int(at.get('morale') or 0)
+                                   - mm_config.
+                                   WAR_MORALE_LOST_PER_BATTLE))
+                        if not any(v > 0 for v in new_res.values()):
+                            # 编制扣空 = 撤退途中溃散（歼灭语义 state=3）
+                            wiped = True
+                            fields.update(state=3, resources={},
+                                          morale=morale)
+                        else:
+                            fields.update(resources=new_res, morale=morale)
+                        # ---- 包围判定 + 友方路线落点（war1.md）----
+                        try:
+                            owners = dict(await STORE.get_war_cities(
+                                war['id']))
+                        except Exception as e:
+                            log(f'      [war_at] city owners read '
+                                f'failed: {e}')
+                            owners = {}
+                        dest_bf, encircled = (
+                            await war_campaign.retreat_eval(
+                                STORE, war['id'], at, owners))
+                        if encircled and mm_config.WAR_ENCIRCLE_CHECK:
+                            code = (war_campaign.
+                                    RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND)
+                            log(f'      [war] AT 撤退拒单 node={node_id} '
+                                f'(encircled)')
+                    if not code:
+                        if wiped:
+                            await STORE.update_command_node(
+                                at['id'], **fields)
+                            log(f'      [war] AT 撤退溃散全歼 '
+                                f'node={node_id}')
+                        else:
+                            # ---- 在途行军中止（移动中撤退清理 movement，
+                            #      否则孤儿行军到点会把已撤 AT 拉回地图）----
+                            for mv in await STORE.list_active_movements(
+                                    war['id']):
+                                if (int(mv.get('commandnode_id') or 0)
+                                        != int(at['id'])):
+                                    continue
+                                await STORE.finish_movement(mv['id'], 2)
+                                cmd = _view_cmd(sess)
+                                if cmd:
+                                    segs = (war_campaign.
+                                            movement_segments(mv))
+                                    is_air = bool(
+                                        segs and segs[0].get('air'))
+                                    await _push_kvcs_delete(
+                                        writer, cmd,
+                                        b'transport_commandnode_segment',
+                                        mv['id'])
+                                    await _push_kvcs_delete(
+                                        writer, cmd,
+                                        b'air_transport' if is_air else
+                                        b'transport_commandnode_destination',
+                                        mv['id'])
+                            if was_in_battle and dest_bf:
+                                # 友方邻城落位：保持部署一跳转移
+                                await STORE.update_command_node(
+                                    at['id'], state=0,
+                                    map_entity_id=dest_bf,
+                                    map_entity_type=(war_campaign.
+                                                     MAP_ENTITY_BATTLEFIELD),
+                                    **fields)
+                                log(f'      [war] AT 交战撤退 node={node_id}'
+                                    f' -> 友方邻城 bf={dest_bf}')
+                            else:
+                                # 非交战 / 无友方路线：撤回待命（M1 行为）；
+                                # 落地变体转回原型（待命=仓库，重新部署
+                                # 须恢复空降能力）
+                                tpl = commandnode_templates().get(
+                                    int(at.get('template_id') or 0)) or {}
+                                rtpl = int(tpl.get('convert_to') or 0)
+                                if (str(tpl.get('name') or '').endswith(
+                                        '_on_ground')
+                                        and rtpl
+                                        and commandnode_templates().get(
+                                            rtpl)):
+                                    await STORE.update_command_node(
+                                        at['id'], is_deployed=False,
+                                        map_entity_id=0, state=0,
+                                        template_id=rtpl, **fields)
+                                    log(f'      [war] 落地变体撤退转回原型 '
+                                        f'node={node_id} '
+                                        f'tpl={tpl.get("id")} -> {rtpl}')
+                                else:
+                                    await STORE.update_command_node(
+                                        at['id'], is_deployed=False,
+                                        map_entity_id=0, state=0, **fields)
+                                log(f'      [war] AT 撤退 node={node_id} '
+                                    f'-> 待命')
+                        at = await STORE.get_command_node(at['id'])
                 except Exception as e:
                     log(f'      [war_at] retreat failed: {e}')
                     code = war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
@@ -483,14 +616,27 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RetreatCommandNodeResponse (msg={code})')
     if at is not None and code == war_campaign.RC_OK:
+        if wiped:
+            # 溃散全歼：删行推送（与解散同表集合）
+            await _push_at_delete(sess, writer, at)
+            return
         # 响应先于行推送（客户端先收 ack 再应用行变更，理由同购买/部署）
         await _push_at_rows(sess, writer, at, at['war_id'])
-        # §10.2 #7：空中半径单位撤回待命 → 删 airbase 行（重新部署时
-        # 再按落位机场重建）
         cmd = _view_cmd(sess)
-        if cmd and war_campaign.is_radius_unit(at):
-            await _push_kvcs_delete(writer, cmd, b'air_commandnode_base',
-                                    at['id'])
+        if not cmd:
+            return
+        if not at.get('is_deployed'):
+            # §10.2 #7：空中半径单位撤回待命 → 删 airbase 行（重新部署
+            # 时再按落位机场重建）
+            if war_campaign.is_radius_unit(at):
+                await _push_kvcs_delete(writer, cmd, b'air_commandnode_base',
+                                        at['id'])
+        elif war_campaign.is_radius_unit(at):
+            # 交战撤退落位友方城的空中单位：airbase 行更新落点
+            await _push_kvcs(writer, cmd, b'air_commandnode_base',
+                             war_campaign.msg_air_commandnode_base_row(
+                                 at, at['war_id'],
+                                 war_campaign.at_current_battlefield(at)))
 
 
 # ------------------------------------------------------------- 增援（#2）
@@ -993,6 +1139,10 @@ async def _dest_semantic_code(store, war, at, dest_bf):
     客户端 CommandnodeArrow 对 1/21/22/23/24 全按成功处理。"""
     try:
         for wb in await store.list_active_war_battles(war['id']):
+            if (int(wb.get('battle_type')
+                    or war_campaign.BATTLE_TYPE_ASSAULT)
+                    != war_campaign.BATTLE_TYPE_ASSAULT):
+                continue  # 野外会战=补给线 id 空间，不算目的城交战
             if int(wb.get('battlefield_id') or 0) == int(dest_bf):
                 return war_campaign.RC_TRANSPORTING_TO_JOIN_BATTLE
         for o in await store.list_war_command_nodes(war['id']):

@@ -512,11 +512,12 @@ async def _create(name='Alpha', abbr='ALT', tpl=501, pricing=8001, cur=2):
     return w, _resp(w, 'CreateCommandNodeResponse')
 
 
-async def _deploy(node, cur=2, sp=0, vp=0):
+async def _deploy(node, cur=2, sp=0, vp=0, cap=0):
     # f2/f3 计价 id（官服 Deploy All 口径：部署请求自带计价 id 补编）
+    # f4 nearCapitalBattlefieldId（玩家所选部署主城）
     w = FakeWriter()
     req = (pb_int64(1, node) + pb_int64(2, sp) + pb_int64(3, vp)
-           + pb_int32(7, cur))
+           + pb_int64(4, cap) + pb_int32(7, cur))
     await war_at.handle_deploy_command_node_request(
         FakeSess(), w, 900, b'DeployCommandNodeRequest', req)
     return w, _resp(w, 'DeployCommandNodeResponse')
@@ -1033,6 +1034,39 @@ async def section_d():
     check('D2e 唯一邻城交战 → 落主城部署成功',
           f.get(1) == 1 and st.ats[500]['map_entity_id'] == 10, str(f))
 
+    # D2f 部署推送行序（2026-09-08 修"主城两个一样图标"）：WarInstance 行
+    # DELETE(旧实例) → ADD(isDeployed=1)，官服口径——客户端 ADD 分支
+    # addAssaultTeamToMap 尾部有 checkLocationForStack 堆叠检查，UPDATE
+    # 分支 handleDeployChanges 没有 → UPDATE 推送时主城多 AT 图标不进
+    # MultiMarker 叠放（MultiMarker + 独立图标两个）。DELETE 先于 ADD
+    # 让客户端走 ADD 分支正确收编；Morale/armyresource 照推、Definition
+    # 不推（部署不改定义，且 DELETE 后 _warInstancesByDefinitionId 映射
+    # 已清，客户端 definitionUpdated 会跳过）
+    st = _setup()
+    _mk_at(st, 500, template=501)
+    w, f = await _deploy(500)
+    events = []
+    for c in _chunks(w.buf):
+        if not c.subs or c.subs[0].data != b'KeyValueChangeSet':
+            continue
+        act = c.subs[0].subs[0]
+        if act.data == b'delete' and act.subs:
+            events.append(('del', act.subs[0].data))
+        elif act.data == b'set' and act.subs:
+            events.append(('set', act.subs[0].data))
+    dels = _dels(w, 'CommandNodeWarInstance')
+    inst = [r for r in _rows(w, 'CommandNodeWarInstance') if r.get(1) == 500]
+    morale = _rows(w, 'CommandNodeMorale')
+    defn = _rows(w, 'CommandNodeDefinition')
+    seq = [e for e in events if e[1] == b'CommandNodeWarInstance']
+    check('D2f 部署推送 DELETE→ADD 行序（WarInstance 重生/Morale 推/Definition 不推）',
+          f.get(1) == 1 and dels == [500]
+          and inst and inst[-1].get(10) == 1
+          and seq == [('del', b'CommandNodeWarInstance'),
+                      ('set', b'CommandNodeWarInstance')]
+          and morale and not defn,
+          f'seq={seq} morale={len(morale)} defn={len(defn)}')
+
     # D3 重复部署 → 150（先成功部署一次）
     st = _setup()
     _mk_at(st, 500, template=501)
@@ -1040,6 +1074,83 @@ async def section_d():
     w, f = await _deploy(500)
     check('D3 重复部署 → 150',
           f.get(1) == war_campaign.RC_COMMANDNODE_ALREADY_DEPLOYED, str(f))
+
+    # D6 占领敌方主城后部署（2026-09-08：玩家报"新占领的城市无法部署"
+    # 排查场景）：wardb.capitals 含敌方主城 20 (default_faction=2 GE)，
+    # initial_city_owners 给 20 出厂属 GE。先 _deploy 一次触发 ensure_war
+    # 写入出厂归属（init_war_cities），再 set_city_owner(20,1) 模拟
+    # 战斗结算占领，第二次 _deploy(cap=20) 须落位到 20（验证
+    # owned_capital_bfs 动态归属判定生效，客户端 f4=新占领城可部署）
+    _orig_caps = wardb.capitals
+    _orig_ico = war_campaign.lifecycle.initial_city_owners
+    _orig_fcb = war_campaign._faction_capital_bf
+    wardb.capitals = lambda: [
+        {'battlefield_id': 10, 'default_faction': 1, 'victory_points': 1},
+        {'battlefield_id': 20, 'default_faction': 2, 'victory_points': 1}]
+    war_campaign.lifecycle.initial_city_owners = lambda: {10: 1, 11: 1, 20: 2}
+    war_campaign._faction_capital_bf = lambda: {1: 10, 2: 20}
+
+    st = _setup()
+    _mk_at(st, 500, template=501)
+    await _deploy(500)              # 触发 ensure_war 写入出厂 city_owners
+    # 战斗结算后 US 占领 20（同 _capture_city_events 调 set_city_owner）
+    await st.set_city_owner(1, 20, 1)
+    _mk_at(st, 501, template=501)
+    w, f = await _deploy(501, cap=20)
+    check('D6 占领敌方主城后部署（f4=20 → 落位 20/响应1）',
+          f.get(1) == 1 and st.ats[501]['is_deployed'] is True
+          and st.ats[501]['map_entity_id'] == 20, str(f))
+
+    # D6b 占领敌方主城但不传 f4 → 回退集合内最小 id（10），部署仍成功
+    # （客户端虽不应走此分支——验证服务端容错不拒单）
+    st = _setup()
+    _mk_at(st, 500, template=501)
+    await _deploy(500)
+    await st.set_city_owner(1, 20, 1)
+    _mk_at(st, 501, template=501)
+    w, f = await _deploy(501, cap=0)
+    check('D6b 占领敌方主城无 f4 → 回退最小 id 仍部署成功',
+          f.get(1) == 1 and st.ats[501]['is_deployed'] is True
+          and st.ats[501]['map_entity_id'] == 10, str(f))
+
+    # D6c 占领敌方主城但同时该城交战 → 221（捕获刚占领即被反攻场景）
+    st = _setup()
+    _mk_at(st, 500, template=501)
+    await _deploy(500)
+    await st.set_city_owner(1, 20, 1)
+    st.battles.append({'war_id': 1, 'battlefield_id': 20})
+    _mk_at(st, 501, template=501)
+    w, f = await _deploy(501, cap=20)
+    check('D6c 占领敌方主城但城战 → 221（占领后立刻被反攻拒单）',
+          f.get(1) == war_campaign.RC_DEPLOY_LOCATION_NOT_FOUND
+          and not st.ats[501]['is_deployed'], str(f))
+
+    # D7 占领中立主城后部署（capital 表里 default_faction=0 的中立主城，
+    # initial_city_owners 过滤掉开局不写归属，占领后 set_city_owner
+    # 才写入）。D6 系列只覆盖敌方主城（default_faction=2）；
+    # 真实场景里中立主城可能没在 city_owners 字典里 → 测试覆盖盲区
+    # 新增 fixture：30 中立主城 default_faction=0
+    _orig_caps_neutral = wardb.capitals
+    wardb.capitals = lambda: [
+        {'battlefield_id': 10, 'default_faction': 1, 'victory_points': 1},
+        {'battlefield_id': 20, 'default_faction': 2, 'victory_points': 1},
+        {'battlefield_id': 30, 'default_faction': 0, 'victory_points': 1}]
+    st = _setup()
+    _mk_at(st, 500, template=501)
+    await _deploy(500)
+    # 中立主城 30 不在 initial_city_owners（default_faction=0 被过滤）
+    # → city_owners 字典里没有 30 → 占领前 owners.get(30)=None
+    await st.set_city_owner(1, 30, 1)   # US 占领中立主城 30
+    _mk_at(st, 501, template=501)
+    w, f = await _deploy(501, cap=30)
+    check('D7 占领中立主城后部署（f4=30 → 落位 30/响应1）',
+          f.get(1) == 1 and st.ats[501]['is_deployed'] is True
+          and st.ats[501]['map_entity_id'] == 30, str(f))
+    wardb.capitals = _orig_caps_neutral
+
+    wardb.capitals = _orig_caps
+    war_campaign.lifecycle.initial_city_owners = _orig_ico
+    war_campaign._faction_capital_bf = _orig_fcb
 
     # D4 部署付费补编（free 已置位 → 按计价扣款；Deploy All 空编缺口修复）
     st = _setup()
@@ -1189,20 +1300,34 @@ async def section_r():
           f.get(1) == 1 and st.ats[500]['map_entity_id'] == 11
           and ab and ab[-1].get(3) == 11 and ab[-1].get(2) == 500, str(f))
 
-    # R1b 候选池无机场 → 回退距主城最近机场（官服"主城附近的机场"）
+    # R1b 候选池无机场 → 回退距主城最近的**己方占领**机场（2026-09-08
+    # 修复：机场须先占领才能部署；18 为更近的敌方机场应被跳过，
+    # 12 为己方机场 → 落 12；无己方机场 → 拒单 221）
     orig_bf, orig_af = wardb.battlefields, war_campaign.at_ops._AIRFIELD_CACHE
     wardb.battlefields = lambda: [
         {'id': 10, 'posx': 0, 'posy': 0, 'gamemap': 0},
         {'id': 11, 'posx': 100, 'posy': 0, 'gamemap': 0},
         {'id': 12, 'posx': 800, 'posy': 0, 'gamemap': 204},
-        {'id': 14, 'posx': 2000, 'posy': 0, 'gamemap': 0}]
+        {'id': 14, 'posx': 2000, 'posy': 0, 'gamemap': 0},
+        {'id': 18, 'posx': 400, 'posy': 0, 'gamemap': 205}]
     war_campaign.common._BF_POS_CACHE = None
     war_campaign.at_ops._AIRFIELD_CACHE = None
     try:
+        # R1b 无己方机场（12/18 均未占领）→ 拒单 221
         st = _setup()
         _mk_at(st, 500, template=505)
         w, f = await _deploy(500)
-        check('R1b 候选池无机场 → 回退最近机场（12）',
+        check('R1b 候选池无机场 + 无己方机场 → 拒单 221',
+              f.get(1) == 221 and not st.ats[500]['is_deployed'], str(f))
+
+        # R1b2 12 己方占领、18 更近但敌方 → 回退落最近的己方机场 12
+        st = _setup()
+        war = await war_campaign.ensure_war(st)
+        st.city_owners[war['id']][12] = 1
+        st.city_owners[war['id']][18] = 2
+        _mk_at(st, 500, template=505)
+        w, f = await _deploy(500)
+        check('R1b2 回退最近己方机场（12，跳过更近敌方 18）',
               f.get(1) == 1 and st.ats[500]['map_entity_id'] == 12, str(f))
     finally:
         wardb.battlefields = orig_bf
@@ -1372,6 +1497,120 @@ async def section_r():
           and not war_campaign.upgrade_allowed(_TPLS[501], _TPLS[501]))
 
 
+# ====================================== T 交战撤退规则（war1.md §撤退）
+# 扩图：18 会战城（补给线邻 19/20，包围/中立用）；10-11 既有友方线
+
+
+def _retreat_graph():
+    wardb.accesspoints = lambda: [
+        {'id': 101, 'battlefield': 10}, {'id': 102, 'battlefield': 11},
+        {'id': 103, 'battlefield': 18}, {'id': 104, 'battlefield': 19},
+        {'id': 105, 'battlefield': 18}, {'id': 106, 'battlefield': 20}]
+    wardb.supplylines = lambda: [
+        {'id': 1, 'ap1': 101, 'ap2': 102},
+        {'id': 2, 'ap1': 103, 'ap2': 104},
+        {'id': 3, 'ap1': 105, 'ap2': 106}]
+    war_campaign.common._ADJACENCY_CACHE = None
+
+
+async def _retreat(node_id):
+    w = FakeWriter()
+    await war_at.handle_retreat_command_node_request(
+        FakeSess(), w, 900, b'RetreatCommandNodeRequest', pb_int64(1, node_id))
+    return w, _resp(w, 'RetreatCommandNodeResponse')
+
+
+async def section_t():
+    _retreat_graph()
+
+    # T1 交战强撤：损 25% 编制 + 扣 20 士气 + 友方邻城落位（保持部署）
+    st = _setup()
+    await war_campaign.ensure_war(st)
+    _mk_at(st, 530, resources={1: 12}, deployed=True, map_entity_id=11,
+           state=2)
+    w, fr = await _retreat(530)
+    check('T1 交战强撤 → 25% 损耗 + -20 士气 + 友方邻城 10 落位（保持部署）',
+          fr.get(1) == 1
+          and st.ats[530]['state'] == 0
+          and st.ats[530]['is_deployed']
+          and st.ats[530]['map_entity_id'] == 10
+          and st.ats[530]['resources'] == {1: 9}
+          and st.ats[530]['morale'] == 80, str(fr))
+
+    # T2 包围：邻城 19/20 全驻敌军 AT → 拒绝撤退，AT 原地不动
+    st = _setup()
+    await war_campaign.ensure_war(st)
+    _mk_at(st, 531, resources={1: 12}, deployed=True, map_entity_id=18,
+           state=2)
+    _mk_at(st, 5311, owner=200, faction=2, deployed=True, map_entity_id=19)
+    _mk_at(st, 5312, owner=200, faction=2, deployed=True, map_entity_id=20)
+    w, fr = await _retreat(531)
+    check('T2 包围（邻城全驻敌军）→ 拒绝撤退 107 / 编制士气不动 / 仍 state=2',
+          fr.get(1) == war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
+          and st.ats[531]['state'] == 2
+          and st.ats[531]['resources'] == {1: 12}
+          and st.ats[531]['morale'] == 100
+          and st.ats[531]['map_entity_id'] == 18, str(fr))
+
+    # T2b 敌空城/中立邻城不算包围 → 无友方路线回退撤回待命（惩罚照扣）
+    st = _setup()
+    await war_campaign.ensure_war(st)
+    _mk_at(st, 532, resources={1: 12}, deployed=True, map_entity_id=18,
+           state=2)
+    _mk_at(st, 5321, owner=200, faction=2, deployed=True, map_entity_id=19)
+    # 20 中立空城 → 可撤但无友方路线
+    w, fr = await _retreat(532)
+    check('T2b 非包围无友方路线 → 撤回待命（仍扣 25% 编制 / -20 士气）',
+          fr.get(1) == 1
+          and not st.ats[532]['is_deployed']
+          and st.ats[532]['map_entity_id'] == 0
+          and st.ats[532]['state'] == 0
+          and st.ats[532]['resources'] == {1: 9}
+          and st.ats[532]['morale'] == 80, str(fr))
+
+    # T3 编制扣空 → 撤退途中溃散全歼（state=3 + 删行推送）
+    st = _setup()
+    await war_campaign.ensure_war(st)
+    _mk_at(st, 533, resources={1: 1}, deployed=True, map_entity_id=11,
+           state=2)
+    w, fr = await _retreat(533)
+    check('T3 撤退溃散 → state=3 + 全表删行推送',
+          fr.get(1) == 1
+          and st.ats[533]['state'] == 3
+          and st.ats[533]['resources'] == {}
+          and st.ats[533]['morale'] == 80
+          and 533 in _dels(w, 'CommandNodeWarInstance')
+          and 533 in _dels(w, 'CommandNodeDefinition'), str(fr))
+
+    # T4 非交战撤退：无惩罚（编制/士气不动）+ 撤回待命（M1 回归）
+    st = _setup()
+    await war_campaign.ensure_war(st)
+    _mk_at(st, 534, resources={1: 12}, deployed=True, map_entity_id=11)
+    w, fr = await _retreat(534)
+    check('T4 非交战撤退 → 待命且无惩罚',
+          fr.get(1) == 1
+          and not st.ats[534]['is_deployed']
+          and st.ats[534]['resources'] == {1: 12}
+          and st.ats[534]['morale'] == 100, str(fr))
+
+    # T5 移动中撤退 → 在途行军中止（movement 终态 + 段/终点行删除推送）
+    st = _setup()
+    await war_campaign.ensure_war(st)
+    _mk_at(st, 535, resources={1: 12}, deployed=True, map_entity_id=11,
+           state=1)
+    mv = await st.create_movement(
+        535, 1,
+        [{'sl_id': 1, 'from_ap': 102, 'to_ap': 101, 'seconds': 100}],
+        started_at=_NOW)
+    w, fr = await _retreat(535)
+    check('T5 移动中撤退 → movement 中止 + segment/destination 删行 + 待命',
+          fr.get(1) == 1
+          and st.movements[mv['id']]['state'] == 2
+          and mv['id'] in _dels(w, 'transport_commandnode_segment')
+          and mv['id'] in _dels(w, 'transport_commandnode_destination')
+          and not st.ats[535]['is_deployed'], str(fr))
+
+
 async def main():
     await section_a()
     await section_b()
@@ -1381,6 +1620,7 @@ async def main():
     await section_d()
     await section_e()
     await section_r()
+    await section_t()
     fails = [label for label, ok in RESULTS if not ok]
     print(f'\n==== {len(RESULTS) - len(fails)}/{len(RESULTS)} PASS ====')
     for label in fails:

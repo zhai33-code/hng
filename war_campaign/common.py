@@ -93,6 +93,25 @@ MAP_ENTITY_ACCESSPOINT = 2
 MAP_ENTITY_SUPPLYLINE = 3
 
 
+# 官方 missiontype（war-gameplay-fix-plan §2 反编译复核）：1=ASSAULT 城战 /
+# 3=SKIRMISH 补给线·步/侦/装 / 5=ENCOUNTER 补给线·纯步兵；
+# 伞兵攻城类型上就是 Assault（288 伞兵是 automission 判定规则，非类型）
+BATTLE_TYPE_ASSAULT = 1
+
+
+BATTLE_TYPE_SKIRMISH = 3
+
+
+BATTLE_TYPE_ENCOUNTER = 5
+
+
+def battle_prep_seconds(battle_type):
+    """会战准备期秒数（城攻 330 / 野外 300，mm_config 可配）。"""
+    return (mm_config.WAR_BATTLE_PREP_ASSAULT
+            if int(battle_type or BATTLE_TYPE_ASSAULT) == BATTLE_TYPE_ASSAULT
+            else mm_config.WAR_BATTLE_PREP_FIELD)
+
+
 def _ts_ms(dt):
     """datetime → 毫秒时间戳（无值回 0）。"""
     if not dt:

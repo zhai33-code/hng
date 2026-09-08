@@ -95,6 +95,7 @@ class FakeStore:
         self.next_mv_id = 1
         self.battles = {}
         self.next_battle_id = 1
+        self.mission_records = {}
 
     # ---- war ----
     async def get_active_war(self):
@@ -132,7 +133,10 @@ class FakeStore:
 
     async def create_mission_record(self, preset, **kw):
         self.next_mission_id = getattr(self, 'next_mission_id', 500) + 1
-        return self.next_mission_id
+        m = {'id': self.next_mission_id, 'state': 0, 'preset': preset}
+        m.update(kw)
+        self.mission_records[m['id']] = m
+        return dict(m)
 
     async def update_war_production(self, war_id, production_ms):
         return True
@@ -194,19 +198,83 @@ class FakeStore:
         return True
 
     # ---- war_battles ----
-    async def create_war_battle(self, war_id, battlefield_id, factions):
+    async def create_war_battle(self, war_id, battlefield_id, factions,
+                                battle_type=1, position=0.0):
         wb = {'id': self.next_battle_id, 'war_id': int(war_id),
               'battlefield_id': int(battlefield_id),
               'factions': [dict(f) for f in (factions or [])],
+              'battle_type': int(battle_type or 1),
+              'position': float(position or 0.0),
               'state': 0, 'started_at': NOW, 'ended_at': None}
         self.next_battle_id += 1
         self.battles[wb['id']] = wb
         return dict(wb)
 
+    async def append_war_battle_faction(self, battle_id, at_id, faction):
+        b = self.battles.get(int(battle_id))
+        if b is None:
+            return None
+        if not any(int(f.get('at_id') or 0) == int(at_id)
+                   for f in b['factions']):
+            b['factions'].append({'at_id': int(at_id),
+                                  'faction': int(faction or 0)})
+        return [dict(f) for f in b['factions']]
+
+    async def shift_movement_started(self, movement_id, seconds):
+        mv = self.movements.get(int(movement_id))
+        if mv is None or mv['state'] != 0:
+            return False
+        mv['started_at'] = (mv['started_at']
+                            + datetime.timedelta(seconds=float(seconds or 0)))
+        return True
+
     async def list_active_war_battles(self, war_id):
         return [dict(wb) for wb in sorted(self.battles.values(),
                                           key=lambda b: b['id'])
                 if wb['war_id'] == int(war_id) and wb['state'] == 0]
+
+    async def get_war_battle(self, battle_id):
+        b = self.battles.get(int(battle_id))
+        return dict(b) if b else None
+
+    async def end_war_battle(self, battle_id, winning_faction=0):
+        b = self.battles.get(int(battle_id))
+        if b is not None:
+            b['state'] = 1
+            b['winning_faction'] = int(winning_faction)
+            b['ended_at'] = NOW
+        return True
+
+    # ---- settle_war_battle 依赖（I 段）----
+    async def count_war_city_owners(self, war_id, battlefield_ids=None):
+        wanted = (None if battlefield_ids is None
+                  else set(int(b) for b in battlefield_ids))
+        counts = {}
+        for bf, owner in self.city_owners.get(int(war_id), {}).items():
+            if owner > 0 and (wanted is None or bf in wanted):
+                counts[owner] = counts.get(owner, 0) + 1
+        return counts
+
+    async def get_mission_record(self, mission_id):
+        return self.mission_records.get(int(mission_id))
+
+    async def set_mission_state(self, mission_id, state):
+        m = self.mission_records.get(int(mission_id))
+        if m is not None:
+            m['state'] = int(state)
+
+    async def get_mission_by_battle(self, battle_id):
+        for m in self.mission_records.values():
+            if int(m.get('battle_id') or 0) == int(battle_id):
+                return dict(m)
+        return None
+
+    async def add_war_funds(self, pid, amount, reason=''):
+        self.funds_log = getattr(self, 'funds_log', [])
+        self.funds_log.append((int(pid), int(amount), reason))
+
+    async def sweep_ended_war_leftovers(self):
+        return [], []
 
 
 def _mk_at(store, war_id, at_id, faction, bf):
@@ -669,6 +737,448 @@ async def main():
           store9.city_owners[war9['id']].get(20) == 1
           and any(tag == b'battlefieldstatus'
                   for _, tag, _ in evh5))
+
+    # H6 敌方补给队驻城不算守军（2026-09-08 修复）：补给队（is_reserve，
+    # template_id%100==4）非战斗部队 → 不挡占领、不拉进会战（与
+    # _check_field_encounters 野外口径一致）。此前 bug：敌补给队驻城
+    # 挡占领还成战 → 玩家报"敌城无守军却无法直接占领"
+    storeR = FakeStore()
+    warR = await war_campaign.ensure_war(storeR)
+    atkR = _mk_at(storeR, warR['id'], 96, 1, 10)
+    resv = _mk_at(storeR, warR['id'], 95, 2, 20)      # GE 补给队驻 20
+    resv['template_id'] = 204                          # reserve 模板
+    await war_campaign.start_movement(storeR, atkR, 20, now=NOW)
+    await war_campaign.advance_movements(
+        storeR, warR, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    check('H6 敌方补给队驻城不挡直接占领（不成战）',
+          storeR.city_owners[warR['id']].get(20) == 1
+          and storeR.ats[96]['state'] == 0
+          and len(storeR.battles) == 0,
+          f"owners={storeR.city_owners[warR['id']]} "
+          f"battles={len(storeR.battles)}")
+
+    # ---- I. 会战生命周期（2026-09-08 审计 #1-#4：A 第三阵营不入战 /
+    #      B 结算释放幸存 AT / C factioncount+excludedFactionId / D 再成局）----
+    # I1 第三阵营 AT 到达交战城：不入战正常驻扎（两方制契约，防结算卡死）
+    storeA = FakeStore()
+    warA = await war_campaign.ensure_war(storeA)
+    us = _mk_at(storeA, warA['id'], 201, 1, 20)          # US 驻 20
+    ge = _mk_at(storeA, warA['id'], 202, 2, 10)          # GE 从 10 → 20
+    await war_campaign.start_movement(storeA, ge, 20, now=NOW)
+    await war_campaign.advance_movements(
+        storeA, warA, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    check('I1 前置：美 vs 德 成局双方 state=2',
+          storeA.ats[201]['state'] == 2 and storeA.ats[202]['state'] == 2
+          and len(storeA.battles) == 1)
+    su = _mk_at(storeA, warA['id'], 203, 3, 10)          # SU 第三方到场
+    await war_campaign.start_movement(storeA, su, 20, now=NOW)
+    await war_campaign.advance_movements(
+        storeA, warA, now=NOW + datetime.timedelta(seconds=2 * SEG_SEC + 20))
+    wbA = list(storeA.battles.values())[0]
+    check('I1 第三阵营 AT 不入战（state=0 驻扎 + 不进 factions）',
+          storeA.ats[203]['state'] == 0
+          and {f['faction'] for f in wbA['factions']} == {1, 2}
+          and len(storeA.battles) == 1,
+          f'state={storeA.ats[203]["state"]}')
+
+    # I1b 同阵营增援照旧入战
+    us2 = _mk_at(storeA, warA['id'], 204, 1, 10)
+    await war_campaign.start_movement(storeA, us2, 20, now=NOW)
+    await war_campaign.advance_movements(
+        storeA, warA, now=NOW + datetime.timedelta(seconds=3 * SEG_SEC + 25))
+    check('I1b 参战阵营增援入战 state=2',
+          storeA.ats[204]['state'] == 2 and len(storeA.battles) == 1)
+    check('I1b2 增援 AT 追加进 factions 名单（结算可释放）',
+          any(f.get('at_id') == 204 for f in wbA['factions']),
+          f"factions={[f.get('at_id') for f in wbA['factions']]}")
+
+    # I2 结算释放幸存 AT（B 修复）：败方编制扣空歼灭 → 胜方 state=2→0
+    #    驻留原地、无再成局（城里无敌对 AT，D 不触发）——隔离验证 B；
+    #    （storeA 的 GE 未歼灭 + SU 驻留，D 再成局在 I3 验证）
+    storeB = FakeStore()
+    warB = await war_campaign.ensure_war(storeB)
+    b_us = _mk_at(storeB, warB['id'], 221, 1, 20)        # US 驻 20
+    b_ge = _mk_at(storeB, warB['id'], 222, 2, 10)        # GE 空*40 编制
+    await war_campaign.start_movement(storeB, b_ge, 20, now=NOW)
+    await war_campaign.advance_movements(
+        storeB, warB, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    wbB = list(storeB.battles.values())[0]
+    storeB.ats[221]['resources'] = {1: 100}
+    evB = await war_campaign.settle_war_battle(storeB, 0, wbB['id'], 1)
+    check('I2 结算释放幸存 AT（胜方 state=0 驻留原地，败方歼灭）',
+          storeB.ats[221]['state'] == 0
+          and storeB.ats[221]['is_deployed'] is True
+          and storeB.ats[221]['map_entity_id'] == 20
+          and storeB.ats[222]['state'] == 3
+          and len(storeB.battles) == 1,
+          f'us={storeB.ats[221]["state"]} ge={storeB.ats[222]["state"]}')
+    check('I2b 会战行终态 + del battle 事件',
+          storeB.battles[wbB['id']]['state'] == 1
+          and ('del', b'battle', wbB['id']) in evB)
+
+    # I2c excludedFactionId：两方局（factions 1,2）→ f9=2 / f10=3
+    rowB = war_campaign.msg_battle_row(wbB)
+    check('I2c battle 行 f9 factioncount=2 / f10 excluded=3',
+          int(pb_parse(rowB)[9]) == 2
+          and int(pb_parse(rowB)[10]) == 3)
+
+    # I3 再成局（连环三方局，D 修复）：storeA 结算（GE 未歼灭 + SU 第三方
+    #     驻留 20）→ 胜方 US 释放后与城中全部敌对 AT（GE+SU）立即开新战，
+    #     factions={1,2,3} 三方如实登记（factioncount=3 / excluded=0），
+    #     无僵持；GE 若未被释放（B 缺失）则 D 找不到胜方 state=0 AT，
+    #     新战不成局——I3 同时覆盖 B+D
+    for _aid in (201, 202, 204):
+        storeA.ats[_aid]['resources'] = {1: 100}
+    evA = await war_campaign.settle_war_battle(storeA, 0, wbA['id'], 1)
+    new_battles = [b for b in storeA.battles.values()
+                   if b['id'] != wbA['id']]
+    check('I3 再成局：胜方释放后与城中敌对 AT 立即开新战（三方登记）',
+          len(new_battles) == 1
+          and new_battles[0]['battlefield_id'] == 20
+          and {f['faction'] for f in new_battles[0]['factions']} == {1, 2, 3}
+          and storeA.ats[201]['state'] == 2
+          and storeA.ats[202]['state'] == 2
+          and storeA.ats[203]['state'] == 2,
+          f'battles={[(b["id"], [f["faction"] for f in b["factions"]]) for b in storeA.battles.values()]}')
+    rowA3 = war_campaign.msg_battle_row(new_battles[0])
+    check('I3b 三方局 battle 行 f9 factioncount=3 / f10 excluded=0',
+          int(pb_parse(rowA3)[9]) == 3
+          and int(pb_parse(rowA3)[10]) == 0)
+
+    # I4 撤退释放（retreat state=0，handlers/war_at 审计 #3）：
+    #    会战中 AT 手动撤退后不再被 RC_COMMANDNODE_IN_BATTLE 拦截
+    #    （handlers 层完整回归见 test_war_at_supply R 系列；此处校验
+    #    settle 侧独立路径——士气投降分支带 state=0 的既有行为不回归）
+    #    （合成 capitals=[] → 投降分支无首都可回，临时 patch 一座）
+    _orig_caps = wardb.capitals
+    wardb.capitals = lambda: [
+        {'battlefield_id': 10, 'default_faction': 1},
+        {'battlefield_id': 40, 'default_faction': 2},
+    ]
+    storeC = FakeStore()
+    warC = await war_campaign.ensure_war(storeC)
+    c1 = _mk_at(storeC, warC['id'], 211, 1, 10)
+    c2 = _mk_at(storeC, warC['id'], 212, 2, 20)
+    await war_campaign.start_movement(storeC, c1, 20, now=NOW)
+    await war_campaign.advance_movements(
+        storeC, warC, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    wbC = list(storeC.battles.values())[0]
+    # 士气 5（≤ surrender 25）→ 投降分支：state=0 + 回首都 + is_deployed=0
+    storeC.ats[211]['morale'] = 5
+    storeC.ats[211]['resources'] = {1: 100}
+    storeC.ats[212]['resources'] = {1: 100}
+    await war_campaign.settle_war_battle(storeC, 0, wbC['id'], 2)
+    check('I4 投降分支回首都（state=0/is_deployed=0）不回归',
+          storeC.ats[211]['state'] == 0
+          and storeC.ats[211]['is_deployed'] is False
+          and storeC.ats[211]['map_entity_id'] == 10,
+          f'state={storeC.ats[211]["state"]} '
+          f'deployed={storeC.ats[211]["is_deployed"]}')
+    wardb.capitals = _orig_caps
+
+    # ---- J. 野外遭遇成局（war-gameplay-fix-plan §2：encounter/skirmish、
+    #      battle 行补给线契约、行军冻结与结算恢复）----
+    # 合成模板：901 纯步兵（cat1 士兵族）/ 902 坦克族（cat7）
+    _orig_tpls = wardb.commandnode_templates
+    wardb.commandnode_templates = lambda: {
+        901: {'id': 901, 'resources': {1: 100}, 'speed': 1.0},
+        902: {'id': 902, 'resources': {7: 10}, 'speed': 1.0},
+    }
+    try:
+        # J1 相向纯步兵同段 → encounter（type 5）
+        storeJ = FakeStore()
+        warJ = await war_campaign.ensure_war(storeJ)
+        j1 = _mk_at(storeJ, warJ['id'], 301, 1, 10)
+        j2 = _mk_at(storeJ, warJ['id'], 302, 2, 20)
+        j1['template_id'] = 901
+        j2['template_id'] = 901
+        mvJ1, _ = await war_campaign.start_movement(storeJ, j1, 20, now=NOW)
+        mvJ2, _ = await war_campaign.start_movement(storeJ, j2, 10, now=NOW)
+        evJ = await war_campaign.advance_movements(
+            storeJ, warJ,
+            now=NOW + datetime.timedelta(seconds=SEG_SEC / 2))
+        wbJ = next((b for b in storeJ.battles.values()), None)
+        check('J1 相向步兵同段成局 encounter（type 5、双方 state=2）',
+              wbJ is not None
+              and wbJ['battle_type'] == war_campaign.BATTLE_TYPE_ENCOUNTER
+              and wbJ['battlefield_id'] == 101
+              and storeJ.ats[301]['state'] == 2
+              and storeJ.ats[302]['state'] == 2,
+              f"type={wbJ and wbJ['battle_type']}")
+        rowJ = pb_parse(war_campaign.msg_battle_row(wbJ))
+        prep = war_campaign.battle_prep_seconds(
+            war_campaign.BATTLE_TYPE_ENCOUNTER)
+        import struct as _struct
+        posJ = _struct.unpack('<f', rowJ[11])[0]
+        check('J1b battle 行补给线契约（f3=sl/f4=type3/f9=2/f10=3/'
+              'f11 position/f12 activation=started+prep）',
+              int(rowJ[3]) == 101
+              and int(rowJ[4]) == war_campaign.MAP_ENTITY_SUPPLYLINE
+              and int(rowJ[9]) == 2 and int(rowJ[10]) == 3
+              and 0.0 < posJ < 1.0
+              and rowJ[12].decode() == war_campaign._fmt_ts(
+                  NOW + datetime.timedelta(seconds=prep)),
+              f'pos={posJ} act={rowJ[12]}')
+        check('J1c position 相向中点 0.5',
+              abs(wbJ['position'] - 0.5) < 1e-6, f"{wbJ['position']}")
+        mrecJ = [m for m in storeJ.mission_records.values()
+                 if m.get('battle_id') == wbJ['id']]
+        check('J1d mission record 落库（map_entity=遭遇段起点城）',
+              len(mrecJ) == 1 and mrecJ[0]['map_entity_id'] == 10,
+              f'{[(m["id"], m["map_entity_id"]) for m in mrecJ]}')
+
+        # J2 冻结：会战中不推进不到达
+        await war_campaign.advance_movements(
+            storeJ, warJ,
+            now=NOW + datetime.timedelta(seconds=5 * SEG_SEC))
+        check('J2 会战冻结（movement 仍 active、AT 停留 sl101、无新战）',
+              storeJ.movements[mvJ1['id']]['state'] == 0
+              and storeJ.movements[mvJ2['id']]['state'] == 0
+              and storeJ.ats[301]['map_entity_id'] == 101
+              and len(storeJ.battles) == 1)
+
+        # J3 结算：无城市易主 + 幸存双方释放 + 冻结行军顺延恢复
+        storeJ.ats[301]['resources'] = {1: 100}
+        storeJ.ats[302]['resources'] = {1: 100}
+        midJ = mrecJ[0]['id'] if mrecJ else 0
+        await war_campaign.settle_war_battle(storeJ, midJ, wbJ['id'], 1)
+        check('J3 野外结算：幸存双方 state=0 + 无城市易主',
+              storeJ.ats[301]['state'] == 0
+              and storeJ.ats[302]['state'] == 0
+              and not storeJ.city_owners.get(warJ['id']),
+              f'owners={storeJ.city_owners.get(warJ["id"])}')
+        check('J3b 冻结行军顺延恢复（started_at 后移，仍 active）',
+              storeJ.movements[mvJ1['id']]['state'] == 0
+              and storeJ.movements[mvJ1['id']]['started_at'] > NOW
+              and storeJ.movements[mvJ2['id']]['started_at'] > NOW,
+              f"start={storeJ.movements[mvJ1['id']]['started_at']}")
+
+        # J4 含坦克族 → skirmish（type 3）
+        storeK = FakeStore()
+        warK = await war_campaign.ensure_war(storeK)
+        k1 = _mk_at(storeK, warK['id'], 311, 1, 10)
+        k2 = _mk_at(storeK, warK['id'], 312, 2, 20)
+        k1['template_id'] = 901
+        k2['template_id'] = 902                  # 坦克族
+        await war_campaign.start_movement(storeK, k1, 20, now=NOW)
+        await war_campaign.start_movement(storeK, k2, 10, now=NOW)
+        await war_campaign.advance_movements(
+            storeK, warK,
+            now=NOW + datetime.timedelta(seconds=SEG_SEC / 2))
+        wbK = next((b for b in storeK.battles.values()), None)
+        check('J4 任一方含装甲族 → skirmish（type 3）',
+              wbK is not None
+              and wbK['battle_type'] == war_campaign.BATTLE_TYPE_SKIRMISH,
+              f"type={wbK and wbK['battle_type']}")
+
+        # J5 同段同阵营不成局
+        storeL = FakeStore()
+        warL = await war_campaign.ensure_war(storeL)
+        l1 = _mk_at(storeL, warL['id'], 321, 1, 10)
+        l2 = _mk_at(storeL, warL['id'], 322, 1, 20)
+        await war_campaign.start_movement(storeL, l1, 20, now=NOW)
+        await war_campaign.start_movement(storeL, l2, 10, now=NOW)
+        await war_campaign.advance_movements(
+            storeL, warL,
+            now=NOW + datetime.timedelta(seconds=SEG_SEC / 2))
+        check('J5 同段同阵营不成局', not storeL.battles)
+    finally:
+        wardb.commandnode_templates = _orig_tpls
+
+    # ---- K. automission 阈值/tie 判定（war-gameplay-fix-plan §3/§4/§7/§8）----
+    import combat_instances
+    _orig_preset_loader = wardb._load_preset
+    _orig_cp_loader = wardb._load_capturepoint_templates
+    _orig_tpls_k = wardb.commandnode_templates
+    # preset 5 → gamemap 55（三点图 3 据点）/ preset 6 → gamemap 66（单点 1）
+    wardb._load_preset = lambda pid: {3: 55 if int(pid or 0) == 5 else 66}
+    wardb._load_capturepoint_templates = (
+        lambda gm: [1, 2, 3] if int(gm) == 55 else [120])
+    wardb.commandnode_templates = lambda: {
+        901: {'id': 901, 'resources': {1: 100}, 'speed': 1.0},
+        108: {'id': 108, 'name': 'paratroopers', 'actionid': 13,
+              'resources': {4: 300}, 'convert_to': 114, 'speed': 1.0},
+        114: {'id': 114, 'name': 'paratroopers_on_ground', 'actionid': 13,
+              'resources': {4: 300}, 'convert_to': 108, 'speed': 1.0},
+    }
+    RN = datetime.datetime.now(datetime.timezone.utc)
+
+    async def _mk_auto_battle(btype, atk_res, def_res, preset=5,
+                              started=None, atk_tpl=0, def_tpl=0):
+        """直造一场 automission 待判会战（攻 f1 守 f2、双方 state=2）。"""
+        st = FakeStore()
+        w = await war_campaign.ensure_war(st)
+        a = _mk_at(st, w['id'], 401, 1, 20)
+        d = _mk_at(st, w['id'], 402, 2, 20)
+        a['resources'] = dict(atk_res)
+        d['resources'] = dict(def_res)
+        a['template_id'] = atk_tpl
+        d['template_id'] = def_tpl
+        a['state'] = 2
+        d['state'] = 2
+        wb = await st.create_war_battle(
+            w['id'], 20 if btype == war_campaign.BATTLE_TYPE_ASSAULT else 101,
+            [{'at_id': 401, 'faction': 1}, {'at_id': 402, 'faction': 2}],
+            battle_type=btype)
+        if started is not None:
+            st.battles[wb['id']]['started_at'] = started
+            wb['started_at'] = started
+        mid = await st.create_mission_record(
+            preset, attacker_faction=1, defender_faction=2,
+            battle_id=wb['id'])
+        return st, w, wb, int(mid['id'])
+
+    try:
+        # K1 野外单点图（preset 6 → 1 据点 → 门槛 144）：攻 100 < 144 ≤
+        #    守 200 → 攻方败（损 25% 编制 + 20 士气 + 释放；胜方无损无经验）
+        st1, _w1, wb1, _m1 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ENCOUNTER,
+            {1: 100}, {1: 200}, preset=6)
+        await war_campaign.automission_tick(st1)
+        b1 = st1.battles[wb1['id']]
+        check('K1 野外单点 144 门槛：攻方不足败北（胜方=守方）',
+              b1['state'] == 1 and b1['winning_faction'] == 2,
+              f"state={b1['state']} win={b1['winning_faction']}")
+        check('K1b 败方损 25% 编制 + 20 士气 + 释放 state=0',
+              st1.ats[401]['resources'] == {1: 75}
+              and st1.ats[401]['morale'] == 80
+              and st1.ats[401]['state'] == 0,
+              f"res={st1.ats[401]['resources']} "
+              f'morale={st1.ats[401]["morale"]}')
+        check('K1c 胜方零损耗 + 系统判定无经验无战币',
+              st1.ats[402]['resources'] == {1: 200}
+              and st1.ats[402]['morale'] == 100
+              and 'battles' not in st1.ats[401]
+              and not getattr(st1, 'funds_log', []),
+              f"res={st1.ats[402]['resources']} "
+              f"funds={getattr(st1, 'funds_log', None)}")
+
+        # K2 野外三点图（preset 5 → 3 据点 → 门槛 216）：攻 200 < 216 ≤
+        #    守 250 → 攻方败（单点门槛下 200 本可胜）
+        st2, _w2, wb2, _m2 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_SKIRMISH,
+            {1: 200}, {1: 250}, preset=5)
+        await war_campaign.automission_tick(st2)
+        check('K2 野外三点 216 门槛：攻 200 不足败北',
+              st2.battles[wb2['id']]['winning_faction'] == 2
+              and st2.ats[401]['resources'] == {1: 150},
+              f"win={st2.battles[wb2['id']]['winning_faction']} "
+              f"res={st2.ats[401]['resources']}")
+
+        # K2b 野外单点图守方不足：攻 200 ≥ 144 > 守 100 → 攻方胜
+        st2b, _w2b, wb2b, _m2b = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ENCOUNTER,
+            {1: 200}, {1: 100}, preset=6)
+        await war_campaign.automission_tick(st2b)
+        check('K2b 野外守方不足 → 攻方胜（守方损 25%）',
+              st2b.battles[wb2b['id']]['winning_faction'] == 1
+              and st2b.ats[402]['resources'] == {1: 75}
+              and st2b.ats[401]['resources'] == {1: 200},
+              f"win={st2b.battles[wb2b['id']]['winning_faction']}")
+
+        # K3 城攻（assault 非伞兵）：攻 100 < 216 → 攻方败城不易主
+        st3, _w3, wb3, _m3 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ASSAULT, {1: 100}, {1: 250})
+        await war_campaign.automission_tick(st3)
+        check('K3 城攻攻方 <216 败北、城不易主',
+              st3.battles[wb3['id']]['winning_faction'] == 2
+              and st3.city_owners.get(_w3['id'], {}).get(20) != 1,
+              f"win={st3.battles[wb3['id']]['winning_faction']} "
+              f"owner={st3.city_owners.get(_w3['id'], {}).get(20)}")
+        # K3b 城攻击方 ≥216 → 攻方胜城易主（守方 {1:1} 被 25% 损耗归零歼灭）
+        st3b, _w3b, wb3b, _m3b = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ASSAULT, {1: 300}, {1: 1})
+        await war_campaign.automission_tick(st3b)
+        check('K3b 城攻击方 ≥216 攻方胜 + 城易主',
+              st3b.battles[wb3b['id']]['winning_faction'] == 1
+              and st3b.city_owners.get(_w3b['id'], {}).get(20) == 1,
+              f"win={st3b.battles[wb3b['id']]['winning_faction']} "
+              f"owner={st3b.city_owners.get(_w3b['id'], {}).get(20)}")
+
+        # K4 伞兵攻城：攻方伞兵（tpl 108）cat4 100 < 288 → 攻方败 +
+        #    落地变步兵（convert_to 114 *_on_ground）
+        st4, _w4, wb4, _m4 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ASSAULT, {4: 100}, {1: 250},
+            atk_tpl=108)
+        await war_campaign.automission_tick(st4)
+        check('K4 伞兵 <288 攻方败北 + 落地变步兵（tpl 108→114）',
+              st4.battles[wb4['id']]['winning_faction'] == 2
+              and st4.ats[401]['template_id'] == 114
+              and st4.ats[401]['resources'] == {4: 75},
+              f"win={st4.battles[wb4['id']]['winning_faction']} "
+              f"tpl={st4.ats[401]['template_id']}")
+        # K5 伞兵 ≥288 且守方 <216 → 伞兵胜占城
+        st5, _w5, wb5, _m5 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ASSAULT, {4: 300}, {1: 100},
+            atk_tpl=108)
+        await war_campaign.automission_tick(st5)
+        check('K5 伞兵 ≥288 守方 <216 → 伞兵胜占城（不落地转换）',
+              st5.battles[wb5['id']]['winning_faction'] == 1
+              and st5.city_owners.get(_w5['id'], {}).get(20) == 1
+              and st5.ats[401]['template_id'] == 108,
+              f"win={st5.battles[wb5['id']]['winning_faction']} "
+              f"tpl={st5.ats[401]['template_id']}")
+
+        # K6 tie：双方满足（三点 216）→ 6h 窗口内不结算；超时后少者败
+        st6, _w6, wb6, _m6 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_SKIRMISH,
+            {1: 250}, {1: 250}, preset=5, started=RN - datetime.timedelta(
+                hours=1))
+        await war_campaign.automission_tick(st6)
+        k6_wait = st6.battles[wb6['id']]['state'] == 0
+        st6.battles[wb6['id']]['started_at'] = (
+            RN - datetime.timedelta(hours=7))
+        st6.ats[402]['resources'] = {1: 200}     # 少者败（250 vs 200）
+        await war_campaign.automission_tick(st6)
+        check('K6 tie：6h 窗口内不结算，超时后兵力少者败',
+              k6_wait
+              and st6.battles[wb6['id']]['winning_faction'] == 1
+              and st6.ats[402]['resources'] == {1: 150},
+              f"wait={k6_wait} "
+              f"win={st6.battles[wb6['id']]['winning_faction']}")
+
+        # K7 未到准备期超时（野外 300s / 城攻 330s）不结算
+        st7, _w7, wb7, _m7 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ENCOUNTER, {1: 100}, {1: 200},
+            preset=6, started=RN - datetime.timedelta(seconds=60))
+        await war_campaign.automission_tick(st7)
+        k7a = st7.battles[wb7['id']]['state'] == 0
+        st7b, _w7b, wb7b, _m7b = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ASSAULT, {1: 100}, {1: 250},
+            started=RN - datetime.timedelta(seconds=60))
+        await war_campaign.automission_tick(st7b)
+        check('K7 准备期内（60s < 300/330s）不结算',
+              k7a and st7b.battles[wb7b['id']]['state'] == 0,
+              f'field={k7a} assault={st7b.battles[wb7b["id"]]["state"]}')
+
+        # K8 真人局战斗会话存活 → 不触碰
+        st8, _w8, wb8, m8 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ASSAULT, {1: 100}, {1: 250})
+        st8.mission_records[m8]['state'] = 1
+        combat_instances.COMBAT_INSTANCES[m8] = object()
+        try:
+            await war_campaign.automission_tick(st8)
+        finally:
+            combat_instances.COMBAT_INSTANCES.pop(m8, None)
+        check('K8 真人局会话存活不结算',
+              st8.battles[wb8['id']]['state'] == 0
+              and st8.ats[401]['state'] == 2,
+              f"state={st8.battles[wb8['id']]['state']}")
+
+        # K9 会话消亡的中途退场局 → 旧口径资源量比较（长超时兜底）
+        st9, _w9, wb9, m9 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ASSAULT, {1: 100}, {1: 200})
+        st9.mission_records[m9]['state'] = 1    # 不在 COMBAT_INSTANCES
+        await war_campaign.automission_tick(st9)
+        check('K9 会话消亡局旧口径兜底（资源多者胜、60% 败方损耗）',
+              st9.battles[wb9['id']]['winning_faction'] == 2
+              and st9.ats[401]['resources'] == {1: 40},
+              f"win={st9.battles[wb9['id']]['winning_faction']} "
+              f"res={st9.ats[401]['resources']}")
+    finally:
+        wardb._load_preset = _orig_preset_loader
+        wardb._load_capturepoint_templates = _orig_cp_loader
+        wardb.commandnode_templates = _orig_tpls_k
 
     fails = [l for l, ok in RESULTS if not ok]
     print(f'\n{"="*50}\nwar_movement 回归：{len(RESULTS)-len(fails)}/{len(RESULTS)} PASS')

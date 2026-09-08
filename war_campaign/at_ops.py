@@ -16,6 +16,7 @@ from state import log
 from .common import (
     supplyline_adjacency,
     _bf_pos,
+    _SOLDIER_CATS,
     )
 from .lifecycle import (
     ensure_war,
@@ -270,17 +271,41 @@ def upgrade_allowed(cur_tpl, target_tpl):
 RC_DEPLOY_LOCATION_NOT_FOUND = 221    # 官服：主城交战/无可用落位城
 
 
-def faction_capital_bfs(faction):
-    """阵营全部首都 battlefield id 集合（部署 UI 玩家可选项，
-    AssaultTeamReinforcementWindowMediator：CapitalTable 己方首都）。"""
-    return {int(c['battlefield_id']) for c in wardb.capitals()
-            if c.get('battlefield_id')
-            and int(c.get('default_faction') or 0) == int(faction or 0)}
+async def owned_capital_bfs(store, war_id, faction, owners=None):
+    """己方当前占领的主城 battlefield id 集合（**动态归属**）。
+
+    客户端实锤（AssaultTeamReinforcementWindowMediator.requestDeployment
+    AS3 L470-480）：部署窗口列出 CapitalTable.allEntries 中
+    battlefieldStatus.factionid == 己方阵营的全部主城 → 占领敌方主城后
+    该城同样进入部署选项（旧实现按静态 default_faction 判定 → 新占领的
+    敌方主城 f4 被无视、AT 落回出厂主城 = 玩家报"新占领的城市没办法
+    部署"）。owners 缺省自查 store；存储不可用回退静态 default_faction
+    （与旧口径一致，宁部署不错杀）。"""
+    if owners is None:
+        try:
+            owners = dict(await store.get_war_cities(war_id))
+        except Exception:
+            owners = None
+    out = set()
+    for c in wardb.capitals():
+        bf = c.get('battlefield_id')
+        if not bf:
+            continue
+        if owners is not None:
+            own = int(owners.get(int(bf), 0) or 0)
+        else:
+            own = int(c.get('default_faction') or 0)
+        if own == int(faction or 0):
+            out.add(int(bf))
+    return out
 
 
 async def _battling_battlefields(store, war_id):
-    """交战城市集合 {battlefield_id}（活跃 war battle 所在城市）。
+    """交战城市集合 {battlefield_id}（活跃城战所在城市）。
+    野外会战（battle_type != ASSAULT）挂在补给线上，battlefield_id 与
+    城市 id 不同空间，不进本集合（撞号会误锁无关城市部署）。
     存储无该接口/异常时回退空集（视为全域非交战，维持可部署）。"""
+    from .common import BATTLE_TYPE_ASSAULT
     try:
         rows = await store.list_active_war_battles(war_id)
     except Exception:
@@ -288,6 +313,9 @@ async def _battling_battlefields(store, war_id):
     out = set()
     for b in rows or ():
         try:
+            if (int(b.get('battle_type') or BATTLE_TYPE_ASSAULT)
+                    != BATTLE_TYPE_ASSAULT):
+                continue
             bid = int(b.get('battlefield_id') or 0)
         except (TypeError, ValueError, AttributeError):
             continue
@@ -297,45 +325,52 @@ async def _battling_battlefields(store, war_id):
 
 
 async def resolve_deploy_battlefield(store, war, at, near_capital_bf=0):
-    """官服部署落位（§10.2 #4/#5）：主城非交战 → random.choice(
-    主城 ∪ 周边非交战己方城)（war1.md「就近原则」= 出生点分布池，
+    """官服部署落位（§10.2 #4/#5）：锚点主城非交战 → random.choice(
+    锚点 ∪ 锚点周边非交战己方城)（war1.md「就近原则」= 出生点分布池，
     非部署门槛——官服开局仅首都 owned，周边全中立必须可部署，
     2026-09-08 修正：周边无己方城时 AT 落主城本身）。
 
-    near_capital_bf（请求 f4 玩家所选首都）为本阵营首都时优先生效，
-    否则回退阵营默认主城。返回 (battlefield, 0)=成功；失败
-    (0, 221)=主城交战（官服 deploy_location_not_found）、(0, 7)=无主城。"""
+    锚点 = near_capital_bf（请求 f4 玩家所选城）在**己方当前占领的主城
+    集合**内时生效（2026-09-08 修正：客户端部署窗口按动态归属列出全部
+    己方主城，占领的敌方主城可选——旧静态 default_faction 判定会把部署
+    落回出厂主城）；否则回退集合内任一（排序取首，确定性）；集合空 =
+    丢光全部主城无处部署。返回 (battlefield, 0)=成功；失败
+    (0, 221)=锚点交战、(0, 7)=无己方主城。"""
     fac = int(at.get('faction') or 0)
+    try:
+        owners = dict(await store.get_war_cities(war['id']))
+    except Exception:
+        owners = None
+    owned_caps = await owned_capital_bfs(store, war['id'], fac, owners)
     capital = int(near_capital_bf or 0)
-    if capital not in faction_capital_bfs(fac):
-        capital = _faction_capital_bf().get(fac, 0)
+    if capital not in owned_caps:
+        capital = sorted(owned_caps)[0] if owned_caps else 0
     if not capital:
         return 0, RC_CANNOT_FIND_COMMANDNODE
     battling = await _battling_battlefields(store, war['id'])
     if capital in battling:
         return 0, RC_DEPLOY_LOCATION_NOT_FOUND
-    try:
-        owners = dict(await store.get_war_cities(war['id']))
-    except Exception:
-        owners = {}
     cands = [capital]
     for edge in supplyline_adjacency().get(capital, ()):
         nb = int(edge[3] or 0)
         if nb in battling or nb == capital:
             continue
         try:
-            if int(owners.get(nb, 0) or 0) != fac:
+            if int((owners or {}).get(nb, 0) or 0) != fac:
                 continue
         except (TypeError, ValueError):
             continue
         cands.append(nb)
     if is_radius_unit(at):
         # §10.2 #7：飞机/伞兵（airborne）只出生在机场——候选池 ∩ 机场；
-        # 空池回退距主城最近的机场（官服"主城附近的机场"口径，不查归属，
-        # fac1 首都邻接无机场的既成事实）
+        # 空池回退距主城最近的**己方占领**机场（2026-09-08 修复：机场须先
+        # 占领才能部署，与半径移动侧"敌方/中立机场拒单"同口径——旧实现
+        # 不查归属，开局只有主城 owned 时飞机直接落中立机场 Biggin Hill/
+        # Kastrup/Érd；fac1 首都邻接无机场 → 开局需先占二跳机场）。
+        # 己方无任何机场 → 拒单 221
         af_cands = [c for c in cands if is_airfield(c)]
         if not af_cands:
-            near = nearest_airfield(capital)
+            near = nearest_owned_airfield(capital, owners, fac)
             if not near:
                 return 0, RC_DEPLOY_LOCATION_NOT_FOUND
             af_cands = [near]
@@ -386,6 +421,13 @@ def _tpl_of(at):
         int(at.get('template_id') or 0)) or {}
 
 
+def is_infantry_at(at):
+    """纯步兵族 AT（模板编制类别全部属士兵族；war1.md 野外遭遇两子类
+    判据：双方纯步兵=encounter / 任一方含载具（侦/装）=skirmish）。"""
+    cats = {int(c) for c in (_tpl_of(at).get('resources') or {})}
+    return bool(cats) and cats <= _SOLDIER_CATS
+
+
 def is_radius_unit(at):
     """有限半径空中单位（伞兵 + 飞机）：1 < transportradius < 无限哨兵。
 
@@ -424,13 +466,42 @@ def bf_distance(from_bf, to_bf):
 
 
 def nearest_airfield(bf_id):
-    """距指定城市最近的机场（官服"主城附近的机场"口径，不查归属——
-    fac1 首都 6724566 邻接无机场，最近机场距离 114）。无坐标返回 0。"""
+    """距指定城市最近的机场（不查归属；部署回退请用
+    nearest_owned_airfield，本函数仅供存储异常回退/勘查口径）。无坐标
+    返回 0。"""
     src = _bf_pos().get(int(bf_id or 0))
     if not src:
         return 0
     best, best_d = 0, None
     for af in airfield_bfs():
+        q = _bf_pos().get(af)
+        if not q:
+            continue
+        d = (src[0] - q[0]) ** 2 + (src[1] - q[1]) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = af, d
+    return best
+
+
+def nearest_owned_airfield(bf_id, owners, faction):
+    """距指定城市最近的**己方占领**机场（部署回退口径：机场须先占领）。
+
+    owners：{battlefield_id: faction}（war_cities 归属）；None = 存储
+    不可用，回退 nearest_airfield（宁部署不错杀，与 owned_capital_bfs
+    静态回退同哲学）。无己方机场/无坐标返回 0。"""
+    if owners is None:
+        return nearest_airfield(bf_id)
+    src = _bf_pos().get(int(bf_id or 0))
+    if not src:
+        return 0
+    fac = int(faction or 0)
+    best, best_d = 0, None
+    for af in airfield_bfs():
+        try:
+            if int(owners.get(af, 0) or 0) != fac:
+                continue
+        except (TypeError, ValueError):
+            continue
         q = _bf_pos().get(af)
         if not q:
             continue

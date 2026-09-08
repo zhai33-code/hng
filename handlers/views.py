@@ -350,7 +350,15 @@ async def handle_unsubscribe(sess, writer, cmd_id, req_type, proto):
 
 async def handle_query_war_catalogue_request(sess, writer, cmd_id, req_type, proto):
     # 战争目录查询：DB 聚合（war_campaign 状态机）优先，DB 不可用回退静态 mock
-    rows = await war_campaign.build_war_catalogue_protos(STORE)
+    # f1 includeWarId：WarIsOver 终局链查结束战争的目录 → 该 war 行置首
+    # （客户端取 warcataloguedata[0]，按默认序会拿到新续战 → 结算界面无数据）
+    inc_war = 0
+    try:
+        f = pb_parse(proto)
+        inc_war = int(f.get(1, 0) or 0)
+    except Exception as e:
+        log(f'      [views] catalogue parse error: {e}')
+    rows = await war_campaign.build_war_catalogue_protos(STORE, inc_war)
     if rows:
         resp_proto = b''.join(
             pb_message(1, row) for row in rows) + pb_int64(2, 0)
@@ -361,7 +369,8 @@ async def handle_query_war_catalogue_request(sess, writer, cmd_id, req_type, pro
     resp = build_response(cmd_id, 'query_war_catalogue_response', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} query_war_catalogue_response ({n_wars} war, 3 factions, {len(resp_proto)}B)')
+    log(f'S->C cmd={cmd_id:<4} query_war_catalogue_response ({n_wars} war'
+        f'{f", includeWarId={inc_war}" if inc_war else ""}, 3 factions, {len(resp_proto)}B)')
 
 
 
@@ -429,14 +438,20 @@ async def handle_join_war_request(sess, writer, cmd_id, req_type, proto):
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} join_war_response (msg={code})')
 
-    # 落库成功 → 重推 player 行（f11=已选 faction）驱动客户端关窗继续
-    if stored:
+    # 落库成功 → 重推 player 行（f11=已选 faction）驱动客户端关窗继续；
+    # factionid=0 无既有选择（WarIsOver 界面"进入下一场战争"按钮 → 新战争
+    # 无 faction 行）同样重推：f11=0 → PlayerModel 检测 war id 变化走
+    # unSubscribeViewsSignal 退订重订阅 + 弹阵营选择窗（此前不重推 →
+    # 客户端停在旧战争上下文）
+    if stored or (code == 1 and factionid not in (1, 2, 3)):
         push_cmd = sess.playerview_cmd or cmd_id
         try:
             player_proto = await _msg_player_for(sess)
             await _push_kvcs(writer, push_cmd, b'player', player_proto)
             log(f'S->C cmd={push_cmd:<4} KeyValueChangeSet '
-                f'(player refreshed, faction selected ★join_war)')
+                f'(player refreshed'
+                f'{", faction selected" if stored else ", no faction (new war)"}'
+                f' ★join_war)')
         except Exception as e:
             log(f'      [views] player refresh after join_war failed: {e}')
 

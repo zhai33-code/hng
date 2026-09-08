@@ -91,8 +91,48 @@ async def ensure_war(store):
         return None
 
 
+async def _broadcast_war_rows(store, war_ids):
+    """war 行 KVCS 推送到所有 playerview 订阅会话（战争结束/续战通知）。
+
+    客户端 WarModel.onWarUpdates（WarTable.changeSignal）凭 war 行
+    UPDATE 驱动全部战争终局链：f7 winningfactionid != 0 → 发
+    query_war_catalogue_request{f1=结束war id} → WarIsOver 结算界面
+    （"进入下一场战争"按钮读目录 f14 sequelWarId → join_war_request）。
+    此前 end_war 只落库不推送 → 战争结束客户端完全无感知（用户报
+    "没弹结算界面"）；续战新 war 行 ADD 同推（currentWar 切换）。
+    push-and-forget：单会话故障不影响其他订阅者。"""
+    from state import FLASH_SESSIONS
+    from messages import _push_kvcs
+    from .war_row import build_war_proto
+    rows = []
+    for wid in war_ids:
+        try:
+            w = await store.get_war(int(wid))
+            if w is not None:
+                rows.append(build_war_proto(w))
+        except Exception as e:
+            log(f'[war] get_war({wid}) for broadcast failed: {e}')
+    if not rows:
+        return
+    for sess in list(FLASH_SESSIONS.values()):
+        cmd = getattr(sess, 'playerview_cmd', None)
+        wtr = getattr(sess, 'writer', None)
+        if not cmd or not wtr:
+            continue
+        for payload in rows:
+            try:
+                await _push_kvcs(wtr, cmd, b'war', payload)
+            except Exception:
+                pass
+
+
 async def check_victory(store, war=None):
-    """检查当前战争胜利条件：某阵营占领首都数 ≥ pointsNeededForVictory。
+    """检查当前战争胜利条件（两支，先判第一支）：
+
+    ① 某阵营占领首都数 ≥ pointsNeededForVictory；
+    ② 某阵营首都数 = 0（失光全部主城）→ 比较剩余两方首都数，多者胜
+      （war1.md 胜利条件第二支；平分时平局，无胜方战争继续）。
+    两支同时成立（极端）优先 ①。
 
     达成 → end_war（winning_faction）+ MM_WAR_SEQUEL_AUTO 时自动开续战
     （复用 ensure_war）。返回胜方 faction id；未达成返回 None。"""
@@ -112,6 +152,18 @@ async def check_victory(store, war=None):
                 winner = faction
                 break
         if not winner:
+            # ② 第二支：某方失光全部主城 → 剩余两方首都数多者胜
+            eliminated = [f for f in (1, 2, 3) if counts.get(f, 0) == 0]
+            if eliminated:
+                rest = [f for f in (1, 2, 3) if counts.get(f, 0) > 0]
+                if len(rest) == 2:
+                    a, b = rest
+                    if counts[a] > counts[b]:
+                        winner = a
+                    elif counts[b] > counts[a]:
+                        winner = b
+                    # 平分：平局，无胜方战争继续
+        if not winner:
             return None
         sequel = 0
         await store.end_war(war['id'], winner)
@@ -120,8 +172,13 @@ async def check_victory(store, war=None):
             if nxt is not None:
                 sequel = nxt['id']
                 await store.update_war_sequel(war['id'], sequel)
-        log(f'[war] 战争 {war["id"]} 结束：阵营 {winner} 占领 '
-            f'{counts.get(winner, 0)} 首都 ≥ {needed}，sequel={sequel}')
+        # ★ 广播 war 行（结束行 f7=胜方 + 续战行 ADD）：客户端凭此弹
+        # WarIsOver 结算界面并切换新战争（链路见 _broadcast_war_rows 注释）
+        await _broadcast_war_rows(store,
+                                   [war['id']] + ([sequel] if sequel else []))
+        if winner:
+            log(f'[war] 战争 {war["id"]} 结束：阵营 {winner} 胜 '
+                f'（首都 {counts}，needed={needed}），sequel={sequel}')
         return winner
     except Exception as e:
         log(f'[war] check_victory failed: {e}')

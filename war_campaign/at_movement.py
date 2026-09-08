@@ -6,6 +6,7 @@
 
 import datetime
 import math
+import random
 import mm_config
 import wardb
 from .common import (
@@ -15,6 +16,7 @@ from .common import (
     MAP_ENTITY_SUPPLYLINE,
     _ts_ms,
     find_supplyline_path,
+    supplyline_adjacency,
     _bf_pos,
     )
 from .lifecycle import (
@@ -120,6 +122,63 @@ def at_current_battlefield(at):
         if bf:
             return bf
     return 0
+
+
+async def retreat_eval(store, war_id, at, owners=None):
+    """交战撤退判定（war1.md §撤退：方向随机、只能沿友方路线；
+    四周路线全被敌军占据时无法撤退）。
+
+    返回 (dest_bf, encircled)：
+    - dest_bf > 0：撤退落点 = 友方邻城中随机一座（多条友方路线随机取向）
+    - dest_bf = 0 且 encircled=False：无友方路线（邻城中立/敌空城）→
+      调用方回退现有行为（撤回待命）
+    - encircled=True：所有补给线邻城均驻有敌军 AT（敌空城/中立/己方
+      不算占据——war2.md 拦路伞兵战术口径：空城可通行、有敌军才堵路）
+      → 无法撤退，战败时全歼（automission 结算侧消费同判据）
+
+    owners：{battlefield_id: faction} 城市归属（调用方可预取）。"""
+    fac = int(at.get('faction') or 0)
+    cur_bf = at_current_battlefield(at)
+    if not cur_bf:
+        return 0, False
+    neighbors = sorted({e[3] for e in supplyline_adjacency().get(cur_bf, ())})
+    if not neighbors:
+        return 0, False
+    if owners is None:
+        try:
+            owners = dict(await store.get_war_cities(war_id))
+        except Exception:
+            owners = {}
+    friendly = [nb for nb in neighbors
+                if int(owners.get(nb) or 0) == fac]
+    if friendly:
+        return random.choice(friendly), False
+    # 无友方邻城 → 包围判定：邻城是否全部驻有敌军 AT
+    hostile = set()
+    try:
+        for o in await store.list_war_command_nodes(war_id):
+            if (int(o.get('state') or 0) >= 3
+                    or int(o.get('faction') or 0) == fac
+                    or is_reserve(o)):
+                continue
+            bf = at_current_battlefield(o)
+            if bf in neighbors:
+                hostile.add(bf)
+    except Exception:
+        pass
+    return 0, len(hostile) >= len(neighbors)
+
+
+def moving_ats_by_supplyline(ats):
+    """在途 AT 按当前补给线段分组 {sl_id: [at…]}（war1.md 野外遭遇判据：
+    state==1 且 map_entity 在补给线上）。"""
+    out = {}
+    for at in ats or []:
+        if (int(at.get('state') or 0) == 1
+                and int(at.get('map_entity_type') or 0)
+                == MAP_ENTITY_SUPPLYLINE):
+            out.setdefault(int(at.get('map_entity_id') or 0), []).append(at)
+    return out
 
 
 def movement_segments(mv):

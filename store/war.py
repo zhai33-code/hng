@@ -283,6 +283,17 @@ class WarStoreMixin:
             out.append(d)
         return out
 
+    async def shift_movement_started(self, movement_id, seconds):
+        """在途行军整体顺延（野外会战冻结恢复：started_at += seconds，
+        段绝对时间由 movement_segments 从 started_at 累加，均匀后移）。"""
+        async with self.pool.acquire() as conn:
+            n = await conn.execute(
+                'UPDATE commandnode_movements SET started_at = '
+                'started_at + make_interval(secs => $2) '
+                'WHERE id = $1 AND state = 0',
+                int(movement_id), float(seconds or 0))
+        return _rowcount(n) > 0
+
     async def finish_movement(self, movement_id, state=1):
         """移动结束（1=arrived 2=cancelled）。返回是否更新。"""
         async with self.pool.acquire() as conn:
@@ -293,28 +304,56 @@ class WarStoreMixin:
 
     # ---- war_battles（M1 桩）----
 
-    async def create_war_battle(self, war_id, battlefield_id, factions):
-        """敌对 AT 相遇 → 会战登记（factions=[{at_id, faction}]）。返回行。"""
+    async def create_war_battle(self, war_id, battlefield_id, factions,
+                                battle_type=1, position=0.0):
+        """敌对 AT 相遇 → 会战登记（factions=[{at_id, faction}]）。
+
+        battle_type：官方 missiontype（1=assault 城战 / 3=skirmish /
+        5=encounter，war_campaign.BATTLE_TYPE_*）；position：补给线会战
+        位置（0-1，城战 0）。返回行。"""
         import json as _json
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                'INSERT INTO war_battles (war_id, battlefield_id, factions_json) '
-                'VALUES ($1, $2, $3) RETURNING id, war_id, battlefield_id, '
-                'factions_json, state, winning_faction, started_at, ended_at',
+                'INSERT INTO war_battles (war_id, battlefield_id, factions_json, '
+                'battle_type, position) '
+                'VALUES ($1, $2, $3, $4, $5) RETURNING id, war_id, '
+                'battlefield_id, factions_json, battle_type, position, '
+                'state, winning_faction, started_at, ended_at',
                 int(war_id), int(battlefield_id),
-                _json.dumps(list(factions or [])))
+                _json.dumps(list(factions or [])),
+                int(battle_type or 1), float(position or 0.0))
         if not row:
             return None
         d = dict(row)
         d['factions'] = _json.loads(d.pop('factions_json') or '[]')
         return d
 
+    async def append_war_battle_faction(self, battle_id, at_id, faction):
+        """追加参战 AT（参战阵营增援/野外遭遇后到方）。返回 factions 列表。
+
+        未追加到 factions 名单的 state=2 AT 结算遍历不到 → 永不释放
+        （会战生命周期审计 #2 关联修复）。已存在幂等返回。"""
+        wb = await self.get_war_battle(battle_id)
+        if wb is None:
+            return None
+        import json as _json
+        factions = list(wb.get('factions') or [])
+        if any(int(f.get('at_id') or 0) == int(at_id) for f in factions):
+            return factions
+        factions.append({'at_id': int(at_id), 'faction': int(faction or 0)})
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE war_battles SET factions_json = $2 WHERE id = $1',
+                int(battle_id), _json.dumps(factions))
+        return factions
+
     async def list_active_war_battles(self, war_id):
         import json as _j
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                'SELECT id, war_id, battlefield_id, factions_json, state, '
-                'winning_faction, started_at, ended_at FROM war_battles '
+                'SELECT id, war_id, battlefield_id, factions_json, '
+                'battle_type, position, state, winning_faction, started_at, '
+                'ended_at FROM war_battles '
                 'WHERE war_id = $1 AND state = 0 ORDER BY id', int(war_id))
         out = []
         for r in rows:
@@ -328,9 +367,9 @@ class WarStoreMixin:
         import json as _j
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                'SELECT id, war_id, battlefield_id, factions_json, state, '
-                'winning_faction, started_at, ended_at FROM war_battles '
-                'WHERE id = $1', int(battle_id))
+                'SELECT id, war_id, battlefield_id, factions_json, '
+                'battle_type, position, state, winning_faction, started_at, '
+                'ended_at FROM war_battles WHERE id = $1', int(battle_id))
         if not row:
             return None
         d = dict(row)

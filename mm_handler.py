@@ -485,7 +485,11 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
         for t in a_aps:
             owner_map[int(t)] = attacker
     pos = battlefield_pos(int(details.get('map_entity_id') or 0)
-                          or MISSION_MAP_ENTITY_ID)
+                         or MISSION_MAP_ENTITY_ID)
+    if pos is None:
+        # battlefield 行不在 wardb（无 WarDatabase 环境 / 异常 map_entity_id）
+        # → 回退原点，f8/f9 坐标仅驱动简报战场标记位置
+        pos = (0.0, 0.0)
 
     by_faction = {}
     for p in players:
@@ -574,12 +578,35 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
     匹配池成局（details 含 'players'）走多人版；旧结构回退 AI 单人版。"""
     f = pb_parse(proto)
     mid = int(f.get(1, 0))
+    bid = int(f.get(2, 0))
     details = _MM_MISSION_DETAILS.get(mid)
+    if details is None and mid == 0 and bid > 0:
+        # ★ 战争图城市点击链（2026-09-08 修复）：有会战的城市点击 →
+        # GetMissionDetailsRequest{f1=0, f2=battleId}（HandleWarBattleCommand
+        # 恒发 missionId=0）。此前只读 f1 → 恒查不到 → 回 43 → 客户端
+        # MissionDetailsWindow 秒关（用户报"点不开城市详情"）。
+        # 按 battle_id 反查 record 构造 war_pending det（走 multi 渲染）。
+        try:
+            wrec = await state.STORE.get_mission_by_battle(bid)
+        except Exception as e:
+            _log(f'[DB] get_mission_by_battle({bid}) failed: {e}')
+            wrec = None
+        if wrec is not None:
+            details = {'battle_id': int(bid),
+                       'preset': int(wrec.get('preset', 0) or 0),
+                       'map_entity_id': int(wrec.get('map_entity_id', 0) or 0),
+                       'attacker_faction':
+                           int(wrec.get('attacker_faction', 0) or 0),
+                       'defender_faction':
+                           int(wrec.get('defender_faction', 0) or 0),
+                       'war_pending': True, 'players': []}
     if details is None:
         # war 会战局回退（M2）：局尚未成（无人加入，_MM_MISSION_DETAILS
         # 未登记）但任务列表已展示 record 行 → 客户端点行拉详情。按 DB
-        # record 构造无 'players' 键的最小 det（走 multi 渲染 = 双方空
-        # 名单，官服成局前观感）；非 war record（battle_id=0）维持 43。
+        # record 构造带空 'players' 的最小 det（走 multi 渲染 = 双方空
+        # 名单，官服成局前观感；此前漏 'players' 键走 AI 分支 KeyError
+        # 'player_id' → HandlerErrorResponse）；非 war record（battle_id=0）
+        # 维持 43。
         wrec = None
         try:
             wrec = await state.STORE.get_mission_record(mid)
@@ -593,7 +620,7 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
                            int(wrec.get('attacker_faction', 0) or 0),
                        'defender_faction':
                            int(wrec.get('defender_faction', 0) or 0),
-                       'war_pending': True}
+                       'war_pending': True, 'players': []}
     if details is None:
         resp = build_response(cmd_id, 'GetMissionDetailsResponse', pb_int32(1, 43))
         writer.write(resp)

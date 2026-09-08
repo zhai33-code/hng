@@ -18,6 +18,7 @@ interface LoginRow {
 }
 
 interface SearchResult {
+  total: number
   rows: LoginRow[]
   machines: Record<string, string[]>
   ips: Record<string, string[]>
@@ -28,6 +29,7 @@ const router = useRouter()
 const loading = ref(false)
 const q = ref('')
 const data = ref<SearchResult | null>(null)
+const page = reactive({ page: 1, page_size: 50 })
 
 const loginResultText: Record<number, string> = { 97: '成功', 98: '密码错误' }
 const loginSourceText: Record<string, string> = {
@@ -43,7 +45,8 @@ async function load() {
   loading.value = true
   try {
     data.value = await get<SearchResult>(
-      `/logins?q=${encodeURIComponent(q.value)}`)
+      `/logins?q=${encodeURIComponent(q.value)}` +
+      `&page=${page.page}&page_size=${page.page_size}`)
   } catch (e: unknown) {
     ElMessage.error((e as Error).message || '加载失败')
   } finally {
@@ -52,6 +55,7 @@ async function load() {
 }
 
 function onSearch() {
+  page.page = 1
   router.replace({ query: q.value ? { q: q.value } : {} })
   load()
 }
@@ -70,6 +74,7 @@ watch(() => route.query.q, (v) => {
   const s = typeof v === 'string' ? v : ''
   if (s !== q.value) {
     q.value = s
+    page.page = 1
     load()
   }
 })
@@ -137,6 +142,12 @@ onMounted(() => {
       </el-table-column>
     </el-table>
     <el-empty v-if="!loading && data && !data.rows.length" description="无匹配记录" :image-size="60" />
+
+    <div class="pager">
+      <el-pagination v-model:current-page="page.page" v-model:page-size="page.page_size"
+                     :total="data?.total ?? 0" :page-sizes="[50, 100, 200]"
+                     layout="total, sizes, prev, pager, next" @change="load" />
+    </div>
   </div>
 </template>
 

@@ -4,6 +4,7 @@
 原 war_campaign.py 阶段 3.5 拆分（docs/warserver-refactor-plan.md §3.5）：
 符号逐字搬运，行为不变。"""
 
+import datetime
 import time
 from protocol import (
     pb_bool,
@@ -17,6 +18,9 @@ from protocol import (
 from .common import (
     _fmt_ts,
     MAP_ENTITY_BATTLEFIELD,
+    MAP_ENTITY_SUPPLYLINE,
+    BATTLE_TYPE_ASSAULT,
+    battle_prep_seconds,
     _ts_ms,
     )
 
@@ -74,16 +78,37 @@ def msg_air_transport_row(at, war_id, mv, seg):
 
 
 def msg_battle_row(wb):
-    """battle 行（会战；f1 id 为 S64，f11 position 仅补给线会战使用）。"""
+    """battle 行（会战；f1 id 为 S64，f11 position 仅补给线会战使用）。
+
+    交战类型建模（war-gameplay-fix-plan §2）：battle_type（官方
+    missiontype）驱动 mapEntityTypeId（城战=BATTLEFIELD、补给线会战=
+    SUPPLYLINE 且 mapEntityId=补给线 id）+ position（补给线 0-1）+
+    activationTimeStamp（= 成局 + 准备期，automission 超时起算点）。
+    factioncount（f9）如实计数；excludedFactionId（f10）= 未参战阵营
+    ——两方局填 1/2/3 中唯一缺席方（官方契约：被排除阵营不得参战）；
+    三方局 = 0。"""
+    btype = int(wb.get('battle_type') or BATTLE_TYPE_ASSAULT)
     factions = wb.get('factions') or []
-    n_factions = len({int(f.get('faction') or 0) for f in factions})
+    present = {int(f.get('faction') or 0) for f in factions
+               if int(f.get('faction') or 0)}
+    n_factions = len(present)
+    excluded = 0
+    if n_factions == 2 and present <= {1, 2, 3}:
+        excluded = ({1, 2, 3} - present).pop()
+    started = wb.get('started_at')
+    activation = started
+    if isinstance(started, datetime.datetime):
+        activation = (started
+                      + datetime.timedelta(seconds=battle_prep_seconds(btype)))
+    ent_type = (MAP_ENTITY_BATTLEFIELD if btype == BATTLE_TYPE_ASSAULT
+                else MAP_ENTITY_SUPPLYLINE)
     m = pb_sfixed64(1, wb['id'])                       # id
     m += pb_int64(2, wb['war_id'])                     # warid
-    m += pb_int64(3, wb['battlefield_id'])             # mapEntityId
-    m += pb_int64(4, MAP_ENTITY_BATTLEFIELD)           # mapEntityTypeId
-    m += pb_string(5, _fmt_ts(wb.get('started_at')))   # start
+    m += pb_int64(3, wb['battlefield_id'])             # mapEntityId（补给线会战=sl id）
+    m += pb_int64(4, ent_type)                         # mapEntityTypeId
+    m += pb_string(5, _fmt_ts(started))                # start
     m += pb_uint32(9, n_factions)                      # factioncount
-    m += pb_int64(10, 0)                               # excludedFactionId
-    m += pb_float(11, 0.0)                             # position
-    m += pb_string(12, _fmt_ts(wb.get('started_at')))  # activationTimeStamp
+    m += pb_int64(10, excluded)                        # excludedFactionId
+    m += pb_float(11, float(wb.get('position') or 0.0))  # position
+    m += pb_string(12, _fmt_ts(activation))            # activationTimeStamp
     return m

@@ -86,6 +86,13 @@ class FakeStore:
     async def list_active_movements(self, war_id):
         return []
 
+    async def list_active_war_battles(self, war_id):
+        # warmapview 快照 battle 行段（2026-09-08 补）用；无会战数据
+        return []
+
+    async def get_war(self, war_id):
+        return self.wars.get(int(war_id))
+
     async def get_war_cities(self, war_id):
         return sorted(self.city_owners.get(war_id, {}).items())
 
@@ -226,6 +233,67 @@ async def main():
     finally:
         mm_config.WAR_SEQUEL_AUTO = old
 
+    # C2. 胜利条件第二支（war1.md 2026-09-08 修复）：一方失光全部主城 →
+    #     剩余两方主城数多者胜；平分平局无胜方；第一支不可达时才走第二支
+    _orig_caps_fn = wardb.capitals
+    wardb.capitals = lambda: [
+        {'battlefield_id': 3001, 'default_faction': 1},
+        {'battlefield_id': 3002, 'default_faction': 1},
+        {'battlefield_id': 3003, 'default_faction': 2},
+        {'battlefield_id': 3004, 'default_faction': 2},
+        {'battlefield_id': 3005, 'default_faction': 3},
+    ]
+    try:
+        # C2a US 失光全部主城，GE 3 > SU 2 → GE 胜（第一支不可达 99→钳 5）
+        store3 = FakeStore()
+        w3 = await war_campaign.ensure_war(store3)
+        w3['points_needed_for_victory'] = 99
+        store3.city_owners[w3['id']] = {
+            3001: 2, 3002: 2, 3003: 3, 3004: 2, 3005: 3}
+        winner3 = await war_campaign.check_victory(store3)
+        check('C2a 失光主城方淘汰 → 剩两方多者胜（GE 3>SU 2）',
+              winner3 == 2 and w3['state'] == 2
+              and w3['winning_faction_id'] == 2,
+              f'winner={winner3} state={w3["state"]}')
+
+        # C2b 平分 → 平局无胜方（战争继续）
+        store4 = FakeStore()
+        w4 = await war_campaign.ensure_war(store4)
+        w4['points_needed_for_victory'] = 99
+        store4.city_owners[w4['id']] = {
+            3001: 2, 3002: 2, 3003: 3, 3004: 3, 3005: 0}
+        winner4 = await war_campaign.check_victory(store4)
+        check('C2b 剩两方平分 → 平局无胜方',
+              winner4 is None and w4['state'] == 1,
+              f'winner={winner4} state={w4["state"]}')
+
+        # C2c 无一方失光（三方各持有）→ 第二支不触发
+        store5 = FakeStore()
+        w5 = await war_campaign.ensure_war(store5)
+        w5['points_needed_for_victory'] = 99
+        store5.city_owners[w5['id']] = {
+            3001: 1, 3002: 2, 3003: 2, 3004: 2, 3005: 3}
+        winner5 = await war_campaign.check_victory(store5)
+        check('C2c 三方各持主城 → 第二支不触发',
+              winner5 is None and w5['state'] == 1,
+              f'winner={winner5}')
+    finally:
+        wardb.capitals = _orig_caps_fn
+
+    # ---- C3. 战争终态 war 行（广播数据端，2026-09-08）----
+    # check_victory 结束战争后 get_war+build_war_proto 必须能构造出
+    # f7=胜方 / f16=sequel 的 war 行（客户端 WarIsOver 链的触发源）
+    store6 = FakeStore()
+    w6 = await war_campaign.ensure_war(store6)
+    await store6.end_war(w6['id'], 1, sequel_war_id=0)
+    await store6.update_war_sequel(w6['id'], 0)
+    ended = await store6.get_war(w6['id'])
+    war_proto = war_campaign.build_war_proto(ended)
+    wf = pb_parse(war_proto)
+    check('C3 终态 war 行 f7 胜方 / f16 sequel 可构造',
+          int(wf[7]) == 1 and int(wf[16]) == 0,
+          f'f7={int(wf.get(7, 0))} f16={int(wf.get(16, 0))}')
+
     # ---- D. war catalogue ----
     store = FakeStore()
     w = await war_campaign.ensure_war(store)
@@ -269,6 +337,17 @@ async def main():
     resp = await war_campaign.build_war_catalogue_response_proto(store)
     check('response proto 含 bonusId(f2)',
           int(pb_parse(resp)[2]) == 0)
+    # includeWarId 置首（2026-09-08）：WarIsOver 终局链取
+    # warcataloguedata[0]——多战争时指定 war 必须排首位
+    w2 = await store.create_war('Second War', 15)
+    await store.init_war_cities(w2['id'], {})
+    rows3 = await war_campaign.build_war_catalogue_protos(store)
+    check('默认序新战争在前', int(pb_parse(rows3[0])[1]) == w2['id'])
+    rows4 = await war_campaign.build_war_catalogue_protos(
+        store, include_war_id=w['id'])
+    check('includeWarId 指定战争置首',
+          int(pb_parse(rows4[0])[1]) == w['id']
+          and int(pb_parse(rows4[1])[1]) == w2['id'])
     # 空库回退
     check('空 store 返回 None',
           await war_campaign.build_war_catalogue_response_proto(FakeStore()) is None)

@@ -69,7 +69,9 @@ from protocol import (
 from state import GAME_DIR, STORE, log
 
 from wardb import (
+    BOOSTER_MINUTES_BY_ID,
     MEMBERSHIP_DAYS_BY_ID,
+    XP_BOOSTER_MINUTES_BY_ID,
     _RIBBON_BOOSTERS,
     _load_wardb_kvcs,
     )
@@ -414,7 +416,9 @@ async def _grant_daily_reward(pid, day):
                 tid = random.choice(_RIBBON_BOOSTER_POOL) \
                     if _RIBBON_BOOSTER_POOL else 1
                 await STORE.add_booster(
-                    pid, tid, duration_minutes=_BOOSTER_MINUTES,
+                    pid, tid,
+                    duration_minutes=BOOSTER_MINUTES_BY_ID.get(
+                        tid, _BOOSTER_MINUTES),
                     is_ribbon=True)
                 out['items'].append(
                     _msg_voucher_pack_item('ribbonboostertemplate', tid))
@@ -769,10 +773,11 @@ async def handle_add_booster(sess, writer, cmd_id, req_type, proto):
             if not ok:
                 raise _PaymentFailed()
             if pid is not None and booster_id:
-                await STORE.add_booster(int(pid), booster_id,
-                                        duration_minutes=_BOOSTER_MINUTES,
-                                        activate_now=activate_now, conn=tx,
-                                        is_ribbon=True)
+                await STORE.add_booster(
+                    int(pid), booster_id,
+                    duration_minutes=BOOSTER_MINUTES_BY_ID.get(
+                        booster_id, _BOOSTER_MINUTES),
+                    activate_now=activate_now, conn=tx, is_ribbon=True)
                 log(f'      [DB] add_booster(ribbon) player={pid} '
                     f'template={booster_id} activate_now={activate_now}')
     except _PaymentFailed:
@@ -807,8 +812,8 @@ async def handle_activate_booster(sess, writer, cmd_id, req_type, proto):
     code = 208
     if pid is not None and STORE is not None and booster_row:
         try:
-            code = await STORE.activate_booster(int(pid), booster_row,
-                                                duration_minutes=_BOOSTER_MINUTES)
+            # 时长按行模板分表解析（store 侧），handler 不传死值
+            code = await STORE.activate_booster(int(pid), booster_row)
         except Exception as e:
             log(f'      [DB] activate_booster failed: {e}')
             code = 208
@@ -848,9 +853,11 @@ async def handle_add_various_booster(sess, writer, cmd_id, req_type, proto):
             if not ok:
                 raise _PaymentFailed()
             if pid is not None and template_id:
-                await STORE.add_booster(int(pid), template_id,
-                                        duration_minutes=_BOOSTER_MINUTES,
-                                        activate_now=activate_now, conn=tx)
+                await STORE.add_booster(
+                    int(pid), template_id,
+                    duration_minutes=XP_BOOSTER_MINUTES_BY_ID.get(
+                        template_id, _BOOSTER_MINUTES),
+                    activate_now=activate_now, conn=tx)
                 log(f'      [DB] add_booster(various) player={pid} '
                     f'template={template_id} type={booster_type}')
     except _PaymentFailed:
@@ -886,8 +893,8 @@ async def handle_activate_various_booster(sess, writer, cmd_id, req_type,
     code = 208
     if pid is not None and STORE is not None and booster_row:
         try:
-            code = await STORE.activate_booster(int(pid), booster_row,
-                                                duration_minutes=_BOOSTER_MINUTES)
+            # 时长按行模板分表解析（store 侧），handler 不传死值
+            code = await STORE.activate_booster(int(pid), booster_row)
         except Exception as e:
             log(f'      [DB] activate_booster failed: {e}')
             code = 208

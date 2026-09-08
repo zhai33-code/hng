@@ -225,6 +225,27 @@ WAR_AUTOMISSION_LOSER_LOSS = _float_env('MM_WAR_AUTOMISSION_LOSER_LOSS', 0.6)
 # 默认取 build_war_proto 同源 morale config 的官方值）
 WAR_MORALE_LOST_PER_BATTLE = _int_env('MM_WAR_MORALE_LOST', 20)
 WAR_MORALE_GAINED_PER_WIN = _int_env('MM_WAR_MORALE_GAINED', 10)
+# 撤退惩罚（war1.md §撤退：交战状态强撤无经验无战争币，损 25% 编制 +
+# 扣 20 士气；士气扣减与战斗失败同源 WAR_MORALE_LOST）
+WAR_RETREAT_LOSS = _float_env('MM_WAR_RETREAT_LOSS', 0.25)
+# 包围判定开关：1=交战撤退时检查四周补给线邻城（全部驻有敌军 AT =
+# 被包围无法撤退，战败时全歼）；0=关闭（恒可撤，M1 旧行为）
+WAR_ENCIRCLE_CHECK = _int_env('MM_WAR_ENCIRCLE_CHECK', 1)
+# 会战准备期秒数（battle 行 activationTimeStamp = 成局 + 准备期；
+# war1.md：野外遭遇 5 分钟 / 城攻 5 分 30 秒；automission 超时以此起算）
+WAR_BATTLE_PREP_FIELD = _int_env('MM_WAR_BATTLE_PREP_FIELD', 300)
+WAR_BATTLE_PREP_ASSAULT = _int_env('MM_WAR_BATTLE_PREP_ASSAULT', 330)
+# ---- automission 阈值判定（war-gameplay-fix-plan §3/§4/§7/§8；war1.md
+# 社区口径 144/216/288/5:00/5:30/6h，客户端无证据，全部可配）----
+# 据点数 ≥ 此值判「三点图」（用 216 门槛），否则「单点图」（144）
+WAR_AUTO_TP_CP = _int_env('MM_WAR_AUTO_TP_CP', 2)
+WAR_AUTO_SP_MIN = _int_env('MM_WAR_AUTO_SP_MIN', 144)    # 单点图步兵门槛
+WAR_AUTO_TP_MIN = _int_env('MM_WAR_AUTO_TP_MIN', 216)    # 三点图/城攻步兵门槛
+WAR_AUTO_LOSS = _float_env('MM_WAR_AUTO_LOSS', 0.25)     # 阈值判定败方编制损耗
+WAR_AUTO_ATTACK_TIMEOUT = _int_env('MM_WAR_AUTO_ATTACK_TIMEOUT', 330)  # 城攻判定
+WAR_AUTO_PARADROP_TIMEOUT = _int_env('MM_WAR_AUTO_PARADROP_TIMEOUT', 330)  # 伞兵攻城
+WAR_AUTO_PARA_MIN = _int_env('MM_WAR_AUTO_PARA_MIN', 288)   # 伞兵攻城判定
+WAR_AUTO_TIE_HOURS = _float_env('MM_WAR_AUTO_TIE_HOURS', 6.0)  # tie 超时（小时）
 # FPS 真人会战结算损耗系数（占参战 AT 当前 resources 比例；官服按局内
 # 死亡逐兵扣减，逐兵数据不可得，退化为按胜负比例扣，可校准）
 WAR_BATTLE_WINNER_LOSS = _float_env('MM_WAR_BATTLE_WINNER_LOSS', 0.15)

@@ -1,17 +1,15 @@
 # -*- coding: utf-8 -*-
-"""阵营资源生产推进（600s/run 游标）与 automission tick。
+"""阵营资源生产推进（600s/run 游标）与增援队列 tick。
 
-原 war_campaign.py 阶段 3.5 拆分（docs/warserver-refactor-plan.md §3.5）：
-符号逐字搬运，行为不变。"""
+原 war_campaign.py 阶段 3.5 拆分（docs/warserver-refactor-plan.md §3.5）。
+automission_tick 主体已迁移 war_campaign/automission.py（war-gameplay-fix-
+plan §3/§4/§7/§8 阈值/tie 判定），本模块保留符号转发。"""
 
 import time
 import mm_config
 import wardb
 from state import log
-from .common import (
-    _as_resources,
-    _ts_ms,
-    )
+from .automission import automission_tick  # noqa: F401（转发，对外符号不变）
 from .lifecycle import (
     ensure_war,
     )
@@ -21,70 +19,6 @@ from .warmap_view import (
 from .supply import (
     supply_windows,
     )
-
-
-async def automission_tick(store):
-    """M2-5 automission（协议 §8.4）：war battle 无人加入超时自动结算。
-
-    每 active battle（state=0）按 mission record 判定：
-      - record 缺失 / state==0（撮合未满，无人加入）：started_at 超过
-        WAR_AUTOMISSION_NORMAL 秒 → 结算；
-      - state==1 且战斗会话已不存在（全员中途退出，release_match 不回写
-        record）：同样按超时结算；
-      - state==1 且会话存活（COMBAT_INSTANCES 有实例）：live，跳过。
-    胜负：双方参战 AT 剩余资源总量多者胜（持平/双方皆空 = 攻方不胜，守方
-    守住）。损耗按 WAR_AUTOMISSION_WINNER_LOSS / LOSER_LOSS。
-    由 realtest_server war_tick 周期调用；返回无值（事件已广播）。
-    """
-    from .tick import broadcast_war_events, settle_war_battle
-    if store is None or getattr(store, 'pool', None) is None:
-        return
-    try:
-        war = await ensure_war(store)
-        if war is None:
-            return
-        import combat_instances       # 延迟 import（防未来循环依赖）
-        now_s = time.time()
-        timeout = max(60, mm_config.WAR_AUTOMISSION_NORMAL)
-        for wb in await store.list_active_war_battles(war['id']):
-            try:
-                mrec = await store.get_mission_by_battle(int(wb['id']))
-            except Exception:
-                mrec = None
-            r_state = int((mrec or {}).get('state', 0) or 0)
-            if r_state == 1 and mrec is not None:
-                if int(mrec['id']) in combat_instances.COMBAT_INSTANCES:
-                    continue          # 成局且战斗会话存活
-            started = _ts_ms(wb.get('started_at')) / 1000.0
-            if started <= 0 or now_s - started < timeout:
-                continue
-            # ---- 超时：按 AT 剩余资源判胜负 ----
-            power = {}
-            for entry in (wb.get('factions') or []):
-                at = await store.get_command_node(
-                    int(entry.get('at_id') or 0))
-                if not at or int(at.get('state') or 0) != 2:
-                    continue
-                fac = int(at.get('faction') or 0)
-                power[fac] = power.get(fac, 0) + sum(
-                    v for v in _as_resources(at.get('resources')).values()
-                    if isinstance(v, (int, float)))
-            winner = 0
-            if power:
-                best = max(power.values())
-                tops = [f for f, p in power.items() if p == best]
-                if best > 0 and len(tops) == 1:
-                    winner = tops[0]
-            log(f'[war] automission: battle {wb["id"]} idle '
-                f'{int(now_s - started)}s, settling (winner={winner})')
-            events = await settle_war_battle(
-                store, int((mrec or {}).get('id') or 0), int(wb['id']),
-                winner,
-                loss_ratios=(mm_config.WAR_AUTOMISSION_WINNER_LOSS,
-                             mm_config.WAR_AUTOMISSION_LOSER_LOSS))
-            await broadcast_war_events(events)
-    except Exception as e:
-        log(f'[war] automission_tick failed: {e}')
 
 
 # ---- M3-1 阵营资源生产（docs/hng-rts-protocol.md §9.1 / §3.12.1）----
