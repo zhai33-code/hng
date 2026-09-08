@@ -60,6 +60,40 @@ def _fmt_ts(dt):
     return dt.astimezone(datetime.timezone.utc).strftime('%Y%m%d%H%M%SZ')
 
 
+def _war_days(war):
+    """war_catalogue f3 wartime：战争已持续天数（字符串，≥1）。
+
+    客户端 WarIsOverScreenMediator 把 wartime 原样代入结算文案
+    "用{3}天的时间占领了欧洲"（WarIsOverScreen/article_neutral 的 {3}），
+    WarModel 另取 int(wartime)/daycycletimescale 作 warElapsed——发天数
+    两处口径都成立。此前误发 begintime 的 Zulu 时间戳 → 结算页"x天"
+    显示成具体日期。结束战争用 endtime；进行中战争用当前时刻；
+    不足一天按 1 天（当天开打当天结束也是"用1天"）。"""
+    begin = war.get('begintime') if isinstance(war, dict) else None
+    if not begin:
+        return '1'
+    end = war.get('endtime')
+    try:
+        begin = _as_dt(begin)
+        end = _as_dt(end) if end else datetime.datetime.now(
+            datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return '1'
+    elapsed = (end - begin).total_seconds()
+    if elapsed <= 0:
+        return '1'
+    return str(max(1, int(-(-elapsed // 86400))))    # ceil
+
+
+def _as_dt(v):
+    """begintime/endtime → aware UTC datetime（naive 按 UTC）。"""
+    if isinstance(v, str):
+        v = datetime.datetime.fromisoformat(v.replace('Z', '+00:00'))
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=datetime.timezone.utc)
+    return v
+
+
 def _as_resources(raw):
     """command_nodes.resources（JSONB 或 str 或 None）→ dict。"""
     if not raw:

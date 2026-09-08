@@ -197,6 +197,17 @@ class FakeStore:
         mv['state'] = int(state)
         return True
 
+    async def update_movement_path(self, movement_id, path,
+                                   arrive_at=None, dest_ap=0):
+        mv = self.movements.get(int(movement_id))
+        if mv is None or mv['state'] != 0:
+            return None
+        mv['path'] = [dict(s) for s in (path or [])]
+        if arrive_at is not None:
+            mv['arrive_at'] = arrive_at
+        mv['dest_ap'] = int(dest_ap or 0)
+        return dict(mv)
+
     # ---- war_battles ----
     async def create_war_battle(self, war_id, battlefield_id, factions,
                                 battle_type=1, position=0.0):
@@ -421,6 +432,138 @@ async def main():
           and all(abs(s['seconds'] - SEG_SEC / NEU) < 1e-6
                   for s in mv8['path']),
           f"secs={[round(s['seconds'], 1) for s in mv8['path']]}")
+
+    # ---- C2. divert_movement（在途改道：走完当前段，下一节点转向）----
+    store_c = FakeStore()
+    war_c = await war_campaign.ensure_war(store_c)
+    at_c = _mk_at(store_c, war_c['id'], 41, 1, 10)
+    mv_c, code_c = await war_campaign.start_movement(
+        store_c, at_c, 30, now=NOW)
+    t_half1 = NOW + datetime.timedelta(seconds=SEG_SEC * 0.5)
+
+    # 改道去当前段终点（20）→ 剩余行程=当前段，无新尾
+    mv_d1, code_d1 = await war_campaign.divert_movement(
+        store_c, at_c, mv_c, 20, now=t_half1)
+    check('C2 改道到当前段终点：单段收尾',
+          code_d1 == war_campaign.RC_OK and mv_d1
+          and len(mv_d1['path']) == 1
+          and mv_d1['path'][0]['to_bf'] == 20
+          and abs((mv_d1['arrive_at'] - NOW).total_seconds() - SEG_SEC)
+          < 1e-6)
+    check('C2 改道 movement id 不变（同 id 覆盖客户端行）',
+          mv_d1['id'] == mv_c['id']
+          and store_c.movements[mv_c['id']]['path'][0]['to_bf'] == 20)
+
+    # 改道折返回出发城市：pivot=20 起接反向段
+    at_c1b = _mk_at(store_c, war_c['id'], 46, 1, 10)
+    mv_c2, _ = await war_campaign.start_movement(
+        store_c, at_c1b, 30, now=NOW)
+    mv_d2, code_d2 = await war_campaign.divert_movement(
+        store_c, at_c1b, mv_c2, 10, now=t_half1)
+    check('C2 改道折返：当前段 + 反向段',
+          code_d2 == war_campaign.RC_OK and mv_d2
+          and [s['to_bf'] for s in mv_d2['path']] == [20, 10]
+          and mv_d2['path'][1]['sl_id'] == 101
+          and abs((mv_d2['arrive_at'] - NOW).total_seconds()
+                  - 2 * SEG_SEC) < 1e-6)
+    check('C2 改道保留当前段时间轴（started_at/首段不动）',
+          mv_d2['started_at'] == NOW
+          and abs(mv_d2['path'][0]['seconds'] - SEG_SEC) < 1e-6)
+
+    # 改道延长行程：单段在途 → 拼接新尾段
+    at_c2 = _mk_at(store_c, war_c['id'], 42, 1, 10)
+    mv_c3, _ = await war_campaign.start_movement(
+        store_c, at_c2, 20, now=NOW)
+    mv_d3, code_d3 = await war_campaign.divert_movement(
+        store_c, at_c2, mv_c3, 30, now=t_half1)
+    check('C2 改道延长：首段 + 新尾段时长正确',
+          code_d3 == war_campaign.RC_OK and mv_d3
+          and [(s['from_bf'], s['to_bf']) for s in mv_d3['path']]
+          == [(10, 20), (20, 30)]
+          and abs(mv_d3['path'][1]['seconds'] - SEG_SEC) < 1e-6
+          and abs((mv_d3['arrive_at'] - NOW).total_seconds()
+                  - 2 * SEG_SEC) < 1e-6)
+
+    # 末段封口（now 超过最后段 end）：pivot=原终点接新路径
+    at_c3 = _mk_at(store_c, war_c['id'], 43, 1, 10)
+    mv_c4, _ = await war_campaign.start_movement(
+        store_c, at_c3, 20, now=NOW)
+    mv_d4, code_d4 = await war_campaign.divert_movement(
+        store_c, at_c3, mv_c4, 30,
+        now=NOW + datetime.timedelta(seconds=SEG_SEC * 2))
+    check('C2 末段封口改道：从原终点续接',
+          code_d4 == war_campaign.RC_OK and mv_d4
+          and [s['to_bf'] for s in mv_d4['path']] == [20, 30])
+
+    # 不可达目标（40 孤岛）→ 7
+    mv_d5, code_d5 = await war_campaign.divert_movement(
+        store_c, at_c3, mv_d4, 40, now=t_half1)
+    check('C2 改道不可达 7',
+          mv_d5 is None
+          and code_d5 == war_campaign.RC_CANNOT_FIND_COMMANDNODE)
+
+    # 空运/半径单位单段 air 在途 → 33 不可改
+    at_c4 = _mk_at(store_c, war_c['id'], 44, 1, 10)
+    store_c.ats[44]['state'] = 1
+    mv_air = await store_c.create_movement(
+        44, war_c['id'],
+        [{'from_bf': 10, 'to_bf': 30, 'sl_id': 0, 'from_ap': 0,
+          'to_ap': 0, 'seconds': 600, 'air': True}],
+        started_at=NOW, arrive_at=NOW + datetime.timedelta(seconds=600))
+    mv_d6, code_d6 = await war_campaign.divert_movement(
+        store_c, at_c4, mv_air, 20, now=t_half1)
+    check('C2 air 在途不可改道 33',
+          mv_d6 is None
+          and code_d6 == war_campaign.RC_ALREADY_IN_TRANSPORT)
+
+    # dest_ap：改道带出兵点 → 更新；不带 → 清除
+    at_c5 = _mk_at(store_c, war_c['id'], 45, 1, 10)
+    mv_c6, _ = await war_campaign.start_movement(
+        store_c, at_c5, 30, override_ap=3, now=NOW)
+    check('C2 前置：dest_ap 已存', mv_c6['dest_ap'] == 3)
+    mv_d7, code_d7 = await war_campaign.divert_movement(
+        store_c, at_c5, mv_c6, 20, now=t_half1)
+    check('C2 改道不带出兵点 dest_ap 清除',
+          code_d7 == war_campaign.RC_OK and mv_d7
+          and mv_d7['dest_ap'] == 0,
+          f"dest_ap={mv_d7 and mv_d7['dest_ap']}")
+    mv_d8, code_d8 = await war_campaign.divert_movement(
+        store_c, at_c5, mv_d7, 20, override_ap=2, now=t_half1)
+    check('C2 改道指定出兵点 dest_ap=2',
+          code_d8 == war_campaign.RC_OK and mv_d8
+          and mv_d8['dest_ap'] == 2
+          and len(mv_d8['path']) == 1)
+
+    # ---- C3. 改道后 advance_movements 全程推进 ----
+    store_d = FakeStore()
+    war_d = await war_campaign.ensure_war(store_d)
+    at_d = _mk_at(store_d, war_d['id'], 51, 1, 10)
+    mv_e, code_e = await war_campaign.start_movement(
+        store_d, at_d, 20, now=NOW)
+    mvd_e, code_ed = await war_campaign.divert_movement(
+        store_d, at_d, mv_e, 30, now=t_half1)
+    check('C3 改道成功', code_ed == war_campaign.RC_OK and mvd_e
+          and [s['to_bf'] for s in mvd_e['path']] == [20, 30])
+    ev_h = await war_campaign.advance_movements(
+        store_d, war_d, now=NOW + datetime.timedelta(seconds=SEG_SEC * 0.75))
+    check('C3 改道后首段仍在途（无换段）',
+          ev_h == [] and store_d.ats[51]['map_entity_id'] == 101)
+    ev_m = await war_campaign.advance_movements(
+        store_d, war_d, now=NOW + datetime.timedelta(seconds=SEG_SEC * 1.5))
+    check('C3 改道后换段正常（sl102）',
+          store_d.ats[51]['map_entity_id'] == 102
+          and any(k == 'set' and tag == b'transport_commandnode_segment'
+                  for k, tag, _ in ev_m))
+    await war_campaign.advance_movements(
+        store_d, war_d,
+        now=NOW + datetime.timedelta(seconds=2 * SEG_SEC + 5))
+    a51 = store_d.ats[51]
+    check('C3 改道后到达新目的地 30',
+          a51['state'] == 0
+          and a51['map_entity_id'] == 30
+          and a51['map_entity_type'] == war_campaign.MAP_ENTITY_BATTLEFIELD
+          and store_d.movements[mvd_e['id']]['state'] == 1)
+
 
     # ---- D. advance_movements ----
     store2 = FakeStore()

@@ -14,6 +14,8 @@ warmapview / commandnodeview 视图增量推送。
 faction id 空间 = 1/2/3 恒等（project_rules 硬约束）。
 """
 
+import time
+
 from protocol import (
     build_response,
     pb_int32,
@@ -1191,15 +1193,22 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
             code = war_campaign.RC_WAR_NOT_FOUND
         else:
             at, code = await _load_at(pid, node_id, war)
+            mv_cur = None          # 在途移动（state=1 改道用）
             if not code:
                 if not at.get('is_deployed'):
                     code = war_campaign.RC_COMMANDNODE_NOT_DEPLOYABLE
                 elif int(at.get('state') or 0) == 2:
                     code = war_campaign.RC_COMMANDNODE_IN_BATTLE
                 elif int(at.get('state') or 0) == 1:
-                    code = war_campaign.RC_ALREADY_IN_TRANSPORT
-                else:
-                    # ---- 目标解析 ----
+                    # 在途改道（官服语义）：走完当前段、到达下一节点后
+                    # 转向新目标；空运/半径单位单段 air 在途不可改道 → 33
+                    mv_cur = await STORE.get_active_movement(at['id'])
+                    segs_cur = (war_campaign.movement_segments(mv_cur)
+                                if mv_cur else [])
+                    if not segs_cur or segs_cur[0].get('air'):
+                        code = war_campaign.RC_ALREADY_IN_TRANSPORT
+                if not code:
+                    # ---- 目标解析（发起移动 / 在途改道共用）----
                     t = (target_type or '').strip().lower()
                     if t == 'battlefield':
                         dest_bf = target_id
@@ -1259,15 +1268,25 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                                     else await _dest_semantic_code(
                                         STORE, war, at, dest_bf))
                     elif not code:
-                        mv, mcode = await war_campaign.start_movement(
-                            STORE, at, dest_bf, override_ap=override_ap,
-                            override_move=override_move)
+                        if mv_cur is not None:
+                            # ---- 在途改道：保留当前段时间轴，从转向点
+                            # （当前段终点城市）拼接新路径 ----
+                            mv, mcode = await war_campaign.divert_movement(
+                                STORE, at, mv_cur, dest_bf,
+                                override_ap=override_ap,
+                                override_move=override_move)
+                        else:
+                            mv, mcode = await war_campaign.start_movement(
+                                STORE, at, dest_bf, override_ap=override_ap,
+                                override_move=override_move)
                         # 注意：start_movement/start_air_transport 返回协议
                         # 风格码（RC_OK=1 / RC_FAIL=0），真值判断会把成功
                         # （1）误当错误吞掉段行广播 → 客户端无移动动画。
-                        if mcode == war_campaign.RC_CANNOT_FIND_COMMANDNODE:
+                        if (mv_cur is None
+                                and mcode == war_campaign.RC_CANNOT_FIND_COMMANDNODE):
                             # 地面不可达 → 空运回退（M3 §9.4）：携运输机
                             # （cat10≥1）消耗 1 架直达目标城市，响应 21
+                            # （改道在途不走空运回退：转向点不可达直接回 7）
                             amv, acode = await war_campaign.start_air_transport(
                                 STORE, at, dest_bf)
                             if acode != war_campaign.RC_OK or amv is None:
@@ -1300,10 +1319,15 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                             caps = war_campaign._faction_capital_bf()
                             events = []
                             if segs:
+                                # 改道在途：推当前段（前缀段时间轴未变）；
+                                # 新发起移动：推首段
+                                seg_i = (war_campaign.current_segment_index(
+                                    segs, int(time.time() * 1000))
+                                    if mv_cur is not None else 0)
                                 events.append((
                                     'set', b'transport_commandnode_segment',
                                     war_campaign.msg_transport_segment_row(
-                                        at, war['id'], mv, segs[0])))
+                                        at, war['id'], mv, segs[seg_i])))
                             events.append((
                                 'set', b'transport_commandnode_destination',
                                 war_campaign.msg_transport_destination_row(
@@ -1318,7 +1342,8 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                                     await war_campaign.advance_movements(
                                         STORE, war))
                             await war_campaign.broadcast_war_events(events)
-                            log(f'      [war] AT 移动 node={node_id} '
+                            log(f'      [war] AT {"改道" if mv_cur is not None else "移动"} '
+                                f'node={node_id} '
                                 f'-> bf={dest_bf} segs={len(segs)}')
                             code = await _dest_semantic_code(
                                 STORE, war, at, dest_bf)

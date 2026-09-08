@@ -231,10 +231,27 @@ def test_kick_sessions():
         TCP_SESSIONS[:] = []
 
 
+def test_logout_closes_connection():
+    """菜单注销：logout → logoutresponse(msg=1) 后必须关连接——客户端对
+    logoutresponse 无回调，回登录界面完全依赖 socket Event.CLOSE →
+    ClearAndConnectCommand(RESET_CONNECTION)；只回包不关连接 = 注销
+    "没反应"（2026-09-08 根因）。"""
+    writer = FakeWriter()
+    asyncio.run(auth_mod.handle_logout(FakeSess(), writer, 7, 0, b''))
+    chunk = Chunk.parse(writer.written[0], 0)[0]
+    f = pb_parse(chunk.subs[0].subs[0].data)
+    check('logout：回 logoutresponse msg=1',
+          chunk.subs[0].data == b'logoutresponse' and f.get(1) == 1,
+          f'title={chunk.subs[0].data!r} fields={sorted(f)}')
+    check('logout：回包后关闭连接（客户端靠 CLOSE 事件回登录界面）',
+          writer.closed)
+
+
 if __name__ == '__main__':
     test_msg_login2_result()
     test_login_ban_enforcement()
     test_query_banned_machine()
     test_kick_sessions()
+    test_logout_closes_connection()
     print(f'\n{PASS} passed, {FAIL} failed')
     sys.exit(1 if FAIL else 0)

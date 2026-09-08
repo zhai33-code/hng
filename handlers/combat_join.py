@@ -35,6 +35,10 @@ async def handle_player_joined(sess, writer, cmd_id, req_type, proto):
     except Exception:
         msid = 0
     mm_sess = _session_by_msid(msid)
+    # 重进战局（rejoin 按钮拉起 / 1c-0 回原局）：撤销掉线保护 deadline
+    if mm_sess:
+        matchmaking.clear_rejoin_deadline(
+            int(mm_sess.get('player_id', 0) or 0))
     log(f'      [combat] PlayerJoined msid={msid} -> '
         f'{mm_sess["gamertag"] if mm_sess else "unknown session"}')
     await _ack_error(writer, cmd_id, 'PlayerJoined acknowledged')
@@ -76,6 +80,12 @@ async def handle_player_exit_batch(sess, writer, cmd_id, req_type, proto):
                     await STORE.add_stat(cid, 'red_grief_points', ex['red'])
             except Exception as e:
                 log(f'      [DB] add_stat(grief) failed: {e}')
+        # ★ 掉线保护起算（2026-09-08）：优雅退出后 300s 内不重进 →
+        #   rejoin_sweep_loop 释放会话（官服 300s 席位超时语义；点取消
+        #   离开的 abandon 清理先到则本 deadline 随 PMS 记录一起消失）
+        if mm_sess:
+            matchmaking.arm_rejoin_deadline(
+                int(mm_sess.get('player_id', 0) or 0), reason='player-exit-batch')
         # ★ 离开战局链路（StatusMediator.onCancelButtonConfirmedClicked）：
         #   客户端关 hng.exe 后 shouldAbandonGameOnSessionUpdate=true，等待
         #   PlayerMissionSession KVCS UPDATE connectionState=2 (Admitted) 才发

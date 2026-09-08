@@ -294,6 +294,27 @@ class WarStoreMixin:
                 int(movement_id), float(seconds or 0))
         return _rowcount(n) > 0
 
+    async def update_movement_path(self, movement_id, path,
+                                   arrive_at=None, dest_ap=0):
+        """在途移动改道：整体替换 path_json（前缀段保持原时间轴，
+        started_at 不变），同步 arrive_at / dest_ap。返回更新后的
+        movement 行（无进行中行返回 None）。"""
+        import json as _json
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'UPDATE commandnode_movements SET path_json = $2, '
+                'arrive_at = COALESCE($3, arrive_at), dest_ap = $4 '
+                'WHERE id = $1 AND state = 0 '
+                'RETURNING id, commandnode_id, war_id, path_json, started_at, '
+                'arrive_at, state, dest_ap',
+                int(movement_id), _json.dumps(list(path or [])),
+                arrive_at, int(dest_ap or 0))
+        if not row:
+            return None
+        d = dict(row)
+        d['path'] = _json.loads(d.pop('path_json') or '[]')
+        return d
+
     async def finish_movement(self, movement_id, state=1):
         """移动结束（1=arrived 2=cancelled）。返回是否更新。"""
         async with self.pool.acquire() as conn:

@@ -160,6 +160,16 @@ async def handle_tcp(reader, writer):
             matchmaking.drop_player(sess.player_id)
         except Exception as e:
             log(f'[drop_player] {type(e).__name__}: {e}')
+        # 玩家游戏进程（hng.exe）连接断开 = 离开战局（崩溃/退出/被杀，
+        # 优雅退出另有 PlayerExitBatch 上报）：起 rejoin 掉线保护——
+        # 记 300s deadline + 给在线 Flash 会话推 PMS Admitted(2)
+        # （客户端 REJOIN 300s 倒计时；超时 rejoin_sweep_loop 释放席位）
+        if getattr(sess, 'is_game_client', False) and sess.player_id:
+            try:
+                await matchmaking.on_game_client_closed(int(sess.player_id))
+            except Exception as e:
+                log(f'[rejoin] game-conn closed hook failed: '
+                    f'{type(e).__name__}: {e}')
         # 战斗服（ZServer wardatacomm）连接断开兜底：远端实例的主要退出
         # 监视（确认 agent pid 已死才回收坑位；本机实例另有
         # _watch_proc_exit，幂等）。进程仍活（网络抖动）不回收，防误杀活局。
@@ -382,9 +392,13 @@ async def main():
             except Exception as e:
                 log(f'[WAR] tick failed: {e}')
     try:
+        # rejoin 掉线保护扫描：hng.exe 断开/优雅退出后 REJOIN_TIMEOUT 秒
+        # 未重进 → 释放战局会话（PMS 清理 + 空局回收 combat server 坑位）
+        from handlers.mission import rejoin_sweep_loop
         await asyncio.gather(_supervise('TCP', start_tcp),
                              _supervise('PING', start_ping_responder),
                              _supervise('STATS', statistics_server.start),
+                             _supervise('REJOIN-SWEEP', rejoin_sweep_loop),
                              _war_ticker())
     finally:
         await STORE.close()

@@ -113,7 +113,8 @@ def segment_seconds(from_bf, to_bf, speed, faction=0, owners=None):
 
 def at_current_battlefield(at):
     """AT 当前驻扎 battlefield id（type1=本身；type2=出兵点所属；
-    type3=在途（新移动被 33 挡，仅回退用）→ 补给线起端 0）。"""
+    type3=在途（改道走 divert_movement 不经此处；此函数仅回退用）
+    → 补给线起端 0）。"""
     ent, ent_type = _at_map_entity(at, _faction_capital_bf())
     if ent_type == MAP_ENTITY_BATTLEFIELD and ent:
         return ent
@@ -251,6 +252,56 @@ async def start_movement(store, at, target_bf, override_ap=0,
             await store.update_command_node(
                 at['id'], map_entity_id=int(override_ap),
                 map_entity_type=MAP_ENTITY_ACCESSPOINT)
+    return mv, RC_OK
+
+
+async def divert_movement(store, at, mv, target_bf, override_ap=0,
+                          override_move=False, now=None):
+    """在途 AT 改道（官服语义：走完当前段，到达下一节点后转向新目标）。
+
+    保留已完成/进行中段的原始时间轴（started_at 与前缀段不动），从当前
+    段终点城市（转向点）重新 BFS 寻路拼接新尾段；movement id 不变，
+    客户端按同 id 覆盖 destination/segment 行即可更新箭头。
+    新目标 = 当前段终点（含仅改出兵点）→ 剩余行程就是当前段，无新尾。
+
+    返回 (movement, error_code)：
+    - 空运/半径单位单段 air 在途不可改道 → (None, RC_ALREADY_IN_TRANSPORT)
+    - 转向点到新目标不可达 → (None, RC_CANNOT_FIND_COMMANDNODE)"""
+    segs = movement_segments(mv)
+    if not segs or segs[0].get('air'):
+        return None, RC_ALREADY_IN_TRANSPORT
+    target_bf = int(target_bf or 0)
+    if not target_bf:
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    idx = current_segment_index(segs, _ts_ms(now))
+    raw = mv.get('path') or []
+    if idx < 0 or idx >= len(raw):
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    pivot = int(segs[idx]['to_bf'])
+    head = [dict(s) for s in raw[:idx + 1]]
+    tail = find_supplyline_path(pivot, target_bf)
+    if tail is None:
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    if tail:
+        speed = at_speed(at)
+        try:
+            owners = dict(await store.get_war_cities(at['war_id']))
+        except Exception:
+            owners = {}
+        fac = int(at.get('faction') or 0)
+        for seg in tail:
+            seg['seconds'] = (0 if override_move
+                              else segment_seconds(seg['from_bf'],
+                                                   seg['to_bf'], speed,
+                                                   fac, owners))
+    new_path = head + tail
+    total = sum(float(s.get('seconds') or 0) for s in new_path)
+    arrive = mv.get('started_at') + datetime.timedelta(seconds=total)
+    mv = await store.update_movement_path(
+        mv['id'], new_path, arrive_at=arrive, dest_ap=int(override_ap or 0))
+    if mv is None:
+        return None, RC_CANNOT_FIND_COMMANDNODE
     return mv, RC_OK
 
 

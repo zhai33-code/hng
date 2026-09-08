@@ -18,6 +18,9 @@
   /undefined, /HnG_Strategy_en.xml 等本地化文件（动态注入缺失 key）
   /online.json        内部在线统计（仅限回环地址，管理后台跨进程拉取）
   /admin*             404（管理后台由独立进程 web/server/ 提供，不经 80 端口）
+  扫描封禁            扫描器黑名单命中（脚本扩展名/敏感点文件/已知探测路径）→
+                     封禁来源 IP 一段时间（scan_bans.json 持久化，重启保留；
+                     回环地址永不封禁，仅作用于 HTTP 80）
   其余                GAME_DIR 静态文件回退（目录列表与敏感扩展名 404）
 
 启动：main() 里 web_server.init(main_loop) 后 threading.Thread(start_http)。
@@ -41,6 +44,8 @@ from http.server import (
     SimpleHTTPRequestHandler,
     ThreadingHTTPServer,
     )
+import socket
+import threading
 
 from state import (
     FLASH_SESSIONS,
@@ -753,6 +758,134 @@ def _deny_static(path):
     return os.path.splitext(path)[1].lower() in _STATIC_DENY_EXTS
 
 
+# ---- 公网扫描封禁（2026-09-08，黑名单制）----
+# 策略：只封互联网扫描器独有的无歧义签名（脚本扩展名 / 敏感点文件 /
+# 已知探测路径），宁可漏封——漏掉的仍回 404（与未部署本机制时一致），
+# 绝不误封真实玩家。曾评估白名单制（白名单外路径即封），实测有真实
+# 误伤面：客户端 SWF 会按目录路径请求 /audio/*.mp3 等资源，放行依赖
+# "文件存在"兜底，远程机缺任一文件即封真实玩家，故弃。
+# 签名来源：fail2ban apache-noscript（扩展名思路）、nginx bad-bot-blocker
+# 与 SecLists 常见探测路径提炼，并逐一核对本服务真实路径不命中
+# （/WarDatabase/、/images/、/admin 书签、/api/* 试验请求等均安全）。
+# 封禁持久化在 scan_bans.json（重启保留），仅作用于 HTTP 80——游戏协议
+# 15110 与管理后台 8080 不受影响；回环地址永不封禁。
+
+SCAN_BAN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'scan_bans.json')
+SCAN_BAN_TTL = 3600                    # 封禁时长（秒），过期自动放行
+_NEVER_BAN = {'127.0.0.1', '::1'}      # 回环永不封禁（测试时可替换）
+
+_BANNED = {}                           # ip -> 拉黑时刻 time.time()
+_BAN_LOCK = threading.Lock()
+
+# 脚本扩展名：动态页面探测（fail2ban apache-noscript 同款思路）。
+# 本服务静态域只下发 .js/.css/.xml/.png/.webp/.mp3/.bz2/.sgn/.txt，
+# 下列扩展名不可能出现在合法流量中。
+SCAN_BAN_EXTS = {
+    '.php', '.asp', '.aspx', '.jsp', '.cgi',       # 动态脚本
+    '.sh',                                          # shell 脚本
+    '.sql', '.bak',                                 # 数据库转储 / 备份
+    '.zip', '.rar', '.7z', '.tar', '.gz',          # 打包归档（hngsync 用 .bz2）
+}
+# 敏感点文件（按路径段匹配：/.env、/.git/config、/.aws/credentials 全覆盖）
+SCAN_BAN_DOTFILES = {
+    '.env', '.git', '.svn', '.hg', '.htaccess', '.htpasswd',
+    '.ssh', '.aws', '.ds_store', '.idea', '.vscode',
+}
+# 已知探测路径关键字（小写子串匹配）：WordPress / phpMyAdmin /
+# Java 中间件 / Laravel RCE / 路由器 IoT 固件默认路径。
+# 已与真实路径核对：不含 'database'/'db'/'war'/'admin' 等会被
+# /WarDatabase/、/admin 书签、/api/* 误命中的词。
+SCAN_BAN_SUBSTRS = (
+    'wp-login', 'wp-admin', 'wp-content', 'wp-includes', 'wp-json',
+    'wordpress', 'xmlrpc',
+    'phpmyadmin', 'fckeditor',
+    'actuator', 'solr', '_ignition', 'phpunit', 'eval-stdin',
+    'jmx-console', 'web-console', 'manager/html',
+    'hnap1', 'boaform', 'goform',
+    'cgi-bin', 'xampp', 'autodiscover', 'muieblackcat',
+)
+
+
+def _path_hostile(path):
+    """请求路径是否命中扫描器黑名单（扩展名 / 点文件 / 探测关键字 / 穿越）。"""
+    p = path.lower()
+    if '..' in p:                       # 路径穿越探测（合法流量不会出现）
+        return True
+    segs = [s for s in p.split('/') if s]
+    if not segs:
+        return False
+    if os.path.splitext(segs[-1])[1] in SCAN_BAN_EXTS:
+        return True
+    if any(os.path.splitext(s)[0] in SCAN_BAN_DOTFILES for s in segs):
+        return True
+    return any(sub in p for sub in SCAN_BAN_SUBSTRS)
+
+
+def _save_bans_locked():
+    """封禁表原子落盘（须持 _BAN_LOCK；顺手清理过期项）。"""
+    now = time.time()
+    live = {ip: ts for ip, ts in _BANNED.items() if now - ts < SCAN_BAN_TTL}
+    _BANNED.clear()
+    _BANNED.update(live)
+    try:
+        tmp = SCAN_BAN_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(_BANNED, f)
+        os.replace(tmp, SCAN_BAN_FILE)
+    except OSError as e:
+        log(f'[HTTP] scan-ban persist failed: {e!r}')
+
+
+def _load_bans():
+    """启动时从 scan_bans.json 恢复封禁表（过期项忽略）。"""
+    try:
+        with open(SCAN_BAN_FILE, encoding='utf-8') as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(saved, dict):
+        return
+    now = time.time()
+    with _BAN_LOCK:
+        _BANNED.update({ip: ts for ip, ts in saved.items()
+                        if isinstance(ts, (int, float))
+                        and now - ts < SCAN_BAN_TTL})
+
+
+def _ban_active(ip):
+    """ip 是否处于封禁期（惰性过期，过期即出表）。"""
+    with _BAN_LOCK:
+        ts = _BANNED.get(ip)
+        if ts is None:
+            return False
+        if time.time() - ts >= SCAN_BAN_TTL:
+            del _BANNED[ip]
+            return False
+        return True
+
+
+def _ban_ip(ip, path):
+    """封禁来源 IP（回环地址除外），持久化并记日志。"""
+    if ip in _NEVER_BAN:
+        return
+    with _BAN_LOCK:
+        _BANNED[ip] = time.time()
+        _save_bans_locked()
+    log(f'[HTTP] SCAN-BAN {ip} for {SCAN_BAN_TTL}s (path={path})')
+
+
+def _guard_scan(handler, path):
+    """do_GET/do_POST/do_HEAD 入口守卫：黑名单命中 → 封禁来源 IP 并回 404。
+
+    返回 True 表示已处置（调用方直接 return）。"""
+    if not _path_hostile(path):
+        return False
+    _ban_ip(handler.client_address[0], path)
+    handler.send_error(404, 'Not Found')
+    return True
+
+
 def _online_snapshot():
     """跨进程在线统计快照：FLASH_SESSIONS（大厅+战斗中的 Flash 连接）+
     匹配队列 + 活跃战局名单。
@@ -834,6 +967,9 @@ class HttpHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split('?')[0]
         self._log_client_request('GET')
+        # 扫描封禁守卫：黑名单命中封禁来源 IP（须在一切路由之前）
+        if _guard_scan(self, path):
+            return
         # ---- 入伍页 SPA（web/dist，history 路由两个入口路径）----
         if path in ('/join', '//join', '/join/', '/join/veteran',
                     '//join/veteran', '/join/veteran/', '/join.html'):
@@ -1096,6 +1232,10 @@ class HttpHandler(SimpleHTTPRequestHandler):
     def do_HEAD(self):
         # HEAD 探测同样不得泄露敏感文件的存在性与大小
         path = self.path.split('?')[0]
+        # 扫描封禁守卫：黑名单命中封禁来源 IP（hngsync 的 HEAD 校验
+        # 只打 CAS 哈希名/清单文件，不触黑名单）
+        if _guard_scan(self, path):
+            return
         if _deny_static(path):
             self.send_error(404, 'Not Found')
             return
@@ -1104,6 +1244,9 @@ class HttpHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split('?')[0]
         self._log_client_request('POST')
+        # 扫描封禁守卫：黑名单命中封禁来源 IP
+        if _guard_scan(self, path):
+            return
         if path == '/api/captcha/check' or path == '//api/captcha/check':
             # CSRF 双保险之一：自定义头（跨站表单无法携带；SameSite 由 Cookie 侧管）
             if self.headers.get('X-Requested-With') != 'XMLHttpRequest':
@@ -1134,7 +1277,24 @@ class HttpHandler(SimpleHTTPRequestHandler):
         log(f'[HTTP] {self.address_string()} - {msg}')
 
 
+class ScanBanHTTPServer(ThreadingHTTPServer):
+    """封禁 IP 的连接在 accept 后立即断开：不进 HTTP 解析、不占 handler 线程。
+
+    静默丢弃（不记日志）——封禁事件本身已有日志，扫描器重试刷屏无信息量。"""
+
+    def process_request(self, request, client_address):
+        if _ban_active(client_address[0]):
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            request.close()
+            return
+        super().process_request(request, client_address)
+
+
 def start_http():
-    srv = ThreadingHTTPServer(('0.0.0.0', 80), HttpHandler)
+    _load_bans()
+    srv = ScanBanHTTPServer(('0.0.0.0', 80), HttpHandler)
     log(f'[HTTP] listening on 0.0.0.0:80  (serving {GAME_DIR})')
     srv.serve_forever()

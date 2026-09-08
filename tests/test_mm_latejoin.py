@@ -555,9 +555,13 @@ def main():
 
         # ---- 14. 重登 rejoin：push_relogin_rejoin 登录订阅重推存活局 ----
         # 客户端整端崩溃重开后 playerMissionSessionId=null；登录订阅时
-        # 服务端必须重推存活 PMS 行（同 pms id，state=3 Entered，避免
-        # 登录瞬间走 Admitted 分支自动拉起 hng.exe）+ BattleInfo，客户端
-        # StatusMediator 才显示"恢复战斗"按钮。无存活战局则不推。
+        # 服务端必须重推存活 PMS 行（同 pms id，state=2 Admitted）+
+        # BattleInfo，客户端 StatusMediator 才显示"恢复战斗"按钮并弹
+        # 出战局详情（REJOIN 弹窗唯一自动显示路径 = Admitted 分支启动的
+        # MISSION_END_TIMER 每秒 tick；state=3 Entered 该分支什么都不做
+        # → 只有按钮没有详情页。登录瞬间不会自动拉起 hng.exe：自动拉起
+        # 条件 gameClientDataDownloaded 在登录开始被 ClearAndConnectCommand
+        # 重置 false，PMS 行到达时必然仍为 false）。无存活战局则不推。
         rpid3 = 555
         pms_c = 600100
         seed_mission(900008, gamemode=5, preset=10, players=1)
@@ -576,10 +580,41 @@ def main():
               data14.count(b'BattleInfo') == 1)
         check('重登 rejoin：同 pms id 重推（f1=600100，hng.exe /P 精确回会话）',
               pb_varint(1, pms_c) in data14)
-        check('重登 rejoin：connectionState=3 Entered（非 2 Admitted 自动拉起）',
-              b'\x70\x03' in data14 and b'\x70\x02' not in data14)
+        check('重登 rejoin：connectionState=2 Admitted（战局详情弹窗源）',
+              b'\x70\x02' in data14 and b'\x70\x03' not in data14)
         check('重登 rejoin：gameConnect 指向本局 combat 端口',
               f':{5600 + 900008 % 100}'.encode() in data14)
+        # 凑队小队重推（四修）：临时凑的小队只在内存（_MM_MISSION_SQUADS/
+        # _SOLO_SQUADS），重登须随 PMS 行一并重推，否则小队面板不恢复
+        mm_state.PMS_TO_SESSION[pms_c]['squad_id'] = 777700
+        mm_state._MM_MISSION_SQUADS.setdefault(900008, {})[777700] = {
+            'name': 'Infantry Squad 1', 'leader_char_id': 42, 'faction': 3,
+            'squad_db_id': 0, 'template': 1,
+            'members': [
+                {'player_id': rpid3, 'char_id': 42, 'gamertag': 'CrashTest',
+                 'rank': 0, 'slot': 0, 'row_id': 800001},
+                {'player_id': 556, 'char_id': 43, 'gamertag': 'SquadMate',
+                 'rank': 0, 'slot': 1, 'row_id': 800002}]}
+        mm_state._SOLO_SQUADS[rpid3] = {
+            'squad_row': 700001, 'member_row': 700002, 'entered': 2,
+            'faction': 3, 'template': 1, 'metrics_session_id': 123456}
+        w14s = FakeWriter()
+        check('重登 rejoin：凑队小队 → SquadSession + 全体成员行',
+              asyncio.run(matchmaking.push_relogin_rejoin(
+                  w14s, 105, rpid3)) is True and
+              w14s.data.count(b'SquadSession') == 1 and
+              w14s.data.count(b'SquadMemberSession') == 2 and
+              w14s.data.count(b'PlayerMissionSession') == 1)
+        # 单人隐式小队重推：solo 行（status=4 InBattle）
+        mm_state._MM_MISSION_SQUADS[900008][777700]['members'] = [
+            {'player_id': rpid3, 'char_id': 42, 'gamertag': 'CrashTest',
+             'rank': 0, 'slot': 0, 'row_id': 800001}]
+        w14t = FakeWriter()
+        check('重登 rejoin：单人 → solo SquadSession + 1 成员行',
+              asyncio.run(matchmaking.push_relogin_rejoin(
+                  w14t, 105, rpid3)) is True and
+              w14t.data.count(b'SquadSession') == 1 and
+              w14t.data.count(b'SquadMemberSession') == 1)
         w14n = FakeWriter()
         check('重登 rejoin：无存活战局 → 不推送（正常登录）',
               asyncio.run(matchmaking.push_relogin_rejoin(
@@ -594,9 +629,344 @@ def main():
         mm_state._MM_QUEUES.pop(rpid3, None)
         mm_state._SOLO_SQUADS.pop(rpid3, None)
 
+        # ---- 15. 指定战局加入校验（好友跟随：_specified_mission_join_error）----
+        # 修复前：JoinMM 一律回 ok，指定局阵营不符/不存在/满员时静默落入
+        # 普通撮合 → 玩家被排进另一场新局（好友跟随失效根因）。
+        class Store15:
+            def __init__(self, war_recs=None, fail_get=False):
+                self.war_recs = war_recs or {}
+                self.fail_get = fail_get
+
+            async def get_mission_record(self, mid):
+                if self.fail_get:
+                    raise RuntimeError('db down')
+                return self.war_recs.get(int(mid))
+
+            async def list_characters(self, p):
+                return [{'id': 42, 'faction': 3, 'name': 'Follower',
+                         'combat_xp': 0, 'template': 1}]
+
+        old_store15 = state.STORE
+        state.STORE = Store15()
+        try:
+            seed_mission(900101, gamemode=5, preset=10, attacker=3,
+                         defender=2, players=1)
+            seed_mission(900102, gamemode=5, preset=10, attacker=3,
+                         defender=2, players=2)   # max_players=2 → 满
+            seed_mission(900103, gamemode=5, preset=10, attacker=1,
+                         defender=2, players=1)
+            check('指定局校验：阵营命中攻方 → None',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      900101, 3)) is None)
+            check('指定局校验：阵营命中守方 → None',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      900101, 2)) is None)
+            check('指定局校验：第三方阵营 → 62（player_faction_invalid）',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      900103, 3)) == 62)
+            check('指定局校验：局不存在 → 43（mission_not_found）',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      999999, 1)) == 43)
+            check('指定局校验：满员 → 227（mission_faction_full）',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      900102, 3)) == 227)
+            # war 会战 record（battle_id>0）
+            state.STORE = Store15({900201: {'battle_id': 7, 'state': 2,
+                                            'attacker_faction': 1,
+                                            'defender_faction': 2}})
+            check('war 局校验：已结算 state=2 → 43',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      900201, 1)) == 43)
+            state.STORE = Store15({900201: {'battle_id': 7, 'state': 3,
+                                            'attacker_faction': 1,
+                                            'defender_faction': 2}})
+            check('war 局校验：已结算 state=3 → 43',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      900201, 1)) == 43)
+            state.STORE = Store15({900201: {'battle_id': 7, 'state': 1,
+                                            'attacker_faction': 1,
+                                            'defender_faction': 2}})
+            check('war 局校验：state=1 无存活会话 → 43',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      900201, 1)) == 43)
+            check('war 局校验：阵营非交战双方 → 62',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      900201, 3)) == 62)
+            seed_mission(900201, gamemode=10, preset=10, attacker=1,
+                         defender=2, players=1)
+            check('war 局校验：state=1 有存活会话 → None（late join）',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      900201, 1)) is None)
+            combat_instances.COMBAT_INSTANCES.pop(900201, None)
+            mm_state._MM_MISSION_DETAILS.pop(900201, None)
+            state.STORE = Store15({900202: {'battle_id': 8, 'state': 0,
+                                            'attacker_faction': 1,
+                                            'defender_faction': 2}})
+            check('war 局校验：state=0 待开局 → None（war 桶排队）',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      900202, 1)) is None)
+            state.STORE = Store15(fail_get=True)
+            check('DB 异常 → 回落内存口径（不存在 → 43）',
+                  asyncio.run(mm_handler._specified_mission_join_error(
+                      999999, 1)) == 43)
+        finally:
+            state.STORE = old_store15
+
+        # ---- 16. _handle_join 指定战局：错误码响应 + 不落入普通撮合 ----
+        calls16 = {'join': [], 'enqueue': []}
+
+        async def fake_eligible16(p):
+            return (None, None)            # solo 路径
+
+        async def fake_join16(p, mid, e, c):
+            calls16['join'].append((p, mid))
+
+        async def fake_enqueue16(squad, members, gm, presets, req_mid):
+            calls16['enqueue'].append(True)
+
+        class Sess16:
+            player_id = 321
+            username = 'Follower'
+            playerview_cmd = None          # 跳过 KVCS 推送
+
+            async def ensure_player(self):
+                return 321
+
+        old16 = (state.STORE, mm_handler._squad_eligible_members,
+                 mm_handler._join_existing_mission, mm_handler._enqueue_squad,
+                 mm_handler._find_joinable_mission)
+        state.STORE = Store15()             # 无 war record → 普通内存局
+        mm_handler._squad_eligible_members = fake_eligible16
+        mm_handler._join_existing_mission = fake_join16
+        mm_handler._enqueue_squad = fake_enqueue16
+        try:
+            # 16a. 阵营不符（SU 士兵进美德局 900103）→ 回 62，不进局不入池
+            proto16 = pb_varint(1, 42) + pb_varint(2, 900103)
+            w16 = FakeWriter()
+            asyncio.run(mm_handler._handle_join(Sess16(), w16, 30, proto16))
+            check('阵营不符：JoinMM 回 62（错误码非 ok）',
+                  w16.data.endswith(b'\x08\x3e'),
+                  f'data_tail={w16.data[-4:]!r}')
+            check('阵营不符：不进局不入池',
+                  not calls16['join'] and 321 not in mm_state._MM_QUEUES
+                  and mm_state.POOL.get(321) is None,
+                  f'join={calls16["join"]} pool={mm_state.POOL.get(321)}')
+            # 16b. 阵营命中（900101 攻方 3）→ 回 ok + late join 指定局
+            proto16b = pb_varint(1, 42) + pb_varint(2, 900101)
+            w16b = FakeWriter()
+            asyncio.run(mm_handler._handle_join(Sess16(), w16b, 30, proto16b))
+            check('阵营命中：JoinMM 回 ok（f1=1）',
+                  w16b.data.endswith(b'\x08\x01'))
+            check('阵营命中：late join 进指定局（900101）',
+                  calls16['join'] and calls16['join'][0] == (321, 900101),
+                  f'join={calls16["join"]}')
+            check('阵营命中：不入普通池',
+                  mm_state.POOL.get(321) is None)
+            mm_state._MM_QUEUES.pop(321, None)
+            mm_state._MATCH_PMM_IDS.pop(321, None)
+            mm_state._SOLO_SQUADS.pop(321, None)
+            # 16c. 校验通过但撮合瞬间失效（竞态）→ 绝不回退普通撮合
+            calls16['join'].clear()
+            mm_handler._find_joinable_mission = lambda *a, **k: None
+            proto16c = pb_varint(1, 42) + pb_varint(2, 900101)
+            w16c = FakeWriter()
+            asyncio.run(mm_handler._handle_join(Sess16(), w16c, 30, proto16c))
+            check('竞态失效：不进局不入普通池（保持匹配中由玩家取消）',
+                  not calls16['join'] and mm_state.POOL.get(321) is None,
+                  f'join={calls16["join"]} pool={mm_state.POOL.get(321)}')
+        finally:
+            state.STORE = old16[0]
+            mm_handler._squad_eligible_members = old16[1]
+            mm_handler._join_existing_mission = old16[2]
+            mm_handler._enqueue_squad = old16[3]
+            mm_handler._find_joinable_mission = old16[4]
+            mm_state._MM_QUEUES.pop(321, None)
+            mm_state._MATCH_PMM_IDS.pop(321, None)
+            mm_state._SOLO_SQUADS.pop(321, None)
+            state.PLAYER_SELECTED_CHAR.pop(321, None)
+
+        # ---- 17. 快速匹配模式解析（11/12/14 虚拟号 → 具体 staging 模式） ----
+        # 17a. _find_joinable_mission(None,...) 跨模式搜局
+        _snap17_inst = dict(combat_instances.COMBAT_INSTANCES)
+        _snap17_det = dict(mm_state._MM_MISSION_DETAILS)
+        combat_instances.COMBAT_INSTANCES.clear()
+        mm_state._MM_MISSION_DETAILS.clear()
+        try:
+            seed_mission(900171, gamemode=5, preset=10, players=1, age=5)
+            r = matchmaking._find_joinable_mission(None, (), 3)
+            check('quickplay 跨模式搜局：具体 staging 局可加入',
+                  r is not None and r[0] == 900171)
+            seed_mission(900172, gamemode=1, preset=9, players=1, age=5)
+            combat_instances.COMBAT_INSTANCES.pop(900171)
+            mm_state._MM_MISSION_DETAILS.pop(900171)
+            check('quickplay 跨模式搜局：训练局(1)不进',
+                  matchmaking._find_joinable_mission(None, (), 3) is None)
+            combat_instances.COMBAT_INSTANCES.pop(900172)
+            mm_state._MM_MISSION_DETAILS.pop(900172)
+            seed_mission(900173, gamemode=5, preset=27, players=1, age=5)
+            mm_state._MM_MISSION_DETAILS[900173]['battle_id'] = 55
+            check('quickplay 跨模式搜局：war 会战局(battle_id)不进',
+                  matchmaking._find_joinable_mission(None, (), 3) is None)
+            combat_instances.COMBAT_INSTANCES.pop(900173)
+            mm_state._MM_MISSION_DETAILS.pop(900173)
+            seed_mission(900174, gamemode=11, preset=27, players=1, age=5)
+            check('quickplay 跨模式搜局：旧虚拟号局(11)不进',
+                  matchmaking._find_joinable_mission(None, (), 3) is None)
+            combat_instances.COMBAT_INSTANCES.pop(900174)
+            mm_state._MM_MISSION_DETAILS.pop(900174)
+            seed_mission(900175, gamemode=8, preset=36, players=1, age=5)
+            r = matchmaking._find_joinable_mission(None, (36,), 3)
+            check('quickplay 跨模式搜局：士兵 tile 局(8)可加入',
+                  r is not None and r[0] == 900175)
+            combat_instances.COMBAT_INSTANCES.pop(900175)
+            mm_state._MM_MISSION_DETAILS.pop(900175)
+            seed_mission(900176, gamemode=5, preset=10, players=1, age=5,
+                         attacker=1, defender=2)
+            check('quickplay 跨模式搜局：阵营过滤照常生效',
+                  matchmaking._find_joinable_mission(None, (), 3) is None)
+            combat_instances.COMBAT_INSTANCES.pop(900176)
+            mm_state._MM_MISSION_DETAILS.pop(900176)
+        finally:
+            combat_instances.COMBAT_INSTANCES.clear()
+            combat_instances.COMBAT_INSTANCES.update(_snap17_inst)
+            mm_state._MM_MISSION_DETAILS.clear()
+            mm_state._MM_MISSION_DETAILS.update(_snap17_det)
+
+        # 17b. _resolve_quickplay_gamemode：并入等待人数最多的池
+        _pool17b = {m: list(lst) for m, lst in mm_state.POOL._by_mode.items()}
+        _poolp17b = dict(mm_state.POOL._by_player)
+        mm_state.POOL._by_mode.clear()
+        mm_state.POOL._by_player.clear()
+        try:
+            m0 = matchmaking._resolve_quickplay_gamemode()
+            check('quickplay 解析：全空池 → 通用模式随机',
+                  m0 in mm_config.QUICKPLAY_POOL_MODES, f'got {m0}')
+            for pid17, gm17 in ((501, 5), (502, 5), (503, 6)):
+                mm_state.POOL.enqueue(mm_pool.QueueEntry(
+                    player_id=pid17, char_id=600 + pid17, faction=3,
+                    gamemode_id=gm17))
+            check('quickplay 解析：并入等待人数最多的池（5×2 > 6×1）',
+                  matchmaking._resolve_quickplay_gamemode() == 5)
+            mm_state.POOL.enqueue(mm_pool.QueueEntry(
+                player_id=504, char_id=604, faction=2, gamemode_id=4))
+            mm_state.POOL.enqueue(mm_pool.QueueEntry(
+                player_id=505, char_id=605, faction=3, gamemode_id=7))
+            check('quickplay 解析：士兵 tile 池(7)不主动并入、仍取最大者',
+                  matchmaking._resolve_quickplay_gamemode() == 5)
+        finally:
+            for pid17 in (501, 502, 503, 504, 505):
+                mm_state.POOL.remove(pid17)
+            mm_state.POOL._by_mode.clear()
+            mm_state.POOL._by_player.clear()
+            mm_state.POOL._by_mode.update(_pool17b)
+            mm_state.POOL._by_player.update(_poolp17b)
+
+        # 17c. _handle_join 全链路：quickplay 请求入池前解析为具体模式
+        calls17 = {'search': [], 'fill': []}
+
+        async def fake_eligible17(p):
+            return (None, None)               # solo 路径
+
+        async def fake_try17():
+            return None
+
+        def fake_search17(gm, presets, faction, only_mission=None,
+                          vehicle_cats=()):
+            calls17['search'].append(gm)
+            return None
+
+        def fake_fill17(pid, gm):              # 真身是同步函数（内部 spawn）
+            calls17['fill'].append(gm)
+
+        class Sess17:
+            player_id = 321
+            username = 'Quickplayer'
+            playerview_cmd = None              # 跳过 KVCS 推送
+
+            async def ensure_player(self):
+                return 321
+
+        from protocol import pb_varint
+        old17 = (state.STORE, mm_handler._squad_eligible_members,
+                 mm_handler._find_joinable_mission, mm_handler._try_form_all,
+                 mm_handler._arm_ai_fill)
+        state.STORE = Store15()
+        mm_handler._squad_eligible_members = fake_eligible17
+        mm_handler._find_joinable_mission = fake_search17
+        mm_handler._try_form_all = fake_try17
+        mm_handler._arm_ai_fill = fake_fill17
+        _pool17c = {m: list(lst) for m, lst in mm_state.POOL._by_mode.items()}
+        _poolp17c = dict(mm_state.POOL._by_player)
+        mm_state.POOL._by_mode.clear()
+        mm_state.POOL._by_player.clear()
+        try:
+            def _cleanup17c():
+                mm_state.POOL.remove(321)
+                mm_state._MM_QUEUES.pop(321, None)
+                mm_state._MATCH_PMM_IDS.pop(321, None)
+                mm_state._SOLO_SQUADS.pop(321, None)
+                calls17['search'].clear()
+                calls17['fill'].clear()
+
+            # 11（按阵营）
+            proto17 = pb_varint(1, 42) + pb_varint(7, 11) + pb_varint(8, 1)
+            w17 = FakeWriter()
+            asyncio.run(mm_handler._handle_join(Sess17(), w17, 30, proto17))
+            e17 = mm_state.POOL.get(321)
+            check('quickplay(11)入池：已解析为具体通用模式',
+                  e17 is not None and e17.gamemode_id in
+                  mm_config.QUICKPLAY_POOL_MODES,
+                  f'gamemode={e17.gamemode_id if e17 else None}')
+            check('quickplay(11)入池：1c 跨模式搜局（gamemode=None）',
+                  calls17['search'] == [None], f'search={calls17["search"]}')
+            check('quickplay(11)入池：_MM_QUEUES/ai_fill 用解析后模式',
+                  mm_state._MM_QUEUES.get(321, {}).get('gamemode') ==
+                  (e17.gamemode_id if e17 else None)
+                  and calls17['fill'] == [e17.gamemode_id if e17 else None],
+                  f'q={mm_state._MM_QUEUES.get(321, {}).get("gamemode")}, '
+                  f'fill={calls17["fill"]}')
+            _cleanup17c()
+            # 12（按士兵）/ 14（全模式）变体同样解析
+            for variant in (12, 14):
+                proto17v = pb_varint(1, 42) + pb_varint(7, variant) \
+                    + pb_varint(8, 1)
+                asyncio.run(mm_handler._handle_join(
+                    Sess17(), FakeWriter(), 30, proto17v))
+                e17v = mm_state.POOL.get(321)
+                check(f'quickplay({variant})变体：同样解析为具体模式',
+                      e17v is not None and e17v.gamemode_id in
+                      mm_config.QUICKPLAY_POOL_MODES,
+                      f'gamemode={e17v.gamemode_id if e17v else None}')
+                _cleanup17c()
+            # 普通具体模式不受影响：保持 5 入池、1c 按模式搜局
+            proto17n = pb_varint(1, 42) + pb_varint(7, 5)
+            asyncio.run(mm_handler._handle_join(
+                Sess17(), FakeWriter(), 30, proto17n))
+            e17n = mm_state.POOL.get(321)
+            check('普通模式(5)：不解析、1c 按模式搜局',
+                  e17n is not None and e17n.gamemode_id == 5
+                  and calls17['search'] == [5],
+                  f'gm={e17n.gamemode_id if e17n else None}, '
+                  f'search={calls17["search"]}')
+        finally:
+            mm_state.POOL.remove(321)
+            mm_state._MM_QUEUES.pop(321, None)
+            mm_state._MATCH_PMM_IDS.pop(321, None)
+            mm_state._SOLO_SQUADS.pop(321, None)
+            mm_state.POOL._by_mode.clear()
+            mm_state.POOL._by_player.clear()
+            mm_state.POOL._by_mode.update(_pool17c)
+            mm_state.POOL._by_player.update(_poolp17c)
+            state.STORE = old17[0]
+            mm_handler._squad_eligible_members = old17[1]
+            mm_handler._find_joinable_mission = old17[2]
+            mm_handler._try_form_all = old17[3]
+            mm_handler._arm_ai_fill = old17[4]
+            state.PLAYER_SELECTED_CHAR.pop(321, None)
+
         # ---- 清理（模块级全局，防污染其它测试） ----
         for mid in (900001, 900002, 900003, 900004, 900005, 900006, 900007,
-                    900008):
+                    900008, 900101, 900102, 900103):
             combat_instances.COMBAT_INSTANCES.pop(mid, None)
             mm_state._MM_MISSION_DETAILS.pop(mid, None)
             mm_state._MM_MISSION_SQUADS.pop(mid, None)

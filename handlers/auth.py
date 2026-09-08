@@ -281,17 +281,21 @@ async def handle_keepalive(sess, writer, cmd_id, req_type, proto):
 
 
 async def handle_logout(sess, writer, cmd_id, req_type, proto):
-    """logout {dummy=1} → logoutresponse {msg=1}。
+    """logout {dummy=1} → logoutresponse {msg=1} + 关闭连接。
 
-    LogoutCommand（菜单"退出登录"）清本地凭证后发送本请求；
-    客户端无回调（走 addNewData 路径，无表注册 → 载荷不被消费），
-    但响应必须回显以解锁请求队列——此前无 handler 走兜底
-    HandlerErrorResponse，客户端 1s 内重发一次 logout（实测日志
-    20:22:15/16 连发两条）后仍继续后续流程。msg=1 沿用 ok 语义。"""
+    LogoutCommand（菜单"退出登录"/不活跃超时/致命错误弹窗）清本地凭证
+    后发送本请求；客户端对 logoutresponse 无回调（载荷不被消费），回
+    登录界面完全依赖 socket Event.CLOSE → ServiceHandler.closeHandler
+    → clearAndConnectSignal(RESET_CONNECTION) → ClearAndConnectCommand
+    清库并置 loggedIn=false——只回包不关连接则客户端原地不动（菜单
+    注销"没反应"的根因）。关连接后 handle_tcp finally 统一断线清理
+    （登出广播/排队释放/匹配出池），客户端 resetConnection 会自动重连
+    回登录界面。msg=1 沿用 ok 语义。"""
     resp = build_response(cmd_id, 'logoutresponse', pb_int32(1, 1))
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} logoutresponse (msg=1)')
+    writer.close()
 
 
 HANDLERS = {

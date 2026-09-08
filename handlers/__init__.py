@@ -66,7 +66,12 @@ async def dispatch(sess, writer, cmd_id, req_type, proto):
     if req_type.lower().startswith('subscribe'):
         await views.handle_subscribe(sess, writer, cmd_id, req_type, proto)
         return True
-    if req_type.startswith('unsubscribe'):
+    # ★ 大小写不敏感：客户端 UnSubscribeViewsCommand 换战争链发的
+    # 'UnsubscribePlayerMissionViewRequest'（大写 U + Request 后缀）此前
+    # 被 case-sensitive 前缀漏掉 → 回 HandlerErrorResponse → 客户端
+    # viewUnsubscribedSignal 不触发 → 6 步退订链卡死在第 4 步，
+    # WarIsOver"继续下一场战争"按钮点了没反应（2026-09-08）。
+    if req_type.lower().startswith('unsubscribe'):
         await views.handle_unsubscribe(sess, writer, cmd_id, req_type, proto)
         return True
     return False

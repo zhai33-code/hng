@@ -37,6 +37,9 @@ MissionInfo {missionId=1, battleId=2, missionpreset=3, mapEntityId=5,
 mission_records.state：0 组队中 1 运行 2 结束 3 放弃。
 """
 
+import asyncio
+import time
+
 from protocol import (
     build_response,
     pb_int32,
@@ -45,7 +48,7 @@ from protocol import (
     pb_parse,
     pb_string,
     )
-from state import PUBLIC_HOST, STORE, log
+from state import FLASH_SESSIONS, PUBLIC_HOST, STORE, log
 
 from matchmaking import (
     AI_MISSIONPRESET,
@@ -307,33 +310,52 @@ async def handle_abandon_mission(sess, writer, cmd_id, req_type, proto):
     ★ 离开战局收尾（ActionGameService abandon 链）：回 response 后必须推
     PlayerMissionSession KVCS DELETE——客户端 DELETE 分支清
     playerMissionSessionId + clearWarBattleSignal + lobbySignal 回大厅；
-    不推则客户端停留在战局状态（继续发 ActiveMissionRequestEventList 轮询）。"""
+    不推则客户端停留在战局状态（继续发 ActiveMissionRequestEventList 轮询）。
+    清理核心见 release_player_mission_sessions（与 rejoin 超时清理共用）。"""
     pid = await sess.ensure_player()
-    if pid is not None and STORE is not None:
-        try:
-            for mid, det in list(_MM_MISSION_DETAILS.items()):
-                if _detail_has_player(det, pid):
-                    await STORE.set_mission_state(mid, 3)
-                    log(f'      [DB] mission {mid} abandoned (player={pid})')
-        except Exception as e:
-            log(f'      [DB] abandon mission failed: {e}')
 
     resp = build_response(cmd_id, 'AbandonMissionResponse', pb_int32(1, RC_OK))
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} AbandonMissionResponse (response=1)')
+    await release_player_mission_sessions(
+        pid, writer, sess.playerview_cmd)
+
+
+async def release_player_mission_sessions(pid, writer=None, view_cmd=None,
+                                          source='abandon'):
+    """释放玩家全部战局会话（abandon 收尾 / rejoin 掉线超时清理共用核心，
+    2026-09-08 从 handle_abandon_mission 提取，行为不变）。
+
+    - mission_records → state=3（有记录的局；sweep 超时同 abandon 口径，
+      防 GetMissionList 空壳局）
+    - PMS DELETE + 小队重置（writer/view_cmd 给定 = Flash 在线时推送；
+      离线只清内部状态，重登登录序列自然回大厅）
+    - PMS_TO_SESSION/PMS_TO_MISSION/_MM_QUEUES 清理 + 好友列表刷新
+    - det['players'] 移除该玩家；全员离场 → release_match 释放 combat server
+    """
+    if pid is None:
+        return
+    if STORE is not None:
+        try:
+            for mid, det in list(_MM_MISSION_DETAILS.items()):
+                if _detail_has_player(det, pid):
+                    await STORE.set_mission_state(mid, 3)
+                    log(f'      [DB] mission {mid} abandoned '
+                        f'(player={pid}, {source})')
+        except Exception as e:
+            log(f'      [DB] abandon mission failed: {e}')
 
     # PMS DELETE + 内部会话状态清理（按 pid 收集本玩家全部会话；
     # 同玩家重复 join 未 abandon 时可能残留多个，取最新推 DELETE，
     # 旧会话行客户端表中不存在 → 不推送，仅清理内部状态）
     my_pms = []
-    if pid is not None:
-        for _pms, s in list(PMS_TO_SESSION.items()):
-            if int(s.get('player_id', 0) or 0) == int(pid):
-                my_pms.append(_pms)
+    for _pms, s in list(PMS_TO_SESSION.items()):
+        if int(s.get('player_id', 0) or 0) == int(pid):
+            my_pms.append(_pms)
     if my_pms:
         pms_id = max(my_pms)          # 最新会话 = 客户端表中的当前行
-        if sess.playerview_cmd is not None:
+        if view_cmd is not None:
             # ★ 必须先于 PMS DELETE 推送：PMS DELETE 触发客户端 lobbySignal →
             #   StatusMediator.onLobbySignalUpdates 读 squadSession.missionId
             #   （匹配状态机已置 isActive=true，squadSession 必须非 null 且
@@ -373,14 +395,14 @@ async def handle_abandon_mission(sess, writer, cmd_id, req_type, proto):
                     if _auto_sq:
                         _auto_rows = _mm_sess.get('auto_sq_rows') or []
                         await _reset_auto_squad_rows(
-                            writer, sess.playerview_cmd,
+                            writer, view_cmd,
                             int(_auto_sq), _auto_rows)
-                    await _push_kvcs(writer, sess.playerview_cmd, b'SquadSession',
+                    await _push_kvcs(writer, view_cmd, b'SquadSession',
                                      _msg_solo_squad_session(
                                          solo['squad_row'], int(pid),
                                          solo['template'], solo['faction'],
                                          0, solo.get('entered', 0)))
-                    await _push_kvcs(writer, sess.playerview_cmd,
+                    await _push_kvcs(writer, view_cmd,
                                      b'SquadMemberSession',
                                      await _msg_solo_squad_member_session(
                                          solo['member_row'], solo['squad_row'],
@@ -389,50 +411,94 @@ async def handle_abandon_mission(sess, writer, cmd_id, req_type, proto):
                                          solo['rank'], 2,
                                          solo.get('metrics_session_id', 0),
                                          solo['faction']))
-                    log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+                    log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet '
                         f'(SquadSession mission=0 + SquadMemberSession status=2 '
                         f'InLobby ★solo squad reset before PMS delete)')
                 except Exception as e:
                     log(f'      [mission] solo squad reset push failed: {e}')
             try:
-                await _push_kvcs_delete(writer, sess.playerview_cmd,
+                await _push_kvcs_delete(writer, view_cmd,
                                         b'PlayerMissionSession', pms_id)
-                log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
-                    f'delete (PlayerMissionSession id={pms_id}) ★back to lobby')
+                log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet '
+                    f'delete (PlayerMissionSession id={pms_id}) '
+                    f'★back to lobby ({source})')
             except Exception as e:
                 log(f'      [mission] PMS delete push failed: {e}')
         # 清理 matchmaking 内部状态（会话/任务映射/队列/详情缓存）
         for _pms in my_pms:
             PMS_TO_SESSION.pop(_pms, None)
             PMS_TO_MISSION.pop(_pms, None)
-        if pid is not None:
-            _MM_QUEUES.pop(int(pid), None)
-            # ★ 好友列表刷新：放弃战斗 missionId 归零（必须在上面 PMS 清理
-            #   之后，social.push_friend_rows 按 PMS_TO_SESSION 实时取值）
-            try:
-                from .social import notify_friends_of
-                await notify_friends_of(int(pid))
-            except Exception as e:
-                log(f'      [social] notify_friends_of({pid}) failed: {e}')
+        _MM_QUEUES.pop(int(pid), None)
+        # ★ 好友列表刷新：放弃战斗 missionId 归零（必须在上面 PMS 清理
+        #   之后，social.push_friend_rows 按 PMS_TO_SESSION 实时取值）
+        try:
+            from .social import notify_friends_of
+            await notify_friends_of(int(pid))
+        except Exception as e:
+            log(f'      [social] notify_friends_of({pid}) failed: {e}')
         # 多人局：从战局详情移除该玩家；全员离场 → 释放 combat server 实例
-        # ★ pid 为 None（未登录会话/ensure_player 失败）时跳过清理：
-        #   int(None) 抛 TypeError 会中断本 handler（response 已发但
-        #   det['players'] 留下幽灵条目 → 玩家列表人数虚高）
-        if pid is not None:
-            for mid, det in list(_MM_MISSION_DETAILS.items()):
-                players = det.get('players')
-                if players is not None:
-                    det['players'] = [p for p in players
-                                      if int(p.get('player_id', 0)) != int(pid)]
-                    if not det['players']:
-                        _MM_MISSION_DETAILS.pop(mid, None)
-                        release_match(mid)
-                        log(f'      [mission] mission {mid} empty, combat '
-                            f'server released')
-                elif int(det.get('player_id', 0)) == int(pid):
-                    # 旧单人结构
+        for mid, det in list(_MM_MISSION_DETAILS.items()):
+            players = det.get('players')
+            if players is not None:
+                det['players'] = [p for p in players
+                                  if int(p.get('player_id', 0)) != int(pid)]
+                if not det['players']:
                     _MM_MISSION_DETAILS.pop(mid, None)
                     release_match(mid)
+                    log(f'      [mission] mission {mid} empty, combat '
+                        f'server released ({source})')
+            elif int(det.get('player_id', 0)) == int(pid):
+                # 旧单人结构
+                _MM_MISSION_DETAILS.pop(mid, None)
+                release_match(mid)
+
+
+async def rejoin_sweep_once():
+    """单轮扫描：rejoin_deadline 已过期的会话 → 释放（官服 300s 席位超时）。
+
+    返回释放的玩家 id 集合。deadline 只在 hng.exe 游戏连接断开
+    （matchmaking.on_game_client_closed）或 PlayerExitBatch 上报时设置；
+    玩家在窗口内重进（PlayerJoined/GetPlayerSettings 精确命中）即被清除。
+    """
+    now = time.time()
+    due = {}
+    for pms_id, rec in list(PMS_TO_SESSION.items()):
+        dl = (rec or {}).get('rejoin_deadline')
+        if not dl or now < float(dl):
+            continue
+        pid = int((rec or {}).get('player_id', 0) or 0)
+        if pid and pid not in due:
+            due[pid] = rec
+    for pid, rec in due.items():
+        gamertag = rec.get('gamertag') or ''
+        flash = FLASH_SESSIONS.get(gamertag)
+        writer = view_cmd = None
+        if flash is not None and flash.playerview_cmd is not None:
+            writer, view_cmd = flash.writer, flash.playerview_cmd
+        log(f'[rejoin-sweep] player {pid} ({gamertag!r}) drop protection '
+            f'expired - releasing mission session')
+        try:
+            await release_player_mission_sessions(
+                pid, writer, view_cmd, source='rejoin-timeout')
+        except Exception as e:
+            log(f'[rejoin-sweep] release player {pid} failed: '
+                f'{type(e).__name__}: {e}')
+    return set(due)
+
+
+async def rejoin_sweep_loop(interval=10.0):
+    """后台任务：周期扫描掉线保护超时会话（realtest_server.main 挂载）。
+
+    单轮异常只记日志不死循环；玩家在线则推 PMS DELETE 收回 REJOIN
+    （客户端 300s 倒计时到 0 转 GAME_TIMED_OUT "closing"，本推送是其
+    服务端对端收尾），离线只清内部状态（重登不再推 REJOIN 行）。
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await rejoin_sweep_once()
+        except Exception as e:
+            log(f'[rejoin-sweep] round failed: {type(e).__name__}: {e}')
 
 
 async def handle_end_mission(sess, writer, cmd_id, req_type, proto):

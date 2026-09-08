@@ -128,6 +128,18 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                     sess.username = str(gamertag)
                 except AttributeError:
                     pass
+                # ★ 玩家游戏连接打标（战斗服 ZServer 连接也会带精确 pms 查
+                #   GetPlayerSettings 做 InitPlayer，必须排除）：连接断开 =
+                #   hng.exe 离开战局 → realtest_server 触发 rejoin 掉线保护
+                #   （on_game_client_closed：推 PMS Admitted 起 300s 倒计时）。
+                if not getattr(sess, 'is_combat_server', False):
+                    try:
+                        sess.is_game_client = True
+                    except AttributeError:
+                        pass
+                    # hng.exe 携本会话重进（rejoin 按钮拉起）：撤销掉线保护
+                    # deadline（连接再断会由 on_game_client_closed 重新起算）
+                    matchmaking.clear_rejoin_deadline(int(player_id))
             # 每局动态 id 与 PMS 推送同源（matchmaking._handle_join 发号入会话），
             # 会话缺失时现场发号 —— 绝不回退他服回放值
             squad_id = int(mm_sess.get('squad_id', 0) or 0) or \

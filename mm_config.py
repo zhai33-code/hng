@@ -85,7 +85,7 @@ def _mode(name, min_players, max_players, ai_fill_after, fallback_presets=None):
 #   400513682 (T03M01_CityRiver) / 595333531 (T03M03_CityBoulevard) /
 #   775928046 (T03M02_CityTrainStation)
 GAMEMODES = {
-    1:  _mode('training',         1,  1,  0,  [9, 10]),               # 官方 First Encounter：Depot / Mill
+    1:  _mode('training',         1,  4,  0,  [9, 10]),               # 官方 First Encounter：Depot / Mill（PVE，≤4 人同局：小队整队进 + JOIN_WINDOW 内散人 late join 汇入，AI 补对面）
     3:  _mode('capture_hold_inf', 2, 18, 30,  [373394539, 373394540,
                                                373394541]),          # 官方 Skirmish 三图
     4:  _mode('capture_hold_all', 2, 18, 30,  [12]),                  # 官方 C&H Tank：仅 Lunéville
@@ -97,6 +97,22 @@ GAMEMODES = {
     11: _mode('quickplay',        2, 18, 30,  [27, 28, 29, 31]),      # quickplay 无选图 → 随机小图
 }
 DEFAULT_GAMEMODE = _mode('default', 2, 18, 30)    # 未知模式兜底
+
+# ★ 快速匹配（客户端 Quick Play：11 按阵营 / 12 按士兵 / 14 全模式，
+#   GamemodesMediator.as 实测）：虚拟模式号，绝不能以虚拟号入池——
+#   按模式分池会把它与所有具体模式池隔离（每个 quickplay 玩家孤立成
+#   局，谁也汇不进谁；12/14 还会走 DEFAULT 兜底，成局落在训练 preset
+#   10 Mill 图上）。服务端在入池前解析为具体模式（官服语义"扔进任何
+#   战局"）：先跨模式搜可中途加入的存活局（QUICKPLAY_JOIN_CANDIDATES），
+#   找不到再并入等待人数最多的具体模式池（QUICKPLAY_POOL_MODES），
+#   全空则从通用模式随机。
+QUICKPLAY_GAMEMODES = (11, 12, 14)
+# 跨模式搜局候选：全部具体 staging 模式（含士兵 tile 7/8；阵营/载具/
+# 满员过滤兜底）。训练(1)、战争(10)、会战(battle_id) 局不进。
+QUICKPLAY_JOIN_CANDIDATES = (3, 4, 5, 6, 7, 8)
+# 入池解析候选：通用 staging 模式（7/8 为飞行员/侦察兵 tile 模式，
+# 随机落进去对步兵玩家不合适，只允许被动并入等待池不主动随机）。
+QUICKPLAY_POOL_MODES = (3, 4, 5, 6)
 
 
 def gamemode_cfg(gamemode_id):
@@ -234,6 +250,12 @@ WAR_ENCIRCLE_CHECK = _int_env('MM_WAR_ENCIRCLE_CHECK', 1)
 # 会战准备期秒数（battle 行 activationTimeStamp = 成局 + 准备期；
 # war1.md：野外遭遇 5 分钟 / 城攻 5 分 30 秒；automission 超时以此起算）
 WAR_BATTLE_PREP_FIELD = _int_env('MM_WAR_BATTLE_PREP_FIELD', 300)
+# rejoin 掉线保护窗口（秒）：hng.exe 游戏连接断开（崩溃/退出）后，
+# 玩家须在此窗口内重进战局，否则会话释放（PMS 清理 + 坑位回收）。
+# 客户端同源倒计时：ActionGameStatusModel.
+# DEFAULT_SECONDS_BEFORE_LOSING_PLAYER_MISSION_SESSION = 300（Admitted
+# 分支 timeAdmitted+300s−serverTime，到 0 转 GAME_TIMED_OUT）
+REJOIN_TIMEOUT = _int_env('MM_REJOIN_TIMEOUT', 300)
 WAR_BATTLE_PREP_ASSAULT = _int_env('MM_WAR_BATTLE_PREP_ASSAULT', 330)
 # ---- automission 阈值判定（war-gameplay-fix-plan §3/§4/§7/§8；war1.md
 # 社区口径 144/216/288/5:00/5:30/6h，客户端无证据，全部可配）----

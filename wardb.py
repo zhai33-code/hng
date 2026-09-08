@@ -424,6 +424,20 @@ def _default_vehicle_ammo_for(parent_vehicle_tid):
     return out
 
 
+def vehicle_ammo_weapon_templates(parent_vehicle_tid, ammo_template_id):
+    """载具基础模板上能发射指定弹药的驾驶员主武器模板集合（去重）。
+
+    结算磨损用：载具弹药按对应武器的实际发数扣减（官服按发计费语义，
+    vehicles.js AMMO_COST"载具:弹药 -> 每发价"表同口径）。武器模板去重
+    防止同模板多槽（如双联装机枪）双计发数。"""
+    tids = set()
+    for (wt, _storage) in _VEHICLE_WEAPON_SLOTS.get(int(parent_vehicle_tid), ()):
+        for (_mid, at, _dflt) in _AMMO_MAPPINGS_BY_WEAPON.get(wt, ()):
+            if at == int(ammo_template_id):
+                tids.add(wt)
+    return tids
+
+
 # Pricing { id=1, type=2, objectId=3, costGold=4, costWarfunds=5, costCredits=6, relativeGoldValue=7 }
 # 购买请求中的 pricingId 即 Pricing.id（客户端 PriceObject.priceId = pricing.id）
 def _build_pricing_map():

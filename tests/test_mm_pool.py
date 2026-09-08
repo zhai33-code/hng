@@ -11,6 +11,8 @@
 8. force_form 超时 AI 补位（1 人也成局）
 9. 模式隔离（不同 gamemode 不互撮）
 10. 训练模式单人直开（min=1）
+10b. 训练模式 4 人容量（小队+散人同局；超容另开新局）
+11. 整队原子性（锚点队超 max 整队成局不截断；装不下的队跳过留池）
 """
 import os
 import sys
@@ -29,10 +31,10 @@ def check(label, ok, detail=''):
     print(f'[{"PASS" if ok else "FAIL"}] {label}{("  " + detail) if detail else ""}')
 
 
-def entry(pid, mode=5, presets=(), faction=3, char_id=None):
+def entry(pid, mode=5, presets=(), faction=3, char_id=None, group_key=0):
     return mm_pool.QueueEntry(player_id=pid, char_id=char_id or pid,
                               faction=faction, gamemode_id=mode,
-                              presets=tuple(presets))
+                              presets=tuple(presets), group_key=group_key)
 
 
 def main():
@@ -181,6 +183,83 @@ def main():
     m = p.try_form()
     check('训练模式：单人立即成局', m is not None and len(m.players) == 1)
     check('训练模式：非 ai_fill', m is not None and m.ai_fill is False)
+
+    # ---- 10b. 训练模式 4 人容量（max=4）----
+    # 4 名散人同模式 → 并入同一局
+    p = mm_pool.MatchPool()
+    for pid in (1, 2, 3, 4):
+        p.enqueue(entry(pid, mode=1))
+    m = p.try_form()
+    check('训练模式：4 人并入同一局', m is not None and
+          len(m.players) == 4,
+          f'players={[e.player_id for e in m.players] if m else None}')
+    check('训练模式：池清空', p.waiting_count() == 0)
+    # 5 人 → 前 4 人成局，第 5 人随后单独成局（不卡池）
+    p = mm_pool.MatchPool()
+    for pid in (1, 2, 3, 4, 5):
+        p.enqueue(entry(pid, mode=1))
+    m = p.try_form()
+    m2 = p.try_form()
+    check('训练模式：超容量者另开新局', m is not None and
+          len(m.players) == 4 and m2 is not None and len(m2.players) == 1,
+          f'first={len(m.players) if m else None}, '
+          f'second={len(m2.players) if m2 else None}')
+    # 小队 3 人整队入池 + 1 散人 → 同一局（≤ max）
+    p = mm_pool.MatchPool()
+    for pid in (1, 2, 3):
+        p.enqueue(entry(pid, mode=1, group_key=800))
+    p.enqueue(entry(9, mode=1))
+    m = p.try_form()
+    check('训练模式：小队 3 人 + 散人 1 人同局', m is not None and
+          len(m.players) == 4,
+          f'players={[e.player_id for e in m.players] if m else None}')
+
+    # ---- 11. 整队原子性（绝不拆队）----
+    # 锚点队规模 > max：整队成局（可超上限），无成员落池（截断拆队回归）
+    p = mm_pool.MatchPool()
+    for pid in (1, 2, 3, 4, 5):                 # 5 人队 vs 模式 99 max=3
+        p.enqueue(entry(pid, mode=99, group_key=700))
+    m = p.try_form()
+    check('整队原子：锚点队超 max 整队成局（不截断）', m is not None and
+          len(m.players) == 5,
+          f'players={[e.player_id for e in m.players] if m else None}')
+    check('整队原子：无成员落池', p.waiting_count() == 0)
+    # force_form（AI 补位）同样不拆队
+    p = mm_pool.MatchPool()
+    for pid in (1, 2, 3, 4):
+        p.enqueue(entry(pid, mode=99, group_key=700))
+    m = p.force_form(mm_config.gamemode_cfg(99), 99)
+    check('整队原子：force_form 超时补位同样整队成局', m is not None and
+          len(m.players) == 4 and p.waiting_count() == 0,
+          f'players={len(m.players) if m else None}')
+    # 非锚点队装不下 → 整队跳过留池；锚点散人照常凑 min 成局，
+    # 下一轮锚点轮到该队 → 整队成局
+    p = mm_pool.MatchPool()
+    p.enqueue(entry(1, mode=99, presets=[10]))  # 散人（最早 → 锚点）
+    p.enqueue(entry(2, mode=99, presets=[10]))  # 散人
+    for pid in (3, 4, 5):                       # 3 人队：2+3 > max=3 装不下
+        p.enqueue(entry(pid, mode=99, group_key=700, presets=[10]))
+    m = p.try_form()
+    check('整队原子：装不下的队跳过（锚点散人凑 min 成局）', m is not None and
+          {e.player_id for e in m.players} == {1, 2},
+          f'players={[e.player_id for e in m.players] if m else None}')
+    check('整队原子：被跳过的队完整留池', p.waiting_count() == 3)
+    m2 = p.try_form()
+    check('整队原子：下一轮整队成局', m2 is not None and
+          {e.player_id for e in m2.players} == {3, 4, 5},
+          f'players={[e.player_id for e in m2.players] if m2 else None}')
+    # 整队装得下 + 散人收编到 max 为止（锚点队 2 人 + 2 散人 vs max=3）
+    p = mm_pool.MatchPool()
+    for pid in (1, 2):
+        p.enqueue(entry(pid, mode=99, group_key=700, presets=[10]))
+    p.enqueue(entry(3, mode=99, presets=[10]))
+    p.enqueue(entry(4, mode=99, presets=[10]))
+    m = p.try_form()
+    check('整队原子：锚点队 + 散人收编到 max', m is not None and
+          {e.player_id for e in m.players} == {1, 2, 3},
+          f'players={[e.player_id for e in m.players] if m else None}')
+    check('整队原子：超出散人留池', p.waiting_count() == 1 and
+          p.get(4) is not None)
 
     failed = [l for l, ok in RESULTS if not ok]
     print(f'\nMM_POOL: {"ALL PASS" if not failed else f"{len(failed)} FAILED: {failed}"} '

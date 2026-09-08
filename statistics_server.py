@@ -250,6 +250,116 @@ async def _persist_type6(chars):
                 f'- logged only (ribbon_xp written by earnings path)')
 
 
+# ===== 每局实际用量（结算磨损数据源，2026-09-09）=====
+# 背景：战后维护费原按 timeActive 估算发数/spawn 数扣减（combat.
+# _apply_equipment_wear），对一发未开的玩家也按估算满额扣费（2026-09-08
+# 1000093 三局被按 60/33/38 发手雷回购弹药，实际全天才扔 3 发）。
+# 官服按实际消耗计费；type6 统计在结算（AnnounceBattleFieldEarnings）
+# 前同秒到达，含每武器模板实际发数（stat 519 WeaponShotsFired）与角色
+# 出生数（stat 12 PlayerSpawns），即官服语义的完整数据源。
+#
+# session_id 关联：type6 session_id = <前缀>×10⁶ + missionId（2026-09-08
+# 全天日志实证，如 730433917384180 ↔ earnings f1 missionId=384180），结算
+# 侧只有 missionId，故两侧统一按 missionId = session_id % 10⁶ 索引
+# （missionId 溢出 10⁶ 时两侧同样回绕，仍能对上）。
+_BATTLE_USAGE = {}        # missionId -> {charId: {'shots': {武器模板: 发数}, 'spawns': 出生数}}
+_BATTLE_USAGE_KEYS = []   # 插入序（FIFO 淘汰，防未结算局堆积泄漏）
+_BATTLE_USAGE_MAX = 128   # 最多缓存局数（正常流程结算即取走）
+_BATTLE_USAGE_DONE = {}   # 已 pop 的局（重复结算免空等；FIFO 淘汰防泄漏）
+
+
+def _accumulate_battle_usage(session_id, chars):
+    """type6 增量 → 每局每角色实际用量累积（发数/出生数）。
+
+    同帧去重：载具武器发数会以裸模板与 (载具模板<<16|模板) 两种 ctx1
+    各报一次且值相同（char 177 实测 w88/WeaponShotsFired=30 与
+    w3801176/WeaponShotsFired=30 并存），按低 16 位武器模板取 max 防
+    双计；帧间是增量语义，跨帧累加。"""
+    mission_id = int(session_id) % 1_000_000
+    if mission_id <= 0:
+        return
+    usage = _BATTLE_USAGE.setdefault(mission_id, {})
+    if mission_id not in _BATTLE_USAGE_KEYS:
+        _BATTLE_USAGE_KEYS.append(mission_id)
+        while len(_BATTLE_USAGE_KEYS) > _BATTLE_USAGE_MAX:
+            _BATTLE_USAGE.pop(_BATTLE_USAGE_KEYS.pop(0), None)
+    for char_id, stats, _ribbons in chars:
+        u = usage.setdefault(int(char_id), {'shots': {}, 'spawns': 0})
+        frame = {}
+        for stat_id, ctx1, ctx2, value in stats:
+            if not value:
+                continue
+            if stat_id == 519:              # WeaponShotsFired
+                wt = int(ctx1) & 0xFFFF
+                frame[wt] = max(frame.get(wt, 0), int(value))
+            elif stat_id == 12:             # PlayerSpawns（标量）
+                u['spawns'] += int(value)
+        for wt, v in frame.items():
+            u['shots'][wt] = u['shots'].get(wt, 0) + v
+
+
+def pop_battle_usage(mission_id):
+    """结算取走该局每角色实际用量 {charId: {...}}；无数据返回 None。
+
+    取走即删：重复结算/迟到补报不会对同一局二次计损。"""
+    mission_id = int(mission_id or 0) % 1_000_000
+    if mission_id not in _BATTLE_USAGE:
+        return None
+    try:
+        _BATTLE_USAGE_KEYS.remove(mission_id)
+    except ValueError:
+        pass
+    _BATTLE_USAGE_DONE[mission_id] = True
+    while len(_BATTLE_USAGE_DONE) > _BATTLE_USAGE_MAX:
+        _BATTLE_USAGE_DONE.pop(next(iter(_BATTLE_USAGE_DONE)))
+    return _BATTLE_USAGE.pop(mission_id)
+
+
+async def wait_battle_usage(mission_id, timeout=3.0):
+    """结算等待该局 type6 用量到达并取走（确保消耗数据到达才计费）。
+
+    type6 帧与结算请求分属不同 TCP 连接、同秒到达（实测先 type6 后
+    结算）；若结算先走到磨损环节而用量帧仍在路上/仍在落库，轮询等待
+    免得把"数据在路上"误判成"无数据"。已取走过的局（重复结算）与
+    超时未到的局返回 None——宁可不扣不多扣。"""
+    mission_id = int(mission_id or 0) % 1_000_000
+    if mission_id <= 0 or mission_id in _BATTLE_USAGE_DONE:
+        return None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if mission_id in _BATTLE_USAGE:
+            return pop_battle_usage(mission_id)
+        if loop.time() >= deadline:
+            return None
+        await asyncio.sleep(0.1)
+
+
+async def process_type6_body(body, peer=''):
+    """type6 载荷处理：解压 → 解析 → 累积用量 → 落库。
+
+    顺序铁律：_accumulate_battle_usage 必须先于 _persist_type6——
+    累积是纯内存同步操作；落库逐角色逐条 await STORE.add_stat 会反复
+    让出事件循环，结算（AnnounceBattleFieldEarnings → 结算磨损）可在
+    落库间隙插队，若先落库后累积，结算 pop 时用量还未入账 → 整局磨损
+    被误判"无 type6 数据"跳过（2026-09-09 01:40 mission=356460 四角色
+    全漏扣的根因）。"""
+    if body[:1] == b'\x78':                  # [0x06][zlib] 变体
+        try:
+            body = zlib.decompress(body)
+        except zlib.error as e:
+            log(f'[stats] type6 decompress failed: {e}')
+            return
+    try:
+        session_id, chars = _parse_type6(body)
+        _accumulate_battle_usage(session_id, chars)   # 先入账（同步无 await）
+        await _persist_type6(chars)                   # 再落库（有 await）
+        log(f'[stats] type6 processed session={session_id} '
+            f'chars={len(chars)} from {peer}')
+    except Exception as e:
+        log(f'[stats] type6 parse failed: {type(e).__name__}: {e}')
+
+
 def _raw_crc32(data: bytes) -> int:
     """statistics_client.dll 使用的 raw CRC32（init=0、无 final XOR）。
 
@@ -473,20 +583,7 @@ async def _handle_conn(reader, writer):
                 await writer.drain()
                 continue
             if mtype == 6:                       # 周期统计上报 → 解析入库
-                body = payload[1:]
-                if body[:1] == b'\x78':          # [0x06][zlib] 变体
-                    try:
-                        body = zlib.decompress(body)
-                    except zlib.error as e:
-                        log(f'[stats] type6 decompress failed: {e}')
-                        continue
-                try:
-                    session_id, chars = _parse_type6(body)
-                    await _persist_type6(chars)
-                    log(f'[stats] type6 processed session={session_id} '
-                        f'chars={len(chars)} from {peer}')
-                except Exception as e:
-                    log(f'[stats] type6 parse failed: {type(e).__name__}: {e}')
+                await process_type6_body(payload[1:], peer)
                 continue
             log(f'[stats] unknown msg type {mtype} from {peer}')
     except (asyncio.IncompleteReadError, ConnectionResetError):

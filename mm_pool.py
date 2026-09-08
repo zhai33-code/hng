@@ -9,7 +9,8 @@
 撮合规则：
   1. FIFO：取池中最早的 entry 为锚点
   2. 收集与其选图有交集（任一方空 = 通配）的同模式 entry
-  3. 凑够 min_players 即成组（截断到 max_players，剩余留池）
+  3. 凑够 min_players 即成组（收编到 max_players，剩余留池；锚点所在
+     整队全员进组、可超 max_players——绝不截断拆队）
   4. 选图：组内被勾选次数最多的公共 preset（并列取 id 小者）；
      全空 → 从该模式 fallback_presets 随机选（无配置 → FALLBACK_PRESET）
 """
@@ -74,6 +75,10 @@ class MatchPool:
         if gamemode_id is None:
             return len(self._by_player)
         return len(self._by_mode.get(gamemode_id, ()))
+
+    def waiting_counts(self):
+        """各模式当前等待人数 {gamemode_id: n}（快速匹配选池解析用）。"""
+        return {m: len(lst) for m, lst in self._by_mode.items() if lst}
 
     # ---- 撮合 ----
     def try_form(self):
@@ -149,9 +154,14 @@ class MatchPool:
         anchor = entries[0]
         group = [anchor]
         if anchor.group_key:
+            # ★ 锚点所在队全员进组，不受 max_p 截断（绝不拆队）：
+            #   截断会把落选成员留在池中单独成局，而 _start_match 已把
+            #   全队 DB 状态置 InBattle，留守者会被 _squad_eligible_members
+            #   过滤（status 非 2/3）→ 永久卡在匹配中（拆队根因）。
+            #   队规模可超 max_p：整队原子性优先于人数上限，后续散人
+            #   收编按 len(group) >= max_p 自然停止。
             for e in entries[1:]:
-                if (e.group_key == anchor.group_key
-                        and len(group) < max_p and e not in group):
+                if e.group_key == anchor.group_key and e not in group:
                     group.append(e)
         for e in entries[1:]:
             if len(group) >= max_p:

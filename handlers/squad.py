@@ -70,8 +70,15 @@ from player_service import (
     )
 
 from messages import _push_kvcs
-from matchmaking import _push_kvcs_delete
-from mm_state import _MM_MISSION_SQUADS, _SOLO_SQUADS
+from matchmaking import _cancel_squad_queue, _push_kvcs_delete, _try_form_all
+from mm_state import (
+    _AI_FILL_TASKS,
+    _MM_MISSION_SQUADS,
+    _MM_QUEUES,
+    _MATCH_PMM_IDS,
+    _SOLO_SQUADS,
+    POOL,
+)
 from wardb import _rank_from_combat_xp, squad_template_for_character
 
 RC_OK = 1
@@ -300,16 +307,20 @@ async def push_squad_rows_to_all_members(squad_id, mission_id=0):
 async def push_squad_deletes_to_sessions(sessions, member_ids, squad_id):
     """解散小队：向给定在线会话推 SquadSession + 全体成员行 DELETE。
 
-    sessions 必须在 dissolve_squad 落库前收集（解散后查库为空）。"""
+    sessions 必须在 dissolve_squad 落库前收集（解散后查库为空）。
+    ★SquadSession 行先删（2026-09-09）：客户端 onSquadSessionChange DELETE
+    按 _squadSession 匹配触发 resetSquad() 全量清理；成员行先删会把
+    _squadSession 置空 → SquadSession DELETE 变 no-op → isOwnedByPlayer
+    残留 → 重登玩家切屏卡 READY_UP"小队未准备好"。"""
     for s in sessions:
         if s.playerview_cmd is None:
             continue
         try:
+            await _push_kvcs_delete(s.writer, s.playerview_cmd,
+                                    b'SquadSession', squad_id)
             for mid in member_ids:
                 await _push_kvcs_delete(s.writer, s.playerview_cmd,
                                         b'SquadMemberSession', mid)
-            await _push_kvcs_delete(s.writer, s.playerview_cmd,
-                                    b'SquadSession', squad_id)
             log(f'S->C cmd={s.playerview_cmd:<4} KeyValueChangeSet '
                 f'(SquadSession delete id={squad_id} + {len(member_ids)} '
                 f'members ★cross-session)')
@@ -421,8 +432,9 @@ async def handle_modify_squad(sess, writer, cmd_id, req_type, proto):
 async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
     """RemoveSquadRequest {dummy=1} → RemoveSquadResponse{response=1}。
 
-    队长解散小队：删 KVCS 行（SquadSession + 全体 SquadMemberSession）。
-    非队长调离队接口（RemoveSquadMemberRequest），此处校验 ownership。
+    队长解散小队：删 KVCS 行（★SquadSession 先删 + 全体 SquadMemberSession，
+    顺序见 push_squad_deletes_to_sessions 注释）；排队中先整队撤队
+    （PMM delete 先推）。非队长调离队接口（RemoveSquadMemberRequest）。
     ★ 单人匹配的隐式小队（matchmaking._SOLO_SQUADS，squadId=0）不在 DB：
       SquadService.deactivate 对 isOwnedByPlayer 也发本请求，须先查注册表，
       否则 get_squad_for_player 找不到 → 161 squad_not_found 弹"解散失败"。"""
@@ -447,13 +459,20 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
                     continue
                 my_row = int(me['row_id'])
                 all_rows = [int(m['row_id']) for m in _info['members']]
-                # 删本人连接上的凑队行（成员行先删，同 _reset_auto_squad_rows）
+                # 删本人连接上的凑队行：★SquadSession 行必须先删——客户端
+                #   onSquadSessionChange DELETE 分支按 _squadSession 匹配才
+                #   触发 resetSquad() 全量清理（isOwnedByPlayer/isSquadLeader
+                #   等一并清）；成员行先删会把 _squadSession 置空，SquadSession
+                #   DELETE 变 no-op → isOwnedByPlayer 残留 true，重登过
+                #   （wasThroughLoginProcessAndHasSessions=true）的玩家切屏
+                #   screenChange→activate() 无条件置 isActive=true → 卡
+                #   READY_UP_STATE"小队未准备好"（2026-09-09 解散卡住根因）
                 if sess.playerview_cmd is not None:
+                    await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                            b'SquadSession', int(_sq_id))
                     for rid in all_rows:
                         await _push_kvcs_delete(writer, sess.playerview_cmd,
                                                 b'SquadMemberSession', rid)
-                    await _push_kvcs_delete(writer, sess.playerview_cmd,
-                                            b'SquadSession', int(_sq_id))
                     log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
                         f'delete (auto squad id={_sq_id} + '
                         f'{len(all_rows)} member rows ★auto squad disband)')
@@ -482,16 +501,54 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
                     f'(auto squad={_sq_id}, response=1)')
                 return
 
-    # ① 单人隐式小队：KVCS 删成员行 + 小队行，清注册表（下次 join 重建）
+    # ① 单人隐式小队：解散 = 退出匹配（若在队，小队是撮合单位）+ 删 KVCS
+    #    行（★SquadSession 先删）+ 清注册表（下次 join 重建）。
+    #    ★2026-09-09 两版教训：
+    #    - 首版"成员行先删"：客户端 handleClearingSlot 置空 _squadSession →
+    #      SquadSession DELETE 变 no-op，resetSquad 被跳过 → isOwnedByPlayer
+    #      残留 true → 重登玩家（wasThroughLoginProcessAndHasSessions=true）
+    #      切屏 screenChange→activate() 无条件置 isActive=true → 卡
+    #      READY_UP_STATE"小队未准备好"（按钮禁用）。
+    #    - 二版"不删行改重推 idle solo 行"：小队永不消失，解散无效果。
+    #    终版：SquadSession 先删（resetSquad 全量清理）+ 排队中一并撤队
+    #    （PMM delete 先推——否则客户端 ActivateSquadCommand 激活态遇上
+    #    squadSession=null，onLobbySignalUpdates 读 missionId 抛
+    #    TypeError #1009 → UI 永卡 processing）。
     if pid is not None:
-        solo = _SOLO_SQUADS.pop(int(pid), None)
+        # ① 前置防劫持（2026-09-09）：solo 注册表条目在玩家加入真小队后
+        #    不会被清理（战斗结束恢复 solo 视图的设计使然）。带残留条目
+        #    解散真小队时若直接消费旧条目 → 删旧 solo 行 + 回 OK，真小队
+        #    未删 → "小队没法解散"。玩家在 DB 真小队中 → 跳过本分支走 ②。
+        in_real_squad = False
+        if STORE is not None:
+            try:
+                in_real_squad = (await STORE.get_squad_for_player(
+                    int(pid))) is not None
+            except Exception as e:
+                log(f'      [DB] solo disband pre-check failed: {e}')
+        solo = None if in_real_squad else _SOLO_SQUADS.pop(int(pid), None)
         if solo is not None:
             if sess.playerview_cmd is not None:
+                q = _MM_QUEUES.pop(int(pid), None)
+                if q is not None:
+                    POOL.remove(int(pid))
+                    _MATCH_PMM_IDS.pop(int(pid), None)
+                    t = _AI_FILL_TASKS.pop(int(pid), None)
+                    if t is not None:
+                        t.cancel()
+                    if q.get('pmm_id') is not None:
+                        await _push_kvcs_delete(
+                            writer, sess.playerview_cmd,
+                            b'PlayerMatchMaking', q['pmm_id'])
+                        log(f'S->C cmd={sess.playerview_cmd:<4} '
+                            f'KeyValueChangeSet delete (PlayerMatchMaking '
+                            f'id={q["pmm_id"]} ★disband cancels queue)')
+                    await _try_form_all()
+                await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                        b'SquadSession', solo['squad_row'])
                 await _push_kvcs_delete(writer, sess.playerview_cmd,
                                         b'SquadMemberSession',
                                         solo['member_row'])
-                await _push_kvcs_delete(writer, sess.playerview_cmd,
-                                        b'SquadSession', solo['squad_row'])
                 log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
                     f'(SquadSession delete id={solo["squad_row"]} + '
                     f'SquadMemberSession delete id={solo["member_row"]} '
@@ -522,6 +579,12 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
                 member_ids = [m['id'] for m in members]
                 # 解散后查库为空 → 先收集在线会话再 dissolve
                 live_sessions = _online_member_sessions(members)
+                # ★解散前整队撤出匹配队列：排队中的真小队解散不清队会留
+                #   幽灵 entry（group_key 指向已删的 squad_id，成局后向不
+                #   存在的小队推局）。必须在 dissolve 前调——_cancel_squad_
+                #   queue 按 DB 成员表逐个撤队，解散后表已空（已成局成员
+                #   mission_id≠0 被跳过，不受影响）。
+                await _cancel_squad_queue(squad_id)
                 await STORE.dissolve_squad(squad_id)
                 log(f'      [DB] dissolve_squad id={squad_id} '
                     f'({len(member_ids)} members)')
@@ -534,12 +597,11 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
         await push_squad_deletes_to_sessions(live_sessions, member_ids,
                                              squad_id)
         if sess not in live_sessions:
+            await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                    b'SquadSession', squad_id)
             for mid in member_ids:
                 await _push_kvcs_delete(writer, sess.playerview_cmd,
                                         b'SquadMemberSession', mid)
-            if squad_id:
-                await _push_kvcs_delete(writer, sess.playerview_cmd,
-                                        b'SquadSession', squad_id)
         log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
             f'(SquadSession delete id={squad_id} + {len(member_ids)} members)')
 
@@ -996,6 +1058,23 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
 
     if code == RC_OK:
         if has_accepted:
+            # ★清残留 solo 隐式小队：接受邀请入真小队后，旧 solo 行会留在
+            #   客户端 SquadSession 表、_SOLO_SQUADS 残留条目会劫持后续
+            #   解散请求（① 分支消费旧条目 → 真小队解散不生效）。先删
+            #   solo 两行（SquadSession 先删，resetSquad 前置条件）再推
+            #   真小队行 → 客户端干净切换到真小队视图。
+            stale_solo = _SOLO_SQUADS.pop(int(pid), None)
+            if stale_solo is not None and sess.playerview_cmd is not None:
+                await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                        b'SquadSession',
+                                        stale_solo['squad_row'])
+                await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                        b'SquadMemberSession',
+                                        stale_solo['member_row'])
+                log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
+                    f'(SquadSession delete id={stale_solo["squad_row"]} + '
+                    f'SquadMemberSession delete '
+                    f'id={stale_solo["member_row"]} ★stale solo on accept)')
             await push_squad_member_row(sess, writer, member_row)
             mem_row = await STORE.get_squad_member(member_row) \
                 if STORE is not None else None

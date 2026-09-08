@@ -60,6 +60,7 @@ from wardb import (
     ammo_wear_params,
     commandnode_template,
     repair_base_price,
+    vehicle_ammo_weapon_templates,
     vehicle_parent_template_id,
     vehicle_upgrade_wear_params,
     vehicle_wear_params_for_variant,
@@ -666,16 +667,6 @@ async def handle_announce_battlefield_winner(sess, writer, cmd_id, req_type, pro
 
 # ---------------------------------------------------------------- 战局结算
 
-def _est_shots(time_active):
-    """按活跃秒数估算本局射击发数（0.75 发/秒，钳 100~2000）。"""
-    return max(100, min(2000, int(time_active * 0.75)))
-
-
-def _est_spawns(time_active):
-    """按活跃秒数估算本局载具出生次数（每 300 秒一次，钳 1~6）。"""
-    return max(1, min(6, int(round(time_active / 300.0))))
-
-
 # autoRepair 三态（客户端 ItemMaintenanceComponent 勾选框）：0=关 1=Credits 2=Gold
 _AR_CURRENCY_KEY = {1: 'credits', 2: 'gold'}
 
@@ -713,33 +704,53 @@ async def _auto_repair_after_wear(pid, auto_flag, params, worn_cond,
     return max_cond
 
 
-async def _apply_equipment_wear(char_times):
-    """战后维护损耗：按 CharacterBattleResult f7 timeActive 估算，扣减参战
-    角色已装备物品的 condition。
+async def _apply_equipment_wear(char_times, usage):
+    """战后维护损耗（官服按实际消耗计费语义，2026-09-09）：
+
+    数据源 = 战斗服 type6 统计（statistics_server._accumulate_battle_usage，
+    实测在 AnnounceBattleFieldEarnings 前同秒到达）：每武器模板实际发数
+    （stat 519）与角色出生数（stat 12 PlayerSpawns）。原按 timeActive 估算
+    发数（0.75 发/秒钳 100~2000）的算法对一发未开的玩家也按满额扣费
+    （2026-09-08 1000093 三局被按 60/33/38 发回购手雷弹药，实际全天才
+    扔 3 发），已废弃。
 
     官方磨损模型（客户端 WeaponUtilities/VehicleUtilities + WarDatabase 模板）：
-      武器/配件 maxCondition=1.0，每发 wearPerShot；
-      载具/载具升级 maxCondition 为点数（25~220），每次 spawn wearPerSpawn；
-      弹药 condition 即剩余发数，wearPerShot 即每发消耗。
-    战斗服统计只到模板粒度（statrequests.WeaponStats 无实例磨损），只能
-    lobby 侧估算。模板磨损全 0（不可维护物品）与已扣到 0 的行跳过；
+      武器/配件 maxCondition=1.0，每发 wearPerShot（全表 wearPerBattle=0）；
+      载具/载具升级 maxCondition 为点数（25~220），每次 spawn wearPerSpawn
+      （全表 1.0；带装备载具的角色每次出生即在载具中，出生数不区分载具/
+      步行——PlayerSpawns 是角色级标量统计）；
+      弹药 condition 即剩余发数，wearPerShot 即每发消耗（1.0/0.5/0）。
+    charge 语义：usage 有该角色数据 → 按实际值扣（0 发 = 0 磨损，绝无
+    估算值）；usage 为 None（该局无 type6，统计链路异常）或角色不在
+    其中 → 跳过该角色磨损（宁可不扣不多扣），记日志。
+    模板磨损全 0（不可维护物品）与已扣到 0 的行跳过；
     仅对参战角色已装备（container_slot / equipped_in_slot / 挂靠已装备
-    武器/载具）的物品生效。char_times: {(pid, charId): timeActive}。
+    武器/载具）的物品生效。char_times: {(pid, charId): timeActive}
+    （0 活跃仍整体跳过）。
+    usage: {charId: {'shots': {武器模板: 发数}, 'spawns': 出生数}}，可为 None。
     返回 (spent, worn_rows)：
       spent      {pid: {credits/gold: 总额}}（>0 才有键，ItemMaintenance 通知用）
       worn_rows  {pid: [(表名 bytes, 物品行 dict, 新 condition)]}——结算后
                  逐玩家重推刷新客户端表缓存（不推则耐久/弹药 UI 需重登才变）"""
     spent = {}
     worn_rows = {}
+    if usage is None:
+        log('      [wear] no type6 usage data this mission -- wear skipped')
     for (pid, char_id), t_active in sorted(char_times.items()):
         if not pid or not char_id or t_active <= 0:
             continue
-        est_shots = _est_shots(t_active)
-        est_spawns = _est_spawns(t_active)
+        u = usage.get(int(char_id)) if usage else None
+        if u is None:
+            log(f'      [wear] player={pid} char={char_id} no usage data '
+                f'-- skipped (no type6 stats for char)')
+            continue
+        spawns = u.get('spawns', 0)
+        shots_of = lambda wt: u.get('shots', {}).get(int(wt), 0)
         worn = 0
         try:
             # ---- 武器（装备中：container_id==角色 && container_slot>0）----
-            # 主武器槽（slot 1）全额定损，副武器按 30% 估算
+            # 发数按武器模板从 type6 实际统计取（弹药槽类别互斥，装备中
+            # 同模板武器至多一件，模板发数即物品发数）
             weapons = await STORE.list_weapons(pid, char_id)
             equipped_w = {int(w['id']): (int(w.get('container_slot') or 0), w)
                           for w in weapons
@@ -749,8 +760,8 @@ async def _apply_equipment_wear(char_times):
                 params = weapon_wear_params(w['template_id'])
                 cond = float(w.get('condition') or 0)
                 if params and cond > 0 and (params[1] or params[2]):
-                    shots = est_shots if slot == 1 else int(est_shots * 0.3)
-                    new_cond = max(0.0, cond - params[1] * shots - params[2])
+                    new_cond = max(0.0, cond - params[1] * shots_of(
+                        w['template_id']) - params[2])
                     if new_cond < cond:
                         new_cond = await _auto_repair_after_wear(
                             pid, w.get('auto_repair'), params, new_cond,
@@ -768,12 +779,13 @@ async def _apply_equipment_wear(char_times):
                 for m in await STORE.list_weapon_modifiers(pid, char_id):
                     if int(m.get('weapon_id') or 0) not in equipped_w:
                         continue
+
                     params = weapon_modifier_wear_params(m['template_id'])
                     cond = float(m.get('condition') or 0)
                     if params and cond > 0 and (params[1] or params[2]):
-                        slot = equipped_w[int(m['weapon_id'])][0]
-                        shots = est_shots if slot == 1 else int(est_shots * 0.3)
-                        new_cond = max(0.0, cond - params[1] * shots - params[2])
+                        w = equipped_w[int(m['weapon_id'])][1]
+                        new_cond = max(0.0, cond - params[1] * shots_of(
+                            w['template_id']) - params[2])
                         if new_cond < cond:
                             new_cond = await _auto_repair_after_wear(
                                 pid, m.get('auto_repair'), params, new_cond,
@@ -793,9 +805,9 @@ async def _apply_equipment_wear(char_times):
                     params = ammo_wear_params(a['ammo_template_id'])
                     cond = float(a.get('condition') or 0)
                     if params and cond > 0 and params[1]:
-                        slot = equipped_w[int(a['weapon_id'])][0]
-                        shots = est_shots if slot == 1 else int(est_shots * 0.3)
-                        new_cond = max(0.0, cond - params[1] * shots)
+                        w = equipped_w[int(a['weapon_id'])][1]
+                        new_cond = max(0.0, cond - params[1] * shots_of(
+                            w['template_id']))
                         if new_cond < cond:
                             new_cond = await _auto_repair_after_wear(
                                 pid, a.get('auto_repair'), params, new_cond,
@@ -818,7 +830,7 @@ async def _apply_equipment_wear(char_times):
                     v['vehicle_variant_template_id'])
                 cond = float(v.get('condition') or 0)
                 if params and cond > 0 and (params[1] or params[2]):
-                    new_cond = max(0.0, cond - params[1] * est_spawns - params[2])
+                    new_cond = max(0.0, cond - params[1] * spawns - params[2])
                     if new_cond < cond:
                         new_cond = await _auto_repair_after_wear(
                             pid, v.get('auto_repair'), params, new_cond,
@@ -834,37 +846,46 @@ async def _apply_equipment_wear(char_times):
 
             # ---- 载具升级/载具弹药（装在已装备载具上）----
             if equipped_v:
-                for u in await STORE.list_vehicle_upgrades(pid):
-                    if int(u.get('vehicle_id') or 0) not in equipped_v:
+                for u_row in await STORE.list_vehicle_upgrades(pid):
+                    if int(u_row.get('vehicle_id') or 0) not in equipped_v:
                         continue
-                    if not int(u.get('equipped_slot_id') or 0):
+                    if not int(u_row.get('equipped_slot_id') or 0):
                         continue
                     params = vehicle_upgrade_wear_params(
-                        u['upgrade_template_id'])
-                    cond = float(u.get('condition') or 0)
+                        u_row['upgrade_template_id'])
+                    cond = float(u_row.get('condition') or 0)
                     if params and cond > 0 and (params[1] or params[2]):
-                        new_cond = max(0.0,
-                                       cond - params[1] * est_spawns - params[2])
+                        new_cond = max(0.0, cond - params[1] * spawns
+                                       - params[2])
                         if new_cond < cond:
                             new_cond = await _auto_repair_after_wear(
-                                pid, u.get('auto_repair'), params, new_cond,
-                                'VehicleUpgradeMaxConditionRepair',
-                                u['upgrade_template_id'], spent)
+                                pid, u_row.get('auto_repair'), params,
+                                new_cond, 'VehicleUpgradeMaxConditionRepair',
+                                u_row['upgrade_template_id'], spent)
                             if new_cond != cond:
                                 await STORE.update_vehicle_upgrade_condition(
-                                    pid, u['id'], new_cond)
+                                    pid, u_row['id'], new_cond)
                                 worn_rows.setdefault(pid, []).append(
-                                    (b'VehicleUpgrade', u, new_cond))
+                                    (b'VehicleUpgrade', u_row, new_cond))
                                 worn += 1
                 for a in await STORE.list_vehicle_ammo(pid):
-                    if int(a.get('vehicle_id') or 0) not in equipped_v:
+                    vid = int(a.get('vehicle_id') or 0)
+                    if vid not in equipped_v:
                         continue
                     if not int(a.get('equipped_storage_id') or 0):
                         continue
                     params = ammo_wear_params(a['ammo_template_id'])
                     cond = float(a.get('condition') or 0)
                     if params and cond > 0 and params[1]:
-                        new_cond = max(0.0, cond - params[1] * est_shots)
+                        # 弹药发数 = 该载具上能发射此弹药的驾驶员主武器
+                        # 实际发数之和（VehicleWeaponSlot→weaponAmmoMapping
+                        # 归属链，与客户端 getAvailableVehicleAmmoStorage 同源）
+                        wts = vehicle_ammo_weapon_templates(
+                            vehicle_parent_template_id(
+                                equipped_v[vid]['vehicle_variant_template_id']),
+                            a['ammo_template_id'])
+                        shots = sum(shots_of(wt) for wt in wts)
+                        new_cond = max(0.0, cond - params[1] * shots)
                         if new_cond < cond:
                             new_cond = await _auto_repair_after_wear(
                                 pid, a.get('auto_repair'), params, new_cond,
@@ -878,8 +899,9 @@ async def _apply_equipment_wear(char_times):
                                 worn += 1
 
             if worn:
+                shots_dbg = dict(sorted(u.get('shots', {}).items())[:8])
                 log(f'      [wear] player={pid} char={char_id} '
-                    f'active={t_active}s shots~{est_shots} spawns~{est_spawns} '
+                    f'active={t_active}s spawns={spawns} shots={shots_dbg} '
                     f'-> {worn} item(s) worn/repaired')
         except Exception as e:
             log(f'      [wear] player={pid} char={char_id} failed: {e}')
@@ -1391,15 +1413,26 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 log(f'      [DB] char result stats (pid={pid}) failed: {e}')
 
         # ---- 战后维护损耗：参战角色已装备的武器/配件/弹药/载具/升级
-        #      按 timeActive 估算扣减 condition（同局重复结算取最大活跃值，
-        #      不叠加；bot 与未参战（timeActive=0）角色跳过）
+        #      按 type6 实际用量扣减（发数/出生数，官服按发计费语义；
+        #      同局重复结算取最大活跃值不叠加，bot 与未参战角色跳过；
+        #      无 type6 数据的局/角色整体跳过磨损——宁可不扣不多扣）
         char_times = {}
         for pid, ch in char_results:
             if not _is_settleable(pid) or not ch['characterId']:
                 continue
             key = (pid, ch['characterId'])
             char_times[key] = max(char_times.get(key, 0), ch['timeActive'])
-        repair_spent, wear_rows = await _apply_equipment_wear(char_times)
+        usage = None
+        if char_times:      # 纯 bot/无可结算角色：无磨损可言，也不必等用量
+            try:
+                import statistics_server
+                # 等待该局 type6 消耗数据到达（与结算分属不同连接、同秒
+                # 先后到达；等待确保"数据到达才计费"，超时宁可不扣）。
+                usage = await statistics_server.wait_battle_usage(mission_id)
+            except Exception as e:
+                log(f'      [wear] battle usage lookup failed: {e}')
+        repair_spent, wear_rows = await _apply_equipment_wear(char_times,
+                                                              usage)
         if repair_spent:
             log(f'      [combat] autorepair spent: {repair_spent}')
 

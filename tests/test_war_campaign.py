@@ -334,6 +334,9 @@ async def main():
     rows2 = await war_campaign.build_war_catalogue_protos(store)
     check('已结束战争保留在目录', len(rows2) == 1
           and int(pb_parse(rows2[0])[5]) == 2)
+    check('catalogue f3 wartime=天数（非 Zulu 时间戳）',
+          pb_parse(rows2[0])[3].decode() == '1',
+          pb_parse(rows2[0])[3].decode())
     resp = await war_campaign.build_war_catalogue_response_proto(store)
     check('response proto 含 bonusId(f2)',
           int(pb_parse(resp)[2]) == 0)
@@ -363,6 +366,34 @@ async def main():
     check('_war_config 数值链',
           cfg['strategytimescale'] == mm_config.WAR_TIMESCALE
           and cfg['morale']['surrender_limit'] == 25)
+
+    # ---- E2. _war_days（WarIsOver 结算文案"用X天占领欧洲"，2026-09-08）----
+    # 此前误发 begintime Zulu 时间戳 → 结算页"X天"显示成具体日期
+    check('_war_days 无 begintime → 1',
+          war_campaign._war_days({}) == '1')
+    check('_war_days 坏时间 → 1',
+          war_campaign._war_days({'begintime': 'bad'}) == '1')
+    check('_war_days 同日开打结束 → 1',
+          war_campaign._war_days({
+              'begintime': datetime.datetime(2026, 9, 2, 10),
+              'endtime': datetime.datetime(2026, 9, 2, 12)}) == '1')
+    check('_war_days 整三天 → 3',
+          war_campaign._war_days({
+              'begintime': datetime.datetime(2026, 9, 2, 10),
+              'endtime': datetime.datetime(2026, 9, 5, 10)}) == '3')
+    check('_war_days 三天+1分钟 → 4（ceil）',
+          war_campaign._war_days({
+              'begintime': datetime.datetime(2026, 9, 2, 10),
+              'endtime': datetime.datetime(2026, 9, 5, 10, 1)}) == '4')
+    check('_war_days 未来开始（elapsed<=0）→ 1',
+          war_campaign._war_days({
+              'begintime': datetime.datetime.now(
+                  datetime.timezone.utc) + datetime.timedelta(days=1)
+          }) == '1')
+    check('_war_days ISO str 时间可用（1天+1分 → 2）',
+          war_campaign._war_days({
+              'begintime': '2026-09-02T10:00:00+00:00',
+              'endtime': '2026-09-03T10:01:00+00:00'}) == '2')
 
     # ---- F. warmapview 快照 ----
     store = FakeStore()

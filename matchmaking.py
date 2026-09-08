@@ -1562,6 +1562,10 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
     路径口径）：跟随好友时 UI 勾选的模式/地图不必与好友那局一致、开打
     多久都应能加入，否则会被筛掉转入普通撮合 → 落进另一场局（跟随失效）。
     阵营/人数上限为硬约束，保留。
+    ★ gamemode_id=None（快速匹配跨模式搜局）：不限模式，但只进具体
+    staging 模式局（QUICKPLAY_JOIN_CANDIDATES）——训练(1)/战争(10)/
+    会战(battle_id>0)/旧虚拟号局一律不进；preset/阵营/窗口/满员/载具
+    过滤照常生效。
     """
     if mm_config.JOIN_WINDOW <= 0 and not only_mission:
         return None
@@ -1575,8 +1579,18 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
         det = _MM_MISSION_DETAILS.get(mission_id)
         if det is None or 'preset' not in det:
             continue
-        if not only_mission and int(det.get('gamemode', 0) or 0) != int(gamemode_id):
-            continue
+        if not only_mission:
+            if gamemode_id is None:
+                # 快速匹配跨模式搜局：只进具体 staging 模式局（训练/战争/
+                # 会战/旧虚拟号局不进——训练是 PVE、战争走战争路径、
+                # 虚拟号局是本修复前的历史遗留）
+                if det.get('battle_id'):
+                    continue
+                if int(det.get('gamemode', 0) or 0) \
+                        not in mm_config.QUICKPLAY_JOIN_CANDIDATES:
+                    continue
+            elif int(det.get('gamemode', 0) or 0) != int(gamemode_id):
+                continue
         if (not only_mission and presets
                 and int(det.get('preset', 0) or 0) not in presets):
             continue
@@ -1611,6 +1625,23 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
                 continue
         return mission_id, inst
     return None
+
+
+def _resolve_quickplay_gamemode():
+    """快速匹配入池模式解析（官服语义"扔进任何战局"的池侧半边）：
+
+    并入等待人数最多的具体 staging 模式池（与已排队玩家凑局最快，
+    并列随机），全空则从 QUICKPLAY_POOL_MODES 随机。返回值一定是
+    QUICKPLAY_POOL_MODES 之一——虚拟模式号（11/12/14）到此为止，
+    绝不入池（入池即与所有具体模式池隔离，谁也汇不进谁）。
+    """
+    counts = POOL.waiting_counts()
+    best = max((counts.get(m, 0) for m in mm_config.QUICKPLAY_POOL_MODES),
+               default=0)
+    if best > 0:
+        return random.choice([m for m in mm_config.QUICKPLAY_POOL_MODES
+                              if counts.get(m, 0) == best])
+    return random.choice(mm_config.QUICKPLAY_POOL_MODES)
 
 
 async def _join_existing_mission(pid, mission_id, e, ctx):
@@ -1797,12 +1828,93 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
     await _push_queue_counts()
 
 
+def _pms_rejoin_expired(rec):
+    """会话掉线保护是否已过期（rejoin_deadline 已过 = 席位已释放语义）。
+
+    rejoin_deadline 只在 hng.exe 游戏连接断开（on_game_client_closed）或
+    PlayerExitBatch 上报时设置；未设置 = 玩家在线/局中，恒未过期。
+    过期会话由 handlers/mission.rejoin_sweep_loop 异步清理，查找器先行
+    过滤（重登 rejoin / 1c-0 回原局 / 好友跟随都不得再命中过期会话）。
+    """
+    dl = (rec or {}).get('rejoin_deadline')
+    return bool(dl) and time.time() >= float(dl)
+
+
+def arm_rejoin_deadline(pid, reason='game-conn-closed'):
+    """给玩家当前存活会话记 rejoin 掉线保护截止（now + mm_config.REJOIN_TIMEOUT）。
+
+    - 已有 deadline 的记录不动（保护期内不重置；已过期的留给
+      rejoin_sweep_loop 释放，绝不"复活"——PlayerExitBatch 在玩家另开
+      新局后上报时不得把同 pid 的过期旧会话重新拉活）
+    - 只给 mission 仍在 COMBAT_INSTANCES 存活的记录起保护（战局收尾
+      中的会话交给战局生命周期）
+    返回是否有记录被起保护。
+    """
+    if pid is None:
+        return False
+    pid = int(pid)
+    armed = False
+    for pms_id, rec in PMS_TO_SESSION.items():
+        if int((rec or {}).get('player_id', 0) or 0) != pid:
+            continue
+        if rec.get('rejoin_deadline'):
+            continue              # 已有 deadline（含已过期）：不覆盖
+        mid = int(PMS_TO_MISSION.get(pms_id, 0) or 0)
+        if not mid or mid not in COMBAT_INSTANCES:
+            continue              # 战局已不存在（收尾中）
+        rec['rejoin_deadline'] = time.time() + mm_config.REJOIN_TIMEOUT
+        armed = True
+    if armed:
+        _log(f'rejoin: player {pid} drop protection armed '
+             f'({mm_config.REJOIN_TIMEOUT}s, {reason})')
+    return armed
+
+
+def clear_rejoin_deadline(pid):
+    """玩家重进战局（hng.exe 携同会话重连）：撤销掉线保护。幂等。"""
+    if pid is None:
+        return
+    pid = int(pid)
+    for rec in PMS_TO_SESSION.values():
+        if int((rec or {}).get('player_id', 0) or 0) == pid:
+            rec.pop('rejoin_deadline', None)
+
+
+async def on_game_client_closed(pid):
+    """hng.exe 游戏连接断开（崩溃/退出/被杀）：官服掉线语义复刻。
+
+    1. 记 rejoin_deadline（now + REJOIN_TIMEOUT），超时由
+       handlers.mission.rejoin_sweep_loop 释放会话（PMS 清理 + 坑位回收）；
+    2. 给在线 Flash 会话推 PMS UPDATE connectionState=2 (Admitted) +
+       新 timeAdmitted → 客户端 ActionGameService Admitted 分支起
+       300s 倒计时（StatusMediator REJOIN + "gameConnectionLostCountdown"，
+       到 0 转 GAME_TIMED_OUT）——此前只靠 PlayerExitBatch（优雅退出才
+       上报），崩溃/被杀路径无任何推送 → REJOIN 按钮无倒计时、席位
+       永不释放（2026-09-08 排查根因）。
+    """
+    pms_id, rec, mission_id = _find_player_live_pms(pid)
+    if pms_id is None or rec is None:
+        return                      # 无存活战局（含已过期被过滤）
+    dl = rec.get('rejoin_deadline')
+    if dl and time.time() < float(dl):
+        return          # 优雅退出已由 PlayerExitBatch 推过（防双触发重复推）
+    arm_rejoin_deadline(pid)
+    from handlers.combat_join import _push_pms_admitted   # 延迟 import 防环
+    flash = FLASH_SESSIONS.get(rec.get('gamertag') or '')
+    if flash is not None and flash.playerview_cmd is not None:
+        await _push_pms_admitted(flash, flash.writer, rec)
+    else:
+        _log(f'rejoin: player {pid} game-conn closed, no live Flash '
+             f'session; countdown push skipped (deadline armed)')
+
+
 def _find_player_active_mission(pid):
     """玩家当前存活的原始战局（掉线 rejoin 用）。
 
     遍历 PMS 会话找 player_id 命中且 mission 仍在 COMBAT_INSTANCES
     存活的记录，返回 mission_id（多条取最大=最新成局）；无 → None。
     drop_player 不清已成局会话（战局照常进行），掉线重连据此找回原局。
+    rejoin_deadline 已过期（掉线保护超时）的会话视为已释放，不再命中。
     """
     if pid is None:
         return None
@@ -1810,6 +1922,8 @@ def _find_player_active_mission(pid):
     best = 0
     for pms_id, rec in list(PMS_TO_SESSION.items()):
         if int((rec or {}).get('player_id', 0) or 0) != pid:
+            continue
+        if _pms_rejoin_expired(rec):
             continue
         mid = int(PMS_TO_MISSION.get(pms_id, 0) or 0)
         if mid and mid in COMBAT_INSTANCES and mid > best:
@@ -1822,7 +1936,8 @@ def _find_player_live_pms(pid):
 
     与 _find_player_active_mission 同口径（mission 必须仍在
     COMBAT_INSTANCES 存活，多条取最新成局），多返回会话记录本身；
-    无 → (None, None, None)。
+    无 → (None, None, None)。rejoin_deadline 已过期的会话不再命中
+    （重登不再推 REJOIN 行，正常登录进大厅）。
     """
     if pid is None:
         return None, None, None
@@ -1831,6 +1946,8 @@ def _find_player_live_pms(pid):
     best = (None, None)
     for pms_id, rec in list(PMS_TO_SESSION.items()):
         if int((rec or {}).get('player_id', 0) or 0) != pid:
+            continue
+        if _pms_rejoin_expired(rec):
             continue
         mid = int(PMS_TO_MISSION.get(pms_id, 0) or 0)
         if mid and mid in COMBAT_INSTANCES and mid > best_mid:
@@ -1862,16 +1979,33 @@ async def push_relogin_rejoin(writer, view_cmd, pid):
     官方行为：登录时服务器把仍在进行的 PMS 行重新下发。此处复刻：
     - 同一 pms 行 id / battle_session_id / metrics id（hng.exe 重拉后
       GetPlayerSettings 按 pms 精确命中原会话，game_server 无需兜底）；
-    - connectionState=3 (Entered)：ADD 不走 handleSessionUpdates 的
-      Admitted 自动拉起分支（state=2 会在登录瞬间直接重启 hng.exe，
-      没有按钮可点），客户端仅置 playerMissionSessionId → REJOIN 态，
-      点按钮 onEnterCombatClicked → launchActionGame 重拉回原局；
+    - ★ connectionState=2 (Admitted)（2026-09-08 三修，战局详情弹窗）：
+      曾经用 state=3（Entered）——按钮有了但 StatusCallout 永不弹出。
+      反编译实锤：REJOIN 弹窗唯一自动显示路径 = ACTION_GAME_SERVICE_
+      MISSION_END_TIMER 每秒 tick → onLosingPlayerMissionSessionCountdown
+      Updates → handleCallOutStatus()，而该定时器只在 handleSession
+      Updates 的 Admitted 分支启动，Entered 分支什么都不做 → 弹窗死路。
+      曾经担心 state=2 会在登录瞬间自动拉起 hng.exe 是误判：自动拉起
+      条件 _isGameLaunchedOnce==false && gameClientDataDownloaded，后者
+      在登录开始被 ClearAndConnectCommand 重置 false、全部 view 订阅完
+      +资产同步后才置 true，PMS 行在 missionview 订阅响应中到达必然
+      早于该时刻 → 不拉起，走倒计时分支弹出战局详情（与优雅退出后
+      300s 倒计时弹窗同一代码路径，已实测）；
     - timeAdmitted 刷新为当前（该字段同时是 Admitted 分支 300s 会话
       丢失倒时基，推旧值会秒判 GAME_TIMED_OUT）；
     - 附带 BattleInfo 'set'（同局同 id 幂等）：PMS 行在而 BattleInfo
-      缺失时客户端不连 game server（见 _push_player_into_mission）。
+      缺失时客户端不连 game server（见 _push_player_into_mission）；
+    - ★ 小队行重推（2026-09-08 四修）：临时凑的小队只存内存
+      （_MM_MISSION_SQUADS / _SOLO_SQUADS），重登无 DB 可查 → 小队面板
+      不恢复。凑队推全量行、单人推 solo 行（status=4）、DB 真小队按
+      本局 mission_id 重推（补 SquadSession.f17）。
     战局结束/放弃仍走 _finish_mission_sessions / mission abandon 照常
-    PMS DELETE（REJOIN 消失回 BASE_STATE）。无存活战局 → 不推（正常登录）。
+    PMS DELETE（REJOIN 消失回 BASE_STATE）。
+    ★ 掉线保护（2026-09-08）：rejoin_deadline 已过期的会话不再命中
+    （_find_player_live_pms 过滤）→ 不推 REJOIN 行，正常登录进大厅；
+    在保护期内重登则照常推（重进战局即清 deadline，保护期到点由
+    rejoin_sweep_loop 推 PMS DELETE 收尾）。无存活战局 → 不推
+    （正常登录）。
     """
     pms_id, rec, mission_id = _find_player_live_pms(pid)
     if pms_id is None or rec is None:
@@ -1905,12 +2039,54 @@ async def push_relogin_rejoin(writer, view_cmd, pid):
                          metrics_session_id=int(
                              rec.get('metrics_session_id', 0) or 0),
                          metrics_device_id=METRICS_DEVICE_ID,
-                         platform='HnG', connection_state=3,
+                         platform='HnG', connection_state=2,
                          battle_session_id=int(
                              rec.get('battle_session_id', 0) or 0)))
     await _push_kvcs(writer, view_cmd, b'BattleInfo',
                      _msg_battle_info(mission_id, pos[0], pos[1]))
     _log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet (PlayerMissionSession '
          f'id={pms_id}, player={rec.get("player_id")}, '
-         f'mission={mission_id}, state=3 Entered ★relogin rejoin)')
+         f'mission={mission_id}, state=2 Admitted ★relogin rejoin)')
+    # ★ 四修（2026-09-08）：小队行重推——临时凑的小队（_MM_MISSION_SQUADS
+    # 内存登记，非 DB）重登后无人推 → 客户端 SquadSession/SquadMemberSession
+    # 表全空，小队面板不恢复（大厅看不到同队队友）。按入局时同一套逻辑推：
+    #   - DB 真小队：views 登录已在 playerview 推过（missionId=0），此处按
+    #     本局 mission_id 重推同 id 行（命中 UPDATE 分支补 f17）；
+    #   - 凑队（≥2 人）：全量行（SquadSession + 全体成员行，客户端按"含
+    #     本人 playerId 的成员行"自动切换当前小队）；
+    #   - 单人：solo 行（status=4 InBattle——玩家仍在局内 rejoin）。
+    try:
+        pid_ = int(rec['player_id'])
+        sq_id = int(rec.get('squad_id', 0) or 0)
+        sq_db = int(rec.get('squad_db_id', 0) or 0)
+        if sq_db:
+            from handlers.squad import push_squad_rows_to_writer
+            await push_squad_rows_to_writer(writer, view_cmd, sq_db,
+                                            mission_id, viewer_pid=pid_)
+        elif sq_id:
+            info = (_MM_MISSION_SQUADS.get(int(mission_id)) or {}).get(sq_id)
+            if info is not None and len(info.get('members') or []) >= 2:
+                solo = _SOLO_SQUADS.get(pid_) or {}
+                await _push_auto_squad_rows(
+                    writer, view_cmd, mission_id, sq_id, info,
+                    int((solo or {}).get('entered', 1) or 1))
+            else:
+                solo = _SOLO_SQUADS.get(pid_)
+                if solo:
+                    await _push_kvcs(writer, view_cmd, b'SquadSession',
+                                     _msg_solo_squad_session(
+                                         solo['squad_row'], pid_,
+                                         solo['template'],
+                                         solo['faction'], mission_id,
+                                         int(solo.get('entered', 1) or 1)))
+                    await _push_kvcs(
+                        writer, view_cmd, b'SquadMemberSession',
+                        await _msg_solo_squad_member_session(
+                            solo['member_row'], solo['squad_row'], pid_,
+                            gamertag, int(rec.get('char_id', 0) or 0),
+                            char_name, rank, 4,
+                            int(solo.get('metrics_session_id', 0) or 0),
+                            solo['faction']))
+    except Exception as e:
+        _log(f'      [WARN] relogin squad re-push failed: {e}')
     return True

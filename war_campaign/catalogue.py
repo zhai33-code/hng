@@ -18,7 +18,7 @@ from .common import (
     _TANK_CATS,
     _GROUND_VEHICLE_CATS,
     _PLANE_CATS,
-    _fmt_ts,
+    _war_days,
     _as_resources,
     )
 from .lifecycle import (
@@ -116,7 +116,7 @@ def _msg_catalogue(war, city_owners, ats, capitals):
     m = b''
     m += pb_int64(1, war['id'])
     m += pb_string(2, war.get('name') or '')
-    m += pb_string(3, _fmt_ts(war.get('begintime')))              # wartime
+    m += pb_string(3, _war_days(war))                             # wartime
     m += pb_int32(4, effective_points_needed(
         war.get('points_needed_for_victory')))
     m += pb_int64(5, war.get('winning_faction_id') or 0)

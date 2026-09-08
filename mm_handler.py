@@ -19,6 +19,7 @@ from wardb import (
 import mm_pool
 import force_pool
 import war_campaign
+import mm_config
 
 from matchmaking import (
     AI_MISSIONPRESET, _arm_ai_fill, _assault_team_nodes, _cancel_squad_queue,
@@ -27,7 +28,8 @@ from matchmaking import (
     _join_existing_mission, _mission_accesspoints, _mission_capturepoints,
     _msg_mission_details_response, _msg_player_matchmaking,
     _msg_solo_squad_member_session, _msg_solo_squad_session, _multi_first,
-    _pool_counts, _push_kvcs, _push_kvcs_delete, _revive_own_membership,
+    _pool_counts, _push_kvcs, _push_kvcs_delete, _resolve_quickplay_gamemode,
+    _revive_own_membership,
     _squad_eligible_members, _try_form_all, _zulu_activated, _zulu_now,
     mission_resource_pool,
 )
@@ -42,6 +44,56 @@ from mm_factions import (
     ASSAULT_DEFENDER_LOGO_AP, FACTION_ROW_IDS, _faction_pair,
     _msg_faction_rows,
 )
+
+
+async def _specified_mission_join_error(req_mission_id, faction):
+    """指定战局加入（JoinMM f2：好友列表"跟随进入战斗"/战争图点战斗）的
+    前置校验：返回错误码（无法加入）或 None（可加入）。
+
+    官服语义（客户端 MatchmakingService.requestJoinMatchMakingCallback
+    反推）：指定局无法加入时回错误码——43 mission_not_found / 62
+    player_faction_invalid 客户端会清跟随状态并弹"无法找到战斗/无效
+    阵营"提示；227 mission_faction_full 文案"该战斗人数已满"。
+    此前服务端一律回 ok 再静默处理：指定局撮合不中（士兵阵营不在该局
+    攻防两方/局已结束/满员）时玩家被普通撮合排进另一场新局——
+    2026-09-08 用户报"好友列表加入好友对局排到新对局"根因。
+    """
+    mid = int(req_mission_id)
+    wrec = None
+    try:
+        wrec = await state.STORE.get_mission_record(mid)
+    except Exception as e:
+        _log(f'[DB] get_mission_record({mid}) failed: {e}')
+    if wrec is not None and int(wrec.get('battle_id') or 0):
+        # war 会战 record：state 2/3（已结算）→ 43；阵营非交战双方 → 62
+        # （原 1b-1 war 分支静默 return：回 ok 但无事发生，玩家永卡匹配中）
+        if int(wrec.get('state', 0) or 0) in (2, 3):
+            return 43
+        w_atk = int(wrec.get('attacker_faction', 0) or 0)
+        w_dfd = int(wrec.get('defender_faction', 0) or 0)
+        if w_atk > 0 and w_dfd > 0 and faction not in (w_atk, w_dfd):
+            return 62
+        # state=1（战斗中）但局内会话已清（战斗服收尾中）→ 局实际已不可
+        # 加入（原 war 分支同样静默忽略 → 玩家永卡匹配中）
+        if (int(wrec.get('state', 0) or 0) == 1
+                and not (_MM_MISSION_DETAILS.get(mid)
+                         and mid in COMBAT_INSTANCES)):
+            return 43
+        return None
+    # 普通撮合局（内存口径，与 friendinfo 推送/late join 同源）
+    det = _MM_MISSION_DETAILS.get(mid)
+    if (det is None or 'preset' not in det
+            or COMBAT_INSTANCES.get(mid) is None):
+        return 43                       # 局不存在 / 已结束
+    atk = int(det.get('attacker_faction', 0) or 0)
+    dfd = int(det.get('defender_faction', 0) or 0)
+    if atk <= 0 or dfd <= 0 or faction not in (atk, dfd):
+        return 62                       # 士兵阵营不在该局攻防两方
+    max_p = int(mm_config.gamemode_cfg(
+        int(det.get('gamemode', 0) or 0)).get('max_players', 18))
+    if len(det.get('players') or ()) >= max_p:
+        return 227                      # 局满
+    return None
 
 
 async def _handle_join(sess, writer, cmd_id, proto):
@@ -124,6 +176,39 @@ async def _handle_join(sess, writer, cmd_id, proto):
         _log(f'[DB] set_player_selected_char failed: {e}')
 
     faction = int(char_info['faction'])
+
+    # ★ 快速匹配模式解析（11 按阵营 / 12 按士兵 / 14 全模式，客户端
+    #   GamemodesMediator）：虚拟模式号绝不能入池——按模式分池会把它与
+    #   所有具体模式池隔离（每个 quickplay 玩家孤立成局、det.gamemode
+    #   挂虚拟号把后续 late join/好友跟随全挡掉；12/14 还会走 DEFAULT
+    #   兜底成局在训练 preset 10 Mill 图上）。入池前解析为具体模式：
+    #   并入等待人数最多的具体模式池（全空随机通用模式）；1c 的跨模式
+    #   搜局（_find_joinable_mission(None,...)）独立于此。小队/单人
+    #   路径都经此解析。指定战局（f2）/战争路由（f4）尊重原值不解析。
+    _is_quickplay = (gamemode_id in mm_config.QUICKPLAY_GAMEMODES
+                     and not req_mission_id and not war_flag)
+    if _is_quickplay:
+        resolved = _resolve_quickplay_gamemode()
+        _log(f'[MM] quickplay: gamemode {gamemode_id} -> {resolved} '
+             f'(merge into busiest pool / random fallback)')
+        gamemode_id = resolved
+
+    # ★ 指定战局加入（f2 missionId：好友列表"跟随进入战斗"/战争图点战斗）
+    #   前置校验：阵营不符/局不存在/已结束/满员必须回错误码（43/62/227，
+    #   客户端 requestJoinMatchMakingCallback 会 sendErrorMessage 并对
+    #   43/62 清跟随态），绝不能回 ok 后落入普通撮合——否则士兵阵营不在
+    #   该局攻防两方时玩家被排进另一场新局（2026-09-08 好友跟随失效根因）。
+    if req_mission_id:
+        join_err = await _specified_mission_join_error(req_mission_id, faction)
+        if join_err is not None:
+            resp = build_response(cmd_id, 'JoinMatchMakingResponse',
+                                  pb_int32(1, join_err))
+            writer.write(resp)
+            await writer.drain()
+            _log(f'S->C cmd={cmd_id:<4} JoinMatchMakingResponse '
+                 f'(response={join_err}: specified mission {req_mission_id} '
+                 f'not joinable, faction={faction})')
+            return
 
     resp = build_response(cmd_id, 'JoinMatchMakingResponse', pb_int32(1, 1))
     writer.write(resp)
@@ -336,11 +421,18 @@ async def _handle_join(sess, writer, cmd_id, proto):
                  f'(session recovered, skip late-join search)')
             await _join_existing_mission(pid, rejoin_mid, entry, ctx)
             return
-    joinable = _find_joinable_mission(gamemode_id, staged_presets, faction,
-                                      only_mission=req_mission_id or None,
-                                      vehicle_cats=entry.vehicle_cats)
+    joinable = _find_joinable_mission(
+        None if _is_quickplay else gamemode_id, staged_presets, faction,
+        only_mission=req_mission_id or None,
+        vehicle_cats=entry.vehicle_cats)
     if joinable is not None:
         await _join_existing_mission(pid, joinable[0], entry, ctx)
+        return
+    if req_mission_id:
+        # 前置校验已过但撮合瞬间失效（满员/局结束竞态）：绝不回退普通撮合
+        # 排进新局（JoinMM 已回 ok 无法二次回错，保持匹配中由玩家取消）。
+        _log(f'[MM] specified mission {req_mission_id} vanished before '
+             f'join (pid={pid}) — no fallback to normal matchmaking pool')
         return
 
     # 2. 入池 + 撮合（训练模式 min=1 立即成组；凑够 min_players 成组；
