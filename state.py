@@ -284,7 +284,15 @@ class _Tee:
         self.maybe_rotate()
 
     def write(self, s):
-        self._stdout.write(s)
+        try:
+            self._stdout.write(s)
+        except UnicodeEncodeError:
+            # Windows GBK 流编不了角色名等非 GBK 字符（ö/å…）——降级
+            # 逐字符 replace。日志丢符号可容忍，绝不打断业务协程
+            # （2026-09-09 VPS：UnicodeEncodeError 沿 log() 打断
+            # _push_stored_soldier_data 致订阅推送中断）
+            enc = getattr(self._stdout, 'encoding', None) or 'ascii'
+            self._stdout.write(s.encode(enc, 'replace').decode(enc))
         self._fh.write(s)
 
     def flush(self):
@@ -302,6 +310,15 @@ class _Tee:
 
 
 sys.stdout = _Tee(_LOG_FH, LOG_FILE)
+
+# stdout/stderr 强制 UTF-8（2026-09-09）：WMI 启动后 stdout 落
+# logs\realtest_stderr.log，Windows 默认编码跟 locale（GBK）——角色名带
+# ö/å 等字符 print 即 UnicodeEncodeError；errors=replace 双保险。
+try:
+    sys.__stdout__.reconfigure(encoding='utf-8', errors='replace')
+    sys.__stderr__.reconfigure(encoding='utf-8', errors='replace')
+except (AttributeError, OSError, ValueError):
+    pass
 
 
 def log(msg):
