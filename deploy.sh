@@ -93,8 +93,9 @@ ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "tar -xzf - -C $REMOTE_DIR" < "$TAR_FILE"
 rm -f "$TAR_FILE"
 # 清理远端 macOS 垃圾（AppleDouble/.DS_Store 为历史 SMB/Finder 拷贝残留，
 # 解压覆盖不删多余文件；._bg-1.jpg 混进验证码素材曾致 PIL 出题 500）
+# 注意：bash 双引号内 \$ 传出字面 $（PowerShell 变量），\\\$ 会多出反斜杠
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
-  "powershell -NoProfile -Command \"Get-ChildItem '$REMOTE_DIR' -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { \\\$_.Name -like '._*' -or \\\$_.Name -eq '.DS_Store' } | Remove-Item -Force -ErrorAction SilentlyContinue\""
+  "powershell -NoProfile -Command \"Get-ChildItem '$REMOTE_DIR' -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { \$_.Name -like '._*' -or \$_.Name -eq '.DS_Store' } | Remove-Item -Force -ErrorAction SilentlyContinue\""
 
 # ===== 4. 重启游戏服（停 80/15110 旧进程 → 拉起 realtest_server）=====
 if [ "$NO_RESTART" -eq 0 ]; then
