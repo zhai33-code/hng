@@ -717,6 +717,10 @@ ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS battles_won INT NOT NULL DEFA
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS stats_updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 -- 补给队（Reserve）父链：template_id=faction*100+4 时指向被补给的 AT
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS parent_command_node_id BIGINT NOT NULL DEFAULT 0;
+-- 飞机/伞兵基地机场（air_commandnode_base 行 f3 的 db 持久化）：部署落机场/
+-- 换基地到达即记录；作战飞离保持原值 → 战局结束飞机据此飞回原机场
+-- （攻占敌方机场例外则更新为该机场）。0=无基地（非 airborne / 待命）。
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS airbase_bf BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_command_nodes_war ON command_nodes(war_id);
 
 -- 旧库修正：rank 默认曾是 1（0 XP 新 AT 可直接升级的根因），存量行按

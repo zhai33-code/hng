@@ -426,7 +426,10 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
                             await STORE.update_command_node(
                                 at['id'], is_deployed=True, map_entity_id=bf,
                                 map_entity_type=war_campaign.
-                                MAP_ENTITY_BATTLEFIELD)
+                                MAP_ENTITY_BATTLEFIELD,
+                                airbase_bf=(bf
+                                            if war_campaign.is_radius_unit(at)
+                                            else 0))
                             at = await STORE.get_command_node(at['id'])
                             log(f'      [war] AT 部署 node={node_id} '
                                 f'-> bf={bf}')
@@ -465,8 +468,27 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
             await _push_kvcs(writer, cmd, b'air_commandnode_base',
                              war_campaign.msg_air_commandnode_base_row(
                                  at, at['war_id'],
-                                 war_campaign.at_current_battlefield(at)))
+                                 int(at.get('airbase_bf') or 0)
+                                 or war_campaign.at_current_battlefield(at)))
         await _push_player_refresh(sess, writer)
+
+
+async def _friendly_airfield_bf(at, war_id):
+    """落地变体当前位置是否为己方机场 → 机场 bf（0=否）。
+
+    方案 1：伞兵落地变体（*_on_ground）撤退到己方机场时空中重整——
+    转回原型（恢复运输机 cat10 编制）+ 留驻机场 + airbase_bf 指向该机场，
+    可再次空降；非机场则维持撤回待命（M1 仓库重部署才恢复空降能力）。"""
+    try:
+        owners = dict(await STORE.get_war_cities(war_id))
+        cur_bf = war_campaign.at_current_battlefield(at)
+    except Exception as e:
+        log(f'      [war_at] 己方机场判定失败: {e}')
+        return 0
+    if (cur_bf and war_campaign.is_airfield(cur_bf)
+            and int(owners.get(cur_bf, 0) or 0) == int(at.get('faction') or 0)):
+        return cur_bf
+    return 0
 
 
 async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
@@ -507,6 +529,8 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
                     was_in_battle = int(at.get('state') or 0) == 2
                     fields = {}
                     dest_bf = 0
+                    auto_flown = 0
+                    retreat_mv = None
                     if was_in_battle:
                         # ---- 交战强撤惩罚（war1.md）：损 25% 编制 +
                         #      扣 20 士气 ----
@@ -589,24 +613,105 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
                                 tpl = commandnode_templates().get(
                                     int(at.get('template_id') or 0)) or {}
                                 rtpl = int(tpl.get('convert_to') or 0)
-                                if (str(tpl.get('name') or '').endswith(
+                                is_ground = (
+                                    str(tpl.get('name') or '').endswith(
                                         '_on_ground')
-                                        and rtpl
-                                        and commandnode_templates().get(
-                                            rtpl)):
+                                    and rtpl
+                                    and commandnode_templates().get(rtpl))
+                                home_bf = 0
+                                if is_ground:
+                                    home_bf = await _friendly_airfield_bf(
+                                        at, war['id'])
+                                if home_bf:
+                                    # 己方机场空中重整（方案1）：转回空中
+                                    # 原型（恢复运输机 cat10）+ 留驻机场，
+                                    # airbase_bf 指向机场可再次空降
                                     await STORE.update_command_node(
-                                        at['id'], is_deployed=False,
-                                        map_entity_id=0, state=0,
-                                        template_id=rtpl, **fields)
-                                    log(f'      [war] 落地变体撤退转回原型 '
-                                        f'node={node_id} '
-                                        f'tpl={tpl.get("id")} -> {rtpl}')
+                                        at['id'], state=0,
+                                        map_entity_id=home_bf,
+                                        map_entity_type=(
+                                            war_campaign.
+                                            MAP_ENTITY_BATTLEFIELD),
+                                        template_id=rtpl,
+                                        airbase_bf=home_bf, **fields)
+                                    log(f'      [war] 落地变体在己方机场'
+                                        f'空中重整 node={node_id} '
+                                        f'tpl={tpl.get("id")} -> {rtpl} '
+                                        f'airfield={home_bf}')
+                                elif is_ground:
+                                    # 非机场落地变体：若驻留城为己方且
+                                    # 有己方机场 → 转回空中原型并自动空运
+                                    # 回最近己方机场重整（不再进仓库）；
+                                    # 敌后/中立/无机场则撤回待命（仓库
+                                    # 重部署才恢复空降能力）
+                                    home_owners = {}
+                                    try:
+                                        home_owners = dict(
+                                            await STORE.get_war_cities(
+                                                war['id']))
+                                    except Exception:
+                                        pass
+                                    cur_bf = (war_campaign
+                                              .at_current_battlefield(at))
+                                    fac = int(at.get('faction') or 0)
+                                    auto_bf = 0
+                                    if (cur_bf and fac
+                                            and int(home_owners.get(
+                                                cur_bf, 0) or 0) == fac):
+                                        auto_bf = (war_campaign.
+                                                   nearest_owned_airfield(
+                                                       cur_bf, home_owners,
+                                                       fac))
+                                    if auto_bf and auto_bf != cur_bf:
+                                        # 转回空中原型（恢复运输机 cat10
+                                        # + 半径）再空运回机场
+                                        await STORE.update_command_node(
+                                            at['id'], template_id=rtpl)
+                                        at = await STORE.get_command_node(
+                                            at['id'])
+                                        retreat_mv, rcode, _atk = (
+                                            await war_campaign.
+                                            start_radius_move(
+                                                STORE, war, at, auto_bf))
+                                        if (rcode == war_campaign.RC_OK
+                                                and retreat_mv):
+                                            await STORE.update_command_node(
+                                                at['id'],
+                                                airbase_bf=auto_bf)
+                                            auto_flown = auto_bf
+                                            log(f'      [war] 落地变体自动'
+                                                f'空运回己方机场 node='
+                                                f'{node_id} '
+                                                f'tpl={tpl.get("id")} '
+                                                f'-> {rtpl} '
+                                                f'airfield={auto_bf}')
+                                        else:
+                                            # 空运失败（无半径航路）→
+                                            # 撤回待命兜底
+                                            await STORE.update_command_node(
+                                                at['id'], is_deployed=False,
+                                                map_entity_id=0, state=0,
+                                                **fields)
+                                            log(f'      [war] 落地变体自动'
+                                                f'空运失败转待命 node='
+                                                f'{node_id}')
+                                    else:
+                                        # 敌后/中立/无己方机场：转回原型
+                                        # + 撤回待命
+                                        await STORE.update_command_node(
+                                            at['id'], is_deployed=False,
+                                            map_entity_id=0, state=0,
+                                            template_id=rtpl, **fields)
+                                        log(f'      [war] 落地变体撤退转回'
+                                            f'原型 node={node_id} '
+                                            f'tpl={tpl.get("id")} '
+                                            f'-> {rtpl}')
                                 else:
                                     await STORE.update_command_node(
                                         at['id'], is_deployed=False,
                                         map_entity_id=0, state=0, **fields)
-                                log(f'      [war] AT 撤退 node={node_id} '
-                                    f'-> 待命')
+                                    log(f'      [war] AT 撤退 node={node_id}'
+                                        f' -> 待命')
                         at = await STORE.get_command_node(at['id'])
                 except Exception as e:
                     log(f'      [war_at] retreat failed: {e}')
@@ -627,7 +732,19 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
         cmd = _view_cmd(sess)
         if not cmd:
             return
-        if not at.get('is_deployed'):
+        if auto_flown:
+            # 落地变体自动空运回己方机场：推 air_transport 行（飞行动画）
+            # + airbase 行指向目标机场（在途仍属 airborne，基地=目的地）
+            segs = (war_campaign.movement_segments(retreat_mv)
+                    if retreat_mv else [])
+            if segs:
+                await _push_kvcs(writer, cmd, b'air_transport',
+                                 war_campaign.msg_air_transport_row(
+                                     at, at['war_id'], retreat_mv, segs[0]))
+            await _push_kvcs(writer, cmd, b'air_commandnode_base',
+                             war_campaign.msg_air_commandnode_base_row(
+                                 at, at['war_id'], auto_flown))
+        elif not at.get('is_deployed'):
             # §10.2 #7：空中半径单位撤回待命 → 删 airbase 行（重新部署
             # 时再按落位机场重建）
             if war_campaign.is_radius_unit(at):

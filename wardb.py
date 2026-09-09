@@ -1355,7 +1355,13 @@ def commandnode_template(faction, name):
 
 
 def _load_preset(preset_id):
-    """读 WarDatabase/missionpreset 行（缓存）。查不到回退 preset 10 硬编码值。"""
+    """读 WarDatabase/missionpreset 行（缓存）。查不到回退 preset 10 硬编码值。
+
+    ★ 兜底行按【原 preset_id】缓存——旧实现回退时把 preset_id 改写成 10
+    再入缓存，会用缺 f6/f8/f12-f15 的兜底行覆盖 preset 10 的真实行
+    （任意一次未知 preset 查询即污染：后续 f12 missionCategoryId /
+    maxPlayerCount 等全读不到，2026-09-10 test_mm_mapfilter B13 发现）。
+    """
     if preset_id in _PRESET_CACHE:
         return _PRESET_CACHE[preset_id]
     row = None
@@ -1367,10 +1373,10 @@ def _load_preset(preset_id):
     except Exception as e:
         log(f'[!] missionpreset parse failed: {e}')
     if row is None:
-        # preset 10: Training - Encounter - Mill（WarDatabase 实测行）
+        # preset 10: Training - Encounter - Mill（WarDatabase 实测行的
+        # 最小子集；仅缺场景等兜底用途，字段不全）
         row = {1: 10, 3: 13, 4: 5, 5: b'Training - Encounter - Mill', 7: 0, 11: 24}
         log(f'[!] preset {preset_id} not in WarDatabase, fallback to preset 10')
-        preset_id = 10
     _PRESET_CACHE[preset_id] = row
     return row
 

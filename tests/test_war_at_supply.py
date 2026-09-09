@@ -1237,8 +1237,11 @@ def section_r_unit():
     13(800,100) 14(2000,0) 15(850,0)敌机 16(450,0) 17(1200,0)机）。"""
     at505 = {'template_id': 505, 'faction': 1}      # 战斗机 950/2850
 
-    ok, atk = war_campaign.check_radius_move(at505, 10, 16, {16: 0}, set())
-    check('R0a 攻击半径内任意城（450×2≤950）→ (True,True)', ok and atk)
+    ok, _ = war_campaign.check_radius_move(at505, 10, 16, {16: 0}, set())
+    check('R0a 攻击半径内未开战非机场城 → 拒（战斗机仅限机场间/已开战）',
+          not ok)
+    ok, atk = war_campaign.check_radius_move(at505, 10, 16, {16: 0}, {16})
+    check('R0a2 攻击半径内已开战城（16 ∈ battling）→ (True,True)', ok and atk)
 
     ok, atk = war_campaign.check_radius_move(at505, 10, 12, {12: 1}, set())
     check('R0b 运输半径内己方非交战机场（800×2∈(950,2850]）→ (True,False)',
@@ -1296,8 +1299,9 @@ async def section_r():
     _mk_at(st, 500, template=505)
     w, f = await _deploy(500)
     ab = _rows(w, 'air_commandnode_base')
-    check('R1a 飞机部署落机场（11）+ airbase 行（f3=11）',
+    check('R1a 飞机部署落机场（11）+ airbase 行（f3=11）+ airbase_bf=11',
           f.get(1) == 1 and st.ats[500]['map_entity_id'] == 11
+          and st.ats[500]['airbase_bf'] == 11
           and ab and ab[-1].get(3) == 11 and ab[-1].get(2) == 500, str(f))
 
     # R1b 候选池无机场 → 回退距主城最近的**己方占领**机场（2026-09-08
@@ -1362,21 +1366,32 @@ async def section_r():
     events = await war_campaign.advance_movements(
         st, war, now=mv['arrive_at'] + datetime.timedelta(seconds=1))
     ab_ev = [e for e in events if e[1] == b'air_commandnode_base']
-    check('R2b 到达换基地 → AT 落位 12 + airbase 行 set',
+    check('R2b 到达换基地 → AT 落位 12 + airbase 行 set + airbase_bf=12',
           st.ats[500]['map_entity_id'] == 12
           and st.ats[500]['state'] == 0
+          and st.ats[500]['airbase_bf'] == 12
           and len(ab_ev) == 1 and ab_ev[0][0] == 'set'
           and pb_parse(ab_ev[0][2]).get(3) == 12)
 
-    # R2c 攻击半径内任意城：12→16（350×2=700≤950）→ 1；飞机作战到达
-    # airbase 行不变
+    # R2c 战斗机未开战非机场城 → 拒单 7（用户纠正 #1：战斗机仅能在
+    # 友方机场间移动，飞入非机场据点须已开战）
+    w, f2c = await _transport(500, target=16)
+    check('R2c 战斗机未开战非机场城 → 7',
+          f2c.get(3) == war_campaign.RC_CANNOT_FIND_COMMANDNODE
+          and len(st.movements) == 1, str(f2c))
+
+    # R2c2 战斗机已开战城 → 23(join battle)；作战到达 airbase 行不变 +
+    # airbase_bf 保持 12
+    st.battles.append({'war_id': 1, 'battlefield_id': 16, 'battle_type': 1,
+                       'id': 1, 'factions': [{'at_id': 999, 'faction': 2}]})
     w, f = await _transport(500, target=16)
     mv = st.movements[2]
     events = await war_campaign.advance_movements(
         st, war, now=mv['arrive_at'] + datetime.timedelta(seconds=1))
-    check('R2c 攻击半径内任意城 → 1；作战到达 airbase 行不变',
-          f.get(3) == war_campaign.RC_OK
+    check('R2c2 战斗机已开战城 → 23；到达 airbase 行不变 + airbase_bf=12',
+          f.get(3) == war_campaign.RC_TRANSPORTING_TO_JOIN_BATTLE
           and st.ats[500]['map_entity_id'] == 16
+          and st.ats[500]['airbase_bf'] == 12
           and not [e for e in events
                    if e[1] == b'air_commandnode_base'], str(f))
 
@@ -1413,6 +1428,7 @@ async def section_r():
     st = _setup()
     war = await war_campaign.ensure_war(st)
     _mk_at(st, 510, template=506, deployed=True, map_entity_id=11)
+    st.ats[510]['airbase_bf'] = 11                   # 部署落机场持久化
     w, f = await _transport(510, target=16)      # 350×2=700≤1850 攻击半径
     mv = st.movements[1]
     events = await war_campaign.advance_movements(
@@ -1424,6 +1440,7 @@ async def section_r():
           f.get(3) == war_campaign.RC_OK
           and st.ats[510]['template_id'] == 507
           and st.ats[510]['map_entity_id'] == 16
+          and st.ats[510]['airbase_bf'] == 0
           and not war_campaign.is_radius_unit(st.ats[510])
           and ev_del_ab and ev_del_ab[0][2] == 510
           and ev_set_def
@@ -1441,6 +1458,7 @@ async def section_r():
           f.get(3) == war_campaign.RC_RELOCATING_TO_NEW_AIRBASE
           and st.ats[511]['template_id'] == 506
           and st.ats[511]['map_entity_id'] == 17
+          and st.ats[511]['airbase_bf'] == 17
           and len(ab_ev) == 1 and ab_ev[0][0] == 'set'
           and pb_parse(ab_ev[0][2]).get(3) == 17, str(f))
 
@@ -1495,6 +1513,46 @@ async def section_r():
           and war_campaign.upgrade_allowed(_TPLS[501], _TPLS[503])
           and not war_campaign.upgrade_allowed(_TPLS[503], _TPLS[501])
           and not war_campaign.upgrade_allowed(_TPLS[501], _TPLS[501]))
+
+    # R4f 落地变体在己方机场撤退 → 空中重整（方案1）：转回空中原型 506
+    # （恢复运输机编制）+ 留驻机场保持部署 + airbase_bf 指向机场 11
+    # （区别于 R4d 非机场 → 撤回待命）
+    _mk_at(st, 523, template=507, deployed=True, map_entity_id=11)
+    w = FakeWriter()
+    await war_at.handle_retreat_command_node_request(
+        FakeSess(), w, 900, b'RetreatCommandNodeRequest', pb_int64(1, 523))
+    fr5 = _resp(w, 'RetreatCommandNodeResponse')
+    check('R4f 落地变体己方机场撤退 → 空中重整（506+部署+airbase_bf=11）',
+          fr5.get(1) == 1
+          and st.ats[523]['template_id'] == 506
+          and st.ats[523]['is_deployed']
+          and st.ats[523]['map_entity_id'] == 11
+          and st.ats[523].get('airbase_bf') == 11
+          and war_campaign.is_radius_unit(st.ats[523]), str(fr5))
+
+    # R4g 落地变体在普通城（己方、非机场）撤退 → 自动空运回最近己方机场
+    # （区别于 R4d 敌后/无机场 → 撤回待命；也区别于 R4f 已在机场 → 就地重整）
+    st = _setup()
+    await war_campaign.ensure_war(st)
+    st.city_owners[1] = {10: 1, 11: 1, 12: 1, 13: 1}
+    _mk_at(st, 524, template=507, deployed=True, map_entity_id=13)
+    w = FakeWriter()
+    await war_at.handle_retreat_command_node_request(
+        FakeSess(), w, 900, b'RetreatCommandNodeRequest', pb_int64(1, 524))
+    fr6 = _resp(w, 'RetreatCommandNodeResponse')
+    air_rows = _rows(w, 'air_transport')
+    ab_rows = _rows(w, 'air_commandnode_base')
+    check('R4g 落地变体普通城撤退 → 自动空运回最近机场 12（506+在途+air_transport）',
+          fr6.get(1) == 1
+          and st.ats[524]['template_id'] == 506
+          and st.ats[524]['is_deployed']
+          and st.ats[524]['state'] == 1
+          and st.ats[524].get('airbase_bf') == 12
+          and len(air_rows) == 1
+          and air_rows[0].get(3) == 13
+          and air_rows[0].get(5) == 12
+          and len(ab_rows) == 1
+          and ab_rows[0].get(3) == 12, str(fr6))
 
 
 # ====================================== T 交战撤退规则（war1.md §撤退）

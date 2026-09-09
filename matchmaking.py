@@ -40,7 +40,7 @@ from wardb import (
     _load_capturepoint_templates, _load_objective_capturepoints,
     _load_preset, _missiontype_for_gamemap, _rank_from_combat_xp,
     assault_ap_decision, battlefield_entity_for_gamemap, battlefield_pos,
-    commandnode_template, is_general_character, preset_scene,
+    character_resource_category, commandnode_template, is_general_character, preset_scene,
     squad_template_for_character, squad_template_slot_count,
     vehicle_resource_category,
 )
@@ -1661,6 +1661,47 @@ def _resolve_quickplay_gamemode():
         return random.choice([m for m in mm_config.QUICKPLAY_POOL_MODES
                               if counts.get(m, 0) == best])
     return random.choice(mm_config.QUICKPLAY_POOL_MODES)
+
+
+def _resolve_mapfilter_gamemode(presets):
+    """地图筛选（gamemode 13 高级筛选）入池模式解析。
+
+    返回 (gamemode, presets)：解析失败回 (None, presets) 由调用方维持
+    原虚拟号走 DEFAULT 兜底。
+
+    客户端链路（反编译实测）：GamemodesView.as:458 高级筛选 "To Battle"
+    按钮 dispatch 13 → GamemodesMediator.gamemodeClicked 13 分支把全部
+    勾选地图装进 selectedMissionPresets → JoinMatchMakingRequest
+    f7=13 + f5=勾选 preset。preset → 模式映射 = missionpreset f12
+    missionCategoryId（与客户端 updateMaps 的 cat==GamemodeId 过滤同源：
+    1=训练 2=C&H步兵 3=C&H坦克 4=C&H全兵种 5/6=Assault 7/8=pilot/recon）。
+
+    解析规则（2026-09-10 修复"地图筛选匹配人机模式不秒开"）：
+    - 勾选全部同分类 → 该模式（勾训练图 → 模式 1 min_players=1 秒成局，
+      此前 13 落 DEFAULT min=2 → 空等 30s AI 补位）
+    - 混合分类 → 排除训练(cat 1)后并入等待人数最多的分类池（并列随机，
+      quickplay 同款语义；仅剩训练 → 训练）
+    - preset 全部未知（WarDatabase 查不到行/f12 缺失）→ None 不解析
+    返回的 presets 同步收窄为命中分类的子集：防混合勾选把其它分类的图
+    经 mm_pool._pick_preset 多数票排进本模式成局（PvP 局开到训练图）。
+    """
+    if not presets:
+        return None, presets
+    cat_presets = {}
+    for p in presets:
+        cat = int(_load_preset(int(p)).get(12, 0) or 0)
+        if cat:
+            cat_presets.setdefault(cat, []).append(int(p))
+    if not cat_presets:
+        return None, presets
+    cats = [c for c in cat_presets if c != 1] or [1]
+    if len(cats) == 1:
+        mode = cats[0]
+    else:
+        counts = POOL.waiting_counts()
+        best = max((counts.get(m, 0) for m in cats), default=0)
+        mode = random.choice([m for m in cats if counts.get(m, 0) == best])
+    return mode, tuple(cat_presets.get(mode, ()))
 
 
 async def _join_existing_mission(pid, mission_id, e, ctx):

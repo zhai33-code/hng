@@ -1660,26 +1660,41 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
         try:
             if solo is not None and not squad_db_id:
                 solo['mission_id'] = 0
-                # ★ 凑队小队行删除（先于 solo 行重推）：进局时被合并进
-                #   2 人以上凑队的玩家，客户端表中的 SquadSession/成员行
-                #   是合并队行——删净后重推 solo 行（ADD）恢复单人小队视图
+                # ★ 战斗结束解散假小队（2026-09-09）：单人成队（solo）与
+                #   散人凑队（auto squad）行一律删除、不重推——玩家打完
+                #   回大厅应回到"无小队"状态，再点匹配重建假小队。
+                #   删除顺序（同 handle_remove_squad 终版）：SquadSession
+                #   先删——客户端 onSquadSessionChange DELETE → resetSquad()
+                #   全量清理（isActive/isOwnedByPlayer 置 false，之后 PMS
+                #   DELETE 的 onLobbySignalUpdates 走 !isActive 分支安全）；
+                #   成员行后删（先删成员行会把 _squadSession 置空、
+                #   SquadSession DELETE 变 no-op → isOwnedByPlayer 残留 →
+                #   切屏卡"小队未准备好"）。
                 if mm_sess.get('auto_sq_id'):
-                    await matchmaking._reset_auto_squad_rows(
+                    await matchmaking._push_kvcs_delete(
                         flash.writer, flash.playerview_cmd,
-                        int(mm_sess.get('auto_sq_id') or 0),
-                        mm_sess.get('auto_sq_rows') or [])
-                await matchmaking._push_kvcs(
-                    flash.writer, flash.playerview_cmd, b'SquadSession',
-                    matchmaking._msg_solo_squad_session(
-                        solo['squad_row'], pid, solo['template'],
-                        solo['faction'], 0, solo.get('entered', 0)))
-                await matchmaking._push_kvcs(
-                    flash.writer, flash.playerview_cmd, b'SquadMemberSession',
-                    await matchmaking._msg_solo_squad_member_session(
-                        solo['member_row'], solo['squad_row'], pid,
-                        solo['gamertag'], solo['char_id'], solo['char_name'],
-                        solo['rank'], 2,
-                        solo.get('metrics_session_id', 0), solo['faction']))
+                        b'SquadSession', int(mm_sess.get('auto_sq_id') or 0))
+                    for rid in mm_sess.get('auto_sq_rows') or []:
+                        await matchmaking._push_kvcs_delete(
+                            flash.writer, flash.playerview_cmd,
+                            b'SquadMemberSession', int(rid))
+                    log(f'S->C cmd={flash.playerview_cmd:<4} '
+                        f'KeyValueChangeSet delete (auto squad '
+                        f'id={int(mm_sess.get("auto_sq_id") or 0)} + '
+                        f'{len(mm_sess.get("auto_sq_rows") or [])} member '
+                        f'rows ★battle end disband)')
+                # solo 行兜底删：凑队成员表内该行已在进局时删除
+                # （客户端对不存在的 id delete 是 no-op，无害）
+                await matchmaking._push_kvcs_delete(
+                    flash.writer, flash.playerview_cmd,
+                    b'SquadSession', solo['squad_row'])
+                await matchmaking._push_kvcs_delete(
+                    flash.writer, flash.playerview_cmd,
+                    b'SquadMemberSession', solo['member_row'])
+                log(f'S->C cmd={flash.playerview_cmd:<4} KeyValueChangeSet '
+                    f'delete (SquadSession id={solo["squad_row"]} + '
+                    f'SquadMemberSession id={solo["member_row"]} '
+                    f'★battle end disband solo squad)')
             await matchmaking._push_kvcs_delete(
                 flash.writer, flash.playerview_cmd,
                 b'PlayerMissionSession', pms_id)

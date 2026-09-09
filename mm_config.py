@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """匹配池配置（纯数据模块）。
 
-gamemodeId 取值来源：客户端 MatchmakingDescription.as / GamemodesMediator.as（反编译实测）：
-  1=First Encounter(训练, AI)  3=Capture&Hold Infantry  4=Capture&Hold Tanks/Battle
-  5=Assault Infantry  6=Assault Battle  7=C&H Pilot(飞行员士兵 tile)  8=C&H Recon(侦察兵士兵 tile)
+gamemodeId 取值来源：客户端 GamemodeDescription.as 静态构造器 + GamemodesMediator.as
+706-714 行把静态描述写回 view model（反编译实测，2026-09-10 校正 C&H 编号）：
+  1=First Encounter(训练, AI)  2=Capture&Hold Infantry  3=Capture&Hold Tanks
+  4=Capture&Hold Battle(全兵种)  5=Assault Infantry  6=Assault Battle
+  7=C&H Pilot(飞行员士兵 tile)  8=C&H Recon(侦察兵士兵 tile)
   10=War  11=Quick Play(按阵营)  12=Quick Play(按士兵)  13=自选图  14=Quick Play(全模式)
+（GamemodesView.as 视图初始值 3=C&H步兵/4=C&H坦克是 mediator 覆写前的占位默认，
+真实 dispatch 以 GamemodeDescription 静态编号为准；编号与 missionpreset f12
+missionCategoryId 一一相等——客户端 updateMaps 按 cat==GamemodeId 过滤地图。）
 
 字段语义：
   min_players    成局所需最少玩家数（达到即撮合）
@@ -66,9 +71,11 @@ def _mode(name, min_players, max_players, ai_fill_after, fallback_presets=None):
 # 每模式匹配配置（gamemodeId → 参数）
 # fallback_presets：组内无人勾选地图时的随机兜底池，★ 2026-09-01 完全对齐
 # 官方运营版地图池（官方 1.10/1.14 更新日志 + wiki 交叉核对，preset f5 官方命名）：
-#   1  First Encounter(训练)：Samrée Depot(9) / Colmar Hamlet(10)
-#   3  C&H Infantry(=官方 Skirmish)：Sawmill / Hill 60 / Village Skirmish
-#   4  C&H Tank(官方 1.14 模式)：仅 Lunéville(12)
+#   1  First Encounter(训练)：Samrée Depot(9) / Colmar Hamlet(10)（32/33 为同图别名 preset）
+#   2  C&H Infantry(=官方 Skirmish)：Sawmill(373394539) / Hill 60(373394540) /
+#      Village Skirmish(373394541)（旧 preset 1/19/20/21 = 同图/俄线图，不入池）
+#   3  C&H Tanks：仅 Lunéville(12)
+#   4  C&H Battle(全兵种)：22/23/24 与 2 号三图同 gamemap、25=RussianSkirmish
 #   5/6 staged Assault：官方 Assault Small 五图 Airfield(26)/Factory(27)/
 #      Forward Airfield(28)/Mountain Town(29)/Town(31)
 #   10 War：官方完整版 Assault 五图 Airfield(5)/Factory(6)/Forward Airfield(7)/
@@ -86,9 +93,10 @@ def _mode(name, min_players, max_players, ai_fill_after, fallback_presets=None):
 #   775928046 (T03M02_CityTrainStation)
 GAMEMODES = {
     1:  _mode('training',         1,  4,  0,  [9, 10]),               # 官方 First Encounter：Depot / Mill（PVE，≤4 人同局：小队整队进 + JOIN_WINDOW 内散人 late join 汇入，AI 补对面）
-    3:  _mode('capture_hold_inf', 2, 18, 30,  [373394539, 373394540,
-                                               373394541]),          # 官方 Skirmish 三图
-    4:  _mode('capture_hold_all', 2, 18, 30,  [12]),                  # 官方 C&H Tank：仅 Lunéville
+    2:  _mode('capture_hold_inf', 2, 18, 30,  [373394539, 373394540,
+                                               373394541]),          # 官方 Skirmish 三图（C&H Infantry）
+    3:  _mode('capture_hold_tank', 2, 18, 30, [12]),                  # 官方 C&H Tanks：仅 Lunéville
+    4:  _mode('capture_hold_all', 2, 18, 30,  [22, 23, 24, 25]),      # 官方 C&H Battle（全兵种）四图
     7:  _mode('capture_hold_pilot', 2, 18, 30, [35]),                 # 官方 C&H Pilot：Lunéville（飞行员士兵专用 tile）
     8:  _mode('capture_hold_recon', 2, 18, 30, [36]),                 # 官方 C&H Recon：Lunéville（侦察兵士兵专用 tile）
     5:  _mode('assault_infantry', 2, 18, 30,  [26, 27, 28, 29, 31]),   # 官方 staged Assault Small
@@ -107,12 +115,20 @@ DEFAULT_GAMEMODE = _mode('default', 2, 18, 30)    # 未知模式兜底
 #   找不到再并入等待人数最多的具体模式池（QUICKPLAY_POOL_MODES），
 #   全空则从通用模式随机。
 QUICKPLAY_GAMEMODES = (11, 12, 14)
-# 跨模式搜局候选：全部具体 staging 模式（含士兵 tile 7/8；阵营/载具/
-# 满员过滤兜底）。训练(1)、战争(10)、会战(battle_id) 局不进。
-QUICKPLAY_JOIN_CANDIDATES = (3, 4, 5, 6, 7, 8)
+# 跨模式搜局候选：全部具体 staging 模式（含 C&H 步兵 2 与士兵 tile 7/8；
+# 阵营/载具/满员过滤兜底）。训练(1)、战争(10)、会战(battle_id) 局不进。
+QUICKPLAY_JOIN_CANDIDATES = (2, 3, 4, 5, 6, 7, 8)
 # 入池解析候选：通用 staging 模式（7/8 为飞行员/侦察兵 tile 模式，
 # 随机落进去对步兵玩家不合适，只允许被动并入等待池不主动随机）。
-QUICKPLAY_POOL_MODES = (3, 4, 5, 6)
+QUICKPLAY_POOL_MODES = (2, 3, 4, 5, 6)
+
+# ★ 地图筛选（客户端高级筛选视图 GamemodesView.as:458 "To Battle" 按钮恒
+#   dispatch 13；GamemodesMediator.gamemodeClicked 13 分支把勾选地图装进
+#   selectedMissionPresets）：同 quickplay 属虚拟模式号，入池前必须按
+#   勾选 preset 的 missionCategoryId（missionpreset f12）解析为具体模式
+#   （matchmaking._resolve_mapfilter_gamemode）。13 不入 GAMEMODES——
+#   兜底走 DEFAULT_GAMEMODE（解析失败的极端场景）。
+MAPFILTER_GAMEMODE = 13
 
 
 def gamemode_cfg(gamemode_id):

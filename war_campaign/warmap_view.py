@@ -270,13 +270,15 @@ async def build_warmap_snapshot(store, war=None):
             for p in msg_armyresource_rows(at, war_id):
                 rows.append((b'armyresource', p))
         # 已部署空中半径单位（§10.2 #6/#7）：airbase 行（客户端
-        # isAirborneUnit 判定 + 半径规则；基地 = 当前驻地）
+        # isAirborneUnit 判定 + 半径规则；基地 = 持久化出发机场 airbase_bf，
+        # 未记录（legacy 行）回退当前驻地）
         for at in ats:
             if at.get('is_deployed') and is_radius_unit(at):
+                base = int(at.get('airbase_bf') or 0) \
+                    or at_current_battlefield(at)
                 rows.append((b'air_commandnode_base',
                              msg_air_commandnode_base_row(
-                                 at, war_id,
-                                 at_current_battlefield(at))))
+                                 at, war_id, base)))
         # 活跃会战 battle 行（2026-09-08 补：成局后新登录/重订阅的客户端
         # 才能看到战斗标记；此前快照缺 battle 段 → 该城 BattleTable 无行
         # → 点击走"城市详情"分支而非"战局详情"分支，且战斗标记不显示）

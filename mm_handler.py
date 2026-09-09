@@ -28,7 +28,8 @@ from matchmaking import (
     _join_existing_mission, _mission_accesspoints, _mission_capturepoints,
     _msg_mission_details_response, _msg_player_matchmaking,
     _msg_solo_squad_member_session, _msg_solo_squad_session, _multi_first,
-    _pool_counts, _push_kvcs, _push_kvcs_delete, _resolve_quickplay_gamemode,
+    _pool_counts, _push_kvcs, _push_kvcs_delete,
+    _resolve_mapfilter_gamemode, _resolve_quickplay_gamemode,
     _revive_own_membership,
     _squad_eligible_members, _try_form_all, _zulu_activated, _zulu_now,
     mission_resource_pool,
@@ -192,6 +193,22 @@ async def _handle_join(sess, writer, cmd_id, proto):
         _log(f'[MM] quickplay: gamemode {gamemode_id} -> {resolved} '
              f'(merge into busiest pool / random fallback)')
         gamemode_id = resolved
+
+    # ★ 地图筛选模式解析（客户端高级筛选 To Battle 恒发 13，见
+    #   mm_config.MAPFILTER_GAMEMODE 注释）：同 quickplay 虚拟模式号绝不
+    #   入池——此前 13 落 DEFAULT（min=2/ai_fill=30）→ 用地图筛选勾训练图
+    #   匹人机模式被 30s 超时补位卡慢（2026-09-10 修复）。按勾选 preset
+    #   的 missionCategoryId 解析为具体模式并收窄选图（防混合勾选把训练图
+    #   多数票进 PvP 局）。小队整队/单人/late-join 全经此解析（早于
+    #   squad 路径与 1c 搜局）；指定战局（f2）尊重指定不解析。
+    if (gamemode_id == mm_config.MAPFILTER_GAMEMODE
+            and not req_mission_id):
+        resolved, keep_presets = _resolve_mapfilter_gamemode(staged_presets)
+        if resolved is not None:
+            _log(f'[MM] mapfilter: gamemode 13 -> {resolved} '
+                 f'(presets {list(staged_presets)} -> {list(keep_presets)})')
+            gamemode_id = resolved
+            staged_presets = keep_presets
 
     # ★ 指定战局加入（f2 missionId：好友列表"跟随进入战斗"/战争图点战斗）
     #   前置校验：阵营不符/局不存在/已结束/满员必须回错误码（43/62/227，

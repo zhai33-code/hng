@@ -202,7 +202,7 @@ class WarStoreMixin:
                    'general_character_id', 'is_deployed', 'upgrade_level',
                    'owner_player_id', 'faction', 'template_id',
                    'has_gotten_soldier_free', 'has_gotten_vehicle_free',
-                   'parent_command_node_id'}
+                   'parent_command_node_id', 'airbase_bf'}
         import json as _json
         sets, args = [], []
         for k, v in fields.items():

@@ -41,6 +41,8 @@ from .at_ops import (
     _tpl_of,
     is_radius_unit,
     is_paradrop_unit,
+    is_aircraft,
+    is_airfield,
     is_infantry_at,
     msg_air_commandnode_base_row,
     is_reserve,
@@ -122,18 +124,21 @@ async def advance_movements(store, war=None, now=None):
                 # ---- 空中半径单位到达（§10.2 #6/#7）----
                 if is_radius_unit(at):
                     if not segs[-1].get('radius_attack'):
-                        # 换基地到达：airbase 行指向新机场
+                        # 换基地到达：airbase 行 + airbase_bf 指向新机场
+                        await store.update_command_node(
+                            at['id'], airbase_bf=int(segs[-1]['to_bf']))
                         events.append((
                             'set', b'air_commandnode_base',
                             msg_air_commandnode_base_row(
                                 at, war_id, segs[-1]['to_bf'])))
                     elif is_paradrop_unit(at):
                         # 空降作战到达：伞兵落地变体（convert_to，*_on_
-                        # ground 半径无限、地面速度）+ 删 airbase 行
+                        # ground 半径无限、地面速度）+ 删 airbase 行 +
+                        # airbase_bf 清 0
                         cvt = int(_tpl_of(at).get('convert_to') or 0)
                         if cvt and wardb.commandnode_templates().get(cvt):
                             await store.update_command_node(
-                                at['id'], template_id=cvt)
+                                at['id'], template_id=cvt, airbase_bf=0)
                             at = await store.get_command_node(at['id'])
                             events.append((
                                 'set', b'CommandNodeDefinition',
@@ -144,10 +149,13 @@ async def advance_movements(store, war=None, now=None):
                                     at, war_id, caps)))
                             for p in msg_armyresource_rows(at, war_id):
                                 events.append(('set', b'armyresource', p))
+                        else:
+                            await store.update_command_node(
+                                at['id'], airbase_bf=0)
                         events.append(('del', b'air_commandnode_base',
                                        at['id']))
-                    # 飞机作战到达：airbase 行保持原基地（作战后拖回机场
-                    # = 换基地，届时更新）
+                    # 飞机作战到达：airbase 行/airbase_bf 保持原基地
+                    # （作战后结算拖回机场，届时更新）
                 # ---- 会战成局桩：目标城市有敌对 AT 驻扎 ----
                 dest_bf = (segs[-1]['to_bf'] if not dest_ap
                            else _ap_battlefield(dest_ap))
@@ -568,6 +576,15 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
         ud_mults = underdog_multipliers(
             await faction_player_counts(store, war_id))
 
+        # ③/D 前置：攻方 + 城战目标城市（飞机战后返回判据需在结算循环内）
+        attacker = 0
+        try:
+            mrec = await store.get_mission_record(int(mission_id))
+            attacker = int((mrec or {}).get('attacker_faction') or 0)
+        except Exception:
+            pass
+        dest_bf = 0 if is_field else int(wb.get('battlefield_id') or 0)
+
         for entry in (wb.get('factions') or []):
             at = await store.get_command_node(int(entry.get('at_id') or 0))
             if not at or int(at.get('state') or 0) != 2:
@@ -686,6 +703,27 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                               - _ts_ms(wb.get('started_at'))) / 1000.0)
                     await store.shift_movement_started(mv['id'], held_s)
             at = await store.get_command_node(at['id'])
+            # ★ 飞机战后返回原机场（用户纠正 #2）：战局结束飞机飞回出发
+            # 机场；例外：攻击并占领敌方机场 → 留在占领机场（成为新基地）
+            if (not is_field and is_aircraft(at)
+                    and at.get('is_deployed')
+                    and int(at.get('state') or 0) == 0):
+                home = int(at.get('airbase_bf') or 0)
+                if won and winner == attacker and is_airfield(dest_bf):
+                    dest_home = int(dest_bf)   # 攻占敌方机场：留在占领机场
+                else:
+                    dest_home = home           # 其余：返回出发机场
+                if dest_home:
+                    await store.update_command_node(
+                        at['id'], map_entity_id=dest_home,
+                        map_entity_type=MAP_ENTITY_BATTLEFIELD,
+                        airbase_bf=dest_home)
+                    at = await store.get_command_node(at['id'])
+                    events.append(('set', b'air_commandnode_base',
+                                   msg_air_commandnode_base_row(
+                                       at, war_id, dest_home)))
+                    log(f'[war] battle {battle_id}: aircraft AT {at["id"]} '
+                        f'{at.get("name")!r} returned to airfield {dest_home}')
             if rank_up:
                 # rank 变化须重推 Definition 行（f7），客户端才会刷新升级选项
                 events.append(('set', b'CommandNodeDefinition',
@@ -705,13 +743,6 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
 
         # ③ 城市易主：攻方胜 → 占领（守方胜城市不变）；野外会战无城可占
         #    （battlefield_id=补给线 id），dest_bf 置 0 同时跳过 ③/D
-        attacker = 0
-        try:
-            mrec = await store.get_mission_record(int(mission_id))
-            attacker = int((mrec or {}).get('attacker_faction') or 0)
-        except Exception:
-            pass
-        dest_bf = 0 if is_field else int(wb.get('battlefield_id') or 0)
         if winner and attacker and winner == attacker and dest_bf:
             # force：会战胜方占领（结算语义，跳过敌驻军检查）；
             # 复用助手补推 supplylinestatus/accesspointstatus 关联行

@@ -27,6 +27,7 @@ from .at_ops import (
     _battling_battlefields,
     RC_CANNOT_FIND_COMMANDNODE,
     is_airfield,
+    is_aircraft,
     _tpl_of,
     is_reserve,
     )
@@ -344,7 +345,10 @@ def check_radius_move(at, cur_bf, target_bf, owners, battling):
     """空中半径单位移动校验 → (allowed, is_attack)。
 
     官服规则（CommandnodeArrow.detectBattleField L440-570）：
-      dist ≤ attackradius/2   → 任意战场（攻击/参战/空降作战）；
+      dist ≤ attackradius/2 → 任意战场（攻击/参战/空降作战）；
+        **战斗机（is_aircraft 且非补给队）例外**（用户纠正 #1）：只能飞
+        入**已开战**的城战（target_bf ∈ battling），未开战的非机场据点
+        一律不可落——战斗机正常情况下仅能在友方机场之间移动；
       attackradius/2 < dist ≤ transportradius/2 → 仅己方非交战机场
         （换基地；reserve 补给队例外允许交战机场）；
       超出 transportradius/2  → 无效；不可落出兵点（调用方拦）。
@@ -364,7 +368,10 @@ def check_radius_move(at, cur_bf, target_bf, owners, battling):
         attack = transport = 0
     target_bf = int(target_bf or 0)
     if dist * 2 <= attack:
-        return True, True
+        if not (is_aircraft(at) and not is_reserve(at)
+                and target_bf not in (battling or set())):
+            return True, True
+        # 战斗机且目标未开战 → 落入 transport 分支（仅己方机场换基地）
     if dist * 2 <= transport:
         fac = int(at.get('faction') or 0)
         try:

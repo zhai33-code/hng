@@ -9,7 +9,9 @@ schema 来源：player.dll protobuf 描述符 @ RVA 0x7b3f78（逆向确认，40
 协议字段，描述符定义的是 hng.exe/player.dll 实际使用的 protobuf schema。
 请求解析与分发见 game_server.py；装备 DB 聚合见 player_service._load_db_loadout。
 """
+import os
 import time
+import xml.etree.ElementTree as ET
 
 from protocol import (
     pb_bool,
@@ -22,7 +24,7 @@ from protocol import (
     pb_varint,
     )
 
-from state import log
+from state import GAME_DIR, log
 
 import force_pool
 from wardb import (
@@ -38,6 +40,7 @@ from wardb import (
     charactertemplate_actionid,
     default_uniform_variant,
     is_general_character,
+    preset_scene,
     spawn_clips_for,
     vehicle_ammo_spawn_clips,
     )
@@ -624,6 +627,54 @@ def _msg_battlefield_settings_faction(faction_id, template_id):
 _TOD_HOURS = {0: 0.0, 1: 6.0, 2: 12.0, 3: 18.0}
 
 
+def _scene_defence_structures(preset_id):
+    """scenesetup 场景 XML <defencestructures> 段 → [(structure, transformation)]。
+
+    BattleFieldSettings f11（repeated defencestructure）数据源。官服链路=
+    战争服务器成局时下发工事布置；本服从场景 XML 读取（不缓存，改完
+    下一局生效）。场景名与 /M 启动参数同源（wardb.preset_scene）：
+    file:mytest01 → scenesetup/mytest01.xml；官方场景（如 T01M08_Mill）
+    → scenesetup/T01M08_Mill.xml（客户端不加载官方场景的 XML，该文件
+    只被本函数消费，给官方图加工事用）。
+    条目为 <defencestructures> 下的任意子节点，须含 <structure> 文本 +
+    <transformation> 12 浮点（3x4 矩阵）；缺字段/浮点数不对的条目跳过。
+    """
+    scene = preset_scene(preset_id)
+    if scene.startswith('file:'):
+        scene = scene[len('file:'):]
+    fpath = os.path.join(GAME_DIR, 'scenesetup', scene + '.xml')
+    try:
+        root = ET.parse(fpath).getroot()
+    except FileNotFoundError:
+        return []
+    except (ET.ParseError, OSError) as e:
+        log(f'[!] scenesetup {scene}.xml parse failed: {e}')
+        return []
+    out = []
+    for holder in root.iter('defencestructures'):
+        for item in holder:
+            s = item.find('structure')
+            t = item.find('transformation')
+            if s is None or t is None or not (s.text or '').strip():
+                continue
+            parts = (t.text or '').split(',')
+            if len(parts) != 12:
+                log(f'[!] scenesetup {scene}.xml defence structure '
+                    f'{s.text!r}: transformation needs 12 floats, skip')
+                continue
+            try:
+                [float(x) for x in parts]
+            except ValueError:
+                log(f'[!] scenesetup {scene}.xml defence structure '
+                    f'{s.text!r}: transformation not numeric, skip')
+                continue
+            out.append((s.text.strip(), (t.text or '').strip()))
+    if out:
+        log(f'[+] scene {scene}: {len(out)} defence structures '
+            f'-> BattleFieldSettings f11')
+    return out
+
+
 def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
                                         defender_faction=BF_DEFENDER_FACTION_ID,
                                         attacker_faction=3,
@@ -713,6 +764,19 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     m += pb_uint32(7, 0)                           # 7 fraglimit
     m += pb_uint32(8, 0)                           # 8 deathlimit
     m += pb_float(9, timeofday)                    # 9 timeofday（按本局时段枚举推导/下发）
+    # f11 defencestructures：官服成局下发工事布置的正式通道（proto
+    # HnG_States/ResponseBattleFieldSettings f11 repeated defencestructure，
+    # 子消息 f1 id / f2 defencesetup / f3 structure 模板名 / f10 transformation
+    # 3x4 矩阵串）。scenesetup XML 的 <defencestructures> 段只被解析进
+    # player.dll 全局数组且无消费者（死路径），工事必须经 f11 下发。
+    defence_msgs = _scene_defence_structures(preset_id)
+    for i, (structure, transformation) in enumerate(defence_msgs):
+        d = b''
+        d += pb_int64(1, 880101 + i)               # 1 id（运行时段，避开 AP 880001 段）
+        d += pb_int64(2, 880100)                   # 2 defencesetup（本局单组）
+        d += pb_string(3, structure)               # 3 structure 模板名
+        d += pb_string(10, transformation)         # 10 transformation 12 浮点矩阵
+        m += pb_message(11, d)
     for ap in ap_msgs:                             # 12 accesspoints ★动态构建
         m += pb_message(12, ap)
     for r in res_msgs:                             # 14 armyResourceList ★动态构建
