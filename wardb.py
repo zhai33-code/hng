@@ -829,6 +829,21 @@ def squad_template_for_character(character_template_id):
         charactertemplate_actionid(character_template_id), 1)
 
 
+# 兵种 actionid → 士兵资源类别（WarDatabase/armyresourcecategory f1）：
+# rifleman(2)→1 infantryman / recon(6)→6 recon / paratrooper(7)→4 paratrooper /
+# tankcrew(10)→5 tank_crew / fighterpilot(11)→2 fighter_pilot。
+# 部署界面按资源条目判定各兵种可用生命数——本局池缺角色自身类别 = 该
+# 兵种小队无法部署；伞兵更狠：引擎开局建伞兵小队失败 → 整队判负
+# （2026-09-09 VPS 实锤：池无 cat4 伞兵玩家进图 1s ReportDefeatedFaction）。
+_ACTIONID_RESOURCE_CAT = {2: 1, 6: 6, 7: 4, 10: 5, 11: 2}
+
+
+def character_resource_category(character_template_id):
+    """兵种模板 → 士兵资源类别 id（成局建池 require_cats 用）；未知返回 0。"""
+    return _ACTIONID_RESOURCE_CAT.get(
+        charactertemplate_actionid(character_template_id), 0)
+
+
 # SquadPlayerSlotTemplate 表（15 行：f1 id / f2 squadTemplateId /
 # f3 defaultSlot / f4 slotNumber（1 基）/ f5 customizationCost）→
 # 每个小队模板的玩家槽位列表 [(slotTemplateId, slotNumber-1)]。

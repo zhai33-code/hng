@@ -871,7 +871,7 @@ def main():
             return None
 
         def fake_search17(gm, presets, faction, only_mission=None,
-                          vehicle_cats=()):
+                          vehicle_cats=(), char_cat=0):
             calls17['search'].append(gm)
             return None
 

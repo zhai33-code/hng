@@ -998,7 +998,9 @@ async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
         ctx = {'writer': w, 'view_cmd': vc, 'gamertag': m['gamertag'],
                'char_name': m['char_name'], 'rank': rank,
                'faction': int(m['faction']),
-               'char_id': int(m['character_id']), 'quickplay': False,
+               'char_id': int(m['character_id']),
+               'char_template': int(m['template']),
+               'quickplay': False,
                'req_mission_id': req_mission_id,
                'metrics_uid': str(uuid.uuid4()),
                'metrics_session_id': _next_match_id(_MM_METRICS_SESSION_ID),
@@ -1016,6 +1018,7 @@ async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
             player_id=mpid, char_id=int(m['character_id']),
             faction=int(m['faction']), gamemode_id=gamemode_id,
             presets=staged_presets, group_key=squad_id,
+            char_cat=character_resource_category(int(m['template'])),
             vehicle_cats=await _char_vehicle_cats(
                 mpid, int(m['character_id']))))
     try:
@@ -1388,6 +1391,14 @@ async def _start_match(match):
         # 查缺补齐（坦克兵/飞行员缺类别即无法部署，攻方 120s 判负根因）
         require_cats = {int(c) for e in match.players
                         for c in getattr(e, 'vehicle_cats', ())}
+        # ★角色自身兵种类别一并保底：部署界面按资源条目判定各兵种可用
+        # 生命数，池缺角色类别 = 该兵种小队无法部署；伞兵尤其致命——引擎
+        # 开局建伞兵小队失败直接整队判负（2026-09-09 VPS 实锤：伞兵进
+        # capture_hold_inf 局池无 cat4，MissionStart 后 1s
+        # ReportDefeatedFaction，连输 3 局；mode 计划有 para 的 assault
+        # 局同玩家则正常）
+        require_cats |= {int(e.char_cat) for e in match.players
+                         if int(getattr(e, 'char_cat', 0) or 0)}
         _init_mission_resources(mission_id, gamemode_id, attacker, defender,
                                 require_cats)
     _log(f'match formed: mission={mission_id}, preset={preset}, map='
@@ -1543,7 +1554,7 @@ async def _push_player_into_mission(e, ctx, sess_rec, pms_id, mission_id,
 
 
 def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
-                           vehicle_cats=()):
+                           vehicle_cats=(), char_cat=0):
     """找一个等待期内可中途加入的战局，返回 (mission_id, inst) 或 None。
 
     条件（全部满足）：
@@ -1556,6 +1567,8 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
       否则坦克兵/飞行员无法部署）——仅 staged 局过滤：war 会战局兵力 =
       将军部署 AT（真实语义不因个人装备改池）、显式指定战局（only_mission
       尊重玩家选择）均不过滤
+    - 玩家角色自身兵种类别本局池必须 >0（char_cat：伞兵=4/坦克兵=5 等，
+      any-of 的载具过滤不覆盖无载具玩家；缺类别进局即判负/无法部署）
     only_mission 非空时只考虑该 mission_id（JoinMatchMakingRequest f2
     指定战局加入：战争地图点进行中战斗、好友列表"跟随进入"两条路径）。
     ★ 指定战局跳过 gamemode/preset/JOIN_WINDOW 三过滤（同 f4=war 的 M2
@@ -1616,12 +1629,18 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
             int(det.get('gamemode', 0) or gamemode_id)).get('max_players', 18))
         if len(det.get('players') or ()) >= max_p:
             continue
-        # 载具覆盖过滤（staged 局；war 局/显式指定战局不过滤，见 docstring）
-        if vehicle_cats and not only_mission and not det.get('battle_id'):
+        # 载具/兵种覆盖过滤（staged 局；war 局/显式指定战局不过滤，见 docstring）
+        if not only_mission and not det.get('battle_id'):
             fac_counts = (force_pool.pool(mission_id) or {}).get(int(faction))
-            if not fac_counts or not any(
+            if vehicle_cats and (not fac_counts or not any(
                     int(c) in fac_counts and fac_counts[int(c)] > 0
-                    for c in vehicle_cats):
+                    for c in vehicle_cats)):
+                continue
+            # 角色自身兵种类别必须本局池有（any-of 的载具过滤不覆盖：
+            # 伞兵/坦克兵等无载具玩家；缺类别进局即判负）
+            if int(char_cat or 0) and (
+                    not fac_counts
+                    or int(fac_counts.get(int(char_cat), 0)) <= 0):
                 continue
         return mission_id, inst
     return None

@@ -152,13 +152,21 @@ def _load_resources():
     backgrounds = []
     bg_dir = os.path.join(ASSETS_DIR, 'backgrounds')
     for name in sorted(os.listdir(bg_dir)):
+        # 点开头跳过：macOS 拷贝残留的 AppleDouble（._bg-1.jpg）会被
+        # endswith('.jpg') 误收 → PIL UnidentifiedImageError 出题 500
+        if name.startswith('.'):
+            continue
         if name.lower().endswith(('.jpg', '.jpeg', '.png')):
             backgrounds.append(
                 Image.open(os.path.join(bg_dir, name)).convert('RGB'))
     graphs = []
     tiles_dir = os.path.join(ASSETS_DIR, 'tiles')
     for name in sorted(os.listdir(tiles_dir)):
+        if name.startswith('.'):
+            continue
         sub = os.path.join(tiles_dir, name)
+        if not os.path.isdir(sub):
+            continue
         paths = {k: os.path.join(sub, f'{k}.png')
                  for k in ('tile', 'tile-shadow', 'tile-mask')}
         if not all(os.path.isfile(p) for p in paths.values()):

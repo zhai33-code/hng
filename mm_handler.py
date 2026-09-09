@@ -14,7 +14,7 @@ import state
 from wardb import (
     _capturepoint_ap_map, _load_objective_capturepoints, _load_preset,
     _missiontype_for_gamemap, _rank_from_combat_xp, assault_ap_decision,
-    battlefield_pos, is_general_character,
+    battlefield_pos, character_resource_category, is_general_character,
 )
 import mm_pool
 import force_pool
@@ -405,10 +405,12 @@ async def _handle_join(sess, writer, cmd_id, proto):
     #     玩家指定了战局（f2 missionId，战争地图点进行中战斗）则只考虑该局。
     #     找不到/超窗/满员/阵营不符 → 正常入池撮合。
     # 官服口径"进局必有装备载具之一"：已装备载具资源类别并集随条目
-    # 入池（成局建池查缺补齐 + 等待期中途加入过滤共用）
+    # 入池（成局建池查缺补齐 + 等待期中途加入过滤共用）；char_cat=角色
+    # 自身兵种类别（伞兵=4 等）一并保底，缺类别进局引擎建小队失败判负
     entry = mm_pool.QueueEntry(
         player_id=pid, char_id=int(char_id), faction=faction,
         gamemode_id=gamemode_id, presets=staged_presets,
+        char_cat=character_resource_category(template),
         vehicle_cats=await _char_vehicle_cats(pid, char_id))
     # 1c-0. ★ rejoin 只能回原局：玩家在存活战局中掉线重连（drop_player
     #       不清已成局会话）→ 直接回原局，不走 late join 搜索（否则按
@@ -424,7 +426,7 @@ async def _handle_join(sess, writer, cmd_id, proto):
     joinable = _find_joinable_mission(
         None if _is_quickplay else gamemode_id, staged_presets, faction,
         only_mission=req_mission_id or None,
-        vehicle_cats=entry.vehicle_cats)
+        vehicle_cats=entry.vehicle_cats, char_cat=entry.char_cat)
     if joinable is not None:
         await _join_existing_mission(pid, joinable[0], entry, ctx)
         return

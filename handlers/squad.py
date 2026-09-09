@@ -156,13 +156,18 @@ async def _member_appearance(member):
         return (0, 0)
 
 
-def _msg_squad_member_session(member, squad_id, uvt=0, upt=0):
+def _msg_squad_member_session(member, squad_id, uvt=0, upt=0, slot=0):
     """SquadMemberSession proto（20 字段，repeated 空省略）。
 
-    uvt/upt：角色装备的迷彩/头盔模板 id（_member_appearance 解析）。"""
+    uvt/upt：角色装备的迷彩/头盔模板 id（_member_appearance 解析）。
+    slot：成员槽位（0 基）→ f3 = slot+1。★f3 必须是 SquadPlayerSlotTemplate
+    表有效行 id（1-4）：客户端 SquadModel.activate() 对每条成员行
+    getFromId(f3) 后直接取 .slotNumber，0 查无此行返回 null → Error #1009
+    （进小队/士兵界面即抛，卡小队界面且匹配按钮不可用，重登复现——登录
+    重推同样带 0）。solo 行官方=1（slot0→1），散人凑队=slot+1 同规律。"""
     m = pb_int64(1, member['id'])                    # id（成员行 id）
     m += pb_int64(2, squad_id)                       # squadSessionId
-    m += pb_int64(3, 0)                              # squadPlayerSlotTemplateId
+    m += pb_int64(3, int(slot or 0) + 1)             # squadPlayerSlotTemplateId
     m += pb_int64(4, member['player_id'])            # playerId
     m += pb_string(5, member['gamertag'])            # gamerTag
     m += pb_int64(6, member['faction'])              # playerFactionTemplateId
@@ -209,13 +214,19 @@ async def push_squad_rows_to_writer(writer, view_cmd, squad_id, mission_id=0,
                         and (m['gamertag'] or '') == viewer_name):
                 viewer_faction = int(m['faction'])
                 break
+    # 槽位分配：队长置顶占 slot0（f3=1），其余按行序。list_squad_members
+    # ORDER BY m.id 本就队长先插（建队先插队长行），排序仅兜底防御。
+    members = sorted(members, key=lambda m: 0 if squad['leader_character_id']
+                     and int(m['character_id']) == int(
+                         squad['leader_character_id']) else 1)
     await _push_kvcs(writer, view_cmd, b'SquadSession',
                      _msg_squad_session(squad, members, mission_id,
                                         viewer_faction=viewer_faction))
-    for mem in members:
+    for slot, mem in enumerate(members):
         uvt, upt = await _member_appearance(mem)
         await _push_kvcs(writer, view_cmd, b'SquadMemberSession',
-                         _msg_squad_member_session(mem, squad_id, uvt, upt))
+                         _msg_squad_member_session(mem, squad_id, uvt, upt,
+                                                   slot=slot))
     log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet '
         f'(SquadSession id={squad_id} + {len(members)} members, '
         f'mission={mission_id or 0})')
@@ -249,10 +260,15 @@ async def push_squad_member_row(sess, writer, member_row_id):
     mem = next((x for x in members if x['id'] == member_row_id), None)
     if mem is None:
         return
+    # 槽位与整队推送同一套规则（队长置顶占 slot0，其余按行序）
+    members = sorted(members, key=lambda x: 0 if squad['leader_character_id']
+                     and int(x['character_id']) == int(
+                         squad['leader_character_id']) else 1)
+    slot = members.index(mem)
     uvt, upt = await _member_appearance(mem)
     await _push_kvcs(writer, sess.playerview_cmd, b'SquadMemberSession',
                      _msg_squad_member_session(mem, mem_row['squad_id'],
-                                               uvt, upt))
+                                               uvt, upt, slot=slot))
     log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet '
         f'(SquadMemberSession id={member_row_id})')
 

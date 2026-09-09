@@ -32,6 +32,9 @@ class QueueEntry:
     group_key: int = 0           # 整队入池键（=squad_id）；0 = 单人
     battle_id: int = 0           # war 会战局 id（M2）；0 = 普通撮合
     vehicle_cats: tuple = ()     # 已装备载具资源类别并集（成局覆盖保证）
+    char_cat: int = 0            # 角色自身士兵类别（wardb.
+                                 # character_resource_category；伞兵=4 等，
+                                 # 池缺该类别引擎建小队失败→开局判负）
 
 
 @dataclass
