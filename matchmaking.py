@@ -1039,11 +1039,17 @@ async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
             _arm_ai_fill(e.player_id, gamemode_id)
 
 
-async def reset_real_squad_to_lobby(squad_db_id, exclude_pids=()):
+async def reset_real_squad_to_lobby(squad_db_id, exclude_pids=(),
+                                    push_rows=True):
     """整队回 InLobby（DB 状态 + 向在线成员推整队行 mission=0）。
 
     战局结束（combat._finish_mission_sessions）/ 放弃（mission abandon）/
-    整队取消 / 整队掉线共用。排除 exclude_pids 中的玩家推送（连接已断）。"""
+    整队取消 / 整队掉线共用。排除 exclude_pids 中的玩家推送（连接已断）。
+    push_rows=False：解散路径专用——dissolve + DELETE 行紧随其后，先推
+    SET 行集会给客户端喂 SquadMemberSession SET（→ evaluatePlayerFactions
+    → 队长自动重发 SetSquadMatchMakingFlagRequest，见 handlers/squad.py
+    handle_set_squad_matchmaking_flag 注释），且立即被 DELETE 覆盖——
+    纯害无益，跳过推送只落 DB。"""
     if state.STORE is None or not squad_db_id:
         return
     try:
@@ -1053,6 +1059,8 @@ async def reset_real_squad_to_lobby(squad_db_id, exclude_pids=()):
             await state.STORE.update_squad_member(m['id'], status=2)
     except Exception as e:
         _log(f'      [DB] reset_real_squad_to_lobby failed: {e}')
+        return
+    if not push_rows:
         return
     from handlers.squad import _online_member_sessions, push_squad_rows_to_writer
     for s in _online_member_sessions(members):
@@ -1066,8 +1074,10 @@ async def reset_real_squad_to_lobby(squad_db_id, exclude_pids=()):
             _log(f'      squad reset push to {s.username!r} failed: {e}')
 
 
-async def _cancel_squad_queue(squad_db_id, exclude_pids=()):
-    """整队取消匹配：全队出池、删 PMM 行、回 InLobby（任何成员取消全队退出）。"""
+async def _cancel_squad_queue(squad_db_id, exclude_pids=(), push_rows=True):
+    """整队取消匹配：全队出池、删 PMM 行、回 InLobby（任何成员取消全队退出）。
+    push_rows=False：解散路径（handle_remove_squad）——DELETE 行紧随其后，
+    跳过整队 SET 行集推送（喂客户端 SetSquadMatchMakingFlag 死循环）。"""
     if state.STORE is None:
         return
     try:
@@ -1090,7 +1100,8 @@ async def _cancel_squad_queue(squad_db_id, exclude_pids=()):
                                         b'PlayerMatchMaking', q['pmm_id'])
             except Exception as e:
                 _log(f'      PMM delete push failed (player={mpid}): {e}')
-    await reset_real_squad_to_lobby(squad_db_id, exclude_pids)
+    await reset_real_squad_to_lobby(squad_db_id, exclude_pids,
+                                    push_rows=push_rows)
     _log(f'squad cancel: squad={squad_db_id}, exclude={list(exclude_pids)}')
 
 

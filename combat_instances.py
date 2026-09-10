@@ -81,6 +81,29 @@ COMBAT_START_COUNTDOWN_OVERRIDE = 10
 TTD_EXE = r'd:\HnG-test\work\ttd\TTD.exe'
 TTD_OUT_DIR = r'd:\HnG-test\work\ttd-traces'
 
+# ---- 每实例 CPU 资源槽（亲核掩码 + packthreads；2026-09-09）----
+# 以 B=最大并发战斗服数为主控推导（公式/根因见 mm_config COMBAT_CORES
+# 注释与 combat_agent.plan_combat_resources），实例按 seq 轮转取槽。
+# B=0（不限）时以端口池大小为有效并发推导。远端 agent 机不读本表——
+# agent 读自己环境的同名变量算自己的核（combat_agent.resource_slot）。
+_effective_b = (mm_config.MAX_CONCURRENT_COMBAT_SERVERS
+                or (mm_config.COMBAT_PORT_MAX - mm_config.COMBAT_PORT_BASE + 1)
+                or 1)
+_detected_cores = combat_agent.detect_cores(mm_config.COMBAT_CORES)
+if _detected_cores and _effective_b > _detected_cores:
+    _log(f'WARNING: 有效并发局数 {_effective_b} > 本机核数 '
+         f'{_detected_cores}（过订阅）：亲核表钳为每实例 1 核、'
+         f'packthreads 退回串行，多人局会掉帧——建议调低 '
+         f'MM_MAX_COMBAT_SERVERS')
+COMBAT_RESOURCE_SLOTS = combat_agent.plan_combat_resources(
+    _detected_cores, _effective_b,
+    mm_config.COMBAT_PACKTHREADS, mm_config.COMBAT_AFFINITY_MASKS)
+if COMBAT_RESOURCE_SLOTS:
+    _log(f'combat 资源槽（{_detected_cores} 核 / B={_effective_b}，'
+         f'实例按 seq 轮转）: '
+         + ', '.join(f'#{i} mask={s["mask"]:#x} packthreads={s["packthreads"]}'
+                     for i, s in enumerate(COMBAT_RESOURCE_SLOTS)))
+
 # ===== 多实例 combat server 管理（每场战局一个实例，动态 UDP 端口）=====
 # CombatInstance dict：{mission_id, port, proc, ready(asyncio.Event), seq, ttd}
 COMBAT_INSTANCES = {}          # mission_id -> CombatInstance
@@ -459,6 +482,38 @@ async def _agent_stop(host, pid):
     await _agent_request(host, 'POST', '/stop', {'pid': int(pid)})
 
 
+def _combat_spawn_args(port, mission_id, pms_id, combat_map, seq,
+                       warserver_addr, statserver_host,
+                       packthreads=0, countdown=None):
+    """本机 spawn 启动参数（与 combat_agent.build_launch_args 同构）。
+
+    /R 选项必须用完整注册名（组.选项）：ZOptionSet 按全名查找，
+    无组前缀的名字会落入未注册选项桶，游戏代码不会读取。
+    """
+    args = [os.path.join(COMBAT_SERVER_DIR, 'hng.exe'),
+            '/D', str(port),
+            '/S', f'session-{mission_id}',
+            '/P', str(pms_id),                # boot.playersessionid = MissionSession ID
+            '/PS', f'login-{pms_id}',
+            '/M', combat_map,
+            '/W', warserver_addr,
+            '/R', 'boot.disable_eac=1',
+            '/R', f'boot.logfile=combat-server-{seq}.log',
+            # 战斗服进程 player.dll 进图时 GetTotals 初始化勋带状态（a2[7]），
+            # 失败→整局无 XP 累加→无 Statistics_Update→客户端无升级弹窗
+            '/R', f'boot.statserver={statserver_host}',
+            '/R', 'boot.statserverport=15115']
+    if packthreads > 0:
+        # 实体状态打包并行度（ZWorkQueue 工作线程数；引擎默认 0=串行是
+        # 多人局 SendPump 饱和根因，推导依据见 mm_config COMBAT_CORES 注释）
+        args += ['/R', f'server.packthreads={int(packthreads)}']
+    if countdown is not None:
+        # 开局等待时间覆盖（秒），见文件头 COMBAT_START_COUNTDOWN_OVERRIDE 注释
+        args += ['/R',
+                 f'controllers.overrideStartCountdown={int(countdown)}']
+    return args
+
+
 async def _ensure_combat_server(mission_id, pms_id, combat_map, timeout=120):
     """拉起本场战局的专用战斗服并等待 BattleFieldSettings 握手完成。
 
@@ -525,26 +580,17 @@ async def _ensure_combat_server(mission_id, pms_id, combat_map, timeout=120):
             return False
 
     # ---- 本机 spawn（原路径；host['warserver'] 可按机覆盖 /W 回连地址）----
-    exe = os.path.join(COMBAT_SERVER_DIR, 'hng.exe')
-    args = [exe,
-            '/D', str(port),
-            '/S', f'session-{mission_id}',
-            '/P', str(pms_id),                # boot.playersessionid = MissionSession ID
-            '/PS', f'login-{pms_id}',
-            '/M', combat_map,
-            '/W', host.get('warserver') or COMBAT_WARSERVER,
-            # /R 选项必须用完整注册名（组.选项）：ZOptionSet 按全名查找，
-            # 无组前缀的名字会落入未注册选项桶，游戏代码不会读取
-            '/R', 'boot.disable_eac=1',
-            '/R', f'boot.logfile=combat-server-{seq}.log',
-            # 战斗服进程 player.dll 进图时 GetTotals 初始化勋带状态（a2[7]），
-            # 失败→整局无 XP 累加→无 Statistics_Update→客户端无升级弹窗
-            '/R', f'boot.statserver={_host_statserver(host)}',
-            '/R', 'boot.statserverport=15115']
-    if COMBAT_START_COUNTDOWN_OVERRIDE is not None:
-        # 开局等待时间覆盖（秒），见文件头 COMBAT_START_COUNTDOWN_OVERRIDE 注释
-        args += ['/R',
-                 f'controllers.overrideStartCountdown={COMBAT_START_COUNTDOWN_OVERRIDE}']
+    # CPU 资源槽（亲核掩码 + packthreads）：按实例 seq 轮转，推导依据见
+    # 模块头 COMBAT_RESOURCE_SLOTS 注释
+    slot = (COMBAT_RESOURCE_SLOTS[seq % len(COMBAT_RESOURCE_SLOTS)]
+            if COMBAT_RESOURCE_SLOTS else None)
+    packthreads = slot['packthreads'] if slot else 0
+    affinity_mask = slot['mask'] if slot else 0
+    args = _combat_spawn_args(
+        port, mission_id, pms_id, combat_map, seq,
+        host.get('warserver') or COMBAT_WARSERVER,
+        _host_statserver(host), packthreads,
+        COMBAT_START_COUNTDOWN_OVERRIDE)
     launch_args = args
     if os.environ.get('TTD_RECORD') and os.path.exists(TTD_EXE):
         os.makedirs(TTD_OUT_DIR, exist_ok=True)
@@ -582,6 +628,21 @@ async def _ensure_combat_server(mission_id, pms_id, combat_map, timeout=120):
         COMBAT_INSTANCES.pop(int(mission_id), None)
         _drain_pending_matches()
         return False
+    # 进程优先级 + 亲核（Windows；失败仅告警不影响开局——调度优化非
+    # 正确性；TTD 包裹时优先级/亲核设在 TTD 进程，hng.exe 子进程按
+    # Windows 默认继承掩码与优先级）
+    prio = combat_agent.combat_priority()
+    if prio and not combat_agent.apply_priority(inst['proc'].pid, prio):
+        _log(f'WARNING: combat server #{seq} priority set failed '
+             f'(pid={inst["proc"].pid}, prio={prio!r})')
+    if affinity_mask:
+        if combat_agent.apply_affinity(inst['proc'].pid, affinity_mask):
+            _log(f'combat server #{seq} pinned to cpu mask '
+                 f'{affinity_mask:#x} (packthreads={packthreads}, '
+                 f'prio={prio!r})')
+        else:
+            _log(f'WARNING: combat server #{seq} affinity set failed '
+                 f'(pid={inst["proc"].pid}, mask={affinity_mask:#x})')
     # 进程退出监视（崩溃/被杀兜底回收坑位；正常关服路径幂等 no-op）
     _spawn(_watch_proc_exit(inst, mission_id),
            f'watch_proc#{seq}')

@@ -600,7 +600,11 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
                 #   存在的小队推局）。必须在 dissolve 前调——_cancel_squad_
                 #   queue 按 DB 成员表逐个撤队，解散后表已空（已成局成员
                 #   mission_id≠0 被跳过，不受影响）。
-                await _cancel_squad_queue(squad_id)
+                #   push_rows=False（2026-09-09）：dissolve + DELETE 行紧随
+                #   其后，撤队时推整队 SET 行集会给队长客户端喂成员行 SET
+                #   → 自动重发 SetSquadMatchMakingFlagRequest（死循环燃料，
+                #   在途请求跨过解散全变 161）——跳过推送。
+                await _cancel_squad_queue(squad_id, push_rows=False)
                 await STORE.dissolve_squad(squad_id)
                 log(f'      [DB] dissolve_squad id={squad_id} '
                     f'({len(member_ids)} members)')
@@ -1223,9 +1227,48 @@ async def handle_set_squad_matchmaking_flag(sess, writer, cmd_id, req_type,
             code = RC_SQUAD_NOT_FOUND
 
     if code == RC_OK:
-        await push_squad_rows(sess, writer, squad_session_id)
-        # 匹配开关同步给全体在线成员（小队界面状态一致）
-        await push_squad_rows_to_all_members(squad_session_id)
+        # ★绝不回推整队行集（2026-09-09 闪烁风暴根因）：客户端每条
+        #   SquadMemberSession SET → onSquadMemberSessionChange:586 →
+        #   evaluatePlayerFactions:1061 → squadMatchMakingFilterUpdateSignal
+        #   → 队长（isOwnedByPlayer 且队内 >1 人）自动重发本请求
+        #   （SquadMatchMakingFilterUpdateCommand:42-47）。全量回推 =
+        #   每个请求给队长喂 2 遍整队行集（含全部成员行 SET）→ 死循环
+        #   （VPS 实测 12:20-12:25 一小时档 4100 请求，队员 UI 每秒重绘
+        #   "一直在闪"；解散后循环仍在途请求全部 161）。官服语义：写操作
+        #   只回 Response，行集推送只给其他成员且只推值变化的行——这里
+        #   仅 SquadSession（f12 flag）变化 → 只推 SquadSession 单行、
+        #   不含成员行（SquadSession SET 不进 evaluatePlayerFactions 链，
+        #   且 Command 有 isOwnedByPlayer 条件，非队长不会回发请求）。
+        #   发起者本地状态在发请求前已是目标值，无需推。
+        if STORE is not None and squad_session_id:
+            try:
+                squad = await STORE.get_squad(squad_session_id)
+                members = await STORE.list_squad_members(squad_session_id) \
+                    if squad is not None else []
+            except Exception as e:
+                log(f'      [DB] set flag sync push failed: {e}')
+                squad, members = None, []
+            if squad is not None:
+                for s in _online_member_sessions(members):
+                    if s is sess or s.playerview_cmd is None:
+                        continue          # 发起者不推
+                    viewer_faction = None
+                    for m in members:
+                        if int(m['player_id']) == int(
+                                getattr(s, 'player_id', 0) or 0):
+                            viewer_faction = int(m['faction'])
+                            break
+                    try:
+                        await _push_kvcs(
+                            s.writer, s.playerview_cmd, b'SquadSession',
+                            _msg_squad_session(squad, members,
+                                               viewer_faction=viewer_faction))
+                        log(f'S->C cmd={s.playerview_cmd:<4} KeyValueChangeSet '
+                            f'(SquadSession id={squad_session_id} flag sync '
+                            f'★single row, no member rows)')
+                    except Exception as e:
+                        log(f'      [squad] flag sync push to '
+                            f'{s.username!r} failed: {e}')
 
     resp = build_response(cmd_id, 'SetSquadMatchMakingFlagResponse',
                           pb_int32(1, code))

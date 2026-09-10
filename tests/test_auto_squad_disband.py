@@ -441,6 +441,108 @@ async def main():
         mm_state._MM_MISSION_SQUADS.clear()
         mm_state._SOLO_SQUADS.clear()
 
+    # --- 用例 8：DB 真小队 SetSquadMatchMakingFlag → 不再全量回推 ---
+    #   2026-09-09 闪烁风暴根因：客户端每条 SquadMemberSession SET →
+    #   evaluatePlayerFactions → 队长（owner 且 >1 人）自动重发本请求；
+    #   旧实现全量回推 2 遍整队行集 → 死循环（VPS 一小时档 4100 请求，
+    #   队员 UI 每秒重绘"一直在闪"）。修复：发起者零推送，其他成员只收
+    #   SquadSession 单行（无成员行 → 不进 evaluatePlayerFactions 链）。
+    class FlagStore:
+        def __init__(self):
+            self.flag_set = None
+
+        async def get_squad(self, sid):
+            return {'id': int(sid), 'leader_character_id': 25, 'faction': 1,
+                    'name': 'Squad of DoubleBird', 'matchmaking_flag': False}
+
+        async def list_squad_members(self, sid):
+            return [
+                {'id': 9001, 'player_id': 2, 'gamertag': 'DoubleBird',
+                 'character_id': 25, 'faction': 1, 'template': 1,
+                 'status': 2, 'combat_xp': 0, 'char_name': 'DB'},
+                {'id': 9002, 'player_id': 11, 'gamertag': 'BotSU1',
+                 'character_id': 31, 'faction': 1, 'template': 1,
+                 'status': 2, 'combat_xp': 0, 'char_name': 'BS'},
+            ]
+
+        async def set_squad_flag(self, sid, flag):
+            self.flag_set = (int(sid), bool(flag))
+            return True
+
+    flag_store = FlagStore()
+    sess_a = FakeSess(2, 'DoubleBird', playerview_cmd=60)
+    sess_b = FakeSess(11, 'BotSU1', playerview_cmd=61)
+    FLASH_SESSIONS['DoubleBird'] = sess_a
+    FLASH_SESSIONS['BotSU1'] = sess_b
+    squad_mod.STORE = flag_store
+    try:
+        w = FakeWriter()
+        await handle_set_squad_matchmaking_flag(
+            sess_a, w, 49, 'SetSquadMatchMakingFlagRequest',
+            b'\x08' + _varint(888) + b'\x18\x01')   # f1=888 f3=1
+        check('flag：DB 落库成功 + 回 OK',
+              _last_response_code(w) == RC_OK
+              and flag_store.flag_set == (888, True),
+              f'code={_last_response_code(w)} flag={flag_store.flag_set}')
+        check('flag：发起者连接零 KVCS set（旧实现回推 2 遍整队行集）',
+              _collect_pushes(w) == []
+              and _collect_pushes(sess_a.writer) == [],
+              f'resp={_collect_pushes(w)} pv={_collect_pushes(sess_a.writer)}')
+        b_pushes = _collect_pushes(sess_b.writer)
+        check('flag：队友只收 SquadSession 单行、无成员行',
+              b_pushes == [('SquadSession', 888)],
+              f'B={b_pushes}')
+    finally:
+        squad_mod.STORE = old_store
+        FLASH_SESSIONS.pop('DoubleBird', None)
+        FLASH_SESSIONS.pop('BotSU1', None)
+
+    # --- 用例 9：排队中真小队解散 → 撤队路径不再推整队 SET 行集 ---
+    #   旧链 handle_remove_squad → _cancel_squad_queue →
+    #   reset_real_squad_to_lobby 会先给全体推 SET 行集再 dissolve+DELETE
+    #   ——SET 喂队长客户端重发 SetSquadMatchMakingFlag（在途请求跨过
+    #   解散全变 161，"解散没用"观感）。修复：push_rows=False。
+    class DisbandStore(FlagStore):
+        def __init__(self):
+            super().__init__()
+            self.dissolved = []
+            self.member_updates = []
+
+        async def get_squad_for_player(self, pid):
+            return {'id': 888, 'leader_character_id': 25, 'faction': 1,
+                    'name': 'Squad of DoubleBird', 'matchmaking_flag': True}
+
+        async def update_squad_member(self, row_id, status=None,
+                                      **kw):
+            self.member_updates.append((row_id, status))
+            return True
+
+        async def dissolve_squad(self, sid):
+            self.dissolved.append(int(sid))
+
+    disband_store = DisbandStore()
+    sess_a = FakeSess(2, 'DoubleBird', playerview_cmd=62)
+    sess_b = FakeSess(11, 'BotSU1', playerview_cmd=63)
+    FLASH_SESSIONS['DoubleBird'] = sess_a
+    FLASH_SESSIONS['BotSU1'] = sess_b
+    squad_mod.STORE = disband_store
+    try:
+        code, w = await _remove_squad(sess_a)
+        check('排队真小队解散：OK + dissolve',
+              code == RC_OK and disband_store.dissolved == [888],
+              f'code={code} dissolved={disband_store.dissolved}')
+        check('解散全程零 KVCS set（撤队不推 SET，只推 DELETE）',
+              _collect_pushes(w) == []
+              and _collect_pushes(sess_a.writer) == []
+              and _collect_pushes(sess_b.writer) == [],
+              f'resp={_collect_pushes(w)} '
+              f'A={_collect_pushes(sess_a.writer)} '
+              f'B={_collect_pushes(sess_b.writer)}')
+    finally:
+        squad_mod.STORE = old_store
+        FLASH_SESSIONS.pop('DoubleBird', None)
+        FLASH_SESSIONS.pop('BotSU1', None)
+
     ok = all(r[1] for r in RESULTS)
     print()
     print('RESULT:', 'PASS' if ok else 'FAIL',

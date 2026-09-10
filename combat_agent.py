@@ -29,14 +29,26 @@ HTTP 调用，在本机拉起/停止/查询 combat server（hng.exe /D）实例�
   - 入站开放 agent TCP 端口（默认 15116，防火墙限 warserver 源 IP 更佳）
   - 入站开放 combat UDP 端口池（客户端直连打战斗）
   - 与 warserver 时钟大致同步（NTP；签名窗口 ±90s，VPS 默认满足）
+
+CPU 资源分配（2026-09-09，"人数越多客户端帧数越低"的服务端半边治理）：
+launch 时按本机核数与 MM_MAX_COMBAT_SERVERS（agent 机自己的环境变量，
+建议与 warserver 侧 host max 同值）推导每实例亲核掩码窗口
+（SetProcessAffinityMask）+ /R server.packthreads（实体状态打包并行度，
+引擎默认 0=串行是多人局 SendPump 饱和根因，见
+docs/hng-combat-protocol.md §6.8.4/§B ZOption_Server）；响应附
+affinity_mask/packthreads 字段。MM_COMBAT_CORES（核数探测覆盖）/
+MM_PACKTHREADS（统一打包线程数，-1=推导）MM_AFFINITY_MASKS（显式掩码
+表，逗号分隔十六进制）可覆盖，与 warserver 侧 mm_config 同名。
 """
 import argparse
+import ctypes
 import hashlib
 import hmac
 import json
 import os
 import secrets
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -158,6 +170,201 @@ def handle_status():
             for pid, it in sorted(_instances.items())]}
 
 
+# ---------------------------------------------------------------- CPU 资源槽
+# 战斗服性能治理（2026-09-09）：专用服每 tick 快照全部实体 × 每客户端打包
+# 下发（O(实例数×客户端数)），server.packthreads 引擎默认 0=串行 → 多人局
+# SendPump 饱和 → 全员 tick 落后 → 客户端 tickrate 自适应被拖慢（= 玩家报
+# "人数越多帧数越低"的服务端半边根因）；主模拟循环单线程需独占一核，多实例
+# 互相挤核会丢 60Hz。以最大并发战斗服数 B 为主控推导每实例资源槽（combat_
+# instances 从本模块 import plan_combat_resources，warserver 本机 spawn 与
+# agent 拉起两侧同构）。
+
+def detect_cores(explicit=0):
+    """本机逻辑核数（资源槽推导输入；agent 单文件部署故自带探测）。
+
+    优先级：显式参数 > MM_COMBAT_CORES env > Windows
+    NUMBER_OF_PROCESSORS（反映宿主机实际分配）> os.cpu_count()。
+    容器/云切片探测失真时用 MM_COMBAT_CORES 钉死。
+    """
+    if explicit and explicit > 0:
+        return int(explicit)
+    v = os.environ.get('MM_COMBAT_CORES')
+    if v and v.isdigit() and int(v) > 0:
+        return int(v)
+    v = os.environ.get('NUMBER_OF_PROCESSORS')
+    if v and v.isdigit() and int(v) > 0:
+        return int(v)
+    return os.cpu_count() or 0
+
+
+def plan_combat_resources(cores, max_servers, packthreads=-1, masks=''):
+    """由最大并发战斗服数 B 推导每实例 CPU 资源槽（亲核掩码 + packthreads）。
+
+    公式（连续核段窗口，互不重叠）：
+      W_i = N // B，前 N%B 个窗口各 +1 核
+      P_i = W_i - 1（窗口内留 1 核给 60Hz 主模拟循环，余核给打包线程）
+      掩码 = 窗口核段位掩码；实例按 seq % len(slots) 轮转取槽
+    B > N 过订阅 → 钳到 N（每实例至少 1 核、P=0 退回串行），调用方负责告警。
+    packthreads >= 0 显式统一覆盖推导值；masks（逗号分隔十六进制掩码表）
+    显式覆盖窗口推导，P_i = popcount(mask) - 1。
+    返回 [{'mask': int, 'packthreads': int}, ...]；cores/B 无效 → []。
+    """
+    if masks:
+        out = []
+        for tok in str(masks).split(','):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                m = int(tok, 0)
+            except ValueError:
+                continue
+            if m > 0:
+                p = packthreads if packthreads >= 0 \
+                    else max(0, bin(m).count('1') - 1)
+                out.append({'mask': m, 'packthreads': max(0, p)})
+        return out
+    if not cores or not max_servers or cores < 1 or max_servers < 1:
+        return []
+    n, b = int(cores), int(max_servers)
+    if b > n:
+        b = n                       # 过订阅钳位：每实例至少 1 核
+    base, rem = divmod(n, b)
+    out, start = [], 0
+    for i in range(b):
+        w = base + (1 if i < rem else 0)
+        p = packthreads if packthreads >= 0 else max(0, w - 1)
+        out.append({'mask': ((1 << w) - 1) << start, 'packthreads': max(0, p)})
+        start += w
+    return out
+
+
+def resource_slot(seq):
+    """本机第 seq 个实例的资源槽 → (亲核掩码, packthreads)。
+
+    读本机环境推导（agent 机与 warserver 机各自算自己的核）：B 取
+    MM_MAX_COMBAT_SERVERS（默认 4），MM_PACKTHREADS / MM_AFFINITY_MASKS
+    可覆盖。无槽表（核数未知 / B=0 不限）→ (0, 0) = 不亲核、不加 /R
+    （引擎默认串行打包）。
+    """
+    v = os.environ.get('MM_MAX_COMBAT_SERVERS')
+    b = int(v) if v and v.lstrip('-').isdigit() else 4
+    v = os.environ.get('MM_PACKTHREADS')
+    pt = int(v) if v and v.lstrip('-').isdigit() else -1
+    cores = detect_cores()
+    if cores and b > cores:
+        print(f'[agent] WARNING: MM_MAX_COMBAT_SERVERS={b} > 本机核数 '
+              f'{cores}（过订阅）：亲核钳为每实例 1 核、串行打包，'
+              f'多人局会掉帧', flush=True)
+    slots = plan_combat_resources(cores, b, pt,
+                                  os.environ.get('MM_AFFINITY_MASKS', ''))
+    if not slots:
+        return 0, 0
+    s = slots[seq % len(slots)]
+    return s['mask'], s['packthreads']
+
+
+def apply_affinity(pid, mask):
+    """Windows 进程亲核（kernel32.SetProcessAffinityMask）。
+
+    失败返回 False（仅告警不影响开局——亲核是优化不是正确性）。
+    非 Windows / 空掩码直接 False。OpenProcess 权限
+    PROCESS_SET_INFORMATION|PROCESS_QUERY_INFORMATION = 0x0200|0x0400。
+    """
+    if sys.platform != 'win32' or not mask or mask <= 0:
+        return False
+    try:
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x0200 | 0x0400, False, int(pid))
+        if not h:
+            return False
+        try:
+            return bool(k32.SetProcessAffinityMask(h, int(mask)))
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+# Windows 优先级 class（winbase.h；映射子集，禁止 Realtime——会饿死
+# 系统进程/驱动，游戏服绝对不能用）。主模拟循环单线程 → 与 PG/frp/
+# 多实例同 Normal 级抢核会丢 60Hz，High 保证同核竞争必赢。
+PRIORITY_CLASSES = {'normal': 0x20, 'above': 0x8000,
+                    'abovenormal': 0x8000, 'high': 0x80}
+
+
+def apply_priority(pid, priority):
+    """Windows 进程优先级（kernel32.SetPriorityClass）。
+
+    priority 接受 PRIORITY_CLASSES 键（不区分大小写）或直接 class 值；
+    失败/未知值/非 Windows → False（仅告警不影响开局）。OpenProcess 权限
+    同 apply_affinity。
+    """
+    if sys.platform != 'win32' or not priority:
+        return False
+    if isinstance(priority, str):
+        priority = PRIORITY_CLASSES.get(priority.strip().lower(), 0)
+    if priority not in PRIORITY_CLASSES.values():
+        return False
+    try:
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x0200 | 0x0400, False, int(pid))
+        if not h:
+            return False
+        try:
+            return bool(k32.SetPriorityClass(h, int(priority)))
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def combat_priority(explicit=None):
+    """战斗服进程优先级（win32）：normal/above(high 同覆盖口)。
+
+    显式参数 > MM_COMBAT_PRIORITY env > 默认 high（与亲核同哲学：调度
+    优化，非正确性）。返回值经 apply_priority 校验（未知值回退 high）。
+    """
+    v = explicit if explicit is not None \
+        else os.environ.get('MM_COMBAT_PRIORITY', 'high')
+    if isinstance(v, str):
+        v = v.strip().lower()
+    if v in (None, '', 0):
+        return None
+    if isinstance(v, str) and v not in PRIORITY_CLASSES \
+            or isinstance(v, int) and v not in PRIORITY_CLASSES.values():
+        print(f'[agent] WARNING: MM_COMBAT_PRIORITY='
+              f'{os.environ.get("MM_COMBAT_PRIORITY")!r} 未知，回退 high',
+              flush=True)
+        v = 'high'
+    return v
+
+
+def build_launch_args(combat_dir, port, mission_id, pms_id, seq,
+                      warserver, statserver_host, combat_map,
+                      countdown=None, packthreads=0):
+    """hng.exe /D 专用服启动参数（与 combat_instances 本机 spawn 同构）。"""
+    args = [os.path.join(combat_dir, 'hng.exe'),
+            '/D', str(port),
+            '/S', f'session-{mission_id}',
+            '/P', str(pms_id),                # boot.playersessionid
+            '/PS', f'login-{pms_id}',
+            '/M', combat_map,
+            '/W', warserver,
+            # /R 选项必须用完整注册名（组.选项），与 warserver 本机路径一致
+            '/R', 'boot.disable_eac=1',
+            '/R', f'boot.logfile=combat-server-{seq}.log',
+            '/R', f'boot.statserver={statserver_host}',
+            '/R', f'boot.statserverport={STATSERVER_PORT}']
+    if packthreads > 0:
+        # 实体状态打包并行度（ZWorkQueue 工作线程数；引擎默认 0=串行，
+        # 推导依据见 plan_combat_resources 注释）
+        args += ['/R', f'server.packthreads={int(packthreads)}']
+    if countdown is not None:
+        args += ['/R', f'controllers.overrideStartCountdown={int(countdown)}']
+    return args
+
+
 def handle_launch(combat_dir, body):
     port = int(body.get('port') or 0)
     pms_id = int(body.get('pms_id') or 0)
@@ -173,27 +380,32 @@ def handle_launch(combat_dir, body):
         _prune_dead()
         if any(it['port'] == port for it in _instances.values()):
             raise ValueError(f'port {port} already in use')
-        args = [os.path.join(combat_dir, 'hng.exe'),
-                '/D', str(port),
-                '/S', f'session-{mission_id}',
-                '/P', str(pms_id),                # boot.playersessionid
-                '/PS', f'login-{pms_id}',
-                '/M', combat_map,
-                '/W', warserver,
-                # /R 选项必须用完整注册名（组.选项），与 warserver 本机路径一致
-                '/R', 'boot.disable_eac=1',
-                '/R', f'boot.logfile=combat-server-{seq}.log',
-                '/R', f'boot.statserver={statserver_host}',
-                '/R', f'boot.statserverport={STATSERVER_PORT}']
-        if countdown is not None:
-            args += ['/R', f'controllers.overrideStartCountdown={int(countdown)}']
+        # 本机资源槽：亲核掩码 + 实体打包并行度（见 resource_slot 注释）
+        affinity_mask, packthreads = resource_slot(seq)
+        args = build_launch_args(combat_dir, port, mission_id, pms_id, seq,
+                                 warserver, statserver_host, combat_map,
+                                 countdown, packthreads)
         proc = subprocess.Popen(
             args, cwd=combat_dir,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # 进程优先级（默认 high；见 combat_priority 注释）
+        prio = combat_priority()
+        if prio and not apply_priority(proc.pid, prio):
+            print(f'[agent] WARNING: set priority {prio!r} failed '
+                  f'for pid {proc.pid}', flush=True)
+        if affinity_mask:
+            if apply_affinity(proc.pid, affinity_mask):
+                print(f'[agent] pid {proc.pid} pinned to cpu mask '
+                      f'{affinity_mask:#x} (packthreads={packthreads})',
+                      flush=True)
+            else:
+                print(f'[agent] WARNING: set affinity {affinity_mask:#x} '
+                      f'failed for pid {proc.pid}', flush=True)
         _instances[proc.pid] = {'proc': proc, 'port': port,
                                 'mission_id': mission_id,
                                 'started_at': int(time.time())}
-        return {'pid': proc.pid, 'cmd': ' '.join(args[1:])}
+        return {'pid': proc.pid, 'cmd': ' '.join(args[1:]),
+                'affinity_mask': affinity_mask, 'packthreads': packthreads}
 
 
 def handle_stop(body):

@@ -26,6 +26,14 @@ missionCategoryId 一一相等——客户端 updateMaps 按 cat==GamemodeId 过
                           Windows 客户端环境跑集成测试用；实例登记/端口
                           占用/并发上限/释放逻辑全部照常真实运转）
   MM_SNOW_CHANCE         随机下雪概率 0.0-1.0（默认 1=常驻雪；0=关，见 SNOW_CHANCE）
+  MM_COMBAT_CORES        战斗服 CPU 核数覆盖（0=自动探测；容器/云切片
+                          探测失真时钉死）
+  MM_PACKTHREADS         server.packthreads 显式值（-1=按并发推导 W-1；
+                          引擎默认 0=串行是多人局 SendPump 饱和根因）
+  MM_AFFINITY_MASKS      战斗服亲核掩码表（逗号分隔十六进制；空=按
+                          MAX_CONCURRENT_COMBAT_SERVERS 推导连续窗口）
+  MM_COMBAT_PRIORITY     战斗服进程优先级（normal/above/high，默认
+                          high；主模拟循环单线程需抢赢同核其它进程）
 """
 import os
 
@@ -169,6 +177,23 @@ if (MAX_CONCURRENT_COMBAT_SERVERS and
         _ports < MAX_CONCURRENT_COMBAT_SERVERS):
     print(f'[mm_config] WARNING: port pool ({_ports} ports) < concurrent limit '
           f'({MAX_CONCURRENT_COMBAT_SERVERS}) - 并发上限实际由端口池决定')
+
+# ---- 战斗服 CPU 资源分配（2026-09-09，以 B=MAX_CONCURRENT_COMBAT_SERVERS
+# 为主控推导每实例亲核掩码窗口与 server.packthreads）----
+# "人数越多客户端帧数越低"的服务端半边根因：专用服每 tick 快照全部实体 ×
+# 每客户端打包下发（O(实例数×客户端数)），而 server.packthreads 引擎默认
+# 0=串行（groups_true.txt 实锤），多人局 SendPump 饱和 → 全员 tick 落后 →
+# 客户端 tickrate 自适应被拖慢（docs/hng-combat-protocol.md §6.4/§6.8.4）；
+# 另主模拟循环单线程需独占一核，多实例无隔离会互相挤核丢 60Hz。
+# 推导（combat_agent.plan_combat_resources，warserver 本机 spawn 与远端
+# agent 两侧同构；agent 机读自己环境的同名变量）：
+#   W_i = 核数 // B（前 核数%B 个窗口各 +1 核），P_i = W_i - 1
+#   掩码 = 窗口核段位掩码，实例按 seq 轮转取槽
+# env 覆盖：MM_COMBAT_CORES（核数）、MM_PACKTHREADS（统一打包线程数，
+# -1=推导）、MM_AFFINITY_MASKS（显式掩码表，P 取 popcount(mask)-1）。
+COMBAT_CORES = _int_env('MM_COMBAT_CORES', 0)      # 0 = 自动探测
+COMBAT_PACKTHREADS = _int_env('MM_PACKTHREADS', -1)   # -1 = 推导 W-1
+COMBAT_AFFINITY_MASKS = os.environ.get('MM_AFFINITY_MASKS', '')
 
 # 玩家全未选图时的兜底 preset（WarDatabase 实测可用：
 # 10 = Training - Encounter - Mill）
