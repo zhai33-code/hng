@@ -143,8 +143,8 @@ async def _arrive_supply_column(store, war_id, col, mv, dest_bf, caps,
     """补给队到达处置（advance_movements 到达分支，替 AT 的落位/占城/
     会战逻辑）：父 AT 在同城 → 汇合并删队；父 AT 挪窝 → 落位后重新寻路
     追击；父 AT 没了 → 就地解散（资源损失，官服口径）。"""
-    events = [('del', b'transport_commandnode_segment', mv['id']),
-              ('del', b'transport_commandnode_destination', mv['id'])]
+    dels = [('del', b'transport_commandnode_segment', mv['id']),
+            ('del', b'transport_commandnode_destination', mv['id'])]
     parent = await store.get_command_node(
         int(col.get('parent_command_node_id') or 0))
     # 落位（城市本体）
@@ -152,9 +152,15 @@ async def _arrive_supply_column(store, war_id, col, mv, dest_bf, caps,
         col['id'], state=0, map_entity_id=int(dest_bf or 0),
         map_entity_type=MAP_ENTITY_BATTLEFIELD)
     col = await store.get_command_node(col['id'])
+    # 推序（批内 dels-first 派发，_push_kvcs_batch 按 delete-先/set-后
+    # 分组，同 tick.py 到达推序）：del segment/destination 信号先派发清
+    # moving，instance/新 segment 行后派发——若旧 del 晚于新 segment set
+    # 派发会错误清掉 moving。批内全部行应用后才派发：del 时 instance
+    # type 已=1，不误触客户端补给线重钉分支；队已删时 del segment 的
+    # getFromId 为 null，客户端直接安全跳过。
     if not parent or int(parent.get('state') or 0) >= 3:
         await store.update_command_node(col['id'], state=3)
-        events.extend(_column_delete_events(col))
+        events = _column_delete_events(col) + dels
         log(f'[war] supply column {col["id"]} dissolved '
             f'(parent AT gone)')
         return events
@@ -164,6 +170,7 @@ async def _arrive_supply_column(store, war_id, col, mv, dest_bf, caps,
         # _cleanup_supply_columns 兜底清理）
         mv2, code = await start_movement(store, col, parent_bf, now=now)
         if mv2 is not None:
+            events = list(dels)
             col = await store.get_command_node(col['id'])
             events.append(('set', b'CommandNodeWarInstance',
                            msg_commandnode_instance_row(col, war_id, caps)))
@@ -178,12 +185,11 @@ async def _arrive_supply_column(store, war_id, col, mv, dest_bf, caps,
             log(f'[war] supply column {col["id"]} retargeting '
                 f'-> bf={parent_bf}')
             return events
-        events.append(('set', b'CommandNodeWarInstance',
-                       msg_commandnode_instance_row(col, war_id, caps)))
-        return events
+        return dels + [('set', b'CommandNodeWarInstance',
+                        msg_commandnode_instance_row(col, war_id, caps))]
     # 汇合（父 AT 在同城 / 父 AT 位置未知（待命回首都）落位失败兜底同此）
-    return events + await _merge_column_events(store, war_id, col, parent,
-                                               caps)
+    return (await _merge_column_events(store, war_id, col, parent,
+                                       caps)) + dels
 
 
 async def column_route(store, war, parent_at, near_capital_bf=0):
@@ -299,6 +305,10 @@ async def _cleanup_supply_columns(store, war=None):
         events = []
         for at in await store.list_war_command_nodes(war['id']):
             if not is_reserve(at) or int(at.get('state') or 0) >= 3:
+                continue
+            if int(at.get('airbase_bf') or 0):
+                # 空降拆分的运输机队（停驻机场待命）：玩家独立财产，
+                # 不随父 AT 解散而清（官服 war 结束按剩余资源退款）
                 continue
             parent = await store.get_command_node(
                 int(at.get('parent_command_node_id') or 0))

@@ -44,6 +44,7 @@ from .lifecycle import (
 from .at_ops import (
     _tpl_of,
     is_paradrop_unit,
+    land_paradrop_split,
     )
 
 
@@ -90,8 +91,10 @@ def _preset_cp_count(preset_id):
 
 async def _paras_land(store, ats):
     """伞兵落地变步兵（§7 攻方败北）：convert_to *_on_ground 变体
-    （已在落地变体的跳过）。返回追加推送事件（Definition 行 + 删 airbase）。"""
-    from .warmap_view import msg_commandnode_definition_row
+    （已在落地变体的跳过）。运输机与空降到达同语义（官服 Spaatz）：
+    拆成玩家名下独立 planes-AT 停原机场（战败伞兵后续损耗只扣落地
+    编制 cat4，运输机在后方机场不受本局结算牵连）。返回追加推送
+    事件。"""
     events = []
     for at in ats or ():
         if not _is_para_family(at):
@@ -102,12 +105,9 @@ async def _paras_land(store, ats):
         cvt = int(tpl.get('convert_to') or 0)
         if not cvt or cvt not in wardb.commandnode_templates():
             continue
-        await store.update_command_node(at['id'], template_id=cvt)
-        at2 = await store.get_command_node(at['id'])
-        if at2:
-            events.append(('set', b'CommandNodeDefinition',
-                           msg_commandnode_definition_row(at2)))
-        events.append(('del', b'air_commandnode_base', at['id']))
+        _at2, evs = await land_paradrop_split(
+            store, int(at.get('war_id') or 0), at)
+        events.extend(evs)
     return events
 
 

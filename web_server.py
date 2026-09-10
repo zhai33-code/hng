@@ -132,6 +132,11 @@ def _sgn_body(cas_name, plain_body):
 #      ResponseCodes 文案），en 沿用原运行时注入文本，其余语言补充翻译。
 # 此前仅英语走 LOCALIZATION_EXTRA 运行时注入，其余语言缺 key；现所有语言
 # 统一直接下发源文件，语言路由无特判。
+# 2026-09-10 增补：ErrorMessages/StrategyGame/no_resupply_in_transport
+# （ResponseCode 116，resupply_request 在 AT 运输 state=1 时返回）12 语言
+# 全缺 → 客户端弹 "not found"；文案取各语言已有 no_resupply_commandnode_
+# in_transport（122）译文，语义一致。另修 cs 文件头 '<?xml' 前杂散文本
+# 'hng-group'（XML 损坏，Flash 解析失败风险）。
 
 # 客户端支持的全部语言（HnGGUIGameVariables.supportedLanguages，与
 # combat-server\texts\HnG_Strategy_<lang>.xml 一一对应）

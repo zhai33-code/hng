@@ -179,14 +179,25 @@ def _unit_price(pricing_id, currency_key):
     return int((_PRICING_MAP.get(_i(pricing_id)) or {}).get(currency_key) or 0)
 
 
-def _at_missing_resources(at, tpl):
-    """AT 缺编 {cat: missing}（模板编制 - 现有资源，负值截 0）。"""
+def _at_missing_resources(at, tpl, air_proto=None):
+    """AT 缺编 {cat: missing}（模板编制 - 现有资源，负值截 0）。
+
+    air_proto（落地变体空中重整）：并入空中原型的**载具编制**——
+    *_on_ground 落地变体编制不含 cat10 运输机（恒"已满编"无法补机），
+    位于己方机场补给时按空中原型（convert_to）的 cat10 目标算缺口。"""
     cur = war_campaign._as_resources(at.get('resources'))
+    full = {int(c): int(n)
+            for c, n in war_campaign.template_resources(tpl).items()}
+    if air_proto is not None:
+        pv = {int(c) for c in (air_proto.get('vehicle_cats') or set())}
+        for cat, n in war_campaign.template_resources(air_proto).items():
+            if int(cat) in pv:
+                full[int(cat)] = max(full.get(int(cat), 0), int(n))
     missing = {}
-    for cat, full in war_campaign.template_resources(tpl).items():
-        gap = int(full) - _i(cur.get(str(cat), cur.get(cat, 0)))
+    for cat, f in full.items():
+        gap = f - _i(cur.get(str(cat), cur.get(cat, 0)))
         if gap > 0:
-            missing[int(cat)] = gap
+            missing[cat] = gap
     return missing
 
 
@@ -315,6 +326,9 @@ async def handle_upgrade_command_node_request(sess, writer, cmd_id, req_type,
     pid = await sess.ensure_player()
     code = war_campaign.RC_OK
     at = None
+    f11_back = False       # 官服 f11 互转：落地变体 → 空中原型
+    home_bf = fly_bf = 0   # 空中重整基地（机场直达 / 自动空运目的地）
+    fly_mv = None
     if pid is None or STORE is None:
         code = war_campaign.RC_CHARACTER_NOT_FOUND
     else:
@@ -338,19 +352,67 @@ async def handle_upgrade_command_node_request(sess, writer, cmd_id, req_type,
                     log(f'      [war_at] upgrade blocked: AT {at["id"]} '
                         f'rank={at.get("rank")} < target level={tgt.get("level")}')
                 else:
-                    cost, ok = await _charge_player(sess, pricing_id, currency)
-                    if not ok:
-                        code = war_campaign.RC_NOT_ENOUGH_WARFUNDS
-                    else:
-                        try:
-                            # 买壳口径：升级只换模板不补编，缺编走 resupply
-                            # 付费补齐（与 create resources={} 一致）
-                            await STORE.update_command_node(
-                                at['id'], template_id=target_tpl)
-                            at = await STORE.get_command_node(at['id'])
-                        except Exception as e:
-                            log(f'      [war_at] upgrade failed: {e}')
-                            code = war_campaign.RC_COMMANDNODE_TEMPLATE_NOT_FOUND
+                    # f11 互转位置门槛（官服口径：落地伞兵须回到可登机
+                    # 位置才能重新装备运输机）：己方机场直接重整；己方
+                    # 城自动空运回最近己方机场；敌后/中立/无机场拒单
+                    f11_back = (str(cur.get('name') or '').endswith(
+                                    '_on_ground')
+                                and int(cur.get('convert_to') or 0)
+                                == target_tpl)
+                    if f11_back:
+                        home_bf = await _friendly_airfield_bf(at, war['id'])
+                        if not home_bf:
+                            try:
+                                owners = dict(await STORE.get_war_cities(
+                                    war['id']))
+                            except Exception:
+                                owners = {}
+                            cur_bf = (war_campaign
+                                      .at_current_battlefield(at))
+                            fac = int(at.get('faction') or 0)
+                            if (cur_bf and fac
+                                    and int(owners.get(cur_bf, 0) or 0)
+                                    == fac):
+                                fly_bf = (war_campaign.
+                                          nearest_owned_airfield(
+                                              cur_bf, owners, fac))
+                            if not fly_bf:
+                                code = (war_campaign.
+                                        RC_COMMANDNODE_TEMPLATE_NOT_FOUND)
+                                log(f'      [war] f11 互转拒单 node='
+                                    f'{node_id}（敌后/无己方机场，无法'
+                                    f'空中重整）')
+                    if not code:
+                        cost, ok = await _charge_player(sess, pricing_id,
+                                                        currency)
+                        if not ok:
+                            code = war_campaign.RC_NOT_ENOUGH_WARFUNDS
+                        else:
+                            try:
+                                # 买壳口径：升级只换模板不补编，缺编走
+                                # resupply 付费补齐（与 create resources={}
+                                # 一致；f11 转回空中原型后编制恢复含
+                                # cat10 → 运输机缺口可补）
+                                await STORE.update_command_node(
+                                    at['id'], template_id=target_tpl,
+                                    **({'airbase_bf': home_bf or fly_bf}
+                                       if f11_back else {}))
+                                at = await STORE.get_command_node(at['id'])
+                                if f11_back and not home_bf:
+                                    # 己方城非机场：空运回最近己方机场
+                                    # 重整（镜像撤退方案2；失败留驻原地
+                                    # 基地仍指向目标机场，可手动再移动）
+                                    fly_mv, rcode, _atk = (
+                                        await war_campaign.
+                                        start_radius_move(
+                                            STORE, war, at, fly_bf))
+                                    if rcode != war_campaign.RC_OK:
+                                        fly_mv = None
+                                        log(f'      [war] f11 互转自动'
+                                            f'空运失败留驻 node={node_id}')
+                            except Exception as e:
+                                log(f'      [war_at] upgrade failed: {e}')
+                                code = war_campaign.RC_COMMANDNODE_TEMPLATE_NOT_FOUND
     ok = not code
     # 响应先于行推送（与买等级同理：客户端先收 ack 再按序消费行变更事件）
     code = code or war_campaign.RC_OK   # 内部 0=通过 → 协议 ok=1
@@ -361,8 +423,24 @@ async def handle_upgrade_command_node_request(sess, writer, cmd_id, req_type,
     log(f'S->C cmd={cmd_id:<4} UpgradeCommandNodeResponse (result={code})')
     if at is not None and ok:
         await _push_at_rows(sess, writer, at, at['war_id'])
+        cmd = _view_cmd(sess)
+        if cmd and f11_back:
+            # 空中重整：airbase 行指向重整/目的地机场；自动空运加推
+            # air_transport 行（飞行动画）
+            if fly_mv:
+                segs = war_campaign.movement_segments(fly_mv)
+                if segs:
+                    await _push_kvcs(
+                        writer, cmd, b'air_transport',
+                        war_campaign.msg_air_transport_row(
+                            at, at['war_id'], fly_mv, segs[0]))
+            await _push_kvcs(writer, cmd, b'air_commandnode_base',
+                             war_campaign.msg_air_commandnode_base_row(
+                                 at, at['war_id'], home_bf or fly_bf))
         await _push_player_refresh(sess, writer)
-        log(f'      [war] AT 升级 node={node_id} -> template={target_tpl}')
+        log(f'      [war] AT 升级 node={node_id} -> template={target_tpl}'
+            + (f'（f11 空中重整 airfield={home_bf or fly_bf}）'
+               if f11_back else ''))
 
 
 # ------------------------------------------------------------- 部署 / 撤退
@@ -489,6 +567,19 @@ async def _friendly_airfield_bf(at, war_id):
             and int(owners.get(cur_bf, 0) or 0) == int(at.get('faction') or 0)):
         return cur_bf
     return 0
+
+
+async def _merge_parked_planes(at, proto, air_bf, war_id):
+    """合并优先（官服 Spaatz "re-use old transport planes"）：落地伞兵
+    在己方机场补给时，先把玩家停驻同机场的运输机队（空降拆分产生的
+    旧机队，reserve 模板 + cat10、同 owner）**免费**并入本 AT 直到
+    补满载具编制。核心下沉 war_campaign.at_ops.merge_parked_planes
+    （落地伞兵走回机场自动重整共用同一实现），此处广播事件。"""
+    take, events = await war_campaign.at_ops.merge_parked_planes(
+        STORE, at, proto, air_bf, war_id)
+    if events:
+        await war_campaign.broadcast_war_events(events)
+    return take
 
 
 async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
@@ -804,7 +895,49 @@ async def _apply_resupply(at, pid, war, currency,
     状态校验（101/116）由调用方自理。"""
     tpl = commandnode_templates().get(_i(at.get('template_id'))) or {}
     fac = int(at.get('faction') or 0)
-    missing = _at_missing_resources(at, tpl)
+    # ---- 落地变体空中重整（2026-09-10 #2，玩家实报"点了补给还是拒绝"）：
+    #      官服 f11 空降⇄落地互转在客户端无按钮，玩家补运输机的实际
+    #      入口是补给窗（客户端只带 vehiclePricing）。落地变体
+    #      （*_on_ground）位于己方机场时：按空中原型（convert_to）的
+    #      载具编制计算 cat10 缺口（补齐运输机）+ 补满后自动转回空中
+    #      原型（恢复空降能力，airbase_bf=所在机场）；非机场/敌后维持
+    #      落地编制口径（103 已满编 = 须先回己方机场才能登机）。
+    proto = None
+    air_bf = 0
+    if str(tpl.get('name') or '').endswith('_on_ground'):
+        _pt = commandnode_templates().get(int(tpl.get('convert_to') or 0))
+        if (_pt and int(_pt.get('faction') or 0)
+                == int(tpl.get('faction') or 0)):
+            proto = _pt
+    if proto is not None:
+        air_bf = await _friendly_airfield_bf(at, war['id'])
+
+    async def _re_embark(cur_at):
+        """运输机满编 → 转回空中原型（f11 空中重整的补给入口版）。
+        未满足条件（不在己方机场/运输机有缺口）返回 None 不动模板。"""
+        if proto is None or not air_bf:
+            return None
+        res = war_campaign._as_resources(cur_at.get('resources'))
+        for cat, full in war_campaign.template_resources(proto).items():
+            if int(cat) not in (proto.get('vehicle_cats') or set()):
+                continue
+            if _i(res.get(str(cat), res.get(cat, 0))) < int(full):
+                return None
+        await STORE.update_command_node(
+            cur_at['id'], template_id=proto['id'], airbase_bf=air_bf)
+        new_at = await STORE.get_command_node(cur_at['id'])
+        log(f'      [war] 落地变体空中重整(补给) node={cur_at["id"]} '
+            f'tpl={tpl.get("id")} -> {proto["id"]} airfield={air_bf}')
+        return new_at
+
+    missing = _at_missing_resources(at, tpl, proto if air_bf else None)
+    if proto is not None and air_bf and missing:
+        # 合并优先（官服 "re-use old transport planes"）：停驻同机场的
+        # 旧机队免费并入，剩余缺口才走计价/库存（免费复用不消耗
+        # has_gotten_vehicle_free 首免机会）
+        if await _merge_parked_planes(at, proto, air_bf, war['id']):
+            at = await STORE.get_command_node(at['id'])
+            missing = _at_missing_resources(at, tpl, proto)
     pending = (await _pending_column_resources(war['id'], at['id'])
                if missing else {})
     if pending:
@@ -812,8 +945,19 @@ async def _apply_resupply(at, pid, war, currency,
                    for c, n in missing.items()}
         missing = {c: n for c, n in missing.items() if n > 0}
     if not missing:
+        # 按落地编制已满编：在己方机场且运输机满编 → 补给=重新登机
+        # 转回空中原型（响应 ok 而非 103，玩家实报场景：资源满编的
+        # 落地伞兵点补给被拒）
+        if proto is not None and air_bf:
+            new_at = await _re_embark(at)
+            if new_at is not None:
+                return 0, new_at
         return war_campaign.RC_NO_RESUPPLY_ALREADY_FULL, at
-    veh_cats = tpl.get('vehicle_cats') or set()
+    veh_cats = set(tpl.get('vehicle_cats') or set())
+    if proto is not None and air_bf:
+        # 计价拆分并入空中原型载具类（cat10 按客户端 vehiclePricing
+        # 计价，防误入 soldierPricing=0 免单）
+        veh_cats |= set(proto.get('vehicle_cats') or set())
     m_sold = sum(n for c, n in missing.items() if c not in veh_cats)
     m_veh = sum(n for c, n in missing.items() if c in veh_cats)
     key = _CUR_KEY.get(currency)
@@ -843,11 +987,18 @@ async def _apply_resupply(at, pid, war, currency,
         if not ok:
             log('      [war_at] resupply rejected: column route unreachable')
             return war_campaign.RC_CANNOT_FIND_COMMANDNODE, at
+    # 客户端 PriceObject.finalFractionCost 口径：Math.floor(单价×数量)——
+    # 先乘后取整（金币 1.2222/架 × 9 = 10；逐架 int()=1×9=9 会少收且与
+    # 客户端显示总价不一致，玩家实报 2026-09-10 "补给不收钱"）
+    def _side_total(pricing_id, n):
+        price = float((_PRICING_MAP.get(_i(pricing_id)) or {}).get(key) or 0)
+        return int(price * n)
+
     total = 0
     if m_sold and not s_free:
-        total += _unit_price(soldier_pricing, key) * m_sold
+        total += _side_total(soldier_pricing, m_sold)
     if m_veh and not v_free:
-        total += _unit_price(vehicle_pricing, key) * m_veh
+        total += _side_total(vehicle_pricing, m_veh)
     if total > 0:
         ok_pay, _bal = await STORE.spend_currency(int(pid), key, total)
         if not ok_pay:
@@ -882,7 +1033,7 @@ async def _apply_resupply(at, pid, war, currency,
             at = await STORE.get_command_node(at['id'])
             log(f'      [war] AT 补编(补给队) node={at["id"]} '
                 f'infantry={m_sold} vehicles={m_veh} '
-                f'free={int(s_free) + int(v_free)} cost={total} '
+                f'free={int(s_free) + int(v_free)} cost={total} {key} '
                 f'columns={col_ids}')
         except Exception as e:
             log(f'      [war_at] resupply column failed: {e}')
@@ -940,13 +1091,19 @@ async def _apply_resupply(at, pid, war, currency,
         log(f'      [war] AT 补编 node={at["id"]} '
             f'infantry={m_sold} vehicles={m_veh} '
             f'free={int(s_free) + int(v_free)} '
-            f'cost={total} given={give} '
+            f'cost={total} {key} given={give} '
             f'queued={queued}')
     except Exception as e:
         log(f'      [war_at] resupply failed: {e}')
         return war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND, at
     code = (war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES
             if queued else 0)
+    if not queued and proto is not None and air_bf:
+        # 即时交付后运输机补满 → 转回空中原型（缺口入队 226 的场景由
+        # 队列交付后玩家再点一次补给触发登机）
+        new_at = await _re_embark(at)
+        if new_at is not None:
+            return 0, new_at
     return code, at
 
 
@@ -1012,6 +1169,15 @@ async def handle_resupply_request(sess, writer, cmd_id, req_type, proto):
         # AT 模型中间态下任一监听器抛异常会卡死客户端请求管线
         # （_runningRequest 永久 true，之后所有请求都发不出，重登才恢复）
         await _push_at_rows(sess, writer, at, at['war_id'])
+        # 空中重整（落地变体补给转回空中原型）：补 airbase 行
+        # （§10.2 #7 同部署口径；普通空中单位重推同值行无副作用）
+        cmd = _view_cmd(sess)
+        if (cmd and war_campaign.is_radius_unit(at)
+                and int(at.get('airbase_bf') or 0)):
+            await _push_kvcs(
+                writer, cmd, b'air_commandnode_base',
+                war_campaign.msg_air_commandnode_base_row(
+                    at, at['war_id'], int(at.get('airbase_bf'))))
 
 
 # ------------------------------------------------------------- 装备（#1）
@@ -1339,7 +1505,52 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                         code = war_campaign.RC_FAIL
                     if not code and not dest_bf:
                         code = war_campaign.RC_FAIL
-                    if not code and war_campaign.is_radius_unit(at):
+                    if not code and war_campaign.is_parked_planes_at(at):
+                        # ---- 独立运输机队（空降拆分产物，reserve 模板 +
+                        #      airbase_bf>0）：官服口径只能飞己方机场
+                        #      （交战机场亦可，reserve 例外）；不走补给线
+                        #      BFS、不消耗 cat10（本身是运输机）。
+                        #      判定先于 radius 分支——停驻机队语义更
+                        #      specific（到达走 paradrop_return 落位，
+                        #      非 radius 到达/补给队汇合）----
+                        if override_ap:
+                            # airborne 单位不可落出兵点
+                            code = war_campaign.RC_CANNOT_FIND_COMMANDNODE
+                        else:
+                            pmv, pcode = (
+                                await war_campaign.start_planes_rebase(
+                                    STORE, war, at, dest_bf,
+                                    override_move=override_move))
+                            if pcode != war_campaign.RC_OK or pmv is None:
+                                code = pcode
+                            else:
+                                at = await STORE.get_command_node(at['id'])
+                                segs = war_campaign.movement_segments(pmv)
+                                caps = war_campaign._faction_capital_bf()
+                                events = [
+                                    ('set', b'air_transport',
+                                     war_campaign.msg_air_transport_row(
+                                         at, war['id'], pmv, segs[0])),
+                                    ('set', b'CommandNodeWarInstance',
+                                     war_campaign.
+                                     msg_commandnode_instance_row(
+                                         at, war['id'], caps))]
+                                for p in war_campaign.msg_armyresource_rows(
+                                        at, war['id']):
+                                    events.append(
+                                        ('set', b'armyresource', p))
+                                if override_move:
+                                    # 瞬移：立即推进入途到达（落位机场 +
+                                    # airbase_bf 更新含在内）
+                                    events.extend(
+                                        await war_campaign.advance_movements(
+                                            STORE, war))
+                                await war_campaign.broadcast_war_events(events)
+                                log(f'      [war] 运输机队换防 node={node_id}'
+                                    f' -> bf={dest_bf}')
+                                code = (
+                                    war_campaign.RC_RELOCATING_TO_NEW_AIRBASE)
+                    elif not code and war_campaign.is_radius_unit(at):
                         # ---- 空中半径单位（§10.2 #6/#7）：不走补给线，
                         # 按攻击/运输半径直达（CommandnodeArrow 半径规则）；
                         # 不消耗 cat10 运输机（空运回退仅地面 AT）----
@@ -1370,6 +1581,24 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                                         at, war['id']):
                                     events.append(
                                         ('set', b'armyresource', p))
+                                if war_campaign.is_radius_unit(at):
+                                    # 飞行指令即时更新目的地行（客户端
+                                    # CommandnodeArrow 目的地 ← base 行
+                                    # f4；只在到达 tick 分支刷会让在途目
+                                    # 的地文字永远指上一目的地——用户实
+                                    # 报，全部 radius 飞行单位均覆盖）：
+                                    # 换基地 → 基地=目的地（与到达推的
+                                    # 行同值幂等）；攻击飞行 → f3 保持
+                                    # 出发机场，f4=目标城
+                                    events.append(
+                                        ('set', b'air_commandnode_base',
+                                         war_campaign.
+                                         msg_air_commandnode_base_row(
+                                             at, war['id'],
+                                             dest_bf if not atk else
+                                             (int(at.get('airbase_bf') or 0)
+                                              or dest_bf),
+                                             target_bf=dest_bf)))
                                 if override_move:
                                     # 瞬移：立即推进入途到达（airbase 行
                                     # 更新/伞兵落地变体含在内）

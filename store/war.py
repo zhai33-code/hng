@@ -409,7 +409,10 @@ class WarStoreMixin:
     async def sweep_ended_war_leftovers(self):
         """已结束战争的残留清理（war_tick 兜底；强制结束/续战竞态遗留）：
         ① state=0 会战所属战争已非 running → 关账（state=1，无胜方）；
-        ② state=2（会战中）AT 所属战争已非 running → 释放回待命（state=0）。
+        ② state=2（会战中）AT 所属战争已非 running → 释放回待命（state=0）；
+        ③ state=0（在途）movement 所属战争已非 running → 置到达（state=1，
+        advance_movements 只推进当前战争，旧战争在途行没人收尾会永久残留）；
+        ④ state=1（在途）AT 所属战争已非 running → 释放回待命（state=0）。
         automission 只结算当前战争，旧战争孤儿会战靠此兜底。
         返回 (closed_battle_ids, released_at_ids)。"""
         async with self.pool.acquire() as conn:
@@ -422,6 +425,14 @@ class WarStoreMixin:
                     'UPDATE command_nodes c SET state = 0 '
                     'FROM wars w WHERE w.id = c.war_id AND w.state <> 1 '
                     'AND c.state = 2 RETURNING c.id')]
+                finished_mvs = [int(r['id']) for r in await conn.fetch(
+                    'UPDATE commandnode_movements m SET state = 1 '
+                    'FROM wars w WHERE w.id = m.war_id AND w.state <> 1 '
+                    'AND m.state = 0 RETURNING m.id')]
+                moved_ats = [int(r['id']) for r in await conn.fetch(
+                    'UPDATE command_nodes c SET state = 0 '
+                    'FROM wars w WHERE w.id = c.war_id AND w.state <> 1 '
+                    'AND c.state = 1 RETURNING c.id')]
         return closed, released
 
     # ---- warfunds 流水 ----

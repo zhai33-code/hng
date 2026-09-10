@@ -32,6 +32,7 @@ from .battle_msgs import (
     )
 from .at_ops import (
     is_radius_unit,
+    is_reserve,
     msg_air_commandnode_base_row,
     )
 
@@ -113,6 +114,13 @@ def msg_commandnode_definition_row(at):
     m += pb_int64(5, at.get('faction') or 0)        # factionTemplateId（1/2/3）
     m += pb_int64(6, at.get('template_id') or 0)    # commandNodeTemplateId
     m += pb_int32(7, int(at.get('rank') or 0))          # rank（0 起，客户端升级门槛）
+    # f8 supplyResourceCategoryId：reserve 单位（补给队/运输机队）运载的
+    # 资源类别 → 战地图图标（客户端 ReserveTeamGraphics 按类别选形状：
+    # cat10=运输机剪影、cat1=步兵、cat20=战斗机…；非 reserve 行不写，
+    # 官服同款字段）。缺省（多类/无资源）= 0 通用底板。
+    if is_reserve(at):
+        cats = sorted(int(c) for c in _as_resources(at.get('resources')))
+        m += pb_int64(8, cats[0] if len(cats) == 1 else 0)
     m += pb_int64(9, at.get('general_character_id') or 0)  # generalCharacterId
     # statUpdateTimeStamp：stats_updated_at 随 rank/xp/battles 变化刷新 →
     # 客户端 statsHaveChanged 重拉 GetAssaultTeamStats（无值回退 created_at）

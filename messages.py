@@ -193,6 +193,39 @@ async def _push_kvcs_delete(writer, view_cmd, table_name, row_id):
         f'via cmd={view_cmd}')
 
 
+async def _push_kvcs_batch(writer, view_cmd, events):
+    """将一组 ('set',table,proto)/('del',table,id) 打包进单个
+    KeyValueChangeSet 消息推送：delete/set 各一个 action 块（delete 在前），
+    表块按行重复（客户端 updateTablesFromChangeset 对 changeset.subChunks
+    逐 action×逐表×取首行）。客户端先应用批内全部行、再按行应用顺序
+    FIFO 派发表更新信号（publishPendingTableUpdates）——delete 块在前
+    意味着 del 信号（如 segment 删除触发 commandnodeStoppedMoving 清
+    moving）先派发，set 信号（如 instance 更新的 updatedWarInstance 重钉，
+    要求 !moving）后派发。批内派发时读到的是整批应用后的最终表状态
+    （如 type 已=1，不会误触补给线重钉），但信号处理器查的 schema/组件
+    级标志（moving）由前序信号设置——跨行原子语义必须整批单消息且
+    del 先 set 后，否则漏掉城市重钉。"""
+    sets = []
+    dels = []
+    for kind, table_name, payload in events:
+        if kind == 'set':
+            sets.append(Chunk(table_name, [Chunk(payload)]))
+        else:
+            dels.append(Chunk(table_name,
+                              [Chunk(struct.pack('<q', int(payload)))]))
+    actions = []
+    if dels:
+        actions.append(Chunk(b'delete', dels))
+    if sets:
+        actions.append(Chunk(b'set', sets))
+    title_chunk = Chunk(b'KeyValueChangeSet', actions)
+    main = Chunk(struct.pack('<i', view_cmd), [title_chunk])
+    writer.write(main.write(b''))
+    await writer.drain()
+    log(f'      [kvcs] batch {len(sets)} set / {len(dels)} del '
+        f'via cmd={view_cmd}')
+
+
 def _msg_store_campaign(campaign_id, ctype):
     """构建 HnG_States.StoreCampaign proto（商店战役/折扣条目）。
     activeFromTime/activeToTime 为 Zulu 格式 YYYYMMDDHHmmss（GMT），

@@ -30,6 +30,7 @@ from .at_ops import (
     is_aircraft,
     _tpl_of,
     is_reserve,
+    is_parked_planes_at,
     )
 from .warmap_view import (
     _ap_battlefield,
@@ -77,12 +78,15 @@ def at_speed(at):
         return 1.0
 
 
-def segment_seconds(from_bf, to_bf, speed, faction=0, owners=None):
+def segment_seconds(from_bf, to_bf, speed, faction=0, owners=None,
+                    air=False):
     """单段移动时长（秒）= 城市坐标距离 / (speed × timescale × move_scale × 地形系数)。
 
     官服语义：步兵 AT 数小时跨越半张图；speed 0.45-5.6（实测表值）、
     城市间典型距离 1100-6400 坐标单位，默认参数下首都对首都 ~1-4 小时。
-    地形减速（#2，仅地面补给线段，air 段不适用）：
+    地形减速（#2，仅地面补给线段，air=True 空中段不适用——飞机/伞兵
+    直线飞行不受海面/中立地形减速，海阈值 550 本按补给线段长标定，
+    空中直线航程 700-1900 常态超阈，误用会把空运拖慢 4 倍）：
     - 跨海段：距离 ≥ WAR_SEA_DISTANCE（实测欧洲图内陆最长 505、
       551+ 全为丹麦↔挪威海峡线）→ × WAR_SEA_SPEED_FACTOR；
     - 中立段：段两端城市归属均非己方（owners 提供）→ × WAR_NEUTRAL_SPEED_FACTOR；
@@ -95,16 +99,17 @@ def segment_seconds(from_bf, to_bf, speed, faction=0, owners=None):
     import math
     dist = math.hypot(a[0] - b[0], a[1] - b[1])
     factor = 1.0
-    thr = float(mm_config.WAR_SEA_DISTANCE or 0)
-    if thr > 0 and dist >= thr:
-        factor = float(mm_config.WAR_SEA_SPEED_FACTOR or 1.0)
-    fac = int(faction or 0)
-    if fac and owners:
-        o1 = int((owners.get(from_bf) or 0) or 0)
-        o2 = int((owners.get(to_bf) or 0) or 0)
-        if o1 != fac and o2 != fac:
-            factor = min(factor,
-                         float(mm_config.WAR_NEUTRAL_SPEED_FACTOR or 1.0))
+    if not air:
+        thr = float(mm_config.WAR_SEA_DISTANCE or 0)
+        if thr > 0 and dist >= thr:
+            factor = float(mm_config.WAR_SEA_SPEED_FACTOR or 1.0)
+        fac = int(faction or 0)
+        if fac and owners:
+            o1 = int((owners.get(from_bf) or 0) or 0)
+            o2 = int((owners.get(to_bf) or 0) or 0)
+            if o1 != fac and o2 != fac:
+                factor = min(factor,
+                             float(mm_config.WAR_NEUTRAL_SPEED_FACTOR or 1.0))
     denom = (float(speed or 1.0) * (mm_config.WAR_TIMESCALE or 1.0)
              * (mm_config.WAR_AT_MOVE_SCALE or 1.0) * factor)
     if denom <= 0:
@@ -347,8 +352,11 @@ def check_radius_move(at, cur_bf, target_bf, owners, battling):
     官服规则（CommandnodeArrow.detectBattleField L440-570）：
       dist ≤ attackradius/2 → 任意战场（攻击/参战/空降作战）；
         **战斗机（is_aircraft 且非补给队）例外**（用户纠正 #1）：只能飞
-        入**已开战**的城战（target_bf ∈ battling），未开战的非机场据点
-        一律不可落——战斗机正常情况下仅能在友方机场之间移动；
+          入**已开战**的城战（target_bf ∈ battling），未开战的非机场据点
+          一律不可落——战斗机正常情况下仅能在友方机场之间移动；
+        **伞兵己方机场例外**（用户纠正 #2）：拖到己方**非交战**机场
+          按换基地处理（机队随队整体转场），不空降自家机场、不拆分
+          返航；己方**交战中**机场仍为空降参战（防御空降，机队返航）；
       attackradius/2 < dist ≤ transportradius/2 → 仅己方非交战机场
         （换基地；reserve 补给队例外允许交战机场）；
       超出 transportradius/2  → 无效；不可落出兵点（调用方拦）。
@@ -367,20 +375,25 @@ def check_radius_move(at, cur_bf, target_bf, owners, battling):
     except (TypeError, ValueError):
         attack = transport = 0
     target_bf = int(target_bf or 0)
+    fac = int(at.get('faction') or 0)
+    try:
+        owner = int((owners or {}).get(target_bf, 0) or 0)
+    except (TypeError, ValueError):
+        owner = 0
+    battling = set(battling or ())
     if dist * 2 <= attack:
-        if not (is_aircraft(at) and not is_reserve(at)
-                and target_bf not in (battling or set())):
+        # 己方非交战机场（伞兵含攻击半径内）→ 换基地，不按攻击
+        friendly_airfield = (is_airfield(target_bf) and owner == fac
+                             and target_bf not in battling)
+        if not friendly_airfield and not (
+                is_aircraft(at) and not is_reserve(at)
+                and target_bf not in battling):
             return True, True
-        # 战斗机且目标未开战 → 落入 transport 分支（仅己方机场换基地）
+        # 己方非交战机场 / 战斗机且目标未开战 → 落入 transport 分支
+        # （仅己方机场换基地）
     if dist * 2 <= transport:
-        fac = int(at.get('faction') or 0)
-        try:
-            owner = int((owners or {}).get(target_bf, 0) or 0)
-        except (TypeError, ValueError):
-            owner = 0
         ok = (is_airfield(target_bf) and owner == fac
-              and (target_bf not in (battling or set())
-                   or is_reserve(at)))
+              and (target_bf not in battling or is_reserve(at)))
         return ok, False
     return False, False
 
@@ -406,7 +419,8 @@ async def start_radius_move(store, war, at, target_bf, override_move=False,
         return None, RC_CANNOT_FIND_COMMANDNODE, False
     now = now or datetime.datetime.now(datetime.timezone.utc)
     seconds = (0 if override_move
-               else segment_seconds(cur_bf, target_bf, at_speed(at)))
+               else segment_seconds(cur_bf, target_bf, at_speed(at),
+                                    air=True))
     seg = {'from_bf': cur_bf, 'to_bf': target_bf, 'sl_id': 0,
            'from_ap': 0, 'to_ap': 0, 'seconds': seconds, 'air': True,
            'radius_attack': is_attack}
@@ -415,3 +429,62 @@ async def start_radius_move(store, war, at, target_bf, override_move=False,
         arrive_at=now + datetime.timedelta(seconds=seconds))
     await store.update_command_node(at['id'], state=1)
     return mv, RC_OK, is_attack
+
+
+async def start_planes_rebase(store, war, at, target_bf, override_move=False,
+                              now=None):
+    """独立运输机队换防（is_parked_planes_at）：只能飞己方机场（交战机场
+    亦可——reserve 例外），单段 air 无限半径（reserve 模板半径 -1）。
+    移速 = 母伞兵 AT 模板速度（paratroopers 2.7 / pathfinders 3.0——
+    运输机 cat10 的巡航速度，split_aircraft_back 返航同款口径）；
+    reserve 模板自身 speed=1.0 是地面补给队口径，直接用会拖慢 ~3 倍。
+    段带 paradrop_return 旗标 → 到达走运输机队落位分支
+    （不汇合/不追击/不占城/不成战）并更新 airbase_bf（旧机 re-use
+    合并以 airbase_bf 匹配）。
+
+    返回 (movement, error_code)；目标非机场/非己方 → RC_CANNOT_FIND_COMMANDNODE。"""
+    cur_bf = at_current_battlefield(at)
+    target_bf = int(target_bf or 0)
+    if (not cur_bf or not target_bf or cur_bf == target_bf
+            or not is_parked_planes_at(at)):
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    if not is_airfield(target_bf):
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    try:
+        owners = dict(await store.get_war_cities(war['id']))
+    except Exception:
+        owners = {}
+    if int(owners.get(target_bf, 0) or 0) != int(at.get('faction') or 0):
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    # 移速：伞兵空中原型速度（用户实报"用伞兵部队的空中速度"）——
+    # 优先母 AT；母 AT 是落地变体（*_on_ground 地面速度 0.48，机队
+    # 换防最常见场景：伞兵落地步行中机队调防）→ 取其 convert_to
+    # 空中原型速度；母 AT 已不在（理论不达：汇合软删时机队已并入）
+    # 回退自身模板速度
+    speed = at_speed(at)
+    try:
+        parent = await store.get_command_node(
+            int(at.get('parent_command_node_id') or 0))
+    except Exception:
+        parent = None
+    if parent:
+        ptpl = wardb.commandnode_templates().get(
+            int(parent.get('template_id') or 0)) or {}
+        if str(ptpl.get('name') or '').endswith('_on_ground'):
+            ptpl = (wardb.commandnode_templates().get(
+                int(ptpl.get('convert_to') or 0)) or ptpl)
+        try:
+            speed = float(ptpl.get('speed') or 0) or 1.0
+        except (TypeError, ValueError):
+            speed = 1.0
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    seconds = (0 if override_move
+               else segment_seconds(cur_bf, target_bf, speed, air=True))
+    seg = {'from_bf': cur_bf, 'to_bf': target_bf, 'sl_id': 0,
+           'from_ap': 0, 'to_ap': 0, 'seconds': seconds, 'air': True,
+           'paradrop_return': True}
+    mv = await store.create_movement(
+        at['id'], at['war_id'], [seg], started_at=now,
+        arrive_at=now + datetime.timedelta(seconds=seconds))
+    await store.update_command_node(at['id'], state=1)
+    return mv, RC_OK

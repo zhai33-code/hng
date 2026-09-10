@@ -39,6 +39,7 @@ from .at_ops import (
     underdog_multipliers,
     faction_player_counts,
     _tpl_of,
+    land_paradrop_split,
     is_radius_unit,
     is_paradrop_unit,
     is_aircraft,
@@ -46,6 +47,8 @@ from .at_ops import (
     is_infantry_at,
     msg_air_commandnode_base_row,
     is_reserve,
+    remount_on_ground_at_airfield,
+    remount_parked_planes_on_arrival,
     )
 from .warmap_view import (
     msg_battlefieldstatus_row,
@@ -100,6 +103,43 @@ async def advance_movements(store, war=None, now=None):
                 # ---- 到达：终段 to_bf（或 dest_ap 出兵点）落位 ----
                 await store.finish_movement(mv['id'], 1)
                 if is_reserve(at):
+                    if segs[-1].get('paradrop_return'):
+                        # 运输机队返航/换防到达（空降拆分产物 + 玩家
+                        # 换防 start_planes_rebase，reserve 模板但非补给
+                        # 队）：落位机场待命（不汇合/不追击/不占城/
+                        # 不成战），删在途行，airbase_bf 指向落位机场
+                        # （换防≠原机场时更新；旧机 re-use 合并以
+                        # airbase_bf 匹配）；落地伞兵回机场补给时免费
+                        # re-use（_merge_parked_planes）
+                        dest_bf = int(segs[-1]['to_bf'] or 0)
+                        await store.update_command_node(
+                            at['id'], state=0, map_entity_id=dest_bf,
+                            map_entity_type=MAP_ENTITY_BATTLEFIELD,
+                            airbase_bf=dest_bf)
+                        at = await store.get_command_node(at['id'])
+                        # 到达推序（批内 dels-first 派发，_push_kvcs_batch
+                        # 按 delete-先/set-后分组）：del air_transport 信号
+                        # 先派发（airAssaultTeamMoveEnded 清 moving），instance
+                        # 信号后派发走 updatedWarInstance 重钉。批内全部行
+                        # 应用后才派发——重钉读到的新 mapEntityId 已就位，
+                        # 不会钉回出发地（此前逐条单消息推送时反序钉回
+                        # 旧机场、重登才恢复——2026-09-11）。
+                        events.append(('del', b'transport_commandnode_segment',
+                                       mv['id']))
+                        events.append(('del', b'air_transport', mv['id']))
+                        events.append(('set', b'CommandNodeWarInstance',
+                                       msg_commandnode_instance_row(
+                                           at, war_id, caps)))
+                        log(f'[war] 运输机队返航到达 node={at["id"]} '
+                            f'-> airfield {dest_bf}')
+                        # ---- 运输机找伞兵（反向自动重整）：落位机场
+                        # 停有同 owner 落地伞兵变体 → 免费并机 + 伞兵转
+                        # 回空中原型（at 可能被替换为伞兵 AT）----
+                        at, fleet_events = (
+                            await remount_parked_planes_on_arrival(
+                                store, war_id, at))
+                        events.extend(fleet_events)
+                        continue
                     # 补给队到达：汇合/追击/解散（不占城、不成战）
                     dest_bf = segs[-1]['to_bf']
                     events.extend(await _arrive_supply_column(
@@ -114,15 +154,34 @@ async def advance_movements(store, war=None, now=None):
                     at['id'], state=0, map_entity_id=ent,
                     map_entity_type=ent_type)
                 at = await store.get_command_node(at['id'])
+                # 到达推序（空/地统一，批内 dels-first 派发）：del
+                # segment/destination/air_transport 信号先派发——清
+                # moving（schema 级 commandnodeStoppedMoving + 组件级
+                # CampaignUnitBase.moving）；instance 信号后派发——
+                # updatedWarInstance 重钉要求 hasChangedMapEntityOrType
+                # && !moving，moving 未清则跳过重钉、单位卡在动画终点
+                # （出兵点偏移位）。批内全部行应用后才派发：del 重钉
+                # 读到的 mapEntityId/type 已是新值（type=1 不误走补给线
+                # 分支，accessPointStatus 无空检查的 NPE 雷区不会触发
+                # ——冻结 kvcs 管线、名字不刷新的根因，2026-09-11）。
                 events.append(('del', b'transport_commandnode_segment',
                                mv['id']))
-                events.append(('del', b'air_transport' if is_air else
-                               b'transport_commandnode_destination',
-                               mv['id']))
+                events.append(
+                    ('del', b'air_transport' if is_air
+                     else b'transport_commandnode_destination', mv['id']))
                 events.append(('set', b'CommandNodeWarInstance',
-                               msg_commandnode_instance_row(at, war_id, caps)))
+                               msg_commandnode_instance_row(
+                                   at, war_id, caps)))
+                # ---- 落地伞兵走回己方机场：与停驻同机场的同主运输机队
+                # 自动重整（免费并机 + 转回空中原型，可再次空降）----
+                remounted = False
+                if not is_air:
+                    at, remount_events = await remount_on_ground_at_airfield(
+                        store, war_id, at)
+                    events.extend(remount_events)
+                    remounted = bool(remount_events)
                 # ---- 空中半径单位到达（§10.2 #6/#7）----
-                if is_radius_unit(at):
+                if is_radius_unit(at) and not remounted:
                     if not segs[-1].get('radius_attack'):
                         # 换基地到达：airbase 行 + airbase_bf 指向新机场
                         await store.update_command_node(
@@ -133,27 +192,21 @@ async def advance_movements(store, war=None, now=None):
                                 at, war_id, segs[-1]['to_bf'])))
                     elif is_paradrop_unit(at):
                         # 空降作战到达：伞兵落地变体（convert_to，*_on_
-                        # ground 半径无限、地面速度）+ 删 airbase 行 +
-                        # airbase_bf 清 0
-                        cvt = int(_tpl_of(at).get('convert_to') or 0)
-                        if cvt and wardb.commandnode_templates().get(cvt):
-                            await store.update_command_node(
-                                at['id'], template_id=cvt, airbase_bf=0)
-                            at = await store.get_command_node(at['id'])
-                            events.append((
-                                'set', b'CommandNodeDefinition',
-                                msg_commandnode_definition_row(at)))
-                            events.append((
-                                'set', b'CommandNodeWarInstance',
-                                msg_commandnode_instance_row(
-                                    at, war_id, caps)))
-                            for p in msg_armyresource_rows(at, war_id):
-                                events.append(('set', b'armyresource', p))
+                        # ground 半径无限、地面速度）+ 运输机拆成玩家
+                        # 名下独立 planes-AT 停原机场（官服 Spaatz 实锤
+                        # "returns the transport planes to the origin of
+                        # the transportation"；非回阵营库存——玩家
+                        # 私有，落地伞兵回机场补给时优先免费合并旧机
+                        # 重登机 "re-use old transport planes"）
+                        if int(_tpl_of(at).get('convert_to') or 0):
+                            at, split_events = await land_paradrop_split(
+                                store, war_id, at)
+                            events.extend(split_events)
                         else:
                             await store.update_command_node(
                                 at['id'], airbase_bf=0)
-                        events.append(('del', b'air_commandnode_base',
-                                       at['id']))
+                            events.append(('del', b'air_commandnode_base',
+                                           at['id']))
                     # 飞机作战到达：airbase 行/airbase_bf 保持原基地
                     # （作战后结算拖回机场，届时更新）
                 # ---- 会战成局桩：目标城市有敌对 AT 驻扎 ----
@@ -443,24 +496,22 @@ async def _capture_city_events(store, war_id, faction, bf_id,
 
 
 async def broadcast_war_events(events):
-    """战争事件广播：全部 warmapview 订阅会话（含敌我视角）。"""
+    """战争事件广播：全部 warmapview 订阅会话（含敌我视角）。整批事件
+    单条 KeyValueChangeSet 推送（原子性见 _push_kvcs_batch——到达等
+    跨行状态迁移要求 set 与 del 行在同一派发批内互相可见）。"""
     if not events:
         return
     from state import FLASH_SESSIONS
-    from messages import _push_kvcs, _push_kvcs_delete
+    from messages import _push_kvcs_batch
     for sess in list(FLASH_SESSIONS.values()):
         cmd = getattr(sess, 'warmap_view_cmd', None)
         w = getattr(sess, 'writer', None)
         if not cmd or not w:
             continue
-        for kind, tag, payload in events:
-            try:
-                if kind == 'set':
-                    await _push_kvcs(w, cmd, tag, payload)
-                else:
-                    await _push_kvcs_delete(w, cmd, tag, payload)
-            except Exception:
-                pass          # 单会话故障不影响其他订阅者
+        try:
+            await _push_kvcs_batch(w, cmd, events)
+        except Exception:
+            pass          # 单会话故障不影响其他订阅者
 
 
 async def _sweep_ended_war_leftovers(store):

@@ -368,6 +368,16 @@ async def main():
                   10, 30, 1.0, 1, {10: 2, 30: 2})
               - (1000.0 / SCALE) / min(SEA, NEU)) < 1e-6)
 
+    # ---- B3. 空中段不受地形减速（#air：飞机/伞兵半径直达 + 运输机返航）----
+    # 10-30 直线 1000 ≥ 550 海阈值，air=True 必须免减速（否则空运慢 4 倍）
+    check('air 段免海面减速（距离≥550 不×0.25）',
+          abs(war_campaign.segment_seconds(10, 30, 1.0, air=True)
+              - 1000.0 / SCALE) < 1e-6)
+    check('air 段免中立减速（owners 全非己方不×0.5）',
+          abs(war_campaign.segment_seconds(
+                  10, 30, 1.0, 1, {10: 2, 30: 2}, air=True)
+              - 1000.0 / SCALE) < 1e-6)
+
     # ---- C. start_movement ----
     store = FakeStore()
     war = await war_campaign.ensure_war(store)

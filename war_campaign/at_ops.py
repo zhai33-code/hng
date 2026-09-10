@@ -4,6 +4,7 @@
 原 war_campaign.py 阶段 3.5 拆分（docs/warserver-refactor-plan.md §3.5）：
 符号逐字搬运，行为不变。"""
 
+import datetime
 import math
 import random
 from protocol import (
@@ -17,6 +18,8 @@ from .common import (
     supplyline_adjacency,
     _bf_pos,
     _SOLDIER_CATS,
+    _as_resources,
+    MAP_ENTITY_BATTLEFIELD,
     )
 from .lifecycle import (
     ensure_war,
@@ -145,6 +148,157 @@ def template_resources(tpl):
             for cat, cnt in (tpl.get('resources') or {}).items()}
 
 
+async def split_aircraft_back(store, at, home_bf=None, drop_bf=None,
+                              now=None):
+    """空降落地拆分（官服 Spaatz 更新实锤："Dropping paratroopers/
+    pathfinders, returns the transport planes to the origin of the
+    transportation"）：按空中原型 vehicle_cats 把 AT 持有的运输机
+    剥离，创建**玩家名下独立运输机队**——reserve 模板 + 只带载具资源
+    + parent 指向伞兵 AT（客户端战地图按 reserve 资源类别显示**运输机
+    剪影图标**、列表/tooltip 挂父 AT 名，官服老视频同款），并从空投点
+    **飞回**原机场（单段 air movement，非瞬移；到达后停机场待命，
+    落地伞兵回机场补给时免费 re-use）。
+
+    返回 (剥离后 resources, 运输机队, 返航 movement)；无可剥离 / 无原
+    机场可回 / 建队失败返回 (None, None, None)（调用方不动 resources，
+    落地变体按已有资源继续，旧机重装由机场补给合并路径兜底）。"""
+    tpl = _tpl_of(at)
+    pv = {int(c) for c in (tpl.get('vehicle_cats') or set())}
+    if not pv:
+        return None, None, None
+    if home_bf is None:
+        home_bf = at.get('airbase_bf')
+    home_bf = int(home_bf or 0)
+    if not home_bf:
+        return None, None, None     # 无出发机场（异常路径）：不拆
+    drop_bf = int(drop_bf or 0)
+    res = _as_resources(at.get('resources'))
+    back = {}
+    for cat, _full in template_resources(tpl).items():
+        cat = int(cat)
+        if cat not in pv:
+            continue
+        have = int(res.get(str(cat), res.get(cat, 0)) or 0)
+        if have > 0:
+            back[cat] = have
+    if not back:
+        return None, None, None
+    fac = int(at.get('faction') or 0)
+    # 官服 reserve 命名：name=父 AT 名（客户端按 parent 替换显示），
+    # abbreviation 带后缀 "(R)"（客户端 updateAssaultTeamNameAndAbbreviation
+    # 同款约定，去 (R) 后参与排序）
+    name = str(at.get('name') or 'transport')[:AT_NAME_MAX_LENGTH]
+    abbr = (str(at.get('abbreviation') or '') + '(R)')[:AT_ABBR_MAX_LENGTH]
+    try:
+        planes = await store.create_command_node(
+            int(at.get('war_id') or 0), reserve_template_id(fac),
+            int(at.get('owner_player_id') or 0), fac,
+            name, {str(c): int(n) for c, n in back.items()},
+            abbreviation=abbr, parent_command_node_id=int(at['id']))
+        await store.update_command_node(
+            planes['id'], is_deployed=True,
+            map_entity_id=drop_bf or home_bf,
+            map_entity_type=MAP_ENTITY_BATTLEFIELD, airbase_bf=home_bf)
+    except Exception as e:
+        log(f'[at_ops] 运输机拆分失败 node={at.get("id")}: {e}')
+        return None, None, None
+    for cat in back:
+        res.pop(str(cat), None)
+        res.pop(cat, None)
+    # ---- 返航：空投点 → 原机场（单段 air；空投点=机场或坐标缺失则
+    #      直接待命无航程）。段带 paradrop_return 旗标，advance_movements
+    #      到达分支据此落位（不走补给队汇合/追击）。
+    mv = None
+    if drop_bf and drop_bf != home_bf:
+        from .at_movement import at_speed, segment_seconds
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        seconds = max(
+            1, int(segment_seconds(drop_bf, home_bf, at_speed(at),
+                                   air=True)))
+        seg = {'from_bf': drop_bf, 'to_bf': home_bf, 'sl_id': 0,
+               'from_ap': 0, 'to_ap': 0, 'seconds': seconds, 'air': True,
+               'paradrop_return': True}
+        try:
+            mv = await store.create_movement(
+                planes['id'], int(at.get('war_id') or 0), [seg],
+                started_at=now,
+                arrive_at=now + datetime.timedelta(seconds=seconds))
+            await store.update_command_node(planes['id'], state=1)
+        except Exception as e:
+            log(f'[at_ops] 运输机返航创建失败 node={planes["id"]}: {e}')
+            mv = None
+    planes = await store.get_command_node(planes['id'])
+    return {str(k): int(v) for k, v in res.items()}, planes, mv
+
+
+async def land_paradrop_split(store, war_id, at, drop_bf=None, now=None):
+    """伞兵落地（空降到达 / 战败落地共用）：模板转 convert_to 落地变体
+    + 运输机拆成玩家名下独立运输机队从空投点飞回原机场
+    （split_aircraft_back）+ 行推送（含 air_transport 在途动画行）。
+    返回 (落地后 AT, 推送事件)。"""
+    from .warmap_view import (
+        msg_commandnode_definition_row,
+        msg_commandnode_instance_row,
+        msg_commandnode_morale_row,
+        msg_armyresource_rows,
+        )
+    from .battle_msgs import msg_air_transport_row
+    from .at_movement import movement_segments
+    caps = _faction_capital_bf()
+    tpl = _tpl_of(at)
+    cvt = int(tpl.get('convert_to') or 0)
+    home = int(at.get('airbase_bf') or 0)
+    if not drop_bf:
+        drop_bf = (int(at.get('map_entity_id') or 0)
+                   if int(at.get('map_entity_type') or 0)
+                   == MAP_ENTITY_BATTLEFIELD else 0)
+    ground_res, planes, mv = await split_aircraft_back(
+        store, at, home, drop_bf=drop_bf, now=now)
+    upd = {'airbase_bf': 0}
+    if cvt and cvt in wardb.commandnode_templates():
+        upd['template_id'] = cvt
+    if ground_res is not None:
+        upd['resources'] = ground_res
+    await store.update_command_node(at['id'], **upd)
+    at = await store.get_command_node(at['id'])
+    events = []
+    if upd.get('template_id'):
+        events.append(('set', b'CommandNodeDefinition',
+                       msg_commandnode_definition_row(at)))
+        if ground_res is not None:
+            # 被剥离载具类的 armyresource 行收缩（落地变体编制不含）
+            for cat in tpl.get('vehicle_cats') or set():
+                events.append(('del', b'armyresource',
+                               int(at['id']) * 1000 + int(cat)))
+    events.append(('set', b'CommandNodeWarInstance',
+                   msg_commandnode_instance_row(at, war_id, caps)))
+    for p in msg_armyresource_rows(at, war_id):
+        events.append(('set', b'armyresource', p))
+    if planes is not None:
+        events.append(('set', b'CommandNodeDefinition',
+                       msg_commandnode_definition_row(planes)))
+        events.append(('set', b'CommandNodeWarInstance',
+                       msg_commandnode_instance_row(planes, war_id, caps)))
+        events.append(('set', b'CommandNodeMorale',
+                       msg_commandnode_morale_row(planes, war_id)))
+        for p in msg_armyresource_rows(planes, war_id):
+            events.append(('set', b'armyresource', p))
+        if mv is not None:
+            # 在途飞行动画（客户端 AirTransportTable → 运输机图标从
+            # 空投点滑向机场；到达 del 行回静止位）
+            segs = movement_segments(mv)
+            if segs:
+                events.append(('set', b'air_transport',
+                               msg_air_transport_row(planes, war_id, mv,
+                                                     segs[0])))
+        log(f'[war] paradrop split: node={at["id"]} on_ground + planes '
+            f'AT {planes["id"]} {planes.get("name")!r} '
+            f'{drop_bf} -> airfield {home}'
+            + (' (flying back)' if mv is not None else ''))
+    events.append(('del', b'air_commandnode_base', at['id']))
+    return at, events
+
+
 def template_rank(tpl):
     """新 AT 初始 rank（commandnodetemplate f10 level：基础模板 guard/
     light_armor 为 0，升级链目标 1/2——客户端升级门槛 rank >= level）。"""
@@ -263,6 +417,15 @@ def upgrade_allowed(cur_tpl, target_tpl):
     if str(target_tpl.get('name') or '').endswith('_on_ground'):
         return False
     if int(target_tpl.get('parent_template_id') or 0) == cur_id:
+        return True
+    # 官服 f11 互转语义（落地变体 → 空中原型）：伞兵空降到达后服务端
+    # 转成 *_on_ground（编制只含伞兵不含运输机 cat10 → resupply 恒
+    # "已满编"），玩家唯一官方恢复通道是 f11 反向链转回空中原型
+    # （111⇄112/311⇄312 双向 convert_to），重新装备运输机后再空降。
+    # 反方向（空中原型 → 落地变体）仍被上面的落地变体目标拒绝挡住
+    # （落地转换只由服务端空降到达/战败逻辑驱动，防升级窗误操作步行化）。
+    if (str(cur_tpl.get('name') or '').endswith('_on_ground')
+            and int(cur_tpl.get('convert_to') or 0) == tgt):
         return True
     return (str(cur_tpl.get('name') or '') == 'motorized_guard'
             and str(target_tpl.get('name') or '') == 'motorized_infantry')
@@ -511,15 +674,18 @@ def nearest_owned_airfield(bf_id, owners, faction):
     return best
 
 
-def msg_air_commandnode_base_row(at, war_id, base_bf):
+def msg_air_commandnode_base_row(at, war_id, base_bf, target_bf=None):
     """air_commandnode_base 行（proto 实锤 f1-f6）：f1 id / f2
     commandNodeWarInstanceId / f3 battlefieldid（基地机场）/ f4
     targetentityid / f5 targetentitytype（'battlefield'，String）/ f6 warid。
 
     行 id = AT id；客户端 AirCommandnodeBaseTable 按 f2 join →
-    isAirborneUnit 判定（有行 = airborne，应用半径规则）。"""
+    isAirborneUnit 判定（有行 = airborne，应用半径规则）。
+    target_bf：目的地实体（CommandnodeArrow 文字/箭头 ← f4）；换基地
+    = 基地机场（缺省同 base_bf），攻击飞行 = 目标城（f3 保持出发机场）。"""
+    tgt = int(target_bf if target_bf is not None else base_bf or 0)
     return (pb_int64(1, int(at['id'])) + pb_int64(2, int(at['id']))
-            + pb_int64(3, int(base_bf or 0)) + pb_int64(4, int(base_bf or 0))
+            + pb_int64(3, int(base_bf or 0)) + pb_int64(4, tgt)
             + pb_string(5, 'battlefield') + pb_int64(6, int(war_id)))
 
 
@@ -537,5 +703,264 @@ def is_reserve(at):
 
 def reserve_template_id(faction):
     """阵营补给队模板 id（faction*100+4；wardb commandnodetemplate 104/
-    204/304 'reserve'，speed=1.0）。"""
-    return int(faction or 0) * 100 + RESERVE_TEMPLATE_OFFSET
+    204/304 'reserve'，speed=1.0）。合成 wardb（测试 501-509 族）无
+    104 时回退同阵营 %100==4 模板（504）。"""
+    faction = int(faction or 0)
+    tid = faction * 100 + RESERVE_TEMPLATE_OFFSET
+    tpls = wardb.commandnode_templates()
+    if tid in tpls:
+        return tid
+    for k, v in sorted(tpls.items()):
+        if (k % 100 == RESERVE_TEMPLATE_OFFSET
+                and int(v.get('faction') or 0) == faction):
+            return k
+    return tid
+
+
+def is_parked_planes_at(at):
+    """独立运输机队（空降拆分产物，split_aircraft_back）：reserve 模板
+    且停驻机场（airbase_bf>0）。区别于补给队（同 reserve 模板但
+    airbase_bf 恒 0，走补给线）。官服口径：独立运输机只能飞己方机场
+    （客户端 CommandnodeArrow L504 `isAirfield && (!underAttack ||
+    isReserve)`——reserve 例外允许交战机场）。"""
+    return (is_reserve(at)
+            and int(at.get('airbase_bf') or 0) > 0)
+
+
+async def merge_parked_planes(store, at, proto, air_bf, war_id):
+    """停驻同机场的同主运输机队**免费**并入 AT 直到补满 proto 载具编制
+    （官服 Spaatz "re-use old transport planes" 核心实现；f11 补给入口
+    与落地伞兵走回机场自动重整共用）。遍历玩家名下停驻该机场的
+    reserve 机队（state<3、is_deployed、airbase_bf=机场），按
+    proto.vehicle_cats 满编口径取机：取尽软删 + del 行，部分取回写 +
+    set armyresource 行。返回 (take {cat: n}, events)——空 take = 无可
+    合并/不适用；events 由调用方决定广播（handler）或随 tick 汇总
+    （tick 路径，advance_movements 返回后统一广播）。"""
+    pv = {int(c) for c in (proto.get('vehicle_cats') or set())}
+    if not pv:
+        return {}, []
+    try:
+        parked = await store.list_player_command_nodes(
+            int(at.get('owner_player_id') or 0), int(war_id))
+    except Exception as e:
+        log(f'      [war_at] 停驻机队查询失败: {e}')
+        return {}, []
+    parked = [p for p in parked
+              if int(p.get('id') or 0) != int(at.get('id') or 0)
+              and is_reserve(p)
+              and int(p.get('airbase_bf') or 0) == int(air_bf)
+              and p.get('is_deployed')
+              and int(p.get('state') or 0) < 3]
+    if not parked:
+        return {}, []
+    res = _as_resources(at.get('resources'))
+    full = {int(c): int(n) for c, n in template_resources(proto).items()
+            if int(c) in pv}
+    take = {}
+    events = []
+    for p in sorted(parked, key=lambda x: int(x.get('id') or 0)):
+        pres = _as_resources(p.get('resources'))
+        left = {}
+        for cat in sorted(pv):
+            have = int(pres.get(str(cat), pres.get(cat, 0)) or 0)
+            if have <= 0:
+                continue
+            cur = (int(res.get(str(cat), res.get(cat, 0)) or 0)
+                   + take.get(cat, 0))
+            g = min(full.get(cat, 0) - cur, have)
+            if g > 0:
+                take[cat] = take.get(cat, 0) + g
+            left[cat] = have - max(g, 0)
+        if not any(v > 0 for v in take.values()):
+            break                       # 已取满：剩余机队保留待下次
+        if not any(v > 0 for v in left.values()):
+            # 取尽：软删 planes-AT + del 行（与 _push_at_delete 同表集）
+            await store.delete_command_node(p['id'])
+            events.append(('del', b'CommandNodeWarInstance', p['id']))
+            events.append(('del', b'CommandNodeDefinition', p['id']))
+            events.append(('del', b'CommandNodeMorale', p['id']))
+            for cat in pv:
+                events.append(('del', b'armyresource',
+                               int(p['id']) * 1000 + int(cat)))
+            events.append(('del', b'air_commandnode_base', p['id']))
+        else:
+            from .warmap_view import msg_armyresource_rows
+            left_res = {str(c): int(n) for c, n in left.items() if n > 0}
+            await store.update_command_node(p['id'], resources=left_res)
+            p2 = await store.get_command_node(p['id'])
+            if p2:
+                for row in msg_armyresource_rows(p2, war_id):
+                    events.append(('set', b'armyresource', row))
+    if not take:
+        return {}, []
+    for cat, n in take.items():
+        res[str(cat)] = int(res.get(str(cat), res.get(cat, 0)) or 0) + n
+    await store.update_command_node(
+        at['id'], resources={str(k): int(v) for k, v in res.items()})
+    log(f'      [war] 旧机队合并(免费) node={at["id"]} take={take} '
+        f'parked={[p["id"] for p in parked]}')
+    return take, events
+
+
+async def remount_on_ground_at_airfield(store, war_id, at):
+    """落地伞兵走回己方机场自动重整（f11 补给 / 撤退重整之外的第三
+    入口）：地面行军**到达**己方机场，且玩家名下停驻同机场的运输机队
+    有机可并时——免费并入（merge_parked_planes）+ 转回空中原型（恢复
+    cat10/半径）+ airbase_bf 指向机场，可再次空降。
+
+    无机可并 / 非机场 / 非己方城 / 非落地变体返回 (at, []) 原样不动
+    （玩家仍可到站后手动补给买机，本函数不替代计价补给）。"""
+    if is_reserve(at):
+        return at, []
+    tpl = _tpl_of(at)
+    if not str(tpl.get('name') or '').endswith('_on_ground'):
+        return at, []
+    proto = wardb.commandnode_templates().get(
+        int(tpl.get('convert_to') or 0)) or None
+    if (proto is None
+            or int(proto.get('faction') or 0) != int(tpl.get('faction') or 0)
+            or 10 not in {int(c) for c in
+                          (proto.get('vehicle_cats') or set())}):
+        return at, []
+    from .at_movement import at_current_battlefield
+    bf = at_current_battlefield(at)
+    if not bf or not is_airfield(bf):
+        return at, []
+    try:
+        owners = dict(await store.get_war_cities(war_id))
+    except Exception as e:
+        log(f'[at_ops] 走回机场重整归属判定失败: {e}')
+        return at, []
+    if int(owners.get(bf, 0) or 0) != int(at.get('faction') or 0):
+        return at, []
+    take, events = await merge_parked_planes(store, at, proto, bf, war_id)
+    if not take:
+        return at, []
+    await store.update_command_node(at['id'], template_id=int(proto['id']),
+                                    airbase_bf=int(bf))
+    at = await store.get_command_node(at['id'])
+    from .warmap_view import (
+        msg_commandnode_definition_row,
+        msg_commandnode_instance_row,
+        msg_armyresource_rows,
+        )
+    caps = _faction_capital_bf()
+    events.append(('set', b'CommandNodeDefinition',
+                   msg_commandnode_definition_row(at)))
+    events.append(('set', b'CommandNodeWarInstance',
+                   msg_commandnode_instance_row(at, war_id, caps)))
+    for p in msg_armyresource_rows(at, war_id):
+        events.append(('set', b'armyresource', p))
+    events.append(('set', b'air_commandnode_base',
+                   msg_air_commandnode_base_row(at, war_id, bf)))
+    log(f'[war] 落地伞兵走回机场重整 node={at["id"]} '
+        f'tpl={tpl.get("id")} -> {proto["id"]} take={take} airfield={bf}')
+    return at, events
+
+
+async def remount_parked_planes_on_arrival(store, war_id, fleet):
+    """运输机队飞抵机场自动重整（"运输机找伞兵"反向入口，与
+    remount_on_ground_at_airfield 伞兵找运输机对称）：返航/换防到达
+    落位后，同机场停有同 owner 落地伞兵变体（*_on_ground，parent AT
+    优先）→ 机免费并入它 + 伞兵转回空中原型（可再次空降）+ 机队取尽
+    软删 / 部分取回保留余机。无伞兵 / 满员返回 (fleet, []) 原样停机
+    （玩家仍可 f11 手动补给/合并）。"""
+    if not is_parked_planes_at(fleet):
+        return fleet, []
+    dest_bf = int(fleet.get('airbase_bf') or 0)
+    if not dest_bf:
+        return fleet, []
+    try:
+        nodes = await store.list_player_command_nodes(
+            int(fleet.get('owner_player_id') or 0), int(war_id))
+    except Exception as e:
+        log(f'[at_ops] 机队到达重整候选查询失败: {e}')
+        return fleet, []
+    from .at_movement import at_current_battlefield
+    parent_id = int(fleet.get('parent_command_node_id') or 0)
+    cands = []
+    for n in nodes:
+        if (is_reserve(n)
+                or int(n.get('state') or 0) != 0
+                or not n.get('is_deployed')
+                or at_current_battlefield(n) != dest_bf):
+            continue
+        ntpl = _tpl_of(n)
+        if not str(ntpl.get('name') or '').endswith('_on_ground'):
+            continue
+        proto = wardb.commandnode_templates().get(
+            int(ntpl.get('convert_to') or 0)) or None
+        if (proto is None
+                or int(proto.get('faction') or 0)
+                != int(ntpl.get('faction') or 0)
+                or 10 not in {int(c) for c in
+                              (proto.get('vehicle_cats') or set())}):
+            continue
+        cands.append((0 if int(n['id']) == parent_id else 1,
+                      int(n['id']), n, proto))
+    if not cands:
+        return fleet, []
+    cands.sort(key=lambda x: (x[0], x[1]))
+    _, _, at, proto = cands[0]
+    # 取机：按原型满编口径从本机队取（同 merge_parked_planes 口径）
+    pv = {int(c) for c in (proto.get('vehicle_cats') or set())}
+    full = {int(c): int(n) for c, n in template_resources(proto).items()
+            if int(c) in pv}
+    pres = _as_resources(fleet.get('resources'))
+    res = _as_resources(at.get('resources'))
+    take = {}
+    left = {}
+    for cat in sorted(pv):
+        have = int(pres.get(str(cat), pres.get(cat, 0)) or 0)
+        cur = int(res.get(str(cat), res.get(cat, 0)) or 0)
+        g = min(full.get(cat, 0) - cur, have)
+        if g > 0:
+            take[cat] = g
+        left[cat] = have - max(g, 0)
+    if not take:
+        return fleet, []                # 伞兵满员：机队保留停驻
+    for cat, n in take.items():
+        res[str(cat)] = int(res.get(str(cat), res.get(cat, 0)) or 0) + n
+    await store.update_command_node(
+        at['id'], template_id=int(proto['id']), airbase_bf=dest_bf,
+        resources={str(k): int(v) for k, v in res.items()})
+    at = await store.get_command_node(at['id'])
+    events = []
+    if any(v > 0 for v in left.values()):
+        # 部分取回：机队保留余机（armyresource 行刷新）
+        await store.update_command_node(
+            fleet['id'],
+            resources={str(c): int(n) for c, n in left.items() if n > 0})
+        from .warmap_view import msg_armyresource_rows
+        fleet2 = await store.get_command_node(fleet['id'])
+        if fleet2:
+            for row in msg_armyresource_rows(fleet2, war_id):
+                events.append(('set', b'armyresource', row))
+    else:
+        # 取尽：软删机队 + del 行（与 merge_parked_planes 同表集）
+        await store.delete_command_node(fleet['id'])
+        events.append(('del', b'CommandNodeWarInstance', fleet['id']))
+        events.append(('del', b'CommandNodeDefinition', fleet['id']))
+        events.append(('del', b'CommandNodeMorale', fleet['id']))
+        for cat in pv:
+            events.append(('del', b'armyresource',
+                           int(fleet['id']) * 1000 + int(cat)))
+        events.append(('del', b'air_commandnode_base', fleet['id']))
+    from .warmap_view import (
+        msg_commandnode_definition_row,
+        msg_commandnode_instance_row,
+        msg_armyresource_rows,
+        )
+    caps = _faction_capital_bf()
+    events.append(('set', b'CommandNodeDefinition',
+                   msg_commandnode_definition_row(at)))
+    events.append(('set', b'CommandNodeWarInstance',
+                   msg_commandnode_instance_row(at, war_id, caps)))
+    for p in msg_armyresource_rows(at, war_id):
+        events.append(('set', b'armyresource', p))
+    events.append(('set', b'air_commandnode_base',
+                   msg_air_commandnode_base_row(at, war_id, dest_bf)))
+    log(f'[war] 运输机队到达并入落地伞兵 node={at["id"]} '
+        f'tpl=-> {proto["id"]} take={take} fleet={fleet["id"]} '
+        f'airfield={dest_bf}')
+    return at, events

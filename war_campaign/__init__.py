@@ -136,6 +136,10 @@ from .at_ops import (
     RESERVE_TEMPLATE_OFFSET,
     is_reserve,
     reserve_template_id,
+    is_parked_planes_at,
+    merge_parked_planes,
+    remount_on_ground_at_airfield,
+    remount_parked_planes_on_arrival,
     )
 from .warmap_view import (
     msg_battlefieldstatus_row,
@@ -172,6 +176,7 @@ from .at_movement import (
     start_air_transport,
     check_radius_move,
     start_radius_move,
+    start_planes_rebase,
     )
 from .supply import (
     bf_in_faction_supply,
@@ -313,6 +318,7 @@ __all__ = [
     'RESERVE_TEMPLATE_OFFSET',
     'is_reserve',
     'reserve_template_id',
+    'is_parked_planes_at',
     'msg_battlefieldstatus_row',
     'msg_supplylinestatus_rows',
     '_ap_battlefield',
@@ -345,6 +351,7 @@ __all__ = [
     'start_air_transport',
     'check_radius_move',
     'start_radius_move',
+    'start_planes_rebase',
     'bf_in_faction_supply',
     '_column_delete_events',
     '_merge_column_events',
