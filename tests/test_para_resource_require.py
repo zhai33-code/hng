@@ -13,7 +13,9 @@ para:1——则正常）。
 
 用例：
  A. character_resource_category 映射（真实 WarDatabase 锚点）
- B. 复现实锤 + 修复后建池（capture_hold_inf = gamemode 3）
+ B. 复现实锤 + 修复后建池（capture_hold_inf = gamemode 2；2026-09-10
+    编号校正前旧文写 3，校正后 3 = capture_hold_tank，2026-09-13 随
+    MODE_PLANS 补坦克条目一并改回本意）
  C. late join 过滤：池缺 char_cat 不放行 / 有则放行 / 步兵不受影响
 """
 import asyncio
@@ -48,7 +50,7 @@ def check(label, ok, detail=''):
     print(f'[{"PASS" if ok else "FAIL"}] {label}{("  " + detail) if detail else ""}')
 
 
-def seed_mission(mid, *, gamemode=3, preset=373394539, attacker=1, defender=2,
+def seed_mission(mid, *, gamemode=2, preset=373394539, attacker=1, defender=2,
                  age=5.0):
     """登记一个（伪）运行中战局（结构同 test_mm_latejoin.seed_mission）。"""
     inst = {'mission_id': mid, 'port': 5600 + mid % 100, 'proc': None,
@@ -89,13 +91,13 @@ def main():
         check('A6: 未知模板 → 0',
               character_resource_category(99999) == 0)
 
-        # ---- B. 复现实锤 + 修复后建池（capture_hold_inf = 模式 3）----
-        force_pool.init_mission(900400, 3, 1, 2)
+        # ---- B. 复现实锤 + 修复后建池（capture_hold_inf = 模式 2）----
+        force_pool.init_mission(900400, 2, 1, 2)
         pools.append(900400)
         p0 = force_pool.pool(900400)
         check('B1: 复现——无 require 时 capture_hold_inf 池无 cat4（实锤条件）',
               all(p.get(4, 0) == 0 for p in p0.values()), f'pool={p0}')
-        force_pool.init_mission(900401, 3, 1, 2, require_cats={4})
+        force_pool.init_mission(900401, 2, 1, 2, require_cats={4})
         pools.append(900401)
         p1 = force_pool.pool(900401)
         check('B2: require {4} → 双方阵营 cat4 > 0（伞兵资源保底）',
@@ -104,19 +106,25 @@ def main():
               all(p.get(1, 0) > 0 for p in p1.values()))
 
         # ---- C. late join 过滤 ----
-        seed_mission(900402)                    # 池 = 无 require 口径
-        force_pool.init_mission(900402, 3, 1, 2)
+        # 2026-09-13 兵种准入矩阵（mm_config.MODE_CHAR_CATS）上线后，伞兵
+        # (cat4) 已被矩阵挡在模式 2 外，本场景改用模式 5（assault_infantry，
+        # 矩阵允许 {1,4,6}，计划含 para:1）验证池覆盖过滤仍在矩阵门禁
+        # 之后正常生效。
+        seed_mission(900402, gamemode=5)     # 池建好后清零 cat4（模拟缺池）
+        force_pool.init_mission(900402, 5, 1, 2)
         pools.append(900402)
+        for fcnts in force_pool.pool(900402).values():
+            fcnts[4] = 0
         check('C1: 伞兵 late join 池缺 cat4 → 不放行（防进局判负）',
               matchmaking._find_joinable_mission(
-                  3, (373394539,), 1, char_cat=4) is None)
-        seed_mission(900403)                    # 池 = require {4} 口径
-        force_pool.init_mission(900403, 3, 1, 2, require_cats={4})
+                  5, (373394539,), 1, char_cat=4) is None)
+        seed_mission(900403, gamemode=5)     # 池 = 计划原生 para:1
+        force_pool.init_mission(900403, 5, 1, 2)
         pools.append(900403)
-        r = matchmaking._find_joinable_mission(3, (373394539,), 1, char_cat=4)
+        r = matchmaking._find_joinable_mission(5, (373394539,), 1, char_cat=4)
         check('C2: 伞兵 late join 池有 cat4 → 放行（跳过缺池局命中 900403）',
               r is not None and r[0] == 900403)
-        r = matchmaking._find_joinable_mission(3, (373394539,), 1)
+        r = matchmaking._find_joinable_mission(5, (373394539,), 1)
         check('C3: 无 char_cat（步兵/旧调用方）→ 不受过滤影响',
               r is not None and r[0] == 900402)
         check('C4: QueueEntry.char_cat 字段存在（入池口径）',

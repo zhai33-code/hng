@@ -138,6 +138,28 @@ QUICKPLAY_POOL_MODES = (2, 3, 4, 5, 6)
 #   兜底走 DEFAULT_GAMEMODE（解析失败的极端场景）。
 MAPFILTER_GAMEMODE = 13
 
+# ★ 官方兵种准入矩阵（客户端 GamemodesMediator.as:572-626 的
+#   UNAVAILABLE_REASON_WRONG_CHARACTER 表镜像）：各模式允许进入的士兵
+#   资源类别（wardb.character_resource_category：1=步兵 2=飞行员
+#   4=伞兵 5=坦克兵 6=侦察兵）。服务器在直排/quickplay/mapfilter/
+#   指定战局/late join/小队入池六个入口统一执法；类别 0（未知模板）
+#   不拦。省略的模式 = 不限兵种（6 Assault 全兵种、10 war、11/12/13/14
+#   虚拟号）。
+MODE_CHAR_CATS = {
+    1: (1,),          # 训练：仅步兵
+    2: (1,),          # C&H Infantry：仅步兵
+    3: (5,),          # C&H Tanks 坦克掌控：仅坦克兵
+    4: (1, 5, 6),     # C&H Battle：步兵/坦克兵/侦察兵
+    5: (1, 4, 6),     # Assault Small：步兵/伞兵/侦察兵
+    7: (2,),          # C&H Pilot：仅飞行员
+    8: (6,),          # C&H Recon 侦查掌控：仅侦察兵
+}
+
+
+def mode_char_cats(gamemode_id):
+    """按 gamemodeId 取允许的士兵类别（None=不限）。"""
+    return MODE_CHAR_CATS.get(int(gamemode_id or 0))
+
 
 def gamemode_cfg(gamemode_id):
     """按 gamemodeId 取配置（未知模式回退 DEFAULT_GAMEMODE）。"""

@@ -17,10 +17,11 @@
 模式抽取计划（gamemode 名称来自 mm_config.GAMEMODES）：
 
   training(1)          固定官方锚点组合（可复现）
-  capture_hold_inf(3)  步兵族×6 + 侦察族×2
-  capture_hold_all(4)  步兵族×6 + 侦察族×2 + 装甲族×2 + 航空族×2
-  assault_infantry(5)  步兵族×8 + 侦察族×2 + 伞兵族×1
-  assault_battle(6)    步兵族×8 + 侦察族×2 + 伞兵族×1 + 装甲族×3 + 航空族×2
+  capture_hold_inf(2)  步兵族×5 + 侦察族×1
+  capture_hold_tank(3) 步兵族×3 + 装甲族×3（官方坦克对坦克 + AI 步兵）
+  capture_hold_all(4)  步兵族×4 + 侦察族×1 + 装甲族×2 + 航空族×1
+  assault_infantry(5)  步兵族×6 + 侦察族×1 + 伞兵族×1
+  assault_battle(6)    步兵族×7 + 侦察族×1 + 伞兵族×1 + 装甲族×2 + 航空族×1
   war(10) / quickplay(11) / default  同上两种全兵种计划
 
 对外接口：
@@ -77,6 +78,10 @@ _FAMILY_CAPS = {
 #   官方 staged 语义压到锚点量级
 MODE_PLANS = {
     'capture_hold_inf': {'infantry': 5, 'recon': 1},
+    # ★ 官方 C&H Tanks（坦克掌控，模式 3）：8v8 坦克对坦克 + AI 步兵，
+    #   无航空/侦察（1.14 更新日志）。缺此条目会回退 DEFAULT_PLAN
+    #   （全兵种含 air）→ 坦克局出现飞机等资源（2026-09-13 实锤）
+    'capture_hold_tank': {'infantry': 3, 'armor': 3},
     'capture_hold_all': {'infantry': 4, 'recon': 1, 'armor': 2, 'air': 1},
     'capture_hold_pilot': {'infantry': 3, 'air': 2},    # C&H Pilot：飞行员主力 + 步兵地面点
     'capture_hold_recon': {'infantry': 3, 'recon': 3},  # C&H Recon：侦察主力 + 步兵

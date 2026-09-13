@@ -47,7 +47,7 @@ from mm_factions import (
 )
 
 
-async def _specified_mission_join_error(req_mission_id, faction):
+async def _specified_mission_join_error(req_mission_id, faction, char_cat=0):
     """指定战局加入（JoinMM f2：好友列表"跟随进入战斗"/战争图点战斗）的
     前置校验：返回错误码（无法加入）或 None（可加入）。
 
@@ -90,6 +90,12 @@ async def _specified_mission_join_error(req_mission_id, faction):
     dfd = int(det.get('defender_faction', 0) or 0)
     if atk <= 0 or dfd <= 0 or faction not in (atk, dfd):
         return 62                       # 士兵阵营不在该局攻防两方
+    # ★ 兵种准入（官方 GamemodesMediator 矩阵，见 mm_config.MODE_CHAR_CATS）：
+    #   好友跟随不得绕过 tile 限制（坦克兵跟不进侦察局）。类别 0（未知
+    #   模板）不拦。与阵营不符同款 62（客户端清跟随态）。
+    allowed = mm_config.mode_char_cats(int(det.get('gamemode', 0) or 0))
+    if allowed and int(char_cat or 0) and int(char_cat) not in allowed:
+        return 62
     max_p = int(mm_config.gamemode_cfg(
         int(det.get('gamemode', 0) or 0)).get('max_players', 18))
     if len(det.get('players') or ()) >= max_p:
@@ -177,6 +183,9 @@ async def _handle_join(sess, writer, cmd_id, proto):
         _log(f'[DB] set_player_selected_char failed: {e}')
 
     faction = int(char_info['faction'])
+    # 士兵资源类别（1 步兵/2 飞行员/4 伞兵/5 坦克兵/6 侦察兵，未知 0）：
+    # quickplay/mapfilter 解析、指定战局校验与直排门禁全需要
+    char_cat = character_resource_category(int(char_info.get('template', 0) or 0))
 
     # ★ 快速匹配模式解析（11 按阵营 / 12 按士兵 / 14 全模式，客户端
     #   GamemodesMediator）：虚拟模式号绝不能入池——按模式分池会把它与
@@ -189,7 +198,7 @@ async def _handle_join(sess, writer, cmd_id, proto):
     _is_quickplay = (gamemode_id in mm_config.QUICKPLAY_GAMEMODES
                      and not req_mission_id and not war_flag)
     if _is_quickplay:
-        resolved = _resolve_quickplay_gamemode()
+        resolved = _resolve_quickplay_gamemode(char_cat)
         _log(f'[MM] quickplay: gamemode {gamemode_id} -> {resolved} '
              f'(merge into busiest pool / random fallback)')
         gamemode_id = resolved
@@ -203,7 +212,7 @@ async def _handle_join(sess, writer, cmd_id, proto):
     #   squad 路径与 1c 搜局）；指定战局（f2）尊重指定不解析。
     if (gamemode_id == mm_config.MAPFILTER_GAMEMODE
             and not req_mission_id):
-        resolved, keep_presets = _resolve_mapfilter_gamemode(staged_presets)
+        resolved, keep_presets = _resolve_mapfilter_gamemode(staged_presets, char_cat)
         if resolved is not None:
             _log(f'[MM] mapfilter: gamemode 13 -> {resolved} '
                  f'(presets {list(staged_presets)} -> {list(keep_presets)})')
@@ -216,7 +225,8 @@ async def _handle_join(sess, writer, cmd_id, proto):
     #   43/62 清跟随态），绝不能回 ok 后落入普通撮合——否则士兵阵营不在
     #   该局攻防两方时玩家被排进另一场新局（2026-09-08 好友跟随失效根因）。
     if req_mission_id:
-        join_err = await _specified_mission_join_error(req_mission_id, faction)
+        join_err = await _specified_mission_join_error(
+            req_mission_id, faction, char_cat)
         if join_err is not None:
             resp = build_response(cmd_id, 'JoinMatchMakingResponse',
                                   pb_int32(1, join_err))
@@ -226,6 +236,24 @@ async def _handle_join(sess, writer, cmd_id, proto):
                  f'(response={join_err}: specified mission {req_mission_id} '
                  f'not joinable, faction={faction})')
             return
+
+    # ★ 兵种准入门禁（官方 GamemodesMediator.as:572-626 矩阵镜像，见
+    #   mm_config.MODE_CHAR_CATS）：坦克掌控(3)只进坦克兵、侦查掌控(8)只进
+    #   侦察兵等。quickplay/mapfilter/指定战局路径在解析/校验时已各自执法，
+    #   此处兜底直排（玩家手动点 tile 排队）路径。指定战局（f2）时
+    #   gamemode_id 是客户端参数而非目标局实际模式，权威校验在
+    #   _specified_mission_join_error（按 det.gamemode），跳过此处。
+    #   类别 0（未知模板）不拦，与将军拦截同款拒绝（response=0）。
+    allowed = (mm_config.mode_char_cats(gamemode_id)
+               if not req_mission_id else None)
+    if allowed and char_cat and int(char_cat) not in allowed:
+        resp = build_response(cmd_id, 'JoinMatchMakingResponse', pb_int32(1, 0))
+        writer.write(resp)
+        await writer.drain()
+        _log(f'S->C cmd={cmd_id:<4} JoinMatchMakingResponse '
+             f'(rejected: char {char_id} cat {char_cat} not allowed in '
+             f'gamemode {gamemode_id} (allowed {allowed}))')
+        return
 
     resp = build_response(cmd_id, 'JoinMatchMakingResponse', pb_int32(1, 1))
     writer.write(resp)

@@ -975,6 +975,24 @@ async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
     小队 matchmaking_flag；整队 KVCS 行推给全体（跨会话）。"""
     if not members:
         return                      # 无可参战成员（如自己已 InBattle）
+    # ★ 兵种准入过滤（官方矩阵 mm_config.MODE_CHAR_CATS）：小队整队
+    #   入池时剔除兵种进不去该模式的成员（如混编队排坦克掌控局时
+    #   步兵/飞行员不随队落池），其余成员正常进池；全被剔则整队不入池。
+    #   类别 0（未知模板）不拦；不限兵种模式（矩阵无条目）不过滤。
+    _allowed = mm_config.mode_char_cats(gamemode_id)
+    if _allowed:
+        _kept = []
+        for m in members:
+            _cc = character_resource_category(int(m['template']))
+            if _cc and int(_cc) not in _allowed:
+                _log(f'      squad enqueue: filter out member '
+                     f'{m["gamertag"]} (char cat {_cc} not allowed in '
+                     f'gamemode {gamemode_id} {_allowed})')
+                continue
+            _kept.append(m)
+        members = _kept
+        if not members:
+            return
     squad_id = int(squad['id'])
     entries = []
     for m in members:
@@ -1628,6 +1646,17 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
             continue
         if faction not in (atk, dfd):
             continue
+        # ★ 兵种准入门禁（官方 GamemodesMediator.as 矩阵，见
+        #   mm_config.MODE_CHAR_CATS）：按该局自身 gamemode 判定，覆盖
+        #   quickplay 跨模式搜局（gamemode_id=None 时候选含 7/8）/普通
+        #   late join/显式指定战局全路径——步兵绝不落进坦克掌控(3)/侦查
+        #   掌控(8)局。类别 0（未知模板）不拦；war 会战局（gamemode=10
+        #   不在矩阵）不受限。
+        allowed_cats = mm_config.mode_char_cats(
+            int(det.get('gamemode', 0) or 0))
+        if (allowed_cats and int(char_cat or 0)
+                and int(char_cat) not in allowed_cats):
+            continue
         # JOIN_WINDOW 仅约束模糊 late join（按模式找局）；显式指定战局
         # 随时可加入（好友跟随/战争图点战斗，官服口径同 M2 路径）
         if (not only_mission
@@ -1657,24 +1686,33 @@ def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
     return None
 
 
-def _resolve_quickplay_gamemode():
+def _resolve_quickplay_gamemode(char_cat=0):
     """快速匹配入池模式解析（官服语义"扔进任何战局"的池侧半边）：
 
     并入等待人数最多的具体 staging 模式池（与已排队玩家凑局最快，
     并列随机），全空则从 QUICKPLAY_POOL_MODES 随机。返回值一定是
     QUICKPLAY_POOL_MODES 之一——虚拟模式号（11/12/14）到此为止，
     绝不入池（入池即与所有具体模式池隔离，谁也汇不进谁）。
+    ★ 候选先按兵种准入矩阵（mm_config.MODE_CHAR_CATS）过滤：坦克兵
+    绝不被随机/并池进步兵/坦克外的模式，步兵不落坦克掌控——与客户端
+    tile 可用性一致（官方 GamemodesMediator）。类别 0 不过滤。
     """
+    modes = []
+    for m in mm_config.QUICKPLAY_POOL_MODES:
+        allowed = mm_config.mode_char_cats(m)
+        if allowed and int(char_cat or 0) and int(char_cat) not in allowed:
+            continue
+        modes.append(m)
+    if not modes:                     # 兜底：矩阵未来收紧时不致无解
+        return random.choice(mm_config.QUICKPLAY_POOL_MODES)
     counts = POOL.waiting_counts()
-    best = max((counts.get(m, 0) for m in mm_config.QUICKPLAY_POOL_MODES),
-               default=0)
+    best = max((counts.get(m, 0) for m in modes), default=0)
     if best > 0:
-        return random.choice([m for m in mm_config.QUICKPLAY_POOL_MODES
-                              if counts.get(m, 0) == best])
-    return random.choice(mm_config.QUICKPLAY_POOL_MODES)
+        return random.choice([m for m in modes if counts.get(m, 0) == best])
+    return random.choice(modes)
 
 
-def _resolve_mapfilter_gamemode(presets):
+def _resolve_mapfilter_gamemode(presets, char_cat=0):
     """地图筛选（gamemode 13 高级筛选）入池模式解析。
 
     返回 (gamemode, presets)：解析失败回 (None, presets) 由调用方维持
@@ -1705,7 +1743,19 @@ def _resolve_mapfilter_gamemode(presets):
             cat_presets.setdefault(cat, []).append(int(p))
     if not cat_presets:
         return None, presets
-    cats = [c for c in cat_presets if c != 1] or [1]
+    # ★ 兵种准入过滤（官方矩阵 mm_config.MODE_CHAR_CATS）：勾选里的
+    #   分类若该兵种进不去（坦克兵勾 C&H 步兵图）则剔出候选；训练
+    #   (cat 1) 仅步兵可保。全部被剔 → 不解析（回 None 走 DEFAULT 兜底，
+    #   DEFAULT 不在矩阵=不限兵种，玩家仍可进局）。
+    def _class_ok(cat):
+        allowed = mm_config.mode_char_cats(cat)
+        return not (allowed and int(char_cat or 0)
+                    and int(char_cat) not in allowed)
+    cats = [c for c in cat_presets if c != 1 and _class_ok(c)]
+    if not cats and 1 in cat_presets and _class_ok(1):
+        cats = [1]
+    if not cats:
+        return None, presets
     if len(cats) == 1:
         mode = cats[0]
     else:
