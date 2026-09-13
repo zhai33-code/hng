@@ -21,8 +21,10 @@
 验证（DB 级，经 PlayerStore 直连）：
   1. send_upgrades_to_depot(weapon 容器) → weapon_modifiers.weapon_id/character_id 清 0
   2. send_upgrades_to_depot(vehicle 容器) → 升级卸下 + 皮肤复位 + 变体实例归仓
-  3. send_item_to_depot → 配件/皮肤/弹药 character_id 跟随（武器与载具）
-  4. set_inventory_item_character → 挂靠行 character_id 跟随指派
+  3. send_item_to_depot → 挂靠件全部解绑入库（2026-09-13 改造）：
+     武器配件/弹药/皮肤 weapon_id 一并清 0 + weapons.variant_id 复位；
+     载具升级/弹药/皮肤 vehicle_id 一并清 0 + vehicles.variant_id 复位
+  4. set_inventory_item_character → 挂靠件均不随行（脱离留仓，可分别发回）
   5. mark_depot_item_new/viewed 幂等往返 + 唯一索引 + list_depot_new_items
 验证（源码级，无需运行服务器）：
   6. 余额不足 response 码按货币映射（56/153/57）
@@ -121,28 +123,42 @@ async def main():
     mark('卸升级：vehicle_variants.character_id 归仓',
          vvrow['character_id'] == 0, f' vv={vvrow["character_id"]}')
 
-    print('== 3. SendItemToDepot 挂靠行跟随（配件/皮肤/弹药）==')
-    # 重建现场：武器+配件+弹药 在角色名下（配件在第 1 节已卸下，先挂回武器）
+    print('== 3. SendItemToDepot 挂靠件全部解绑入库 ==')
+    # 重建现场：武器+配件+皮肤+弹药 在角色名下（配件在第 1 节已卸下，
+    # 先挂回：新语义指派武器不带配件，须在指派后直接挂到士兵名下的武器上）
+    await st.set_inventory_item_character(pid, 'weapon', wid, cid)
     async with st.pool.acquire() as conn:
         await conn.execute('UPDATE weapon_modifiers SET weapon_id = $1, '
-                           'character_id = 0 WHERE id = $2', wid, mid)
-    await st.set_inventory_item_character(pid, 'weapon', wid, cid)
+                           'character_id = $2 WHERE id = $3', wid, cid, mid)
     wv = await st.create_weapon_variant(pid, wid, cid, 40)
     wvid = int(wv['id'])
     a = await st.create_weapon_ammo(pid, 14, cid, wid, 1, 100.0)
     aid = int(a['id'])
+    # 现场补齐 weapons.variant_id 反向引用（模拟已装备皮肤）
+    async with st.pool.acquire() as conn:
+        await conn.execute('UPDATE weapons SET variant_id = $1 WHERE id = $2',
+                           wvid, wid)
     await st.send_item_to_depot(pid, 1, wid)
     async with st.pool.acquire() as conn:
-        mrow = await conn.fetchrow('SELECT character_id FROM weapon_modifiers '
-                                   'WHERE id = $1', mid)
-        wvrow = await conn.fetchrow('SELECT character_id FROM weapon_variants '
-                                    'WHERE id = $1', wvid)
-        arow = await conn.fetchrow('SELECT character_id FROM weapon_ammo '
-                                   'WHERE id = $1', aid)
-    mark('武器退仓：配件/皮肤/弹药 character_id 跟随清 0',
-         mrow['character_id'] == 0 and wvrow['character_id'] == 0
-         and arow['character_id'] == 0,
-         f' m={mrow["character_id"]} wv={wvrow["character_id"]} a={arow["character_id"]}')
+        mrow = await conn.fetchrow('SELECT weapon_id, character_id '
+                                   'FROM weapon_modifiers WHERE id = $1', mid)
+        wvrow = await conn.fetchrow('SELECT weapon_id, character_id '
+                                    'FROM weapon_variants WHERE id = $1', wvid)
+        arow = await conn.fetchrow('SELECT weapon_id, character_id '
+                                   'FROM weapon_ammo WHERE id = $1', aid)
+        wrow = await conn.fetchrow('SELECT variant_id FROM weapons '
+                                   'WHERE id = $1', wid)
+    mark('武器退仓：配件解绑入库（weapon_id/character_id 清 0 → 独立仓库件，'
+         '可与武器分别发回）',
+         mrow['weapon_id'] == 0 and mrow['character_id'] == 0,
+         f' m=({mrow["weapon_id"]},{mrow["character_id"]})')
+    mark('武器退仓：弹药/皮肤解绑入库（weapon_id/character_id 清 0）',
+         arow['weapon_id'] == 0 and arow['character_id'] == 0
+         and wvrow['weapon_id'] == 0 and wvrow['character_id'] == 0,
+         f' a=({arow["weapon_id"]},{arow["character_id"]}) '
+         f'wv=({wvrow["weapon_id"]},{wvrow["character_id"]})')
+    mark('武器退仓：weapons.variant_id 反向引用复位（不指向已独立皮肤）',
+         wrow['variant_id'] == 0, f' variant_id={wrow["variant_id"]}')
 
     # 载具现场：载具+升级+弹药 在角色名下
     await st.set_inventory_item_character(pid, 'vehicle', vid, cid)
@@ -155,36 +171,49 @@ async def main():
                            vid, cid, upid)
     await st.send_item_to_depot(pid, 2, vid)
     async with st.pool.acquire() as conn:
-        uprow = await conn.fetchrow('SELECT character_id FROM vehicle_upgrades '
-                                    'WHERE id = $1', upid)
-        varow = await conn.fetchrow('SELECT character_id FROM vehicle_ammo '
+        uprow = await conn.fetchrow('SELECT vehicle_id, character_id '
+                                    'FROM vehicle_upgrades WHERE id = $1', upid)
+        varow = await conn.fetchrow('SELECT vehicle_id, equipped_storage_id, '
+                                    'character_id FROM vehicle_ammo '
                                     'WHERE id = $1', vaid)
-    mark('载具退仓：升级/弹药 character_id 跟随清 0',
-         uprow['character_id'] == 0 and varow['character_id'] == 0,
-         f' up={uprow["character_id"]} va={varow["character_id"]}')
+    mark('载具退仓：升级解绑入库（vehicle_id/character_id 清 0，slot 保留）',
+         uprow['vehicle_id'] == 0 and uprow['character_id'] == 0,
+         f' up=({uprow["vehicle_id"]},{uprow["character_id"]})')
+    mark('载具退仓：弹药解绑入库（vehicle_id/storage/character_id 清 0 → '
+         '独立仓库件，可与载具分别发回）',
+         varow['vehicle_id'] == 0 and varow['equipped_storage_id'] == 0
+         and varow['character_id'] == 0,
+         f' va=({varow["vehicle_id"]},{varow["equipped_storage_id"]},'
+         f'{varow["character_id"]})')
 
-    print('== 4. SetInventoryItemToCharacter 挂靠行跟随 ==')
+    print('== 4. SetInventoryItemToCharacter 挂靠件均不随行 ==')
     await st.set_inventory_item_character(pid, 'weapon', wid, cid)
     async with st.pool.acquire() as conn:
-        mrow = await conn.fetchrow('SELECT character_id FROM weapon_modifiers '
-                                   'WHERE id = $1', mid)
-        wvrow = await conn.fetchrow('SELECT character_id FROM weapon_variants '
-                                    'WHERE id = $1', wvid)
-        arow = await conn.fetchrow('SELECT character_id FROM weapon_ammo '
-                                   'WHERE id = $1', aid)
-    mark('武器指派：配件/皮肤/弹药 character_id 跟随指回角色',
-         mrow['character_id'] == cid and wvrow['character_id'] == cid
-         and arow['character_id'] == cid,
-         f' m={mrow["character_id"]} wv={wvrow["character_id"]} a={arow["character_id"]}')
+        mrow = await conn.fetchrow('SELECT weapon_id, character_id '
+                                   'FROM weapon_modifiers WHERE id = $1', mid)
+        wvrow = await conn.fetchrow('SELECT weapon_id, character_id '
+                                    'FROM weapon_variants WHERE id = $1', wvid)
+        arow = await conn.fetchrow('SELECT weapon_id, character_id '
+                                   'FROM weapon_ammo WHERE id = $1', aid)
+    mark('武器指派：配件/皮肤/弹药均不随行（入库已解绑，(weapon_id,'
+         'character_id) 保持 0 → 留仓库可与武器分别发回）',
+         mrow['weapon_id'] == 0 and mrow['character_id'] == 0
+         and wvrow['weapon_id'] == 0 and wvrow['character_id'] == 0
+         and arow['weapon_id'] == 0 and arow['character_id'] == 0,
+         f' m=({mrow["weapon_id"]},{mrow["character_id"]}) '
+         f'wv=({wvrow["weapon_id"]},{wvrow["character_id"]}) '
+         f'a=({arow["weapon_id"]},{arow["character_id"]})')
     await st.set_inventory_item_character(pid, 'vehicle', vid, cid)
     async with st.pool.acquire() as conn:
-        uprow = await conn.fetchrow('SELECT character_id FROM vehicle_upgrades '
-                                    'WHERE id = $1', upid)
-        varow = await conn.fetchrow('SELECT character_id FROM vehicle_ammo '
-                                    'WHERE id = $1', vaid)
-    mark('载具指派：升级/弹药 character_id 跟随指回角色',
-         uprow['character_id'] == cid and varow['character_id'] == cid,
-         f' up={uprow["character_id"]} va={varow["character_id"]}')
+        uprow = await conn.fetchrow('SELECT vehicle_id, character_id '
+                                    'FROM vehicle_upgrades WHERE id = $1', upid)
+        varow = await conn.fetchrow('SELECT vehicle_id, character_id '
+                                    'FROM vehicle_ammo WHERE id = $1', vaid)
+    mark('载具指派：升级/弹药均不随行（入库已解绑，留仓库可与载具分别发回）',
+         uprow['vehicle_id'] == 0 and uprow['character_id'] == 0
+         and varow['vehicle_id'] == 0 and varow['character_id'] == 0,
+         f' up=({uprow["vehicle_id"]},{uprow["character_id"]}) '
+         f'va=({varow["vehicle_id"]},{varow["character_id"]})')
 
     print('== 4b. 挂靠件单独指派角色（脱离容器，官方不变式）==')
     # 现场A：仓库枪 + 挂在枪上的配件（character_id=0, weapon_id=仓库枪）

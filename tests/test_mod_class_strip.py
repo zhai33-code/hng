@@ -1,24 +1,27 @@
 # -*- coding: utf-8 -*-
-"""2026-09-04 兵种专属配件误随武器指派修复回归测试。
+"""2026-09-04 兵种专属配件误随武器指派修复回归测试
+（2026-09-13 配件入库解绑改造后更新）。
 
 事故：侦察兵带 ZF-39 镜的 98k 入仓库，指派步兵后镜子跟着走（步兵不该
 获得侦察镜）。根因 set_inventory_item_character 无差别带走全部挂靠配件。
-修复设计：入库不拆挂靠（客户端 isModded + "卸下升级件"按钮依赖 weapon_id
-关联，同兵种往返也应保留配件）；出库指派时按目标兵种过滤——配件的
-level>0 解锁需求 uid 中无一条适用于目标角色（faction 相符或 0 且
-characterType 相符或 0，客户端 getUnlocksRequiredForItem 同口径）→
-剥离回仓库（detach_weapon_modifiers，weapon_id/character_id 清 0）。
+2026-09-13 改造：武器入库即解绑配件（weapon_modifiers.weapon_id 一并
+清 0 → 独立仓库件，可与武器分别发回士兵）；指派武器不再带走配件。
+兵种限制保留并前移到挂接时点（setweaponmodifierrequest 按
+_mod_usable_by_class 校验，不兼容拒绝挂接 response=0）；指派剥离逻辑
+保留作历史脏数据兜底。
 
 验证：
   1. _mod_usable_by_class 判定表（真实 wardb 数据：K98/M1903/FG42/StG44，
      含正向/反向/双兵种/无门槛/无映射）
   2. handle_setinventoryitemtocharacterrequest 集成（stub STORE/sess）：
-     带侦察镜 98k 指派步兵 → 侦察镜剥离回仓库且重推 WeaponModifier 行、
-     双兵种镜随行、别的武器上的配件不动；指派侦察兵 → 镜子随行不剥
+     仓库 K98 挂镜指派步兵/侦察 → 配件一律解绑留仓不随行、不触发剥离
+  2b. handle_setweaponmodifierrequest 集成（stub STORE/sess）：
+     步兵挂 ZF-39 到 K98 → 拒绝（response=0，不落库）；侦察挂 → 允许
   3. PlayerStore.detach_weapon_modifiers（DB 级：指定 id 清 0、其余不动、
      空列表/非法 id 安全、跨玩家不可卸）
-  4. 源码级：handler 剥离+重推链路、import 完整（2026-09-04 复发事故：
-     _weapon_template_id import 丢失 → NameError 被吞 → 剥离静默失效）
+  4. 源码级：指派剥离兜底链路 + 挂接兵种校验链路、import 完整
+     （2026-09-04 复发事故：_weapon_template_id import 丢失 → NameError
+     被吞 → 剥离静默失效）
 """
 import asyncio
 import inspect
@@ -73,15 +76,20 @@ class _StubStore:
         return 0
 
     async def set_inventory_item_character(self, pid, itype, iid, cid):
-        # 仿真真实现：武器上挂靠配件的 character_id 无差别跟随（事故根因）
+        # 仿真真实现（2026-09-13 改造后）：指派武器不带配件——挂靠配件
+        # weapon_id 清 0 脱离留仓（character_id 不动），可分别发回
         self.assigned = (itype, iid, cid)
-        for m in self.mods:
-            if int(m['weapon_id']) == int(iid):
-                m['character_id'] = int(cid)
+        if str(itype).strip().lower() == 'weapon':
+            for m in self.mods:
+                if int(m['weapon_id']) == int(iid):
+                    m['weapon_id'] = 0
         return True
 
     async def list_characters(self, pid):
         return [dict(c) for c in self.chars]
+
+    async def list_weapons(self, pid):
+        return []
 
     async def list_weapon_modifiers(self, pid):
         return [dict(m) for m in self.mods]
@@ -142,7 +150,7 @@ async def main():
         mark(f'({mt},{wt}) f{fa}/t{ct} → {exp}（{desc}）', got == exp,
              f' got={got}')
 
-    print('== 2. 指派 handler 剥离集成（stub STORE/sess/writer）==')
+    print('== 2. 指派 handler 集成（stub STORE/sess/writer）==')
     # 现场：仓库 K98（实例 9001，模板 43）挂 ZF-39(107) + ZF-41(106)；
     # 另一把枪 9002 挂 ZF-39(107)（不应被波及）
     wid = 9001
@@ -163,33 +171,132 @@ async def main():
     m1, m2, m3 = store.mods
     mark('指派步兵：指派成功（stub 记录 weapon→char 88）',
          store.assigned == ('weapon', wid, 88), f' assigned={store.assigned}')
-    mark('指派步兵：侦察镜 ZF-39 剥离回仓库（weapon_id/character_id 清 0）',
-         store.detached == [501] and m1['weapon_id'] == 0
-         and m1['character_id'] == 0,
-         f' detached={store.detached} m1=({m1["weapon_id"]},{m1["character_id"]})')
-    mark('指派步兵：双兵种镜 ZF-41 随行（character_id=88，weapon_id 保留）',
-         m2['character_id'] == 88 and m2['weapon_id'] == wid,
+    mark('指派步兵：侦察镜 ZF-39 解绑留仓（weapon_id 清 0 脱离，步兵拿不到）',
+         m1['weapon_id'] == 0 and m1['character_id'] == 0,
+         f' m1=({m1["weapon_id"]},{m1["character_id"]})')
+    mark('指派步兵：双兵种镜 ZF-41 同样解绑留仓（新语义一律不随行，'
+         '可与武器分别发回）',
+         m2['weapon_id'] == 0 and m2['character_id'] == 0,
          f' m2=({m2["weapon_id"]},{m2["character_id"]})')
     mark('指派步兵：其他武器上的配件不受波及',
          m3['character_id'] == 55 and m3['weapon_id'] == 9002,
          f' m3=({m3["weapon_id"]},{m3["character_id"]})')
-    mark('指派步兵：剥离行显式重推 WeaponModifier（否则 UI 仍显示挂枪上）',
-         bytes(writer.buf).count(b'WeaponModifier') == 1,
+    mark('指派步兵：无剥离触发则无 WeaponModifier 补推',
+         bytes(writer.buf).count(b'WeaponModifier') == 0,
          f' pushes={bytes(writer.buf).count(b"WeaponModifier")}')
 
-    # 反向：同枪指派侦察兵 → 镜子随行，不剥离、不重推
+    # 反向：同枪指派侦察兵 → 配件同样解绑留仓（不再随行）
     mods2 = [dict(m) for m in
              [{'id': 501, 'template_id': 107, 'weapon_id': wid,
                'character_id': 0, 'auto_repair': 0, 'condition': 1.0}]]
     store2 = _StubStore(chars, mods2)
     writer2 = await _run_assign(hc, store2, sess, 'weapon', wid, 99)
-    mark('指派侦察：ZF-39 随行不剥离（同兵种往返保留配件）',
-         store2.detached is None and mods2[0]['character_id'] == 99
-         and mods2[0]['weapon_id'] == wid,
+    mark('指派侦察：ZF-39 同样解绑留仓（不随行，需单独发回再挂接）',
+         store2.detached is None and mods2[0]['weapon_id'] == 0
+         and mods2[0]['character_id'] == 0,
          f' detached={store2.detached} m=({mods2[0]["weapon_id"]},'
          f'{mods2[0]["character_id"]})')
-    mark('指派侦察：无剥离则无 WeaponModifier 补推',
+    mark('指派侦察：无 WeaponModifier 补推',
          bytes(writer2.buf).count(b'WeaponModifier') == 0)
+
+    print('== 2b. 挂接 handler 兵种校验集成（stub STORE/sess/writer）==')
+    # 兵种限制前移到挂接时点：步兵挂 ZF-39（侦察限定）→ 拒绝；
+    # 侦察挂 ZF-39 → 允许；步兵挂 ZF-41（双兵种）→ 允许
+    import handlers.weapons as hw
+    import handlers.career as hcar
+
+    class _EquipStubStore(_StubStore):
+        def __init__(self, chars, mods):
+            super().__init__(chars, mods)
+            self.equipped = None
+
+        async def set_weapon_modifier_weapon(self, pid, mid, wid, cid=None):
+            self.equipped = (mid, wid, cid)
+            for m in self.mods:
+                if int(m['id']) == int(mid):
+                    m['weapon_id'] = int(wid)
+                    if cid is not None:
+                        m['character_id'] = int(cid)
+            return True
+
+        async def clear_weapon_modifier_category(self, pid, wid, tids, keep):
+            return 0
+
+    async def _run_equip(hwx, store, sess, mid, wid, do_equip, cid):
+        from protocol import pb_int64
+        writer = _BufWriter()
+        proto = (pb_int64(1, mid) + pb_int64(2, wid)
+                 + pb_int64(3, 1 if do_equip else 0) + pb_int64(4, cid))
+        saved_store = hwx.STORE
+        saved_push = hwx._push_player_refresh
+        saved_order = hcar.complete_order_and_push
+
+        async def _noop(*a, **k):
+            pass
+
+        hwx.STORE = store
+        hwx._push_player_refresh = _noop
+        hcar.complete_order_and_push = _noop
+        try:
+            await hwx.handle_setweaponmodifierrequest(
+                sess, writer, 62, 'SetWeaponModifierRequest', proto)
+        finally:
+            hwx.STORE = saved_store
+            hwx._push_player_refresh = saved_push
+            hcar.complete_order_and_push = saved_order
+        return writer
+
+    # 步兵（88）挂 ZF-39(107) 到 K98（9001）→ 拒绝，response=0
+    emods = [{'id': 601, 'template_id': 107, 'weapon_id': 0, 'character_id': 88,
+              'auto_repair': 0, 'condition': 1.0}]
+    estore = _EquipStubStore(chars, emods)
+    # _weapon_template_id 优先走 sess.weapons 缓存（int 键）
+    esess = _Sess(7, {9001: {'template_id': 43}})
+    wdenied = await _run_equip(hw, estore, esess, 601, 9001, True, 88)
+    denied_ok = estore.equipped is None and emods[0]['weapon_id'] == 0
+    mark('挂接校验：步兵挂 ZF-39 到 K98 → 拒绝（不落库，weapon_id 保持 0）',
+         denied_ok, f' equipped={estore.equipped} '
+         f'm=({emods[0]["weapon_id"]},{emods[0]["character_id"]})')
+
+    # 侦察（99）挂 ZF-39(107) → 允许，挂上武器
+    emods2 = [{'id': 602, 'template_id': 107, 'weapon_id': 0, 'character_id': 99,
+               'auto_repair': 0, 'condition': 1.0}]
+    estore2 = _EquipStubStore(chars, emods2)
+    wok = await _run_equip(hw, estore2, esess, 602, 9001, True, 99)
+    mark('挂接校验：侦察挂 ZF-39 到 K98 → 允许（weapon_id/character_id 落库）',
+         estore2.equipped == (602, 9001, 99) and emods2[0]['weapon_id'] == 9001
+         and emods2[0]['character_id'] == 99,
+         f' equipped={estore2.equipped}')
+
+    # 步兵（88）挂 ZF-41(106)（双兵种）→ 允许
+    emods3 = [{'id': 603, 'template_id': 106, 'weapon_id': 0, 'character_id': 88,
+               'auto_repair': 0, 'condition': 1.0}]
+    estore3 = _EquipStubStore(chars, emods3)
+    await _run_equip(hw, estore3, esess, 603, 9001, True, 88)
+    mark('挂接校验：步兵挂双兵种 ZF-41 到 K98 → 允许',
+         estore3.equipped == (603, 9001, 88) and emods3[0]['weapon_id'] == 9001,
+         f' equipped={estore3.equipped}')
+
+    # 2026-09-13 步兵买侦察镜事故收尾：武器归属步兵 88，客户端 UI 卡死
+    # 拿侦察 charId 99 发挂接 → 归属校验拒绝（按请求 charId 校验会误放行）
+    emods4 = [{'id': 604, 'template_id': 107, 'weapon_id': 0, 'character_id': 0,
+               'auto_repair': 0, 'condition': 1.0}]
+    estore4 = _EquipStubStore(chars, emods4)
+    sess88 = _Sess(7, {9001: {'template_id': 43, 'character_id': 88}})
+    await _run_equip(hw, estore4, sess88, 604, 9001, True, 99)
+    mark('挂接校验：拿侦察 charId 挂步兵武器 → 拒绝（owner 88 != char 99）',
+         estore4.equipped is None and emods4[0]['weapon_id'] == 0,
+         f' equipped={estore4.equipped} '
+         f'm=({emods4[0]["weapon_id"]},{emods4[0]["character_id"]})')
+
+    # 武器不存在 → 拒绝（防悬空 weapon_id 引用）
+    emods5 = [{'id': 605, 'template_id': 107, 'weapon_id': 0, 'character_id': 0,
+               'auto_repair': 0, 'condition': 1.0}]
+    estore5 = _EquipStubStore(chars, emods5)
+    await _run_equip(hw, estore5, esess, 605, 9999, True, 99)
+    mark('挂接校验：武器不存在 → 拒绝（不落库）',
+         estore5.equipped is None and emods5[0]['weapon_id'] == 0,
+         f' equipped={estore5.equipped}')
 
     print('== 3. PlayerStore.detach_weapon_modifiers（DB 级）==')
     import store
@@ -243,7 +350,7 @@ async def main():
 
     print('== 4. 源码级回归标记 ==')
     src = inspect.getsource(hc.handle_setinventoryitemtocharacterrequest)
-    mark('handler：指派武器时兵种兼容检查 + 剥离（_mod_usable_by_class/'
+    mark('handler：指派武器时兵种兼容检查 + 剥离兜底（_mod_usable_by_class/'
          'detach_weapon_modifiers）',
          '_mod_usable_by_class' in src and 'detach_weapon_modifiers' in src)
     mark('handler：剥离行显式重推 WeaponModifier（weapon_id 清 0 后'
@@ -255,6 +362,23 @@ async def main():
     src = inspect.getsource(store.maintenance.MaintenanceMixin)  # 拆分后驻留 maintenance 域
     mark('store：detach_weapon_modifiers 批量卸件方法存在',
          'async def detach_weapon_modifiers' in src)
+    mark('store：入库解绑（send_item_to_depot 配件 weapon_id 一并清 0）',
+         'async def send_item_to_depot' in src
+         and "SET character_id = 0, weapon_id = 0" in src)
+    mark('store：指派武器不带配件（挂靠 weapon_id 清 0 脱离）',
+         'async def set_inventory_item_character' in src
+         and 'UPDATE weapon_modifiers SET weapon_id = 0' in src)
+    import wardb as _wb
+    import handlers.weapons as hw2
+    mark('wardb：_mod_usable_by_class 驻留共享（weapons/characters 共用）',
+         hasattr(_wb, '_mod_usable_by_class')
+         and hasattr(hw2, '_mod_usable_by_class'))
+    src = inspect.getsource(hw2.handle_setweaponmodifierrequest)
+    mark('weapons handler：挂接兵种校验（不兼容拒绝 response=0）',
+         '_mod_usable_by_class' in src and 'equip_denied' in src)
+    src = inspect.getsource(hc.handle_senditemtodepotrequest)
+    mark('characters handler：入库解绑配件显式重推 WeaponModifier',
+         'attached_mods' in src and 'WeaponModifier' in src)
 
     await cleanup(st, pid)
     print('  [cleanup] u12modstrip 测试行已清理')

@@ -24,9 +24,11 @@ from wardb import (
     _REQ_UNLOCK_BY_ITEM,
     _VEHICLE_UPGRADE_MAXCOND,
     _VEHICLE_UPGRADE_SLOT,
+    _VEHICLE_AMMO_STORAGE_SLOTS,
     _VEHICLE_VARIANT_PARENT,
     _default_vehicle_ammo_for,
     _vehicle_supports_ammo,
+    vehicle_ammo_purchase_count,
     vehicle_full_condition,
     )
 
@@ -47,6 +49,42 @@ from player_service import (
     )
 
 
+async def grant_default_vehicle_ammo(pid, char_id, vehicle_id, parent_vehicle_tid,
+                                     sess=None, writer=None):
+    """新车默认弹药发放（购买载具 / 新兵初始载具 / 商店礼包发货共用）。
+
+    每个默认弹药仓按 VehicleAmmoStorage.storageSlots 发满并逐槽装填，
+    新车出厂即满弹带上膛（与"购买弹药一次发满一仓"策略一致）。
+    _default_vehicle_ammo_for 已按 (storage, ammo) 去重；同一仓多条默认
+    映射只按首条发满，多个武器槽共享同一弹药仓（如 78 号机 6 挺机枪
+    共用 storage 116）也只发 storageSlots 份。默认弹无勋带页条目，
+    不参与已拥有判定，仅为满弹带上膛。
+
+    返回 [(storageId, slot, vehicle_ammo行), ...]；传 sess/writer 且
+    soldier_view_cmd 有效时逐条 KVCS 推送（须在 Vehicle 行推送之后调用，
+    客户端按 vehicle id 关联）。DB 失败抛异常，由调用方决定记录/中断。"""
+    out = []
+    filled = set()
+    for (storage_id, ammo_template_id) in _default_vehicle_ammo_for(parent_vehicle_tid):
+        if int(storage_id) in filled:
+            continue
+        filled.add(int(storage_id))
+        for slot in range(1, _VEHICLE_AMMO_STORAGE_SLOTS.get(int(storage_id), 1) + 1):
+            va = await STORE.create_vehicle_ammo(
+                pid, ammo_template_id, vehicle_id, char_id,
+                _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
+            await STORE.set_vehicle_ammo_equipment(pid, va['id'], int(storage_id),
+                                                   slot, True)
+            out.append((int(storage_id), slot, va))
+            if sess is not None and writer is not None and sess.soldier_view_cmd is not None:
+                await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo',
+                                 _msg_vehicle_ammo(va['id'], ammo_template_id,
+                                                   vehicle_id, int(storage_id), slot,
+                                                   char_id, va['condition']))
+                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo '
+                    f'id={va["id"]}, template={ammo_template_id}, '
+                    f'storage={storage_id}, slot={slot})')
+    return out
 
 
 async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, proto):
@@ -215,9 +253,8 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
     # 2.5 购买载具自动赠送默认弹药并装备到对应弹药仓（weaponAmmoMapping.defaultAmmo=true；
     #     客户端 VehicleUpgradeUtilities.updateVehicleAmmoObject 用
     #     equippedVehicleAmmoStorageId != 0 判定已装备，slotNumber 从 1 开始）。
-    #     同一 storage 的多个默认弹药顺延装备到后续槽位（storageSlots=1 或 3）。
+    #     默认弹按弹药仓槽数发满，新车出厂即满配。
     parent_vv = _VEHICLE_VARIANT_PARENT.get(int(vv_template_id))
-    vv_storage_slots = {}
     if parent_vv is not None:
         try:
             for v in await STORE.list_vehicles(pid):
@@ -226,34 +263,13 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
                     break
         except Exception as e:
             log(f'[DB] reload vehicle char failed: {e}')
-        for (storage_id, ammo_template_id) in _default_vehicle_ammo_for(parent_vv):
-            slot_ammo = vv_storage_slots.get(storage_id, 1)
-            vv_storage_slots[storage_id] = slot_ammo + 1
-            va_id = None
-            try:
-                va = await STORE.create_vehicle_ammo(pid, ammo_template_id, vid,
-                                                     vv_char_id,
-                                                     _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
-                va_id = va['id']
-            except Exception as e:
-                log(f'[DB] create_vehicle_ammo failed: {e}')
-            if va_id is None:
-                va_id = getattr(sess, '_fallback_vehicle_ammo_id', 599) + 1
-                sess._fallback_vehicle_ammo_id = va_id
-            # 装备到弹药仓槽位（equipped_storage_id + slot_index，互斥由 STORE 处理）
-            try:
-                await STORE.set_vehicle_ammo_equipment(pid, va_id, storage_id,
-                                                       slot_ammo, True)
-            except Exception as e:
-                log(f'[DB] equip default vehicle ammo failed: {e}')
-            if sess.soldier_view_cmd is not None:
-                aproto = _msg_vehicle_ammo(va_id, ammo_template_id, vid, storage_id,
-                                           slot_ammo, vv_char_id,
-                                           _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
-                await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo', aproto)
-                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo '
-                    f'id={va_id}, template={ammo_template_id}, storage={storage_id}, '
-                    f'slot={slot_ammo})')
+        # 默认弹按弹药仓槽数发满并逐槽装填（公共发放函数与建号/礼包
+        # 发货共用，策略与细节见 grant_default_vehicle_ammo docstring）
+        try:
+            await grant_default_vehicle_ammo(pid, vv_char_id, vid, parent_vv,
+                                             sess, writer)
+        except Exception as e:
+            log(f'[DB] grant default vehicle ammo failed: {e}')
 
     # 3. 推送 player 刷新货币显示
     if sess.playerview_cmd is not None:
@@ -397,6 +413,7 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
     # weaponAmmoMapping 推导；客户端 canVehicleSupportAmmunition 同链路）
     va_char_id = 0
     va_ok = False
+    parent_tpl = 0
     pid = await sess.ensure_player()
     if pid is not None:
         try:
@@ -405,6 +422,8 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
                     va_char_id = v['character_id']
                     parent = _VEHICLE_VARIANT_PARENT.get(int(v['vehicle_variant_template_id']))
                     va_ok = parent is not None and _vehicle_supports_ammo(parent, va_template_id)
+                    if va_ok:
+                        parent_tpl = parent
                     break
         except Exception as e:
             log(f'[DB] vehicle ammo ownership check failed: {e}')
@@ -427,38 +446,46 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
         log(f'S->C cmd={cmd_id:<4} CreateVehicleAmmoResponse (response=56 not_enough) cost={cost}')
         return
 
-    # 持久化载具弹药实例（condition = 模板满耐久；失败时用内存计数器兜底）
+    # 持久化载具弹药实例（condition = 模板满耐久；失败时用内存计数器兜底）。
+    # 一次购买按弹药仓槽数发满实例：客户端勋带页判定"已拥有"的条件是
+    # 该载具上此弹药实例数 >= storageSlots（ProgressionOverviewWindowMediator
+    # eWeaponAmmoMapping 载具分支），只发 1 份时多槽弹药仓（如 storage 2 的
+    # 3 槽）永远显示可购买；发满即"买一次就显示已拥有"（只扣一次款）。
     maxcond = _AMMO_MAXCOND.get(int(va_template_id), 100.0)
+    buy_count = vehicle_ammo_purchase_count(parent_tpl, va_template_id) if parent_tpl else 1
     pid2 = await sess.ensure_player()
-    if pid2 is not None:
-        try:
-            a = await STORE.create_vehicle_ammo(pid2, va_template_id, va_vehicle_id,
-                                                va_char_id, maxcond)
-            va_id = a['id']
-        except Exception as e:
-            log(f'[DB] create_vehicle_ammo failed: {e}')
-            va_id = None
-    else:
+    va_ids = []
+    for _i in range(buy_count):
         va_id = None
-    if va_id is None:
-        va_id = getattr(sess, '_fallback_vehicle_ammo_id', 599) + 1
-        sess._fallback_vehicle_ammo_id = va_id
+        if pid2 is not None:
+            try:
+                a = await STORE.create_vehicle_ammo(pid2, va_template_id, va_vehicle_id,
+                                                    va_char_id, maxcond)
+                va_id = a['id']
+            except Exception as e:
+                log(f'[DB] create_vehicle_ammo failed: {e}')
+        if va_id is None:
+            va_id = getattr(sess, '_fallback_vehicle_ammo_id', 599) + 1
+            sess._fallback_vehicle_ammo_id = va_id
+        va_ids.append(va_id)
 
     # 1. 返回 CreateVehicleAmmoResponse (response=1 ok)，客户端显示购买成功
     resp_proto = pb_int32(1, 1)
     resp = build_response(cmd_id, 'CreateVehicleAmmoResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} CreateVehicleAmmoResponse (response=1 ok, ammoId={va_id})')
+    log(f'S->C cmd={cmd_id:<4} CreateVehicleAmmoResponse (response=1 ok, '
+        f'ammoIds={va_ids}, count={buy_count})')
 
-    # 2. 通过 SOLDIER_VIEW 推送 VehicleAmmo 数据（客户端 VehicleAmmoTable 识别已购买，
-    #    VehicleModificationMediator 显示可装填弹药）
+    # 2. 通过 SOLDIER_VIEW 推送全部 VehicleAmmo 实例（客户端 VehicleAmmoTable
+    #    识别已购买并触发勋带页刷新，VehicleModificationMediator 显示可装填弹药）
     if sess.soldier_view_cmd is not None:
-        aproto = _msg_vehicle_ammo(va_id, va_template_id, va_vehicle_id, 0, 0,
-                                   va_char_id, maxcond)
-        await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo', aproto)
-        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo id={va_id}, '
-            f'template={va_template_id}, vehicle={va_vehicle_id}, condition={maxcond})')
+        for va_id in va_ids:
+            aproto = _msg_vehicle_ammo(va_id, va_template_id, va_vehicle_id, 0, 0,
+                                       va_char_id, maxcond)
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo', aproto)
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo id={va_id}, '
+                f'template={va_template_id}, vehicle={va_vehicle_id}, condition={maxcond})')
 
     # 3. 推送 player 刷新货币显示
     if sess.playerview_cmd is not None:

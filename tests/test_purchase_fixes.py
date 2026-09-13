@@ -142,6 +142,17 @@ def test_starting_sight_purchase_waiver():
             self.created.append((tpl, cid, wid))
             return {'id': 999, 'condition': 1.0}
 
+        async def clear_weapon_modifier_category(self, pid, wid, tpls, keep):
+            # 购买同槽互斥卸下（2026-09-13 买新镜子老镜子不卸下事故）
+            n = 0
+            for m in self.mods:
+                if (int(m.get('weapon_id') or 0) == int(wid)
+                        and int(m.get('id') or 0) != int(keep)
+                        and int(m.get('template_id') or 0) in set(tpls)):
+                    m['weapon_id'] = 0
+                    n += 1
+            return n
+
     class _Writer:
         def __init__(self):
             self.buf = b''
@@ -180,11 +191,17 @@ def test_starting_sight_purchase_waiver():
         return _response_value(w.buf), store.created
 
     # 打桩：mapping/等级要求受控（不依赖 WarDatabase），其余外呼全部短路
-    saved = (hw.STORE, hw._weapon_template_id, hw._charge_player,
-             hw._repush_character_unlocks, hw._MOD_MAPPING_IDS, hw._MOD_REQ_LEVEL)
+    saved = (hw.STORE, hw._weapon_template_id, hw._weapon_owner_id,
+             hw._charge_player, hw._repush_character_unlocks,
+             hw._MOD_MAPPING_IDS, hw._MOD_REQ_LEVEL)
 
     async def _wtpl(sess, wid):
         return 43                              # K98
+
+    _owner_box = {'owner': 12}                 # 武器实例归属（默认 char 12 自己）
+
+    async def _wowner(sess, wid):
+        return _owner_box['owner'] if wid else 0
 
     async def _charge(sess, pricing_id, currency):
         return 0, True
@@ -196,6 +213,7 @@ def test_starting_sight_purchase_waiver():
     rifle = {'id': 12, 'faction': 1, 'template': 1}   # 美军步兵（对照）
     hw.STORE = None    # 占位，循环内逐用例替换
     hw._weapon_template_id = _wtpl
+    hw._weapon_owner_id = _wowner
     hw._charge_player = _charge
     hw._repush_character_unlocks = _noop_republish
     hw._MOD_MAPPING_IDS = {(107, 43): 295, (108, 43): 296}
@@ -216,19 +234,68 @@ def test_starting_sight_purchase_waiver():
               val == 0 and not created,
               f'response={val} created={created}')
         # 4.3 豁免仅限起始兵种：美军步兵买 107 不豁免 → 拒绝
+        #     （2026-09-13 起先行被兵种校验拦截，结论不变）
         st = _Store(rifle, [])
         val, created = asyncio.run(_run(st, 107))
         check('美军步兵买 ZF-39 不豁免 response=0',
               val == 0 and not created, f'response={val}')
         # 4.4 原行为回归：已拥有同款实例时重复购买放行（不因本次改动破坏）
-        st = _Store(recon, [{'character_id': 12, 'weapon_id': 192,
+        st = _Store(recon, [{'id': 77, 'character_id': 12, 'weapon_id': 192,
                              'template_id': 108}])
         val, created = asyncio.run(_run(st, 108))
         check('已拥有 108 重复购买仍放行 response=1', val == 1, f'response={val}')
+        # 4.5 归属校验（2026-09-13 步兵买侦察镜事故）：武器实例属于别人
+        #     （如步兵 88 的 98k）时，即便 charId 是有豁免的侦察兵也拒绝
+        _owner_box['owner'] = 88
+        st = _Store(recon, [])
+        val, created = asyncio.run(_run(st, 107))
+        check('侦察 charId 配步兵武器实例买 ZF-39 拒绝 response=0',
+              val == 0 and not created,
+              f'response={val} created={created}')
+        _owner_box['owner'] = 12
+        # 4.6 weaponId=0（无挂靠目标的购买请求）拒绝
+        st = _Store(recon, [])
+        val, created = asyncio.run(_run(st, 107, weapon_id=0))
+        check('weaponId=0 购买配件拒绝 response=0',
+              val == 0 and not created,
+              f'response={val} created={created}')
+        # 4.7 购买同槽互斥（2026-09-13 买新镜子老镜子不卸下事故）：购买是
+        #     "创建即挂接"，不经过 SetWeaponModifier——K98 已装 ZF-41(106)
+        #     再买 ZF-39(107)（同为 Sight 槽 4），老镜子必须被卸下
+        #     （weapon_id 清 0），不能同武器同槽位双装
+        st = _Store(recon, [{'id': 55, 'character_id': 12, 'weapon_id': 192,
+                             'template_id': 106}])
+        val, created = asyncio.run(_run(st, 107))
+        check('买新镜子(107)卸下老镜子(106)：response=1 且旧配件 weapon_id=0',
+              val == 1 and created == [(107, 12, 192)]
+              and st.mods[0]['weapon_id'] == 0,
+              f'response={val} created={created} '
+              f'old_weapon_id={st.mods[0]["weapon_id"]}')
+        # 4.8 不同槽位不互斥：老镜子(Sight 槽 4) + 新配件(槽 9)同武器共存
+        #     （打桩槽位表，确保与真实 WarDatabase 解耦）
+        saved_cat = (hw._MOD_CATEGORY_BY_TEMPLATE, hw._MOD_CATEGORY_SLOT,
+                     hw._mod_usable_by_class)
+        hw._MOD_CATEGORY_BY_TEMPLATE = {106: 4, 107: 4, 200: 9}
+        hw._MOD_CATEGORY_SLOT = {4: 4, 9: 9}
+        hw._MOD_MAPPING_IDS[(200, 43)] = 297
+        hw._MOD_REQ_LEVEL[297] = (31, 0)
+        hw._mod_usable_by_class = lambda tpl, wt, f, t: True
+        try:
+            st = _Store(recon, [{'id': 56, 'character_id': 12, 'weapon_id': 192,
+                                 'template_id': 106}])
+            val, created = asyncio.run(_run(st, 200))
+            check('不同槽位不互斥(200/槽9)：response=1 且老镜子仍装备',
+                  val == 1 and st.mods[0]['weapon_id'] == 192,
+                  f'response={val} mirror_weapon_id={st.mods[0]["weapon_id"]}')
+        finally:
+            (hw._MOD_CATEGORY_BY_TEMPLATE, hw._MOD_CATEGORY_SLOT,
+             hw._mod_usable_by_class) = saved_cat
+            del hw._MOD_MAPPING_IDS[(200, 43)]
+            del hw._MOD_REQ_LEVEL[297]
     finally:
-        (hw.STORE, hw._weapon_template_id, hw._charge_player,
-         hw._repush_character_unlocks, hw._MOD_MAPPING_IDS,
-         hw._MOD_REQ_LEVEL) = saved
+        (hw.STORE, hw._weapon_template_id, hw._weapon_owner_id,
+         hw._charge_player, hw._repush_character_unlocks,
+         hw._MOD_MAPPING_IDS, hw._MOD_REQ_LEVEL) = saved
 
 
 def main():

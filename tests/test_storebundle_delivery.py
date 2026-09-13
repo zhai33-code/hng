@@ -25,6 +25,8 @@ os.environ.setdefault('HNG_GAME_DIR', r'd:\HnG-test')
 import wardb                                          # noqa: E402
 import player_service                                 # noqa: E402
 from handlers import shop as shop_handlers             # noqa: E402
+from handlers import vehicles_purchase as vp_handlers  # noqa: E402
+from handlers import weapons_purchase as wp_handlers   # noqa: E402
 
 PASS = FAIL = 0
 
@@ -253,15 +255,23 @@ class _FakeStore:
 
 
 def _with_fakes(store):
-    """把 FakeStore 同时挂到 shop 与 player_service（发货/扣款/解锁位图）。"""
+    """把 FakeStore 挂到所有发货路径模块的 STORE（shop/player_service/
+    vehicles_purchase/weapons_purchase——后两者的公共发放函数
+    grant_default_vehicle_ammo/grant_weapon_ammo 用各自模块级 STORE）。"""
     old_shop = shop_handlers.STORE
     old_ps = player_service.STORE
+    old_vp = vp_handlers.STORE
+    old_wp = wp_handlers.STORE
     shop_handlers.STORE = store
     player_service.STORE = store
+    vp_handlers.STORE = store
+    wp_handlers.STORE = store
 
     def restore():
         shop_handlers.STORE = old_shop
         player_service.STORE = old_ps
+        vp_handlers.STORE = old_vp
+        wp_handlers.STORE = old_wp
     return restore
 
 
@@ -287,7 +297,9 @@ def _count(root, tag, nested=False):
 
 
 def _vehicle_ammo_matches(st, detail=False):
-    """每个已创建载具的弹药行数 == 父模板默认弹药映射数（0 允许）。"""
+    """每个已创建载具的弹药行数 == 默认弹药仓槽数总和（0 允许）。
+    发放函数 grant_default_vehicle_ammo 每仓按 VehicleAmmoStorage.
+    storageSlots 发满，同一仓多条默认映射只发一份。"""
     ammo_by_vid = {}
     for a in st.vehicle_ammo:
         ammo_by_vid[a['vehicle_id']] = ammo_by_vid.get(a['vehicle_id'], 0) + 1
@@ -296,7 +308,9 @@ def _vehicle_ammo_matches(st, detail=False):
     for v in st.vehicles:
         parent = wardb._VEHICLE_VARIANT_PARENT.get(
             int(v['vehicle_variant_template_id']))
-        expect = len(wardb._default_vehicle_ammo_for(parent)) \
+        expect = sum(wardb._VEHICLE_AMMO_STORAGE_SLOTS.get(int(s), 1)
+                     for s in {sid for (sid, _at)
+                               in wardb._default_vehicle_ammo_for(parent)}) \
             if parent is not None else 0
         got = ammo_by_vid.get(v['id'], 0)
         rows.append((v['id'], v['vehicle_variant_template_id'], expect, got))
@@ -750,6 +764,8 @@ def test_handler_purchase_flow():
         st2.spend_ok = False
         shop_handlers.STORE = st2
         player_service.STORE = st2
+        vp_handlers.STORE = st2
+        wp_handlers.STORE = st2
         proto2 = (_varint(1, bid) + _varint(2, price_id) + _varint(3, 0)
                   + _varint(4, 55) + _varint(5, 1))
         sess2, writer2 = _MockSess(), _MockWriter()

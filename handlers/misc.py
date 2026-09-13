@@ -24,9 +24,12 @@ from state import (
     log,
     )
 
+from wardb import _mod_usable_by_class
+
 from messages import (
     _msg_vehicle,
     _msg_weapon,
+    _msg_weapon_modifier,
     _push_kvcs,
     _push_kvcs_delete,
     )
@@ -82,6 +85,39 @@ async def handle_set_equipmentselection(sess, writer, cmd_id, req_type, proto):
                 else:
                     sess.weapons[int(wa['id'])] = dict(wa)
 
+    # 兵种不兼容配件剥离（2026-09-13 步兵买侦察镜事故收尾：装备路径与
+    # 指派路径 SetInventoryItemToCharacter 同口径兜底——武器装进角色槽位
+    # 时挂靠配件按目标兵种过滤，不兼容的剥离回仓库独立存放，防止历史
+    # 脏数据/伪造请求让侦察镜随武器容器落到步兵手里）
+    stripped_mods = []
+    if pid is not None and int(equip_slot) > 0 and affected:
+        try:
+            wrow = next((a for a in affected if int(a['id']) == int(equip_id)), None)
+            faction = template = 0
+            for ch in await STORE.list_characters(pid):
+                if int(ch['id']) == int(eq_char_id):
+                    faction, template = int(ch['faction']), int(ch['template'])
+                    break
+            if wrow is not None and faction:
+                wtemplate = int(wrow['template_id'])
+                for m in await STORE.list_weapon_modifiers(pid):
+                    if int(m['weapon_id']) != int(equip_id):
+                        continue
+                    if not _mod_usable_by_class(m['template_id'], wtemplate,
+                                                faction, template):
+                        stripped_mods.append(m)
+        except Exception as e:
+            log(f'[DB] equip mod class-compat check failed: {e}')
+        if stripped_mods:
+            try:
+                await STORE.detach_weapon_modifiers(
+                    pid, [m['id'] for m in stripped_mods])
+                log(f'      stripped {len(stripped_mods)} class-incompatible '
+                    f'mod(s) from weapon {equip_id} on equip -> depot')
+            except Exception as e:
+                log(f'[DB] detach_weapon_modifiers failed: {e}')
+                stripped_mods = []
+
     # 返回 msg=1 (ok)
     resp_proto = pb_int32(1, 1)
     resp = build_response(cmd_id, 'set_equipmentselection_response', resp_proto)
@@ -103,6 +139,16 @@ async def handle_set_equipmentselection(sess, writer, cmd_id, req_type, proto):
             await _push_kvcs(writer, sess.soldier_view_cmd, b'weapon', wproto)
             log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
                 f'(weapon id={wa["id"]} slot={wa["container_slot"]})')
+        # 剥离回仓库的配件行（weapon_id 已清 0）显式重推，
+        # 否则客户端仍显示挂在武器上（与指派路径同处理）
+        for m in stripped_mods:
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponModifier',
+                             _msg_weapon_modifier(m['id'], m['template_id'],
+                                                  0, 0,
+                                                  m.get('auto_repair', 0),
+                                                  m.get('condition', 1.0)))
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                f'(WeaponModifier id={m["id"]} stripped, weaponId=0)')
 
     # 生涯军令 18 eEquipSMG / 28 eEquipAntiTankWeapon（装备类别状态推导）
     # + 推行实时刷新

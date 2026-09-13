@@ -37,7 +37,6 @@ from wardb import (
     _RIBBON_UPGRADES,
     _VEHICLE_VARIANT_PARENT,
     _default_ammo_for,
-    _default_vehicle_ammo_for,
     _parse_wardb_table,
     _rank_from_combat_xp,
     default_uniform_variant,
@@ -71,6 +70,9 @@ from handlers.economy import (
     push_booster_rows,
     push_membership_rows,
     )
+
+from handlers.vehicles_purchase import grant_default_vehicle_ammo
+from handlers.weapons_purchase import grant_weapon_ammo
 
 
 # ===== StoreBundle 发货数据（模块加载时从 WarDatabase 构建一次）=====
@@ -164,27 +166,22 @@ async def _bundle_deliver_weapon(sess, writer, pid, char_id, wvt_id, nested, equ
         w['container_slot'] = 1
 
     # 弹药：嵌套 mapping id 优先，否则按基础模板默认弹药
+    # （公共发放函数与购买武器/建号共用：首条装备槽 1，其余持有）
     ammo_rows = []
     nested_ammo = [int(c.get('id', 0) or 0) for c in nested
                    if c.tag.lower() == 'weaponammomapping']
     if nested_ammo:
-        for i, mid in enumerate(nested_ammo):
+        mappings = []
+        for mid in nested_ammo:
             at = _AMMO_TPL_BY_MAPPING.get(mid)
             if at is None:
                 log(f'      [bundle] ammo mapping {mid} unknown, skipped')
                 continue
-            slot = 1 if i == 0 else 0
-            a = await STORE.create_weapon_ammo(
-                pid, at, char_id, wid, slot,
-                _AMMO_MAXCOND.get(int(at), 100.0))
-            ammo_rows.append(a)
+            mappings.append((mid, at))
+        ammo_rows = await grant_weapon_ammo(pid, char_id, wid, mappings)
     else:
-        for i, (_mid, at) in enumerate(_default_ammo_for(wt)):
-            slot = 1 if i == 0 else 0
-            a = await STORE.create_weapon_ammo(
-                pid, at, char_id, wid, slot,
-                _AMMO_MAXCOND.get(int(at), 100.0))
-            ammo_rows.append(a)
+        ammo_rows = await grant_weapon_ammo(pid, char_id, wid,
+                                            _default_ammo_for(wt))
 
     # 配件：嵌套 WeaponModMapping
     mod_rows = []
@@ -209,7 +206,7 @@ async def _bundle_deliver_weapon(sess, writer, pid, char_id, wvt_id, nested, equ
                              w.get('clip_count', 0), w.get('auto_repair', 0),
                              w.get('condition', 1.0))
         await _push_kvcs(writer, sess.soldier_view_cmd, b'weapon', wproto)
-        for a in ammo_rows:
+        for (_mid, a) in ammo_rows:
             await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponAmmo',
                              _msg_weapon_ammo(a['id'], a['ammo_template_id'],
                                               a['character_id'], a['weapon_id'],
@@ -237,15 +234,9 @@ async def _bundle_deliver_vehicle(sess, writer, pid, char_id, vvt_id, equip_slot
     ammo_rows = []
     parent_vv = _VEHICLE_VARIANT_PARENT.get(int(vvt_id))
     if parent_vv is not None:
-        storage_slots = {}
-        for (storage_id, at) in _default_vehicle_ammo_for(parent_vv):
-            slot_ammo = storage_slots.get(storage_id, 1)
-            storage_slots[storage_id] = slot_ammo + 1
-            va = await STORE.create_vehicle_ammo(
-                pid, at, vid, char_id, _AMMO_MAXCOND.get(int(at), 100.0))
-            await STORE.set_vehicle_ammo_equipment(pid, va['id'], storage_id,
-                                                   slot_ammo, True)
-            ammo_rows.append((storage_id, slot_ammo, va))
+        # 与买车/建号共用的发放函数：每仓按 storageSlots 发满装填；
+        # KVCS 由本函数统一推（须先推 Vehicle 行再弹药行）
+        ammo_rows = await grant_default_vehicle_ammo(pid, char_id, vid, parent_vv)
     if sess.soldier_view_cmd is not None:
         await _push_kvcs(writer, sess.soldier_view_cmd, b'Vehicle',
                          _msg_vehicle(vid, int(vvt_id), char_id,

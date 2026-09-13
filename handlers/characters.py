@@ -24,11 +24,8 @@ from state import (
     )
 
 from wardb import (
-    _E_WEAPON_MOD_MAPPING,
-    _MOD_MAPPING_IDS,
-    _REQ_UNLOCK_BY_ITEM,
-    _UNLOCK_UID_META,
     _WEAPON_RIBBONS,
+    _mod_usable_by_class,
     _rank_from_combat_xp,
     daily_bonus_template_for,
     )
@@ -607,22 +604,6 @@ async def _repush_item_row(sess, writer, pid, item_type, item_id):
         log(f'[DB] repush item row failed: {e}')
 
 
-def _mod_usable_by_class(mod_template_id, weapon_template_id, faction, char_template):
-    """配件是否可供该阵营/兵种使用：WeaponModMapping 的 level>0 解锁需求
-    uid 中存在适用于该角色的一条（faction 相符或 0，且 characterType 相符
-    或 0）。无映射/无需求（即买即用）恒可用——兵种门槛只来自 uid 元数据
-    （如 K98 的 ZF-39 仅 uid(0,6) 侦察、ZF-41 有 (0,6)+(0,1) 双兵种）。"""
-    mid = _MOD_MAPPING_IDS.get((int(mod_template_id), int(weapon_template_id)))
-    reqs = _REQ_UNLOCK_BY_ITEM.get((mid, _E_WEAPON_MOD_MAPPING)) if mid else None
-    if not reqs:
-        return True
-    for uid in reqs:
-        ft, ct = _UNLOCK_UID_META.get(int(uid), (0, 0))
-        if (not ft or ft == int(faction)) and (not ct or ct == int(char_template)):
-            return True
-    return False
-
-
 async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_type, proto):
     # 装备/仓库物品指派到角色（仓库物品栏拖拽）
     # SetInventoryItemToCharacterRequest { string itemType=1; int64 itemId=2; int64 characterId=3; }
@@ -661,12 +642,12 @@ async def handle_setinventoryitemtocharacterrequest(sess, writer, cmd_id, req_ty
         except Exception as e:
             log(f'[DB] set_inventory_item_character failed: {e}')
 
-    # 兵种专属配件剥离（2026-09-04 98k 事故：侦察带镜武器入库再指派步兵，
-    # set_inventory_item_character 无差别带走全部挂靠配件 → 步兵拿到侦察
-    # 专属瞄具）。入库不拆挂靠（客户端 isModded + "卸下升级件"按钮依赖
-    # weapon_id 关联，同兵种往返也应保留配件），在出库指派时按目标兵种
-    # 过滤：不兼容配件剥离回仓库（weapon_id/character_id 清 0，单件版
-    # SendUpgradesToDepot）。无映射/无需求（即买即用）配件不限制，随武器走。
+    # 兵种专属配件剥离兜底（2026-09-04 98k 事故：侦察带镜武器入库再指派
+    # 步兵，配件被无差别带走 → 步兵拿到侦察专属瞄具）。2026-09-13 入库
+    # 解绑改造后正常流程指派时武器已无挂靠配件（store 层兜底清挂靠），
+    # 此段仅防御历史脏数据/异常写入：仍挂在目标武器上的配件按目标兵种
+    # 过滤，不兼容的剥离回仓库（weapon_id/character_id 清 0，单件版
+    # SendUpgradesToDepot）。无映射/无需求（即买即用）配件不限制。
     stripped_mods = []
     if updated and pid is not None and si_char_id and _si_tid == 1:
         try:
@@ -800,6 +781,39 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
                 f'not_enough) cost={cost}')
             return
 
+    # 入库前捕获武器/载具全部挂靠件（入库即解绑为独立仓库件，2026-09-13
+    # 改造；解绑后 weapon_id/vehicle_id 清 0 无法反查归属，需先查后改）
+    attached_mods = []    # 武器配件
+    attached_wammo = []   # 武器弹药
+    attached_wvar = []    # 武器皮肤
+    attached_vupg = []    # 载具升级
+    attached_ammo = []    # 载具弹药
+    attached_vvar = []    # 载具皮肤
+    if pid is not None and sd_object_id and cur_char:
+        try:
+            if int(sd_item_type) == 1:
+                for m in await STORE.list_weapon_modifiers(pid):
+                    if int(m['weapon_id']) == int(sd_object_id):
+                        attached_mods.append(m)
+                for a in await STORE.list_weapon_ammo(pid):
+                    if int(a['weapon_id']) == int(sd_object_id):
+                        attached_wammo.append(a)
+                for vv in await STORE.list_weapon_variants(pid):
+                    if int(vv['weapon_id']) == int(sd_object_id):
+                        attached_wvar.append(vv)
+            elif int(sd_item_type) == 2:
+                for u in await STORE.list_vehicle_upgrades(pid):
+                    if int(u['vehicle_id']) == int(sd_object_id):
+                        attached_vupg.append(u)
+                for a in await STORE.list_vehicle_ammo(pid):
+                    if int(a['vehicle_id']) == int(sd_object_id):
+                        attached_ammo.append(a)
+                for vv in await STORE.list_vehicle_variants(pid):
+                    if int(vv['vehicle_id']) == int(sd_object_id):
+                        attached_vvar.append(vv)
+        except Exception as e:
+            log(f'[DB] list attached rows failed: {e}')
+
     updated = False
     if pid is not None and sd_object_id:
         try:
@@ -826,6 +840,75 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
     if updated:
         await _repush_item_row(sess, writer, pid, int(sd_item_type),
                                sd_object_id)
+        # 解绑配件行显式重推（weapon_id 已清 0，_repush_weapon_rows 按
+        # weapon_id 过滤不会带上 → 不推则客户端仍显示挂在枪上 isModded）
+        if attached_mods and sess.soldier_view_cmd is not None:
+            for m in attached_mods:
+                await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponModifier',
+                                 _msg_weapon_modifier(m['id'], m['template_id'],
+                                                      0, 0,
+                                                      m.get('auto_repair', 0),
+                                                      m.get('condition', 1.0)))
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                f'(WeaponModifier x{len(attached_mods)} detached to depot '
+                f'with weapon {sd_object_id})')
+        # 解绑弹药行显式重推（weapon_id 已清 0，_repush_weapon_rows 按
+        # weapon_id 过滤不会带上 → 不推则客户端弹药仍挂在武器名下）
+        if attached_wammo and sess.soldier_view_cmd is not None:
+            for a in attached_wammo:
+                await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponAmmo',
+                                 _msg_weapon_ammo(a['id'], a['ammo_template_id'],
+                                                  0, 0, a['slot_index'],
+                                                  a.get('condition', 100.0),
+                                                  a.get('auto_repair', 0)))
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                f'(WeaponAmmo x{len(attached_wammo)} detached to depot '
+                f'with weapon {sd_object_id})')
+        # 解绑皮肤行显式重推（weapon_id 已清 0 → 独立仓库皮肤；
+        # 武器行 variant_id 复位随 _repush_item_row 的武器行推送覆盖）
+        if attached_wvar and sess.soldier_view_cmd is not None:
+            for vv in attached_wvar:
+                await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponVariant',
+                                 _msg_weapon_variant(vv['id'], 0, 0,
+                                                     vv['weapon_variant_template_id']))
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                f'(WeaponVariant x{len(attached_wvar)} detached to depot '
+                f'with weapon {sd_object_id})')
+        # 解绑升级行显式重推（vehicle_id 已清 0，_repush_vehicle_row 按
+        # vehicle_id 过滤不会带上 → 不推则客户端仍显示 hasUpgradeEquipped）
+        if attached_vupg and sess.soldier_view_cmd is not None:
+            for u in attached_vupg:
+                await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleUpgrade',
+                                 _msg_vehicle_upgrade(u['id'],
+                                                      u['upgrade_template_id'], 0,
+                                                      u['equipped_slot_id'], 0,
+                                                      u.get('condition', 100.0),
+                                                      u.get('auto_repair', 0)))
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                f'(VehicleUpgrade x{len(attached_vupg)} detached to depot '
+                f'with vehicle {sd_object_id})')
+        # 解绑弹药行显式重推（vehicle_id 已清 0，_repush_vehicle_row 按
+        # vehicle_id 过滤不会带上 → 不推则客户端弹药仍挂在载具名下）
+        if attached_ammo and sess.soldier_view_cmd is not None:
+            for a in attached_ammo:
+                await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo',
+                                 _msg_vehicle_ammo(a['id'], a['ammo_template_id'],
+                                                   0, 0, a['slot_index'], 0,
+                                                   a.get('condition', 100.0),
+                                                   a.get('auto_repair', 0)))
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                f'(VehicleAmmo x{len(attached_ammo)} detached to depot '
+                f'with vehicle {sd_object_id})')
+        # 解绑皮肤行显式重推（vehicle_id 已清 0 → 独立仓库皮肤；
+        # 载具行 variant_id 复位随 _repush_item_row 的载具行推送覆盖）
+        if attached_vvar and sess.soldier_view_cmd is not None:
+            for vv in attached_vvar:
+                await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleVariant',
+                                 _msg_vehicle_variant(vv['id'], 0, 0,
+                                                      vv['vehicle_variant_template_id']))
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                f'(VehicleVariant x{len(attached_vvar)} detached to depot '
+                f'with vehicle {sd_object_id})')
         # 重推原角色 KVCS：unlockBits 随归属变化（武器/弹药/配件/载具 uid
         # 移除；此前只覆盖 1/5/6，制服与载具件退仓后原角色本会话解锁状态
         # 不刷新）

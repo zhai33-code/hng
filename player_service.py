@@ -36,6 +36,7 @@ from wardb import (
     _UNLOCK_BY_ITEM,
     _UNLOCK_UID_META,
     _VEHICLE_VARIANT_PARENT,
+    _VEHICLE_AMMO_STORAGE_SLOTS,
     _default_ammo_for,
     _default_vehicle_ammo_for,
     _prog_max,
@@ -319,6 +320,27 @@ async def _weapon_template_id(sess, weapon_id):
         log(f'[DB] weapon template lookup failed: {e}')
     return 0
 
+
+
+async def _weapon_owner_id(sess, weapon_id):
+    """按 weapon_id 查武器归属角色 id（先会话缓存，后数据库）。0 = 未找到。
+
+    2026-09-13 步兵买侦察镜事故：CreateWeaponModifier 校验配件须买给
+    charId 自己名下的武器实例，防止客户端 UI 卡死后拿别的角色武器 id
+    越权挂接（如侦察 charId 配步兵的 98k 实例）。"""
+    w = getattr(sess, 'weapons', {}).get(weapon_id)
+    if w:
+        return int(w.get('character_id') or 0)
+    pid = await sess.ensure_player()
+    if pid is None:
+        return 0
+    try:
+        for wrow in await STORE.list_weapons(pid):
+            if wrow['id'] == weapon_id:
+                return int(wrow.get('character_id') or 0)
+    except Exception as e:
+        log(f'[DB] weapon owner lookup failed: {e}')
+    return 0
 
 
 async def _char_ribbon_level(sess, char_id, ribbon_id):
@@ -634,65 +656,64 @@ async def _push_stored_soldier_data(sess, writer):
                                               u.get('auto_repair', 0)))
     # 为没有弹药的载具补创建默认弹药并装备到对应弹药仓（老账号重启前买的载具；
     # 客户端 VehicleUpgradeUtilities 用 equippedVehicleAmmoStorageId != 0 判定已装备）。
-    # 已持有但未装备（storage=0）的默认弹药在该仓未被占用时也补装备。
-    # 若该载具的弹药仓已装有其他弹药（storage 槽被占），默认弹药只持有不装备，避免槽位冲突。
-    v_existing = {(a['vehicle_id'], a['ammo_template_id']) for a in v_ammo_list}
-    v_equipped = {(a['vehicle_id'], a['equipped_storage_id']) for a in v_ammo_list
-                  if a['equipped_storage_id'] > 0}
+    # 默认弹按弹药仓槽数发满：空槽补默认弹带（优先复用该载具未装备的同弹实例），
+    # 已被其他弹药占用的槽不动；多个武器槽可共享同一弹药仓（如 78 号机 6 挺机枪
+    # 共用 storage 116），每仓只填一次，槽数以 VehicleAmmoStorage.storageSlots 为准。
+    v_un = {}
+    for a in v_ammo_list:
+        if not a['equipped_storage_id']:
+            v_un.setdefault((a['vehicle_id'], a['ammo_template_id']), []).append(a)
     for v in vehicles:
         parent = _VEHICLE_VARIANT_PARENT.get(int(v['vehicle_variant_template_id']))
         if parent is None:
             continue
-        storage_slots = {}
+        occupied = {a['slot_index'] for a in v_ammo_list
+                    if a['vehicle_id'] == v['id'] and a['equipped_storage_id']}
+        filled_storages = set()
         for (storage_id, ammo_template_id) in _default_vehicle_ammo_for(parent):
-            slot_ammo = storage_slots.get(storage_id, 1)
-            storage_slots[storage_id] = slot_ammo + 1
-            if (v['id'], storage_id) in v_equipped:
-                continue  # 该弹药仓已被占用，默认弹药持有但不装备
-            if (v['id'], ammo_template_id) in v_existing:
-                # 已有该默认弹药实例：若未装备（storage=0）则补装备到该仓
-                try:
-                    for a in v_ammo_list:
-                        if (a['vehicle_id'] == v['id']
-                                and a['ammo_template_id'] == ammo_template_id
-                                and a['equipped_storage_id'] == 0):
-                            try:
-                                await STORE.set_vehicle_ammo_equipment(pid, a['id'],
-                                                                       storage_id,
-                                                                       slot_ammo, True)
-                            except Exception as e:
-                                log(f'[DB] equip default vehicle ammo failed: {e}')
-                            await _push_kvcs(writer, cmd, b'VehicleAmmo',
-                                             _msg_vehicle_ammo(a['id'], ammo_template_id,
-                                                               v['id'], storage_id,
-                                                               slot_ammo, v['character_id'],
-                                                               a.get('condition', 100.0)))
-                            log(f'S->C cmd={cmd:<4} KeyValueChangeSet (VehicleAmmo id={a["id"]} '
-                                f'equipped default ammo for vehicle {v["id"]}, '
-                                f'template={ammo_template_id}, storage={storage_id}, '
-                                f'slot={slot_ammo})')
-                            break
-                except Exception as e:
-                    log(f'[DB] equip existing vehicle default ammo failed: {e}')
+            if storage_id in filled_storages:
                 continue
-            try:
-                va = await STORE.create_vehicle_ammo(pid, ammo_template_id, v['id'],
-                                                     v['character_id'],
-                                                     _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
-                try:
-                    await STORE.set_vehicle_ammo_equipment(pid, va['id'], storage_id,
-                                                           slot_ammo, True)
-                except Exception as e:
-                    log(f'[DB] equip default vehicle ammo failed: {e}')
+            filled_storages.add(storage_id)
+            for slot_ammo in range(1, _VEHICLE_AMMO_STORAGE_SLOTS.get(int(storage_id), 1) + 1):
+                if slot_ammo in occupied:
+                    continue
+                occupied.add(slot_ammo)
+                row = None
+                reuse = v_un.get((v['id'], ammo_template_id))
+                if reuse:
+                    row = reuse.pop(0)
+                    try:
+                        await STORE.set_vehicle_ammo_equipment(pid, row['id'],
+                                                               storage_id,
+                                                               slot_ammo, True)
+                    except Exception as e:
+                        log(f'[DB] equip default vehicle ammo failed: {e}')
+                else:
+                    try:
+                        row = await STORE.create_vehicle_ammo(pid, ammo_template_id,
+                                                              v['id'], v['character_id'],
+                                                              _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
+                        try:
+                            await STORE.set_vehicle_ammo_equipment(pid, row['id'],
+                                                                   storage_id,
+                                                                   slot_ammo, True)
+                        except Exception as e:
+                            log(f'[DB] equip default vehicle ammo failed: {e}')
+                    except Exception as e:
+                        log(f'[DB] auto-create default vehicle ammo failed: {e}')
+                if row is None:
+                    continue
+                # 同步内存行，末尾全量推送时状态正确
+                row['equipped_storage_id'] = storage_id
+                row['slot_index'] = slot_ammo
                 await _push_kvcs(writer, cmd, b'VehicleAmmo',
-                                 _msg_vehicle_ammo(va['id'], ammo_template_id, v['id'],
-                                                   storage_id, slot_ammo, v['character_id'],
-                                                   va.get('condition', 100.0)))
-                log(f'S->C cmd={cmd:<4} KeyValueChangeSet (VehicleAmmo id={va["id"]} '
-                    f'auto-created for vehicle {v["id"]}, template={ammo_template_id}, '
+                                 _msg_vehicle_ammo(row['id'], ammo_template_id,
+                                                   v['id'], storage_id, slot_ammo,
+                                                   v['character_id'],
+                                                   row.get('condition', 100.0)))
+                log(f'S->C cmd={cmd:<4} KeyValueChangeSet (VehicleAmmo id={row["id"]} '
+                    f'default ammo filled vehicle {v["id"]}, template={ammo_template_id}, '
                     f'storage={storage_id}, slot={slot_ammo})')
-            except Exception as e:
-                log(f'[DB] auto-create default vehicle ammo failed: {e}')
     for a in v_ammo_list:
         await _push_kvcs(writer, cmd, b'VehicleAmmo',
                          _msg_vehicle_ammo(a['id'], a['ammo_template_id'], a['vehicle_id'],

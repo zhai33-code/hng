@@ -140,6 +140,24 @@ for (_iid, _itype), _uids in _UNLOCK_BY_ITEM.items():
     if _req:
         _REQ_UNLOCK_BY_ITEM[(_iid, _itype)] = _req
 
+
+def _mod_usable_by_class(mod_template_id, weapon_template_id, faction, char_template):
+    """配件是否可供该阵营/兵种使用：WeaponModMapping 的 level>0 解锁需求
+    uid 中存在适用于该角色的一条（faction 相符或 0，且 characterType 相符
+    或 0）。无映射/无需求（即买即用）恒可用——兵种门槛只来自 uid 元数据
+    （如 K98 的 ZF-39 仅 uid(0,6) 侦察、ZF-41 有 (0,6)+(0,1) 双兵种）。
+    2026-09-13 配件入库解绑改造后驻留 wardb：characters（指派剥离兜底）
+    与 weapons（挂接校验）共用，避免 handlers 间循环导入。"""
+    mid = _MOD_MAPPING_IDS.get((int(mod_template_id), int(weapon_template_id)))
+    reqs = _REQ_UNLOCK_BY_ITEM.get((mid, _E_WEAPON_MOD_MAPPING)) if mid else None
+    if not reqs:
+        return True
+    for uid in reqs:
+        ft, ct = _UNLOCK_UID_META.get(int(uid), (0, 0))
+        if (not ft or ft == int(faction)) and (not ct or ct == int(char_template)):
+            return True
+    return False
+
 # ShopMembershipItems { id=1, identifier=2, durationDays=3, ... }
 # 会员商品时长（天）：AddMembershipRequest membershipTemplateId → durationDays
 # （买 180 天老兵必须按表发 180 天，不能统一 30 天）
@@ -394,6 +412,37 @@ for _f in _parse_wardb_table('VehicleWeaponSlot'):
 # （La-7 B-20：1 × 100 × 3 = 300 发；此前误发 16 → 4800 发）。
 _VEHICLE_AMMO_STORAGE_CLIPS = {int(f.get(1, 0)): int(f.get(2, 0) or 1)
                                for f in _parse_wardb_table('VehicleAmmoStorage')}
+
+# VehicleAmmoStorage f3 = storageSlots（弹药仓槽位数）。勋带页"已拥有"判定用：
+# 客户端 ProgressionOverviewWindowMediator eWeaponAmmoMapping 载具分支按
+# "该角色该载具上此弹药实例数 >= storageSlots" 判定，多槽弹药仓（如
+# storage 2 = 3 槽）买 1 份永远显示可购买；一次购买按槽数发满即
+# "买一次就显示已拥有"。
+_VEHICLE_AMMO_STORAGE_SLOTS = {int(f.get(1, 0)): int(f.get(3, 0) or 1)
+                               for f in _parse_wardb_table('VehicleAmmoStorage')}
+
+# 客户端 VehicleUtilities.getVehicleWeaponSlotsForWeaponTemplate 同规则：
+# 全表扫 driver+primary 武器槽，同武器模板后出现者覆盖（last wins）→
+# 该武器模板的弹药仓。发实例数按此对齐，确保客户端计数判定能过。
+_WEAPON_STORAGE_BY_TEMPLATE = {}
+for _f in _parse_wardb_table('VehicleWeaponSlot'):
+    if int(_f.get(5, 0)) != 1 or int(_f.get(7, 0)) != 0:
+        continue
+    _WEAPON_STORAGE_BY_TEMPLATE[int(_f.get(3, 0))] = int(_f.get(6, 0))
+
+
+def vehicle_ammo_purchase_count(parent_vehicle_tid, ammo_template_id):
+    """一次购买应创建的载具弹药实例数 = 弹药仓 storageSlots（未知回退 1）。
+    取该载具上能发射此弹药的驾驶员主武器，按客户端全局"武器→弹药仓"
+    规则查槽数；同弹药多武器时取最大，保证勋带页计数判定必过。"""
+    need = 1
+    for (wt, storage) in _VEHICLE_WEAPON_SLOTS.get(int(parent_vehicle_tid), ()):
+        for (_mid, at, _dflt) in _AMMO_MAPPINGS_BY_WEAPON.get(wt, ()):
+            if at == int(ammo_template_id):
+                sid = _WEAPON_STORAGE_BY_TEMPLATE.get(wt, storage)
+                need = max(need, _VEHICLE_AMMO_STORAGE_SLOTS.get(sid, 1))
+                break
+    return need
 
 
 def vehicle_ammo_spawn_clips(storage_id):

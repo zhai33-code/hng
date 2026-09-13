@@ -20,12 +20,10 @@ from state import (
     )
 
 from wardb import (
-    _AMMO_MAXCOND,
     CHARACTER_PACKS,
     _EXPERIENCE_LEVELS,
     _PRICING_MAP,
     _default_ammo_for,
-    _default_vehicle_ammo_for,
     _VEHICLE_VARIANT_PARENT,
     default_uniform_variant,
     )
@@ -54,6 +52,8 @@ from starting_gear import STARTING_GEAR
 
 
 from .characters import _repush_character_row
+from .vehicles_purchase import grant_default_vehicle_ammo
+from .weapons_purchase import grant_weapon_ammo
 
 
 async def _grant_starting_gear(pid, char_id, gear):
@@ -79,18 +79,15 @@ async def _grant_starting_gear(pid, char_id, gear):
         w['container_id'] = int(char_id)
         w['container_slot'] = 1
         weapon_info = {'row': w, 'ammo': [], 'modifier': None}
-        for i, (mapping_id, ammo_template_id) in enumerate(_default_ammo_for(wt)):
-            slot_ammo = 1 if i == 0 else 0  # 首个默认弹药装备，其余持有
-            a = await STORE.create_weapon_ammo(
-                pid, ammo_template_id, char_id, w['id'], slot_ammo,
-                _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
-            weapon_info['ammo'].append((mapping_id, a))
+        # 与购买武器/礼包发货共用的发放函数：首条装备槽 1，其余持有
+        weapon_info['ammo'] = await grant_weapon_ammo(
+            pid, char_id, w['id'], _default_ammo_for(wt))
         sm = int(gear.get('sight_mod', 0) or 0)
         if sm:
             weapon_info['modifier'] = await STORE.create_weapon_modifier(
                 pid, sm, char_id, w['id'])
 
-    # 2. 赠送载具（坦克兵坦克 / 飞行员侦察机）+ 默认载具弹药（按弹药仓顺延装备）
+    # 2. 赠送载具（坦克兵坦克 / 飞行员侦察机）+ 默认载具弹药（按弹药仓槽数发满）
     vvt = int(gear.get('vehicle_variant', 0) or 0)
     if vvt:
         v = await STORE.create_vehicle(pid, vvt, char_id)
@@ -99,16 +96,9 @@ async def _grant_starting_gear(pid, char_id, gear):
         vehicle_info = {'row': v, 'ammo': []}
         parent_vv = _VEHICLE_VARIANT_PARENT.get(vvt)
         if parent_vv is not None:
-            storage_slots = {}
-            for (storage_id, ammo_template_id) in _default_vehicle_ammo_for(parent_vv):
-                slot_ammo = storage_slots.get(storage_id, 1)
-                storage_slots[storage_id] = slot_ammo + 1
-                va = await STORE.create_vehicle_ammo(
-                    pid, ammo_template_id, v['id'], char_id,
-                    _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
-                await STORE.set_vehicle_ammo_equipment(pid, va['id'], storage_id,
-                                                       slot_ammo, True)
-                vehicle_info['ammo'].append((storage_id, slot_ammo, va))
+            # 与买车/礼包发货共用的发放函数：每仓按 storageSlots 发满装填
+            vehicle_info['ammo'] = await grant_default_vehicle_ammo(
+                pid, char_id, v['id'], parent_vv)
     return weapon_info, vehicle_info
 
 

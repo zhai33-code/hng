@@ -446,10 +446,15 @@ async def set_ban(pool, player_id: int, banned: bool, reason: str = '',
                 if row is None:
                     raise LookupError('玩家不存在')
                 if ban_machines:
+                    # ★ $2 同用于 SELECT 列表与 WHERE：INSERT..SELECT 的列表
+                    #   参数不会按目标列定型（默认 text），与 WHERE 的 bigint
+                    #   冲突 → AmbiguousParameterError（HTTP 500）。必须显式
+                    #   cast；$1 一并 cast 保持明确。
                     await conn.execute(
                         'INSERT INTO machine_bans (machine_id, reason, '
                         'banned_player_id) '
-                        'SELECT DISTINCT machine_id, $1, $2 FROM login_events '
+                        'SELECT DISTINCT machine_id, $1::text, $2::bigint '
+                        "FROM login_events "
                         "WHERE player_id = $2 AND machine_id <> '' "
                         'ON CONFLICT (machine_id) DO NOTHING',
                         reason, player_id)

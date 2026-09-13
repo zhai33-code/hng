@@ -21,10 +21,13 @@ from wardb import (
     _AMMO_MAXCOND,
     _AMMO_REQ_LEVEL,
     _E_WEAPON,
+    _MOD_CATEGORY_BY_TEMPLATE,
+    _MOD_CATEGORY_SLOT,
     _MOD_MAPPING_IDS,
     _MOD_REQ_LEVEL,
     _REQ_UNLOCK_BY_ITEM,
     _default_ammo_for,
+    _mod_usable_by_class,
     )
 
 from messages import (
@@ -42,11 +45,42 @@ from player_service import (
     _charge_player_multi,
     _msg_player_for,
     _unlock_need_for_char,
+    _weapon_owner_id,
     _weapon_template_id,
     )
 
 from handlers.characters import _repush_character_row
 from starting_gear import STARTING_GEAR
+
+
+async def grant_weapon_ammo(pid, char_id, weapon_id, ammo_mappings,
+                            sess=None, writer=None):
+    """武器弹药发放（购买武器默认弹/新兵初始武器/礼包武器弹药共用）。
+
+    ammo_mappings = [(mappingId, ammoTemplateId), ...]：默认弹直接传
+    _default_ammo_for(武器模板) 输出（weaponAmmoMapping.defaultAmmo=true），
+    礼包嵌套弹药传 XML mapping id 解析结果。首条装备到弹药槽 1（客户端
+    getWeaponEquipStatus: equippedAmmoSlotIndex==1 即已装备，否则弹药槽
+    显示"未拥有"无法装备/购买其他弹药），其余持有不装备（武器仅一个
+    弹药槽，避免多个默认弹药同时占 slot 1）。
+
+    返回 [(mappingId, weapon_ammo行), ...]；传 sess/writer 且
+    soldier_view_cmd 有效时逐条 KVCS 推送（须在 weapon 行之后调用，
+    客户端按 weapon id 关联）。DB 失败抛异常，由调用方决定记录/中断。"""
+    out = []
+    for i, (mapping_id, at) in enumerate(ammo_mappings):
+        slot = 1 if i == 0 else 0  # 首条装备，其余持有
+        a = await STORE.create_weapon_ammo(pid, at, char_id, weapon_id, slot,
+                                           _AMMO_MAXCOND.get(int(at), 100.0))
+        out.append((mapping_id, a))
+        if sess is not None and writer is not None and sess.soldier_view_cmd is not None:
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponAmmo',
+                             _msg_weapon_ammo(a['id'], at, char_id, weapon_id, slot,
+                                              a.get('condition', 100.0)))
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (WeaponAmmo '
+                f'id={a["id"]}, template={at}, mapping={mapping_id}, '
+                f'equippedSlot={slot})')
+    return out
 
 
 async def _repush_character_unlocks(sess, writer, char_id):
@@ -295,31 +329,14 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
 
     # 3.5 购买武器自动赠送默认弹药（weaponAmmoMapping.defaultAmmo=true），
     #     否则客户端弹药槽显示"未拥有"，无法装备/购买其他弹药。
-    #     第一个默认弹药直接装备到槽位 1（客户端 getWeaponEquipStatus:
-    #     equippedAmmoSlotIndex==1 即已装备），其余默认弹药持有但不装备
-    #     （武器只有一个弹药槽，避免多个默认弹药同时占 slot 1）。
-    default_ammo = _default_ammo_for(weapon_template_id)
-    for i, (mapping_id, ammo_template_id) in enumerate(default_ammo):
-        slot_ammo = 1 if i == 0 else 0  # 第一个默认弹药装备，其余持有
-        aid = None
-        if pid is not None:
-            try:
-                a = await STORE.create_weapon_ammo(pid, ammo_template_id, char_id, wid,
-                                                   slot_ammo,
-                                                   _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
-                aid = a['id']
-            except Exception as e:
-                log(f'[DB] create_weapon_ammo failed: {e}')
-        if aid is None:
-            aid = getattr(sess, '_fallback_ammo_id', 299) + 1
-            sess._fallback_ammo_id = aid
-        if sess.soldier_view_cmd is not None:
-            aproto = _msg_weapon_ammo(aid, ammo_template_id, char_id, wid, slot_ammo,
-                                      _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
-            await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponAmmo', aproto)
-            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (WeaponAmmo id={aid}, '
-                f'template={ammo_template_id}, mapping={mapping_id}, '
-                f'equippedSlot={slot_ammo})')
+    #     公共发放函数 grant_weapon_ammo 与建号/礼包发货共用：
+    #     首条装备到槽 1，其余持有（细节见其 docstring）。
+    try:
+        await grant_weapon_ammo(pid, char_id, wid,
+                                _default_ammo_for(weapon_template_id),
+                                sess, writer)
+    except Exception as e:
+        log(f'[DB] grant default weapon ammo failed: {e}')
 
     # 4. 推送 player 刷新货币显示
     if sess.playerview_cmd is not None:
@@ -359,6 +376,20 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
     mapping_id = 0
     req = None
     if pid_v is not None:
+        # 归属校验（2026-09-13 步兵买侦察镜事故：客户端 UI 卡死/伪造请求拿
+        # 侦察 charId 配步兵武器实例的 weaponId 发购买请求——创建即挂接，
+        # 绕过 SetWeaponModifier 挂接兵种校验，ZF-39 直落步兵枪上）：
+        # 配件只能买给 charId 自己名下的武器实例，weaponId=0 / 别人的枪
+        # / 不存在的武器一律拒绝
+        wowner = await _weapon_owner_id(sess, mod_weapon_id)
+        if int(wowner) != int(mod_char_id):
+            resp_proto = pb_int32(2, 0)  # fail（response 字段号=2）
+            resp = build_response(cmd_id, 'CreateWeaponModifierResponse', resp_proto)
+            writer.write(resp)
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} CreateWeaponModifierResponse (rejected: '
+                f'weapon {mod_weapon_id} owner {wowner} != char {mod_char_id})')
+            return
         wtemplate = await _weapon_template_id(sess, mod_weapon_id)
         # 起始瞄具豁免：侦察兵随枪赠送瞄具（STARTING_GEAR.sight_mod，如德军
         # K98 的 ZF-39=107）——unlockBits 授予认 STARTING_GEAR（客户端显示
@@ -368,6 +399,20 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
             ch = await STORE.get_character(pid_v, mod_char_id)
         except Exception:
             ch = None
+        # 兵种校验：与 SetWeaponModifier 挂接时点同口径（_mod_usable_by_class），
+        # 创建即挂接不能比挂接校验宽松——如 K98 的 ZF-39 仅侦察可用，
+        # 步兵给（哪怕自己的）K98 买 ZF-39 也要拒绝
+        if ch is not None and wtemplate and not _mod_usable_by_class(
+                int(mod_template_id), int(wtemplate), int(ch['faction']),
+                int(ch['template'])):
+            resp_proto = pb_int32(2, 0)
+            resp = build_response(cmd_id, 'CreateWeaponModifierResponse', resp_proto)
+            writer.write(resp)
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} CreateWeaponModifierResponse (rejected: '
+                f'mod {mod_template_id} not usable by char {mod_char_id} '
+                f'class faction={ch["faction"]} template={ch["template"]})')
+            return
         gear = (STARTING_GEAR.get((int(ch['faction']), int(ch['template'])), {})
                 if ch else {})
         starting_sight = (int(gear.get('weapon') or 0) == int(wtemplate or 0)
@@ -413,12 +458,15 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
 
     # 持久化配件实例（失败时用内存计数器兜底，仅本次会话可见）
     pid = await sess.ensure_player()
+    mid_db = False     # 配件是否真实落库（互斥卸下只对落库路径生效）
+    replaced_ids = []  # 被同槽位互斥卸下的旧配件（重推 weaponId=0）
     if pid is not None:
         try:
             mod = await STORE.create_weapon_modifier(pid, mod_template_id,
                                                      mod_char_id, mod_weapon_id)
             mid = mod['id']
             mod_condition = mod.get('condition', 1.0)
+            mid_db = True
         except Exception as e:
             log(f'[DB] create_weapon_modifier failed: {e}')
             mid = None
@@ -428,6 +476,34 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
         mid = getattr(sess, '_fallback_modifier_id', 199) + 1
         sess._fallback_modifier_id = mid
         mod_condition = 1.0  # 配件满耐久（WeaponModifierTemplate.maxCondition=1.0）
+
+    # 同槽位（分类）互斥（2026-09-13 买新镜子老镜子不卸下事故）：购买是
+    # "创建即挂接"（create_weapon_modifier 直接写 weapon_id，不经过
+    # SetWeaponModifier），创建后必须卸下同武器同槽位的旧配件——如已装
+    # ZF-41 再买 ZF-39，老镜子要取消装备（镜子只能装备一个）；与手动
+    # 装备路径（weapons.py handle_setweaponmodifierrequest）同口径，否则
+    # 数据库出现同武器同槽位双配件，客户端按槽位互斥渲染与数据不一致。
+    # 槽位取 WeaponModifierTemplate.f28（weaponModCategoryId）→
+    # WeaponModCategory.f4（slotIndex：4=Sight 等）
+    if mid_db and mod_weapon_id:
+        try:
+            cat = _MOD_CATEGORY_BY_TEMPLATE.get(int(mod_template_id), 0)
+            slot = _MOD_CATEGORY_SLOT.get(cat, cat)
+            if slot:
+                same_slot = [t for t, c in _MOD_CATEGORY_BY_TEMPLATE.items()
+                             if _MOD_CATEGORY_SLOT.get(c, c) == slot]
+                replaced_ids = [int(m['id']) for m in
+                                await STORE.list_weapon_modifiers(pid)
+                                if int(m['weapon_id']) == int(mod_weapon_id)
+                                and int(m['id']) != int(mid)
+                                and int(m['template_id']) in same_slot]
+                if replaced_ids:
+                    await STORE.clear_weapon_modifier_category(
+                        pid, int(mod_weapon_id), same_slot, int(mid))
+                    log(f'      CreateWeaponModifier: slot {slot} exclusive, '
+                        f'unequipped old mods {replaced_ids}')
+        except Exception as e:
+            log(f'[DB] purchase slot-exclusive unequip failed: {e}')
 
     # 1. 返回 CreateWeaponModifierResponse (response=1 ok)，客户端显示购买成功并关闭确认窗
     #    ★ response 字段号=2（客户端 Descriptor 定义 field 2；发 field 1 会被解析成
@@ -439,13 +515,30 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
     log(f'S->C cmd={cmd_id:<4} CreateWeaponModifierResponse (response=1 ok, modifierId={mid})')
 
     # 2. 通过 SOLDIER_VIEW 推送 WeaponModifier 数据（客户端 WeaponModifierTable
-    #    识别已购买，modAlreadyPurchased 不再重复弹确认窗）
+    #    识别已购买，modAlreadyPurchased 不再重复弹确认窗）；被互斥卸下的
+    #    旧配件一并重推 weaponId=0，客户端才能及时取消 isEquipped
     if sess.soldier_view_cmd is not None:
         mod_proto = _msg_weapon_modifier(mid, mod_template_id, mod_char_id,
                                          mod_weapon_id, 0, mod_condition)
         await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponModifier', mod_proto)
         log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (WeaponModifier id={mid}, '
             f'{len(mod_proto)}B, template={mod_template_id})')
+        if replaced_ids and pid is not None:
+            try:
+                for m in await STORE.list_weapon_modifiers(pid):
+                    if int(m['id']) in set(replaced_ids):
+                        await _push_kvcs(
+                            writer, sess.soldier_view_cmd, b'WeaponModifier',
+                            _msg_weapon_modifier(m['id'], m['template_id'],
+                                                 m['character_id'],
+                                                 m['weapon_id'],
+                                                 m.get('auto_repair', 0),
+                                                 m.get('condition', 1.0)))
+                        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
+                            f'(WeaponModifier id={m["id"]} re-pushed, '
+                            f'weaponId={m["weapon_id"]})')
+            except Exception as e:
+                log(f'[DB] reload modifier after purchase failed: {e}')
 
     # 3. 推送 player 刷新货币显示
     if sess.playerview_cmd is not None:

@@ -22,6 +22,7 @@ from wardb import (
     _CUR_NAME,
     _MOD_CATEGORY_BY_TEMPLATE,
     _MOD_CATEGORY_SLOT,
+    _mod_usable_by_class,
     weapon_template_clipcount,
     )
 
@@ -37,6 +38,8 @@ from messages import (
 from player_service import (
     _charge_player,
     _push_player_refresh,
+    _weapon_owner_id,
+    _weapon_template_id,
     )
 
 
@@ -614,50 +617,93 @@ async def handle_setweaponmodifierrequest(sess, writer, cmd_id, req_type, proto)
 
     pid = await sess.ensure_player()
     replaced_ids = []  # 被同槽位互斥卸下的配件（重推 weaponId=0）
+    equip_denied = False  # 兵种校验拒绝（不挂接，response=0）
     if pid is not None and sm_modifier_id:
         try:
-            # 同槽位（分类）互斥：装备前卸下同武器同槽位的其他配件。
-            # 槽位取 WeaponModifierTemplate.f28（weaponModCategoryId）→
-            # WeaponModCategory.f4（slotIndex：2=Barrel 3=Internal 4=Sight
-            # 5=Trigger），客户端 ModifyWeaponMediator 每槽位只装一个，
-            # 与弹药 clear_weapon_ammo_slots 互斥同理。
+            # 兵种/归属校验（2026-09-13 配件入库解绑改造：配件不再随武器
+            # 容器转移、可单独发回任意士兵，兵种门槛收敛到挂接时点——
+            # WeaponModMapping 的 level>0 解锁需求无一条适用于该角色
+            # （_mod_usable_by_class，与客户端 getUnlocksRequiredForItem
+            # 同口径）则拒绝挂接。如 K98 的 ZF-39 仅侦察可用，步兵名下
+            # 的 ZF-39 挂 K98 → response=0。无映射/无需求（即买即用）
+            # 配件不限制。
+            # 2026-09-13 步兵买侦察镜事故收尾：兵种以「武器归属角色」为
+            # 准（配件挂谁的枪就按谁校验），且请求 charId 必须就是武器
+            # owner——客户端 UI 卡死/伪造请求会拿侦察 charId 把步兵名下
+            # 的 ZF-39 挂到步兵武器上（按请求 charId 校验会误放行）；
+            # 武器不存在同样拒绝（防悬空 weapon_id 引用）
             if sm_do_equip and sm_weapon_id:
-                all_mods = await STORE.list_weapon_modifiers(pid)
-                target = next((m for m in all_mods
-                               if int(m['id']) == int(sm_modifier_id)), None)
-                if target is not None:
-                    cat = _MOD_CATEGORY_BY_TEMPLATE.get(
-                        int(target['template_id']), 0)
-                    slot = _MOD_CATEGORY_SLOT.get(cat, cat)
-                    if slot:
-                        same_slot = [t for t, c
-                                     in _MOD_CATEGORY_BY_TEMPLATE.items()
-                                     if _MOD_CATEGORY_SLOT.get(c, c) == slot]
-                        replaced_ids = [
-                            int(m['id']) for m in all_mods
-                            if int(m['weapon_id']) == int(sm_weapon_id)
-                            and int(m['id']) != int(sm_modifier_id)
-                            and int(m['template_id']) in same_slot]
-                        if replaced_ids:
-                            await STORE.clear_weapon_modifier_category(
-                                pid, int(sm_weapon_id), same_slot,
-                                int(sm_modifier_id))
-                            log(f'      SetWeaponModifier: slot {slot} exclusive, '
-                                f'unequipped {replaced_ids}')
-            # 装备 → 挂到武器；卸下 → weapon_id 清 0
-            await STORE.set_weapon_modifier_weapon(
-                pid, int(sm_modifier_id),
-                int(sm_weapon_id) if sm_do_equip else 0,
-                int(sm_char_id) if sm_do_equip else None)
+                wowner = await _weapon_owner_id(sess, int(sm_weapon_id))
+                wtemplate = await _weapon_template_id(sess, int(sm_weapon_id))
+                if not wtemplate:
+                    equip_denied = True
+                    log(f'      SetWeaponModifier: weapon {sm_weapon_id} '
+                        f'not found, equip denied')
+                elif int(wowner) > 0 and int(wowner) != int(sm_char_id):
+                    equip_denied = True
+                    log(f'      SetWeaponModifier: owner check denied '
+                        f'modifier {sm_modifier_id} on weapon {sm_weapon_id} '
+                        f'(owner {wowner} != char {sm_char_id})')
+                if not equip_denied:
+                    owner_id = int(wowner) or int(sm_char_id)
+                    faction = template = 0
+                    for ch in await STORE.list_characters(pid):
+                        if int(ch['id']) == owner_id:
+                            faction, template = int(ch['faction']), int(ch['template'])
+                            break
+                    if faction and wtemplate:
+                        target = next(
+                            (m for m in await STORE.list_weapon_modifiers(pid)
+                             if int(m['id']) == int(sm_modifier_id)), None)
+                        if target is not None and not _mod_usable_by_class(
+                                target['template_id'], wtemplate, faction, template):
+                            equip_denied = True
+                            log(f'      SetWeaponModifier: class check denied '
+                                f'modifier {sm_modifier_id} on weapon '
+                                f'{sm_weapon_id} for char {owner_id}')
+            if not equip_denied:
+                # 同槽位（分类）互斥：装备前卸下同武器同槽位的其他配件。
+                # 槽位取 WeaponModifierTemplate.f28（weaponModCategoryId）→
+                # WeaponModCategory.f4（slotIndex：2=Barrel 3=Internal 4=Sight
+                # 5=Trigger），客户端 ModifyWeaponMediator 每槽位只装一个，
+                # 与弹药 clear_weapon_ammo_slots 互斥同理。
+                if sm_do_equip and sm_weapon_id:
+                    all_mods = await STORE.list_weapon_modifiers(pid)
+                    target = next((m for m in all_mods
+                                   if int(m['id']) == int(sm_modifier_id)), None)
+                    if target is not None:
+                        cat = _MOD_CATEGORY_BY_TEMPLATE.get(
+                            int(target['template_id']), 0)
+                        slot = _MOD_CATEGORY_SLOT.get(cat, cat)
+                        if slot:
+                            same_slot = [t for t, c
+                                         in _MOD_CATEGORY_BY_TEMPLATE.items()
+                                         if _MOD_CATEGORY_SLOT.get(c, c) == slot]
+                            replaced_ids = [
+                                int(m['id']) for m in all_mods
+                                if int(m['weapon_id']) == int(sm_weapon_id)
+                                and int(m['id']) != int(sm_modifier_id)
+                                and int(m['template_id']) in same_slot]
+                            if replaced_ids:
+                                await STORE.clear_weapon_modifier_category(
+                                    pid, int(sm_weapon_id), same_slot,
+                                    int(sm_modifier_id))
+                                log(f'      SetWeaponModifier: slot {slot} exclusive, '
+                                    f'unequipped {replaced_ids}')
+                # 装备 → 挂到武器；卸下 → weapon_id 清 0
+                await STORE.set_weapon_modifier_weapon(
+                    pid, int(sm_modifier_id),
+                    int(sm_weapon_id) if sm_do_equip else 0,
+                    int(sm_char_id) if sm_do_equip else None)
         except Exception as e:
             log(f'[DB] set_weapon_modifier_weapon failed: {e}')
 
-    resp_proto = pb_int32(2, 1)  # response = 1 (ok；字段号 2)
+    resp_proto = pb_int32(2, 0 if equip_denied else 1)  # response（字段号 2）
     resp = build_response(cmd_id, 'SetWeaponModifierResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} SetWeaponModifierResponse '
-        f'(response=1 ok, doEquip={sm_do_equip})')
+        f'(response={0 if equip_denied else 1}, doEquip={sm_do_equip})')
 
     # 重推 WeaponModifier（weaponId 变化 → 客户端配件槽刷新；
     # 被互斥卸下的也重推 weaponId=0，客户端才能及时取消 isEquipped）
@@ -679,7 +725,8 @@ async def handle_setweaponmodifierrequest(sess, writer, cmd_id, req_type, proto)
             log(f'[DB] reload modifier after equip failed: {e}')
 
     # 生涯军令 30 eEquipWeaponUpgrade（配件挂接到武器，状态推导）+ 推行刷新
-    if pid is not None and sm_do_equip:
+    # （兵种校验拒绝的挂接不算完成）
+    if pid is not None and sm_do_equip and not equip_denied:
         from handlers.career import complete_order_and_push
         await complete_order_and_push(sess, writer, pid)
 

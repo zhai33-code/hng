@@ -214,9 +214,9 @@ class MaintenanceMixin:
         """装备/仓库物品指派到角色（SetInventoryItemToCharacterRequest，
         itemType 为小写字符串 'weapon'/'vehicle'/...）。返回是否更新。
 
-        武器指派时配件/皮肤随行（character_id 跟随武器，否则 _char_unlock_bits_for
-        的配件 mapping uid 挂在旧角色名下 → 新角色配件显示锁定 + "Ribbon required"，
-        与 2026-08-27 弹药跟随同根因）；载具指派时升级/弹药/皮肤同理随行。"""
+        武器/载具指派时挂靠件（弹药/皮肤/配件/升级）均不随行
+        （2026-09-13 改造：入库即全部解绑，可与武器/载具分别发回士兵；
+        此处对历史脏数据兜底脱离挂靠，防幽灵挂靠件）。"""
         tbl = self._ITEM_TABLES.get(str(item_type or '').strip().lower())
         if tbl is None:
             return False
@@ -226,38 +226,55 @@ class MaintenanceMixin:
                     f'UPDATE {tbl} SET character_id = $3 WHERE id = $1 '
                     'AND player_id = $2',
                     int(item_id), int(player_id), int(character_id))
-                # 弹药随武器指派（slot_index 保留：默认弹药 slot 1 自动恢复装备）
+                # 弹药不随武器指派（2026-09-13 改造：入库即解绑，可与武器
+                # 分别发回士兵；此处对历史脏数据兜底脱离挂靠——否则指派后
+                # 挂在新角色名下武器上的弹药，其 uid 计入 unlockBits 推导）
                 await conn.execute(
-                    'UPDATE weapon_ammo SET character_id = $3 WHERE weapon_id = $1 '
+                    'UPDATE weapon_ammo SET weapon_id = 0 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(item_id), int(player_id))
+                # 配件不随武器指派（同改造语义；兜底脱离挂靠防幽灵配件）
+                await conn.execute(
+                    'UPDATE weapon_modifiers SET weapon_id = 0 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(item_id), int(player_id))
+                # 皮肤不随武器指派（同改造语义；兜底脱离挂靠）+
+                # weapons.variant_id 反向引用复位（武器不得指向留仓皮肤）
+                await conn.execute(
+                    'UPDATE weapon_variants SET weapon_id = 0 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(item_id), int(player_id))
+                await conn.execute(
+                    'UPDATE weapons SET variant_id = 0 WHERE id = $1 '
                     'AND player_id = $2',
-                    int(item_id), int(player_id), int(character_id))
-                # 配件/皮肤随武器指派（weapon_id 挂靠关系保留）
-                await conn.execute(
-                    'UPDATE weapon_modifiers SET character_id = $3 '
-                    'WHERE weapon_id = $1 AND player_id = $2',
-                    int(item_id), int(player_id), int(character_id))
-                await conn.execute(
-                    'UPDATE weapon_variants SET character_id = $3 '
-                    'WHERE weapon_id = $1 AND player_id = $2',
-                    int(item_id), int(player_id), int(character_id))
+                    int(item_id), int(player_id))
             elif tbl == 'vehicles':
                 n = await conn.execute(
                     f'UPDATE {tbl} SET character_id = $3 WHERE id = $1 '
                     'AND player_id = $2',
                     int(item_id), int(player_id), int(character_id))
-                # 升级/弹药/皮肤随载具指派（vehicle_id 挂靠关系与槽位保留）
+                # 升级不随载具指派（2026-09-13 改造：入库即解绑，可与载具
+                # 分别发回士兵；兜底脱离挂靠防幽灵升级件）
                 await conn.execute(
-                    'UPDATE vehicle_upgrades SET character_id = $3 '
+                    'UPDATE vehicle_upgrades SET vehicle_id = 0 '
                     'WHERE vehicle_id = $1 AND player_id = $2',
-                    int(item_id), int(player_id), int(character_id))
+                    int(item_id), int(player_id))
+                # 弹药不随载具指派（同改造语义；兜底脱离挂靠，防幽灵弹药）
                 await conn.execute(
-                    'UPDATE vehicle_ammo SET character_id = $3 '
-                    'WHERE vehicle_id = $1 AND player_id = $2',
-                    int(item_id), int(player_id), int(character_id))
+                    'UPDATE vehicle_ammo SET vehicle_id = 0, '
+                    'equipped_storage_id = 0 WHERE vehicle_id = $1 '
+                    'AND player_id = $2',
+                    int(item_id), int(player_id))
+                # 皮肤不随载具指派（同改造语义；兜底脱离挂靠）+
+                # vehicles.variant_id 反向引用复位（载具不得指向留仓皮肤）
                 await conn.execute(
-                    'UPDATE vehicle_variants SET character_id = $3 '
+                    'UPDATE vehicle_variants SET vehicle_id = 0 '
                     'WHERE vehicle_id = $1 AND player_id = $2',
-                    int(item_id), int(player_id), int(character_id))
+                    int(item_id), int(player_id))
+                await conn.execute(
+                    'UPDATE vehicles SET variant_id = 0 WHERE id = $1 '
+                    'AND player_id = $2',
+                    int(item_id), int(player_id))
             elif tbl == 'tracer_effects':
                 # 曳光弹指派角色：character_id 置目标角色；若此前装备在某
                 # 武器上需解除绑定（武器不得引用别的角色名下的曳光弹行，
@@ -313,44 +330,64 @@ class MaintenanceMixin:
                     'UPDATE weapons SET character_id = 0, container_id = 0, '
                     'container_slot = 0 WHERE id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
-                # 弹药随武器退仓：不清理会留下"武器在仓库、弹药仍挂在角色名下
-                # 且装备中"的脏数据 → unlockBits 弹药回查查不到武器（不在角色
-                # 名下），默认弹药 uid 加不上 → 客户端显示锁定 + "Ribbon
-                # required"（2026-08-27 weapon 147/ammo 346 实锤）。slot_index
-                # 保留，重新指派角色时默认弹药自动恢复装备槽。
+                # 弹药随武器退仓并解绑（weapon_id 一并清 0 → 独立仓库弹药，
+                # 可与武器分别发回士兵，2026-09-13 改造；slot_index 保留，
+                # 重新挂靠后恢复默认弹药装备槽；unlockBits 按 character_id
+                # 推导，解绑后不挂任何角色名下）
                 await conn.execute(
-                    'UPDATE weapon_ammo SET character_id = 0 WHERE weapon_id = $1 '
+                    'UPDATE weapon_ammo SET character_id = 0, weapon_id = 0 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                # 配件随武器退仓并解绑（weapon_id 一并清 0 → 独立仓库配件，
+                # 可与武器分别发回士兵；2026-09-13 改造：此前只清 character_id
+                # 保留挂靠，出库指派时配件被武器无差别带走。兵种限制不因此
+                # 丢失——挂接时点 setweaponmodifierrequest 按 _mod_usable_by_class
+                # 校验）
+                await conn.execute(
+                    'UPDATE weapon_modifiers SET character_id = 0, weapon_id = 0 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                # 皮肤随武器退仓并解绑（weapon_id 清 0 → 独立仓库皮肤）+
+                # weapons.variant_id 反向引用复位（否则武器行指向已独立
+                # 皮肤，客户端显示不一致）
+                await conn.execute(
+                    'UPDATE weapon_variants SET character_id = 0, weapon_id = 0 '
+                    'WHERE weapon_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                await conn.execute(
+                    'UPDATE weapons SET variant_id = 0 WHERE id = $1 '
                     'AND player_id = $2',
-                    int(object_id), int(player_id))
-                # 配件/皮肤随武器退仓（weapon_id 挂靠关系保留：客户端 isModded
-                # 靠 WeaponModifierTable 按 weapon_id 索引，清 0 会显示"无配件"，
-                # 且卸配件的 SendUpgradesToDepot 按钮也不再出现）
-                await conn.execute(
-                    'UPDATE weapon_modifiers SET character_id = 0 '
-                    'WHERE weapon_id = $1 AND player_id = $2',
-                    int(object_id), int(player_id))
-                await conn.execute(
-                    'UPDATE weapon_variants SET character_id = 0 '
-                    'WHERE weapon_id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
             elif tbl == 'vehicles':
                 n = await conn.execute(
                     'UPDATE vehicles SET character_id = 0, equipped_in_slot = 0 '
                     'WHERE id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
-                # 升级/弹药/皮肤随载具退仓（vehicle_id 挂靠关系与槽位保留，
-                # 语义同武器配件：客户端按 vehicle_id 判定 hasUpgradeEquipped）
+                # 升级随载具退仓并解绑（vehicle_id 一并清 0 → 独立仓库
+                # 升级件，可与载具分别发回士兵，2026-09-13 改造；
+                # equipped_slot_id 保留，重新挂靠后恢复槽位）
                 await conn.execute(
-                    'UPDATE vehicle_upgrades SET character_id = 0 '
+                    'UPDATE vehicle_upgrades SET character_id = 0, vehicle_id = 0 '
+                    'WHERE vehicle_id = $1 AND player_id = $2',
+                    int(object_id), int(player_id))
+                # 弹药随载具退仓并解绑（vehicle_id/equipped_storage_id 一并
+                # 清 0 → 独立仓库弹药，可与载具分别发回士兵，对齐武器配件
+                # 2026-09-13 改造；slot_index 保留，重新指派后可恢复装备位）
+                await conn.execute(
+                    'UPDATE vehicle_ammo SET character_id = 0, vehicle_id = 0, '
+                    'equipped_storage_id = 0 WHERE vehicle_id = $1 '
+                    'AND player_id = $2',
+                    int(object_id), int(player_id))
+                # 皮肤随载具退仓并解绑（vehicle_id 清 0 → 独立仓库皮肤）+
+                # vehicles.variant_id 反向引用复位（否则载具行指向已独立
+                # 皮肤，客户端显示不一致）
+                await conn.execute(
+                    'UPDATE vehicle_variants SET character_id = 0, vehicle_id = 0 '
                     'WHERE vehicle_id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
                 await conn.execute(
-                    'UPDATE vehicle_ammo SET character_id = 0 '
-                    'WHERE vehicle_id = $1 AND player_id = $2',
-                    int(object_id), int(player_id))
-                await conn.execute(
-                    'UPDATE vehicle_variants SET character_id = 0 '
-                    'WHERE vehicle_id = $1 AND player_id = $2',
+                    'UPDATE vehicles SET variant_id = 0 WHERE id = $1 '
+                    'AND player_id = $2',
                     int(object_id), int(player_id))
             elif tbl == 'tracer_effects':
                 # 曳光弹退仓：解除武器绑定与装备位，weapons.tracer_effect_id
