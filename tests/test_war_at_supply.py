@@ -244,6 +244,26 @@ class FakeStore:
         return [dict(b) for b in self.battles
                 if b['war_id'] == int(war_id)]
 
+    # ---- 成局链（R2i：敌城空降到达 → _check_battle_formation）----
+    async def create_war_battle(self, war_id, battlefield_id, factions,
+                                battle_type=1):
+        bid = max((int(b.get('id', 0)) for b in self.battles), default=0) + 1
+        b = {'id': bid, 'war_id': int(war_id),
+             'battlefield_id': int(battlefield_id),
+             'battle_type': int(battle_type), 'state': 0,
+             'winning_faction': 0, 'factions': list(factions or []),
+             'started_at': _NOW}
+        self.battles.append(b)
+        return dict(b)
+
+    async def create_mission_record(self, preset, attacker_faction=0,
+                                    defender_faction=0, battle_id=0, **kw):
+        return {'id': 900000 + int(battle_id or 0), 'state': 0,
+                'preset': int(preset or 0),
+                'attacker_faction': int(attacker_faction or 0),
+                'defender_faction': int(defender_faction or 0),
+                'battle_id': int(battle_id or 0)}
+
     # ---- movement（R 组）----
     async def create_movement(self, at_id, war_id, path, started_at=None,
                               arrive_at=None, dest_ap=0):
@@ -1007,6 +1027,27 @@ async def section_d():
           and st.spend_log == [(100, 'warfunds', 500)]
           and defn and defn[-1].get(2) == b'Alpha', str(f))
 
+    # D1b 持有上限不计 reserve 行（2026-09-11 玩家报全员购买回
+    # commandnode_limit_reached(114) 根因：补给列 spawn_supply_column 与
+    # 空降运输机队 split_aircraft_back 同为玩家名下 reserve 模板行，
+    # 计入 MM_WAR_AT_MAX 后活跃玩家名下行数很快 ≥10 → 购买全拒）
+    st = _setup()
+    for i in range(9):
+        _mk_at(st, 600 + i, template=501)
+    for i in range(10):
+        _mk_at(st, 700 + i, template=504)   # 补给列/运输机队（reserve）
+    w, f = await _create(name='Bravo', abbr='BRV')
+    check('D1b 上限不计 reserve（9 真实 AT+10 reserve → 购买成功）',
+          f.get(1) == 1 and len(st.ats) == 20, str(f))
+
+    # D1c 上限仍对真实 AT 生效：MM_WAR_AT_MAX（默认 100）个真实 AT → 114
+    st = _setup()
+    for i in range(mm_config.WAR_AT_MAX):
+        _mk_at(st, 600 + i, template=501)
+    w, f = await _create(name='Charlie', abbr='CHL')
+    check('D1c 真实 AT 顶满上限 → 114（limit 仍生效）',
+          f.get(1) == war_campaign.RC_COMMANDNODE_LIMIT_REACHED, str(f))
+
     # D2 deploy：官服随机落位（#4/#5：主城10 + 邻接己方非交战城11 池）
     # + 部署即补编（§10.2 #4/#5：新 AT 首次免费满编置位，余额不动）
     st = _setup()
@@ -1719,6 +1760,37 @@ async def section_r():
           and st.ats[541]['resources'].get(10) == 9
           and not split_ats,
           f'{st.ats[541]} split={split_ats}')
+
+    # ---- R2i 敌城空降到达（★2026-09-11 敌区交战时序修复）----
+    # 目标有敌驻军 → 不拆分：保持空中原型编制（cat4+cat10 成对入战
+    # ——战斗内伞兵从运输机跳伞出生）state=2 成局，运输机在会战结算
+    # 时才返航（玩家报"敌城空降运输机秒走"；结算时序回归见 K4/K5）
+    st = _setup()
+    war = await war_campaign.ensure_war(st)
+    st.city_owners[1][16] = 2
+    _mk_at(st, 550, template=1, owner=101, faction=2,
+           deployed=True, map_entity_id=16, resources={1: 100})
+    _mk_at(st, 551, template=506, deployed=True, map_entity_id=11,
+           resources={4: 36, 10: 9})
+    st.ats[551]['airbase_bf'] = 11
+    w, f = await _transport(551, target=16)
+    mv = st.movements[1]
+    events = await war_campaign.advance_movements(
+        st, war, now=mv['arrive_at'] + datetime.timedelta(seconds=1))
+    split_ats = [a for a in st.ats.values()
+                 if a.get('parent_command_node_id') == 551]
+    check('R2i 敌城空降到达 → 空中原型入战不拆分（tpl 506 + state=2 '
+          '+ 成局 + 无运输机队 AT）',
+          f.get(3) == war_campaign.RC_TRANSPORTING_TO_ATTACK_SUPPLY
+          and st.ats[551]['template_id'] == 506
+          and st.ats[551]['state'] == 2
+          and st.ats[551].get('airbase_bf') == 11
+          and st.ats[551]['resources'].get(10) == 9
+          and any(b.get('battlefield_id') == 16 and b.get('state', 0) == 0
+                  for b in st.battles)
+          and not split_ats,
+          f"tpl={st.ats[551]['template_id']} "
+          f"state={st.ats[551]['state']} split={split_ats}")
 
     # ---- R3 伞兵落地变体（#6：空降作战到达 → *_on_ground）----
     st = _setup()

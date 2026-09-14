@@ -262,7 +262,7 @@ WAR_NAME = os.environ.get('MM_WAR_NAME') or 'The Great War'    # 新战争名
 WAR_SEQUEL_AUTO = bool(_int_env('MM_WAR_SEQUEL_AUTO', 1))      # 战争结束自动开续战
 WAR_CATALOGUE_LIMIT = _int_env('MM_WAR_CATALOGUE_LIMIT', 20)   # 目录返回战争数上限
 # AT 生命周期（Phase 5）：单玩家 AT 持有上限 / 解散返还比例（官服近似，可校准）
-WAR_AT_MAX = _int_env('MM_WAR_AT_MAX', 10)
+WAR_AT_MAX = _int_env('MM_WAR_AT_MAX', 100)
 WAR_DISSOLVE_REFUND = _float_env('MM_WAR_DISSOLVE_REFUND', 0.5)
 # 购买/部署 AT 需拥有指挥点角色（官服 gate = commandPointsUnlocked > 0：
 # 将军默认 3 点；普通角色军衔 12+ 起每级 +1；客户端无 isGeneral 检查。

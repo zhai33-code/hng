@@ -137,6 +137,10 @@ async def validate_create_at(store, war, player_id, faction, name, abbr,
         ats = await store.list_player_command_nodes(player_id, war['id'])
     except Exception:
         ats = []
+    # 持有上限只统计真实 AT：补给列（spawn_supply_column）与空降运输机队
+    # （split_aircraft_back）同为玩家名下 reserve 模板行，计入会把活跃
+    # 玩家顶到 MM_WAR_AT_MAX 导致购买全回 commandnode_limit_reached(114)
+    ats = [a for a in ats if not is_reserve(a)]
     if len(ats) >= mm_config.WAR_AT_MAX:
         return RC_COMMANDNODE_LIMIT_REACHED, None
     return 0, tpl

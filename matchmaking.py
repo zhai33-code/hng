@@ -151,14 +151,32 @@ async def _char_vehicle_cats(pid, char_id):
     return tuple(sorted(cats))
 
 
+def _at_composition(node):
+    """AT → 编制 {cat: count}：实际存量（command_nodes.resources，含
+    战斗损耗/撤退扣减）优先，缺省回退模板满编（composition_for_template）
+    ——与 war_pending roster/增援同口径，损耗传导到下一场对局
+    （docs/war-battle-details-missionid-bug.md 修复 3）。"""
+    res = (node or {}).get('resources') or {}
+    if res:
+        try:
+            comp = {int(c): int(v) for c, v in res.items()}
+            if comp:
+                return comp
+        except (TypeError, ValueError):
+            pass
+    return force_pool.composition_for_template(
+        int((node or {}).get('template_id', 0) or 0))
+
+
 async def _init_war_mission_resources(mission_id, battle_id, attacker,
                                       defender):
     """war 会战资源池（M2-3）：兵力 = 双方实际参战 AT 编制之和。
 
     AT 名单 = war_battles.factions_json（会战登记的双方 AT 实例 id）；
-    编制 = AT template_id → commandnodetemplate 兵种名 → 编制表原值。
-    任一侧无有效 AT（DB 异常/实例已解散）→ 整局回退镜像随机抽取，
-    保证会战可玩（宁要可打的局，不要空池死局）。"""
+    编制 = AT 实际存量（command_nodes.resources）优先、缺省模板满编
+    （_at_composition——打残 AT 的损耗传导进本局池，与简报 roster 同
+    口径，成局前后数字不跳变）。任一侧无有效 AT（DB 异常/实例已解散）
+    → 整局回退镜像随机抽取，保证会战可玩（宁要可打的局，不要空池死局）。"""
     comps = {int(attacker): [], int(defender): []}
     names = {int(attacker): [], int(defender): []}
     ats = {int(attacker): [], int(defender): []}   # AT 实例（战报 f11.f3 归属）
@@ -176,7 +194,7 @@ async def _init_war_mission_resources(mission_id, battle_id, attacker,
             if fac not in comps or node is None:
                 continue
             tid = int(node.get('template_id', 0) or 0)
-            comp = force_pool.composition_for_template(tid)
+            comp = _at_composition(node)
             if comp is None:
                 continue
             comps[fac].append(comp)
@@ -221,6 +239,45 @@ def consume_mission_resource(mission_id, faction, cat, n=1, ap=None):
 def release_mission_resources(mission_id):
     """局结束清理（与 _MM_MISSION_DETAILS 同生命周期）。"""
     force_pool.release(mission_id)
+
+
+async def add_reinforcement_to_live_mission(battle_id, at):
+    """war 会战中途增援（官方语义：增援 AT 为进行中战斗补充可出生兵力）。
+
+    battle → mission record → 已开局的战斗服（details+COMBAT_INSTANCES
+    双命中）→ AT 编制并入该局资源池（force_pool.add_war_reinforcement，
+    f2 轮询/出生消耗/结算缴获快照同源生效）。局未开（record state0
+    排队中）不处理——_start_match 建池时按 war_battles.factions 全量
+    读取，天然含开局前到达的增援。返回是否并入。"""
+    try:
+        if state.STORE is None or not battle_id:
+            return False
+        rec = await state.STORE.get_mission_by_battle(int(battle_id))
+        if rec is None:
+            return False
+        mid = int(rec['id'])
+        if (mid not in _MM_MISSION_DETAILS
+                or mid not in COMBAT_INSTANCES):
+            return False
+        tid = int(at.get('template_id') or 0)
+        comp = _at_composition(at)
+        if comp is None:
+            return False
+        fac = int(at.get('faction') or 0)
+        ok = force_pool.add_war_reinforcement(
+            mid, fac, comp, force_pool.template_name(tid) or f'at{tid}',
+            {'id': int(at.get('id') or 0),
+             'name': str(at.get('name') or ''),
+             'owner_player_id': int(at.get('owner_player_id') or 0),
+             'template_id': tid})
+        if ok:
+            _log(f'[war] reinforcement AT {at.get("id")} (tpl={tid}) '
+                 f'joined live mission={mid} battle={battle_id} '
+                 f'faction={fac} +{comp}')
+        return ok
+    except Exception as ex:
+        _log(f'[war] reinforcement into battle {battle_id} failed: {ex}')
+        return False
 
 
 def _msg_battle_info(battle_id, pos_x, pos_y):
@@ -1192,8 +1249,25 @@ async def _start_match(match):
             for e in match.players:
                 _cleanup_queued_player(int(e.player_id))
             return
+        # war 局激活时刻（battle 行 started_at+准备期，单一事实源）：
+        # MissionInfo f11 → 客户端真实"已激活时长"（修复刚成局显示
+        # "已启动于 1 小时"——_zulu_activated 固定回溯 1h 是普通即时
+        # 匹配局的旧口径）；查行失败回退 None（渲染层回退 zulu）
+        war_activation = None
+        war_entity = None
+        try:
+            from war_campaign.common import (battle_activation_ts,
+                                             battle_map_entity)
+            _wb_row = await state.STORE.get_war_battle(int(battle_id))
+            war_activation = battle_activation_ts(_wb_row) or None
+            war_entity = battle_map_entity(_wb_row)
+            if not war_entity[0]:
+                war_entity = None
+        except Exception as ex:
+            _log(f'      [DB] get_war_battle({battle_id}) failed: {ex}')
     else:
         attacker, defender, one_sided = _split_factions(match.players)
+        war_activation = None
     # ★ AI 策略（2026-09-01 按官方实现复刻 killfeed 阵营默认名）：官方两套
     #   bot 系统按模式互斥（战斗服 player.dll 逆向实锤）：
     #   - 训练模式（gamemode 1）f20 enableBots=True：战斗服本地 bot
@@ -1391,6 +1465,14 @@ async def _start_match(match):
         # war 会战局（M2）：battle_id>0 → MissionInfo f2=真实 battleId、
         # f7 isAutogenerated=0；结算钩子按 battle_id 回写战争状态
         'battle_id': battle_id,
+        # war 局激活时刻（battle 行 started_at+准备期，单一事实源）——
+        # MissionInfo f11 客户端显示真实"已激活时长"（未过准备期显示
+        # 集结倒计时）；普通局缺省回退 _zulu_activated 回溯口径
+        'activation': war_activation,
+        # war 局简报实体口径（battle 行同源：城战=城市 bf/1、野外=补给
+        # 线 id/3）——MissionInfo f5/f6，客户端按 type3 拼"城市名-字母"
+        'entity_id': war_entity[0] if war_entity else None,
+        'entity_type': war_entity[1] if war_entity else None,
         # 成局时刻（monotonic）：等待期中途加入窗口（mm_config.JOIN_WINDOW）
         # 从此起算；release_match 随详情一并清理
         'formed_at': time.monotonic(),

@@ -385,6 +385,34 @@ def init_mission_war(mission_id, attacker, defender, comps_by_faction,
     return True
 
 
+def add_war_reinforcement(mission_id, faction, comp, name, at=None):
+    """war 局中途增援：AT 编制并入该阵营主池（出生消耗/结算缴获/战报
+    AT 名单均以池为准，并入即生效——f2 轮询读实时池，战斗服下一轮
+    即见新兵力）。
+
+    攻方已分线（assign_lines）时重置分线缓存，下一次 f14/f2 渲染的
+    assign_lines 按扩后名单重分（全线总量仍 = 攻方主池 1 份不翻倍）；
+    重置与重分之间 line_counts 返回 None，调用方回退全量池挂载。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if rec is None or rec.get('mode') != 'war':
+        return False
+    fac = int(faction)
+    counts = rec['pool'].setdefault(fac, {})
+    for cat, cnt in (comp or {}).items():
+        counts[int(cat)] = counts.get(int(cat), 0) + int(cnt)
+    rec.setdefault('names_by_faction', {}).setdefault(fac, []).append(str(name))
+    if at is not None:
+        rec.setdefault('war_ats', {}).setdefault(fac, []).append(dict(at))
+    if fac == rec.get('attacker'):
+        rec.setdefault('names', []).append(str(name))
+        if rec.get('lines') is not None:
+            rec['lines'] = rec['line_pool'] = None
+            rec['ap_line'] = {}
+    log(f'[force_pool] mission={mission_id} reinforcement +{name} '
+        f'faction={fac} pool={counts}')
+    return True
+
+
 def pool(mission_id):
     """本局资源池 {faction: {cat: count}}；无池返回 None。"""
     rec = _MISSIONS.get(int(mission_id or 0))

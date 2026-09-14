@@ -280,6 +280,10 @@ class FakeStore:
                 return dict(m)
         return None
 
+    async def get_command_nodes_by_ids(self, ids):
+        return [dict(self.ats[int(i)]) for i in ids or []
+                if int(i) in self.ats]
+
     async def add_war_funds(self, pid, amount, reason=''):
         self.funds_log = getattr(self, 'funds_log', [])
         self.funds_log.append((int(pid), int(amount), reason))
@@ -1135,6 +1139,90 @@ async def main():
             storeL, warL,
             now=NOW + datetime.timedelta(seconds=SEG_SEC / 2))
         check('J5 同段同阵营不成局', not storeL.battles)
+
+        # J6 野外会战增援：交战阵营迟到 AT 入战（对齐城市会战口径
+        # append_war_battle_faction + state=2），第三阵营照常行军不入战
+        storeM = FakeStore()
+        warM = await war_campaign.ensure_war(storeM)
+        m1 = _mk_at(storeM, warM['id'], 331, 1, 10)
+        m2 = _mk_at(storeM, warM['id'], 332, 2, 20)
+        m1['template_id'] = 901
+        m2['template_id'] = 901
+        await war_campaign.start_movement(storeM, m1, 20, now=NOW)
+        await war_campaign.start_movement(storeM, m2, 10, now=NOW)
+        await war_campaign.advance_movements(
+            storeM, warM, now=NOW + datetime.timedelta(seconds=SEG_SEC / 2))
+        wbM = next((b for b in storeM.battles.values()), None)
+        m3 = _mk_at(storeM, warM['id'], 333, 1, 10)   # 攻方阵营增援
+        m4 = _mk_at(storeM, warM['id'], 334, 3, 10)   # 第三阵营路过
+        m3['template_id'] = 901
+        m4['template_id'] = 901
+        _ = await war_campaign.start_movement(
+            storeM, m3, 20, now=NOW + datetime.timedelta(seconds=1))
+        _ = await war_campaign.start_movement(
+            storeM, m4, 20, now=NOW + datetime.timedelta(seconds=1))
+        await war_campaign.advance_movements(
+            storeM, warM, now=NOW + datetime.timedelta(seconds=SEG_SEC))
+        check('J6 野外增援：交战阵营入战（state=2 + factions 追加）',
+              wbM is not None
+              and storeM.ats[333]['state'] == 2
+              and any(f.get('at_id') == 333
+                      for f in storeM.battles[wbM['id']]['factions'])
+              and len(storeM.battles) == 1,
+              f"m3={storeM.ats[333]['state']} "
+              f"n={len(storeM.battles)}")
+        check('J6b 第三阵营照常行军不入战',
+              storeM.ats[334]['state'] == 1
+              and not any(f.get('at_id') == 334
+                          for f in storeM.battles[wbM['id']]['factions']),
+              f"m4={storeM.ats[334]['state']}")
+
+        # J7 增援并入已开局战斗服资源池（matchmaking.
+        # add_reinforcement_to_live_mission → force_pool）
+        import matchmaking as _mm
+        import force_pool as _fp
+        import state as _state_mod
+        mrecM = [m for m in storeM.mission_records.values()
+                 if m.get('battle_id') == wbM['id']]
+        midM = mrecM[0]['id'] if mrecM else 0
+        _mm._MM_MISSION_DETAILS[midM] = {'preset': 5}
+        _mm.COMBAT_INSTANCES[midM] = {'stub': 1}
+        _prev_store = _state_mod.STORE
+        _state_mod.STORE = storeM
+        _prev_comp = _fp.composition_for_template
+        _prev_tn = _fp.template_name
+        _fp.composition_for_template = lambda tid: {1: 100}
+        _fp.template_name = lambda tid: 'infantry'
+        try:
+            _fp.init_mission_war(
+                midM, 1, 2, {1: [{1: 50}], 2: [{1: 60}]},
+                {1: ['infantry'], 2: ['infantry']},
+                {1: [{'id': 331, 'name': 'a', 'owner_player_id': 9,
+                      'template_id': 901}],
+                 2: [{'id': 332, 'name': 'b', 'owner_player_id': 9,
+                      'template_id': 901}]})
+            ok = await _mm.add_reinforcement_to_live_mission(
+                wbM['id'], storeM.ats[333])
+            p = _fp.pool(midM)
+            check('J7 增援并入 live 池（攻方 cat1 50+100=150，守方不动）',
+                  ok and p and p[1][1] == 150 and p[2][1] == 60,
+                  f'ok={ok} p={p}')
+            names = _fp.assault_team_names(midM, 1)
+            check('J7b 名单同步（攻方 names 计 2）',
+                  names and names.count('infantry') == 2, f'{names}')
+            _mm._MM_MISSION_DETAILS.pop(midM, None)
+            ok2 = await _mm.add_reinforcement_to_live_mission(
+                wbM['id'], storeM.ats[333])
+            check('J7c 局未开不并入（排队局建池时按 factions 全量读取）',
+                  not ok2 and _fp.pool(midM)[1][1] == 150,
+                  f'ok2={ok2}')
+        finally:
+            _fp.composition_for_template = _prev_comp
+            _fp.template_name = _prev_tn
+            _state_mod.STORE = _prev_store
+            _mm._MM_MISSION_DETAILS.pop(midM, None)
+            _mm.COMBAT_INSTANCES.pop(midM, None)
+            _fp.release(midM)
     finally:
         wardb.commandnode_templates = _orig_tpls
 
@@ -1260,15 +1348,17 @@ async def main():
               and st4.ats[401]['resources'] == {4: 75},
               f"win={st4.battles[wb4['id']]['winning_faction']} "
               f"tpl={st4.ats[401]['template_id']}")
-        # K5 伞兵 ≥288 且守方 <216 → 伞兵胜占城
+        # K5 伞兵 ≥288 且守方 <216 → 伞兵胜占城（★官方口径：胜方运输机
+        #    也飞回出发机场——落地变体驻城 tpl 108→114；2026-09-11 敌区
+        #    交战时序修复前旧期望为保持 108）
         st5, _w5, wb5, _m5 = await _mk_auto_battle(
             war_campaign.BATTLE_TYPE_ASSAULT, {4: 300}, {1: 100},
             atk_tpl=108)
         await war_campaign.automission_tick(st5)
-        check('K5 伞兵 ≥288 守方 <216 → 伞兵胜占城（不落地转换）',
+        check('K5 伞兵 ≥288 守方 <216 → 伞兵胜占城 + 落地（tpl 108→114）',
               st5.battles[wb5['id']]['winning_faction'] == 1
               and st5.city_owners.get(_w5['id'], {}).get(20) == 1
-              and st5.ats[401]['template_id'] == 108,
+              and st5.ats[401]['template_id'] == 114,
               f"win={st5.battles[wb5['id']]['winning_faction']} "
               f"tpl={st5.ats[401]['template_id']}")
 
@@ -1332,6 +1422,95 @@ async def main():
         wardb._load_preset = _orig_preset_loader
         wardb._load_capturepoint_templates = _orig_cp_loader
         wardb.commandnode_templates = _orig_tpls_k
+
+    # ---- L. war_pending 简报兵力（大厅战局详情 f4/f5 = battle roster
+    #      真实 AT，非 FALLBACK 静态锚点；2026-09-11 玩家报"成局战局
+    #      兵力值展示不对"修复回归）----
+    import mm_handler
+    import state as _st_l
+    from protocol import pb_field_payload, pb_split_top
+    stL = FakeStore()
+    warL2 = await war_campaign.ensure_war(stL)
+    aL1 = _mk_at(stL, warL2['id'], 441, 1, 10)
+    aL2 = _mk_at(stL, warL2['id'], 442, 1, 10)
+    dL1 = _mk_at(stL, warL2['id'], 443, 2, 10)
+    aL1['template_id'] = 901
+    aL2['template_id'] = 901
+    dL1['template_id'] = 901
+    aL1['resources'] = {1: 90}
+    aL2['resources'] = {1: 60, 6: 12}
+    dL1['resources'] = {1: 120}
+    aL1['owner_player_id'] = 7001
+    dL1['owner_player_id'] = 7002
+    stL.ats[442]['state'] = 3        # 被歼：不计入简报
+    wbL = await stL.create_war_battle(
+        warL2['id'], 10,
+        [{'at_id': 441, 'faction': 1}, {'at_id': 442, 'faction': 1},
+         {'at_id': 443, 'faction': 2}],
+        battle_type=war_campaign.BATTLE_TYPE_ASSAULT)
+    _prev_store_l = _st_l.STORE
+    _st_l.STORE = stL
+    try:
+        roster = await mm_handler._war_pending_roster(int(wbL['id']))
+        check('L1 roster：编制合计（state>=3 跳过）',
+              roster is not None
+              and roster[1] == {1: {1: 90}, 2: {1: 120}}
+              and [a['id'] for a in roster[0][1]] == [441]
+              and [a['id'] for a in roster[0][2]] == [443],
+              f'{roster and roster[1]}')
+        # L4 activation：war_pending det f11 = battle 行 started_at+准备期
+        #    （单一事实源；修复"刚成局显示已启动 1 小时"——旧口径
+        #    _zulu_activated 固定回溯 1h）；普通 det 回退 zulu 参数
+        from war_campaign.common import battle_activation_ts as _bat
+        act = roster[2]
+        check('L4 activation = battle 行激活时刻（非 1 小时回溯）',
+              act == _bat(stL.battles[int(wbL['id'])])
+              and act.endswith('Z') and len(act) == 15,
+              f'act={act}')
+        det = {'battle_id': int(wbL['id']), 'preset': 10,
+               'map_entity_id': 10,
+               'attacker_faction': 1, 'defender_faction': 2,
+               'war_pending': True, 'players': [],
+               'war_at_rows': roster[0], 'war_counts': roster[1],
+               'activation': act}
+        raw = mm_handler._msg_mission_details_response_multi(
+            990100, det, 'zulu')
+        f11 = [pb_parse(pb_field_payload(blk))[11]
+               for fn, blk in pb_split_top(raw)
+               if fn == 2 and 11 in pb_parse(pb_field_payload(blk))]
+        check('L4b MissionInfo f11 = det activation；无 activation 回退 zulu',
+              f11 == [act.encode()]
+              and pb_parse(pb_field_payload(
+                  next(blk for fn, blk in pb_split_top(
+                      mm_handler._msg_mission_details_response_multi(
+                          990101, {**det, 'activation': None}, 'zulu'))
+                  if fn == 2)))[11] == b'zulu',
+              f'f11={f11}')
+        det = {'battle_id': int(wbL['id']), 'preset': 10,
+               'map_entity_id': 10,
+               'attacker_faction': 1, 'defender_faction': 2,
+               'war_pending': True, 'players': [],
+               'war_at_rows': roster[0], 'war_counts': roster[1]}
+        raw = mm_handler._msg_mission_details_response_multi(
+            990100, det, 'zulu')
+        f4_rows = [pb_parse(pb_field_payload(blk))
+                   for fn, blk in pb_split_top(raw) if fn == 4]
+        f5_rows = [pb_parse(pb_field_payload(blk))
+                   for fn, blk in pb_split_top(raw) if fn == 5]
+        atk_inf = sum(int(r[4]) for r in f5_rows
+                      if int(r[1]) == 1 and int(r[2]) == 1)
+        dfd_inf = sum(int(r[4]) for r in f5_rows
+                      if int(r[1]) == 2 and int(r[2]) == 1)
+        check('L2 f5 兵力 = roster 真实编制（攻 90/守 120，非 1800 锚点）',
+              atk_inf == 90 and dfd_inf == 120,
+              f'atk={atk_inf} dfd={dfd_inf}')
+        atk_f4 = [(int(r[2]), int(r[4])) for r in f4_rows if int(r[1]) == 1]
+        dfd_f4 = [(int(r[2]), int(r[4])) for r in f4_rows if int(r[1]) == 2]
+        check('L3 f4 AT 行 = 真实模板 id + 属主（被歼 AT 不发）',
+              atk_f4 == [(901, 7001)] and dfd_f4 == [(901, 7002)],
+              f'atk={atk_f4} dfd={dfd_f4}')
+    finally:
+        _st_l.STORE = _prev_store_l
 
     fails = [l for l, ok in RESULTS if not ok]
     print(f'\n{"="*50}\nwar_movement 回归：{len(RESULTS)-len(fails)}/{len(RESULTS)} PASS')

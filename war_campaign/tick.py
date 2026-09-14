@@ -191,14 +191,25 @@ async def advance_movements(store, war=None, now=None):
                             msg_air_commandnode_base_row(
                                 at, war_id, segs[-1]['to_bf'])))
                     elif is_paradrop_unit(at):
-                        # 空降作战到达：伞兵落地变体（convert_to，*_on_
-                        # ground 半径无限、地面速度）+ 运输机拆成玩家
-                        # 名下独立 planes-AT 停原机场（官服 Spaatz 实锤
-                        # "returns the transport planes to the origin of
-                        # the transportation"；非回阵营库存——玩家
-                        # 私有，落地伞兵回机场补给时优先免费合并旧机
-                        # 重登机 "re-use old transport planes"）
-                        if int(_tpl_of(at).get('convert_to') or 0):
+                        # 空降作战到达（★2026-09-11 敌情分流修复：玩家报
+                        # "敌城空降运输机秒走"）：目标有敌驻军/同城进行中
+                        # 会战 → 不拆分，保持空中原型编制（cat4 伞兵 +
+                        # cat10 运输机成对入战——战斗内伞兵从运输机跳伞
+                        # 出生，结算时才拆分返航）；无敌情（友方/中立/
+                        # 空城）→ 伞兵落地变体（convert_to，*_on_ground
+                        # 半径无限、地面速度）+ 运输机拆成玩家名下独立
+                        # planes-AT 停原机场（官服 Spaatz 实锤 "returns
+                        # the transport planes to the origin of the
+                        # transportation"；非回阵营库存——玩家私有，
+                        # 落地伞兵回机场补给时优先免费合并旧机重登机
+                        # "re-use old transport planes"）
+                        dest_chk = (segs[-1]['to_bf'] if not dest_ap
+                                    else _ap_battlefield(dest_ap))
+                        if await _dest_hostile(store, war_id, at, dest_chk):
+                            log(f'[war] paradrop onto hostile battlefield '
+                                f'{dest_chk}: AT {at["id"]} 以空中原型入战'
+                                f'（cat4+cat10，运输机结算时返航）')
+                        elif int(_tpl_of(at).get('convert_to') or 0):
                             at, split_events = await land_paradrop_split(
                                 store, war_id, at)
                             events.extend(split_events)
@@ -249,6 +260,43 @@ async def advance_movements(store, war=None, now=None):
         return []
 
 
+async def _reinforce_live_battle(wb, at):
+    """增援 AT 并入已开战的会战资源池（官服口径：增援给进行中战斗
+    补充可出生兵力）。matchmaking 属上层模块（import war_campaign，
+    函数级引用防 import 环）。"""
+    try:
+        from matchmaking import add_reinforcement_to_live_mission
+        await add_reinforcement_to_live_mission(int(wb['id']), at)
+    except Exception as e:
+        log(f'[war] reinforce live battle {wb.get("id")} failed: {e}')
+
+
+async def _dest_hostile(store, war_id, at, dest_bf):
+    """空降目标是否有敌情（敌驻军 / 同城进行中会战）——判据与
+    _check_battle_formation 同源。
+
+    有敌情 → 伞兵保持空中原型编制（cat4 + cat10 成对）入战，运输机
+    在会战结算时才拆分返航（官方敌区交战时序：战败"运输机会返回
+    出发的机场，然后按步兵进攻失败的逻辑撤退"、战胜"运输机飞回
+    出发的机场"、包围歼灭含运输机）；无敌情（友方/中立/空城）→
+    落地即拆分返航（官方口径）。"""
+    if not dest_bf:
+        return False
+    my_faction = int(at.get('faction') or 0)
+    for wb in await store.list_active_war_battles(war_id):
+        if (int(wb.get('battle_type') or BATTLE_TYPE_ASSAULT)
+                == BATTLE_TYPE_ASSAULT
+                and int(wb.get('battlefield_id') or 0) == int(dest_bf)):
+            return True
+    others = await store.list_war_command_nodes(war_id)
+    return any(o['id'] != at['id'] and o.get('is_deployed')
+               and not is_reserve(o)
+               and int(o.get('state') or 0) < 3
+               and int(o.get('faction') or 0) != my_faction
+               and at_current_battlefield(o) == int(dest_bf)
+               for o in others)
+
+
 async def _check_battle_formation(store, war_id, at, dest_bf):
     """到达敌情检查（M1 会战桩 → M2 成局）：目标城市驻有敌对 AT →
     war_battles 登记 + war mission record 落库（任务列表可见）。
@@ -294,6 +342,8 @@ async def _check_battle_formation(store, war_id, at, dest_bf):
                 if wb2:
                     wb['factions'] = wb2.get('factions') or []
                 events.append(('set', b'battle', msg_battle_row(wb)))
+                # 已开局的战斗服资源池同步并入增援编制
+                await _reinforce_live_battle(wb, at)
             # else：第三阵营 AT 到场 → 不入战，正常驻扎（两方制契约）
             return events
     factions = [{'at_id': at['id'], 'faction': at.get('faction') or 0}]
@@ -350,17 +400,43 @@ async def _check_field_encounters(store, war_id, now_ms=None):
         if not groups:
             return events
         active = await store.list_active_war_battles(war_id)
-        field_active = {(int(wb.get('battlefield_id') or 0)
+        # 同段已有进行中野外会战：交战阵营的迟到 AT 入战（对齐城市会战
+        # 增援口径 append_war_battle_faction + state=2 + live 池并入），
+        # 第三阵营照常行军（两方制契约）；不重复建战
+        field_battles = {int(wb.get('battlefield_id') or 0): wb
                          for wb in active
                          if int(wb.get('battle_type')
-                                or BATTLE_TYPE_ASSAULT) != BATTLE_TYPE_ASSAULT)}
+                                or BATTLE_TYPE_ASSAULT) != BATTLE_TYPE_ASSAULT}
         sl_by_id = {int(s.get('id') or 0): s
                     for s in wardb.supplylines()}
         for sl_id, group in sorted(groups.items()):
             group = [a for a in group if not is_reserve(a)
                      and a.get('is_deployed')]
             facs = {int(a.get('faction') or 0) for a in group}
-            if len(facs) < 2 or sl_id in field_active:
+            wb0 = field_battles.get(sl_id)
+            if wb0 is not None:
+                bfacs = {int(f.get('faction') or 0)
+                         for f in (wb0.get('factions') or [])}
+                joined = [a for a in group
+                          if int(a.get('faction') or 0) in bfacs]
+                for a in joined:
+                    await store.append_war_battle_faction(
+                        int(wb0['id']), a['id'], a.get('faction'))
+                    await store.update_command_node(a['id'], state=2)
+                if joined:
+                    wb2 = await store.get_war_battle(int(wb0['id']))
+                    if wb2:
+                        wb0['factions'] = wb2.get('factions') or []
+                        events.append(
+                            ('set', b'battle', msg_battle_row(wb0)))
+                        for a in joined:
+                            await _reinforce_live_battle(wb0, a)
+                    bypass = [a['id'] for a in group if a not in joined]
+                    log(f'[war] field battle {wb0["id"]} reinforced by '
+                        f'{[a["id"] for a in joined]} on supplyline {sl_id}'
+                        + (f'（{bypass} 第三阵营照常行军）' if bypass else ''))
+                continue
+            if len(facs) < 2:
                 continue
             # ---- position：各 AT 当前段进度 → 补给线绝对位置均值 ----
             sl = sl_by_id.get(sl_id) or {}
@@ -396,7 +472,7 @@ async def _check_field_encounters(store, war_id, now_ms=None):
             if not wb:
                 continue
             events.append(('set', b'battle', msg_battle_row(wb)))
-            field_active.add(sl_id)
+            field_battles[sl_id] = wb
             try:
                 preset_pool = (mm_config.gamemode_cfg(10)
                                .get('fallback_presets') or [])
@@ -791,6 +867,24 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                 else:
                     events.append(('del', b'armyresource',
                                    at['id'] * 1000 + cat))
+            # ★ 伞兵战后落地（官方敌区交战时序收口，2026-09-11）：会战
+            # 结算时运输机才返航——伞兵转落地变体驻留战场（胜方留城/
+            # 败方原地待后续撤退），运输机拆分飞回原机场（官方原文：
+            # 胜"夺取该城，运输机飞回出发的机场"/败"运输机会返回出发
+            # 的机场"）。敌区到达不再提前拆分 → 空中原型带着 cat10 入战
+            # （战斗内伞兵从运输机跳伞出生 + 战损/歼灭含运输机）。
+            # ★方向防反跳：模板表 108↔114 双向 convert_to（落地变体
+            # 回机场重新登机也走 convert_to）——仅空中原型（非
+            # *_on_ground）拆分，落地变体幂等跳过；automission 败方
+            # _paras_land 先行拆分后此处自然跳过。野外会战无空中原型。
+            if (not is_field and at.get('is_deployed')
+                    and int(at.get('state') or 0) == 0
+                    and int(_tpl_of(at).get('convert_to') or 0)
+                    and not str(_tpl_of(at).get('name') or '')
+                    .endswith('_on_ground')):
+                at, split_events = await land_paradrop_split(
+                    store, war_id, at)
+                events.extend(split_events)
 
         # ③ 城市易主：攻方胜 → 占领（守方胜城市不变）；野外会战无城可占
         #    （battlefield_id=补给线 id），dest_bf 置 0 同时跳过 ③/D

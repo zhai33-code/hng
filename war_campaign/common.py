@@ -146,6 +146,44 @@ def battle_prep_seconds(battle_type):
             else mm_config.WAR_BATTLE_PREP_FIELD)
 
 
+def battle_map_entity(wb):
+    """battle 行 → (mapEntityId, mapEntityTypeId)（MissionInfo f5/f6 用，
+    与 battle 行 f3/f4 同源：城战=城市 battlefield id/1、野外遭遇=
+    补给线 id/3）。客户端按 f6 分流显名：type1=BattlefieldTable.bftitle
+    城市名，type3=getMissionCityName 拼"城市名-方向字母"（修复野外遭遇
+    局简报城市名取段起点城市的问题，docs/war-battle-details-missionid-
+    bug.md §三.5 B1/B2）。行缺失回退 (0, 0)（调用方回退 record 旧值）。"""
+    btype = int((wb or {}).get('battle_type') or BATTLE_TYPE_ASSAULT)
+    ent_type = (MAP_ENTITY_BATTLEFIELD if btype == BATTLE_TYPE_ASSAULT
+                else MAP_ENTITY_SUPPLYLINE)
+    try:
+        ent_id = int((wb or {}).get('battlefield_id') or 0)
+    except (TypeError, ValueError):
+        ent_id = 0
+    return ent_id, ent_type
+
+
+def battle_activation_ts(wb):
+    """battle 行 → activationTimeStamp Zulu 串（= started_at + 准备期，
+    与 battle 行 f12 同源同值）——war 会战局激活时刻的单一事实源。
+
+    MissionInfo f11（GetMissionList / GetMissionDetails）复用：客户端
+    MissionDetailsMediator 的"已激活时长" = serverTime − f11。此前 war 局
+    复用 _zulu_activated()（固定回溯 1 小时，普通即时匹配局防 serverTime
+    同步延迟的设计）→ 会战刚成立即显示"战斗已启动于 1 小时"（2026-09-11
+    玩家反馈）。war 局发真实激活时刻：未过准备期 → 客户端显示集结倒计时
+    （battle_ready_in，官方观感）；已过 → 真实激活时长。行缺失/时间缺失
+    回退 ''（调用方回退旧 zulu）。"""
+    started = (wb or {}).get('started_at')
+    if not started:
+        return ''
+    activation = started
+    if isinstance(started, datetime.datetime):
+        activation = (started + datetime.timedelta(
+            seconds=battle_prep_seconds((wb or {}).get('battle_type'))))
+    return _fmt_ts(activation)
+
+
 def _ts_ms(dt):
     """datetime → 毫秒时间戳（无值回 0）。"""
     if not dt:
