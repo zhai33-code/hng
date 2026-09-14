@@ -1268,6 +1268,7 @@ async def _start_match(match):
     else:
         attacker, defender, one_sided = _split_factions(match.players)
         war_activation = None
+        war_entity = None
     # ★ AI 策略（2026-09-01 按官方实现复刻 killfeed 阵营默认名）：官方两套
     #   bot 系统按模式互斥（战斗服 player.dll 逆向实锤）：
     #   - 训练模式（gamemode 1）f20 enableBots=True：战斗服本地 bot
