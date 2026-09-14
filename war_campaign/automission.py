@@ -142,12 +142,16 @@ async def _judge_threshold(store, wb, mrec, now_s):
     is_para = (btype == BATTLE_TYPE_ASSAULT
                and any(_is_para_family(a) for a in atk_ats))
     # ---- 准备期超时（§3 野外 300s / §4 城攻 330s / §7 伞兵 330s）----
+    # 准备期结束只是战斗开始（activationTimeStamp，客户端切正向计时），
+    # 系统判定在开战后 WAR_AUTO_BATTLE_GRACE（war1.md 4分30秒）才执行
     if btype == BATTLE_TYPE_ASSAULT:
-        timeout = (mm_config.WAR_AUTO_PARADROP_TIMEOUT if is_para
-                   else mm_config.WAR_AUTO_ATTACK_TIMEOUT)
+        prep = (mm_config.WAR_AUTO_PARADROP_TIMEOUT if is_para
+                else mm_config.WAR_AUTO_ATTACK_TIMEOUT)
     else:
-        timeout = mm_config.WAR_BATTLE_PREP_FIELD
-    if now_s - started < max(1, int(timeout)):
+        prep = mm_config.WAR_BATTLE_PREP_FIELD
+    timeout = (max(1, int(prep))
+               + max(0, int(mm_config.WAR_AUTO_BATTLE_GRACE)))
+    if now_s - started < timeout:
         return None
     atk_inf = _troop_count(atk_ats, _SOLDIER_CATS)
     def_inf = _troop_count(def_ats, _SOLDIER_CATS)
@@ -177,7 +181,7 @@ async def _judge_threshold(store, wb, mrec, now_s):
             return atk_fac, []
         # 双方不足 / 双方满足 → tie（§8）
     # ---- tie：WAR_AUTO_TIE_HOURS 后兵力少者败（持平无胜方收局）----
-    if now_s - started < mm_config.WAR_AUTO_TIE_HOURS * 3600.0:
+    if now_s - started < timeout + mm_config.WAR_AUTO_TIE_HOURS * 3600.0:
         return None
     if atk_inf > def_inf:
         return atk_fac, []

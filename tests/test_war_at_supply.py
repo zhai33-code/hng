@@ -763,12 +763,16 @@ async def section_c():
     check('C4 移动中 → 116',
           f.get(2) == war_campaign.RC_NO_RESUPPLY_IN_TRANSPORT, str(f))
 
-    # C5 103：满编
+    # C5 满编 → ok no-op（2026-09-14 修"部署成功后卡部署界面"：部署
+    # 窗口自动补编链 issueSupplyRequest 在部署已补满编后必达（快照价
+    # >0），回 103 会让 requestSuppliesResponse 进错误态永久卡窗——
+    # 仅 ok 关窗；满编 ok 无扣款无行变更）
     st = _setup()
     _mk_at(st, 500, template=501, resources={'1': 12})
     w, f = await _resupply(500)
-    check('C5 满编 → 103',
-          f.get(2) == war_campaign.RC_NO_RESUPPLY_ALREADY_FULL, str(f))
+    check('C5 满编 → ok no-op（无扣款/资源不变）',
+          f.get(2) == 1 and st.ats[500]['resources'] == {'1': 12}
+          and not st.spend_log, str(f))
 
     # C6 首次免费：补满 + 置位 + 免单 + armyresource 推送
     st = _setup()
@@ -1107,12 +1111,18 @@ async def section_d():
     check('D2e 唯一邻城交战 → 落主城部署成功',
           f.get(1) == 1 and st.ats[500]['map_entity_id'] == 10, str(f))
 
-    # D2f 部署推送行序（2026-09-08 修"主城两个一样图标"）：WarInstance 行
-    # DELETE(旧实例) → ADD(isDeployed=1)，官服口径——客户端 ADD 分支
-    # addAssaultTeamToMap 尾部有 checkLocationForStack 堆叠检查，UPDATE
-    # 分支 handleDeployChanges 没有 → UPDATE 推送时主城多 AT 图标不进
-    # MultiMarker 叠放（MultiMarker + 独立图标两个）。DELETE 先于 ADD
-    # 让客户端走 ADD 分支正确收编；Morale/armyresource 照推、Definition
+    # D2f 部署推送行序（2026-09-08 修"主城两个一样图标"；2026-09-14 修
+    # "部署成功后卡部署界面"）：WarInstance 行 DELETE(旧实例) →
+    # ADD(isDeployed=1) → 【末尾】同值 set(→客户端 UPDATE)。ADD 走官服
+    # 口径——客户端 ADD 分支 addAssaultTeamToMap 尾部有
+    # checkLocationForStack 堆叠检查，UPDATE 分支 handleDeployChanges
+    # 没有 → 若首推走 UPDATE 主城多 AT 图标不进 MultiMarker 叠放。
+    # 末尾补推的同值 set 行到达时行已存在 → 客户端派发 UPDATE 事件：
+    # 部署窗口 AssaultTeamReinforcementWindowMediator 收 ok 响应时无
+    # 动作（仅 226 直接收窗），关窗只认 UPDATE → 没有这条就永久卡在
+    # 禁用的部署界面；地图层 hasChanged* 按新旧行比较，同值无副作用。
+    # 补推须在 armyresource 之后（窗口用 armyresource 重算补编价再决定
+    # 关窗还是走自动补编链）。Morale/armyresource 照推、Definition
     # 不推（部署不改定义，且 DELETE 后 _warInstancesByDefinitionId 映射
     # 已清，客户端 definitionUpdated 会跳过）
     st = _setup()
@@ -1132,13 +1142,21 @@ async def section_d():
     morale = _rows(w, 'CommandNodeMorale')
     defn = _rows(w, 'CommandNodeDefinition')
     seq = [e for e in events if e[1] == b'CommandNodeWarInstance']
-    check('D2f 部署推送 DELETE→ADD 行序（WarInstance 重生/Morale 推/Definition 不推）',
+    last_ar = max((i for i, e in enumerate(events)
+                   if e[1] == b'armyresource'), default=-1)
+    last_wi = max((i for i, e in enumerate(events)
+                   if e[1] == b'CommandNodeWarInstance'), default=-1)
+    check('D2f 部署推送 DELETE→ADD→末尾同值UPDATE 行序（解卡窗/Morale 推/Definition 不推）',
           f.get(1) == 1 and dels == [500]
           and inst and inst[-1].get(10) == 1
           and seq == [('del', b'CommandNodeWarInstance'),
+                      ('set', b'CommandNodeWarInstance'),
                       ('set', b'CommandNodeWarInstance')]
+          and len(inst) == 2 and inst[0] == inst[-1]     # 两条 set 同值
+          and last_wi > last_ar >= 0                     # UPDATE 在 armyresource 后
           and morale and not defn,
-          f'seq={seq} morale={len(morale)} defn={len(defn)}')
+          f'seq={seq} morale={len(morale)} defn={len(defn)} '
+          f'last_wi={last_wi} last_ar={last_ar}')
 
     # D3 重复部署 → 150（先成功部署一次）
     st = _setup()
@@ -1416,16 +1434,16 @@ async def section_e():
           and st.spend_log == [(100, 'warfunds', 1000)]
           and len(ab_rows) == 1 and ab_rows[0].get(3) == 11, str(f))
 
-    # E10 落地变体在普通城（非机场）补给 → 维持落地口径 103
-    # （须先回己方机场才能登机；缺口不算/不扣款/模板不动）
+    # E10 落地变体在普通城（非机场）补给 → 满编 ok no-op（C5 同口径；
+    # 须先回己方机场才能登机；缺口不算/不扣款/模板不动）
     st = _setup()
     await war_campaign.ensure_war(st)
     st.city_owners[1] = {10: 1, 11: 1, 12: 1, 13: 1}
     _mk_at(st, 615, template=509, deployed=True, map_entity_id=13,
            resources={4: 36, 10: 5}, veh_free=True)
     w, f = await _resupply(615, sp=9001, vp=9002)
-    check('E10 落地变体普通城补给 → 103（模板不动/不扣款/资源不动）',
-          f.get(2) == war_campaign.RC_NO_RESUPPLY_ALREADY_FULL
+    check('E10 落地变体普通城补给 → ok no-op（模板不动/不扣款/资源不动）',
+          f.get(2) == 1
           and st.ats[615]['template_id'] == 509
           and st.ats[615]['resources'] == {4: 36, 10: 5}
           and not st.spend_log, str(f))
@@ -2261,19 +2279,30 @@ async def _retreat(node_id):
 async def section_t():
     _retreat_graph()
 
-    # T1 交战强撤：损 25% 编制 + 扣 20 士气 + 友方邻城落位（保持部署）
+    # T1 交战强撤：损 25% 编制 + 扣 20 士气 + 向友方邻城撤退行军（动画）
     st = _setup()
     await war_campaign.ensure_war(st)
     _mk_at(st, 530, resources={1: 12}, deployed=True, map_entity_id=11,
            state=2)
     w, fr = await _retreat(530)
-    check('T1 交战强撤 → 25% 损耗 + -20 士气 + 友方邻城 10 落位（保持部署）',
+    mv530 = next((m for m in st.movements.values()
+                  if m['commandnode_id'] == 530 and m['state'] == 0), None)
+    check('T1 交战强撤 → 25% 损耗 + -20 士气 + 向友方邻城 10 撤退行军',
           fr.get(1) == 1
-          and st.ats[530]['state'] == 0
+          and st.ats[530]['state'] == 1
           and st.ats[530]['is_deployed']
-          and st.ats[530]['map_entity_id'] == 10
           and st.ats[530]['resources'] == {1: 9}
-          and st.ats[530]['morale'] == 80, str(fr))
+          and st.ats[530]['morale'] == 80
+          and mv530 is not None
+          and mv530['path'][-1]['to_bf'] == 10, str(fr))
+
+    # T1b 撤退行军到达 → 落位友方城（保持部署，不逼重新部署）
+    mv530['path'][0]['seconds'] = 0
+    await war_campaign.advance_movements(st)
+    check('T1b 撤退行军到达 → 友方邻城 10 落位（保持部署）',
+          st.ats[530]['state'] == 0
+          and st.ats[530]['is_deployed']
+          and st.ats[530]['map_entity_id'] == 10, str(fr))
 
     # T2 包围：邻城 19/20 全驻敌军 AT → 拒绝撤退，AT 原地不动
     st = _setup()
@@ -2350,6 +2379,9 @@ async def section_t():
 
 
 async def main():
+    # 本套件回归即时/库存入队链（M3-2）：钉 mode=0 关闭补给队
+    # （全局默认已改 2=官服一律出队，出队分支由 test_war_supply_column 覆盖）
+    mm_config.WAR_SUPPLY_COLUMN_MODE = 0
     await section_a()
     await section_b()
     await section_c()

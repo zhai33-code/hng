@@ -534,7 +534,10 @@ def _accesspoint_layout(preset_id=MISSION_PRESET_ID,
         # HasResources → 守方小队/坦克部署中心 O 区）；攻方随机激活
         # 2~3 条边线，未激活线不开启。O 点归属走 BattleFieldSettings
         # f3 defender（H3 已实测证实，与出兵点归属无关）。
-        d_ap, a_aps, _inactive = assault_ap_decision(gamemap_id, mission_id)
+        d_ap, a_aps, _inactive = assault_ap_decision(
+            gamemap_id, mission_id,
+            prefer=force_pool.attacker_ap_tmpls(mission_id),
+            strict=bool(force_pool.attacker_ap_tmpls(mission_id)))
         for tmpl in aps4:
             if tmpl in a_aps:
                 layout.append((tmpl, attacker_faction))

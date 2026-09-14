@@ -335,6 +335,17 @@ async def main():
                 log(f'[DB] closed {n} stale mission_records (server restart)')
         except Exception as e:
             log(f'[DB] close_stale_missions failed: {e}')
+        # 活跃会战 record 重建：close_stale_missions 只关 record 不动
+        # war_battles——战图战斗标记仍在，但 battle→mission 链（详情/
+        # 加入/增援统一 get_mission_by_battle states 0/1）全断 → 点开
+        # 战局详情回 43 秒关、加入战局直接退池。
+        try:
+            n = await war_campaign.rebuild_orphan_battle_missions(STORE)
+            if n:
+                log(f'[DB] rebuilt {n} mission_records for active '
+                    f'war battles (server restart)')
+        except Exception as e:
+            log(f'[DB] rebuild orphan battle missions failed: {e}')
         # 选中士兵注册表回放（player_selected_char → 内存，
         # 组队入队规则"被邀者当前选中角色"跨重启保留）
         try:

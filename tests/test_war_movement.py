@@ -185,6 +185,11 @@ class FakeStore:
                 return dict(mv)
         return None
 
+    async def get_last_movement(self, commandnode_id):
+        mvs = [m for m in self.movements.values()
+               if m['commandnode_id'] == int(commandnode_id)]
+        return dict(max(mvs, key=lambda m: m['id'])) if mvs else None
+
     async def list_active_movements(self, war_id):
         return [dict(mv) for mv in sorted(self.movements.values(),
                                           key=lambda m: m['id'])
@@ -614,7 +619,7 @@ async def main():
           and ('set', b'CommandNodeWarInstance') in tags3
           and ('set', b'battle') in tags3,
           f'{sorted(tags3)}')
-    check('到达落位城市 30 type=1',
+    check('到达落位城市 30 type=1（官服：图标叠城，方向差异在详情兵线）',
           store2.ats[21]['map_entity_id'] == 30
           and store2.ats[21]['map_entity_type']
           == war_campaign.MAP_ENTITY_BATTLEFIELD)
@@ -1033,6 +1038,66 @@ async def main():
           f'deployed={storeC.ats[211]["is_deployed"]}')
     wardb.capitals = _orig_caps
 
+    # I5 败方原路撤退（③b 原路优先）：攻方战败 → 撤回进攻出发城
+    #    （path[0].from_bf 仍己方）；出发城已丢 → 回退最近友方城
+    _orig_caps_i5 = wardb.capitals
+    wardb.capitals = lambda: [
+        {'battlefield_id': 10, 'default_faction': 1},
+        {'battlefield_id': 20, 'default_faction': 1},
+        {'battlefield_id': 30, 'default_faction': 2},
+    ]
+
+    async def _i5_run():
+        sti = FakeStore()
+        wari = await war_campaign.ensure_war(sti)
+        _mk_at(sti, wari['id'], 231, 1, 10)
+        _mk_at(sti, wari['id'], 232, 2, 30)
+        at_i5 = sti.ats[231]
+        await war_campaign.start_movement(sti, at_i5, 30, now=NOW)
+        await war_campaign.advance_movements(
+            sti, wari,
+            now=NOW + datetime.timedelta(seconds=2 * SEG_SEC + 5))
+        wb_i5 = list(sti.battles.values())[0]
+        sti.ats[231]['resources'] = {1: 100}
+        sti.ats[232]['resources'] = {1: 100}
+        return sti, wari, wb_i5
+
+    sti, wari, wb_i5 = await _i5_run()
+    await war_campaign.settle_war_battle(sti, 0, wb_i5['id'], 2)
+    mv231 = next((m for m in sti.movements.values()
+                  if m['commandnode_id'] == 231 and m['state'] == 0), None)
+    check('I5a 败方原路撤退 → 向出发城 10 撤退行军（保持部署，动画）',
+          mv231 is not None
+          and mv231['path'][-1]['to_bf'] == 10
+          and sti.ats[231]['state'] == 1
+          and sti.ats[231]['is_deployed'] is True,
+          f'{mv231 and mv231["path"][-1]["to_bf"]}/{sti.ats[231]["state"]}')
+    for _seg in mv231['path']:
+        _seg['seconds'] = 0
+    await war_campaign.advance_movements(sti, wari)
+    check('I5a2 撤退行军到达 → 出发城 10 落位（state=0 保持部署）',
+          sti.ats[231]['map_entity_id'] == 10
+          and sti.ats[231]['state'] == 0
+          and sti.ats[231]['is_deployed'] is True,
+          f'{sti.ats[231]["map_entity_id"]}/{sti.ats[231]["state"]}')
+
+    sti, wari, wb_i5 = await _i5_run()
+    sti.city_owners[wari['id']][10] = 2      # 出发城 10 已被敌占
+    await war_campaign.settle_war_battle(sti, 0, wb_i5['id'], 2)
+    mv231 = next((m for m in sti.movements.values()
+                  if m['commandnode_id'] == 231 and m['state'] == 0), None)
+    check('I5b 出发城已丢 → 向最近友方城 20 撤退行军（BFS 兜底）',
+          mv231 is not None
+          and mv231['path'][-1]['to_bf'] == 20,
+          f'{mv231 and mv231["path"][-1]["to_bf"]}')
+    for _seg in mv231['path']:
+        _seg['seconds'] = 0
+    await war_campaign.advance_movements(sti, wari)
+    check('I5b2 撤退行军到达 → 友方城 20 落位',
+          sti.ats[231]['map_entity_id'] == 20,
+          f'{sti.ats[231]["map_entity_id"]}')
+    wardb.capitals = _orig_caps_i5
+
     # ---- J. 野外遭遇成局（war-gameplay-fix-plan §2：encounter/skirmish、
     #      battle 行补给线契约、行军冻结与结算恢复）----
     # 合成模板：901 纯步兵（cat1 士兵族）/ 902 坦克族（cat7）
@@ -1216,6 +1281,157 @@ async def main():
             check('J7c 局未开不并入（排队局建池时按 factions 全量读取）',
                   not ok2 and _fp.pool(midM)[1][1] == 150,
                   f'ok2={ok2}')
+
+            # J8 详情兵线按进攻方向（assign_lines）：ap_tmpl 命中激活线
+            # 模板的 AT 分到对应线（war accesspoint.template = 对局图
+            # accesspointtemplate.id），无方向 AT 蛇形补位
+            _fp._MISSIONS[9001] = {
+                'mode': 'war', 'names': ['infA', 'infB', 'infC'],
+                'names_by_faction': {1: ['infA', 'infB', 'infC']},
+                'war_ats': {1: [
+                    {'id': 1, 'name': 'a', 'owner_player_id': 9,
+                     'template_id': 901, 'ap_tmpl': 15},
+                    {'id': 2, 'name': 'b', 'owner_player_id': 9,
+                     'template_id': 901, 'ap_tmpl': 8},
+                    {'id': 3, 'name': 'c', 'owner_player_id': 9,
+                     'template_id': 901, 'ap_tmpl': 0},
+                ]},
+                'attacker': 1, 'defender': 2,
+                'pool': {1: {'1': 330}, 2: {'1': 330}},
+                'lines': None, 'line_pool': None, 'ap_line': {},
+            }
+            _orig_atcomp = _fp._AT_COMP
+            _fp._AT_COMP = {'infA': {1: 100}, 'infB': {1: 200},
+                            'infC': {1: 30}}
+            try:
+                _fp.assign_lines(9001, 2, [8, 15])
+                check('J8 兵线按进攻方向：ap_tmpl 15→线1 / 8→线0 / '
+                      '无方向蛇形补位',
+                      _fp._MISSIONS[9001]['lines'][0] == ['infB', 'infC']
+                      and _fp._MISSIONS[9001]['lines'][1] == ['infA']
+                      and _fp._MISSIONS[9001]['ap_line'] == {8: 0, 15: 1},
+                      f'{_fp._MISSIONS[9001]["lines"]}')
+            finally:
+                _fp._AT_COMP = _orig_atcomp
+                _fp._MISSIONS.pop(9001, None)
+
+            # J9 war 激活线按进攻方向（用户口径：不随机凑 2-3 条，哪条
+            # 线有进攻兵力就开哪条）——strict=True 只开命中本图的来向线
+            _j9 = wardb.assault_ap_decision(204, 9002, prefer=(1164235,),
+                                            strict=True)
+            check('J9 war 激活线=来向线（只开 1164235，其余全关）',
+                  _j9[1] == [1164235]
+                  and sorted(_j9[2]) == [2717391, 2881042, 3386581]
+                  and 1164235 not in _j9[2]
+                  and wardb.assault_ap_decision(204, 9003,
+                                                strict=False)[1] != [1164235],
+                  f'{_j9}')
+
+            # J10 守方红线进简报（官方规则：边线连向的相邻城市为守方占领
+            # → 该线归属守方，可能多条；_init_war_mission_resources 计算
+            # dfn_lanes，简报 f6 逐线发归属）
+            from protocol import (pb_split_top as _pst,
+                                  pb_field_payload as _pfp,
+                                  pb_parse_loose as _ppl)
+            _fp._MISSIONS[9004] = {
+                'mode': 'war', 'attacker': 2, 'defender': 3,
+                'prefer_aps': [1164235], 'dfn_lanes': [2881042, 2717391],
+                'names_by_faction': {2: ['infantry'], 3: ['infantry']},
+                'names': ['infantry'], 'lines': [['infantry']],
+                'ap_line': {1164235: 0},
+                'pool': {2: {1: 10}, 3: {1: 10}},
+                'war_ats': {2: [{'ap_tmpl': 1164235}],
+                            3: [{'ap_tmpl': 0}]}}
+            _mm._MM_MISSION_DETAILS[9004] = {'preset': 5}
+            _f610 = {}
+            _f410 = []
+            try:
+                for _fn, _blk in _pst(_mm._msg_mission_details_response(
+                        9004, 1, 't', 'z', player_faction=2, gamemap_id=204)):
+                    if _fn == 4:
+                        _ef4 = _ppl(_pfp(_blk))
+                        _f410.append((int(_ef4.get(1)),
+                                      int(_ef4.get(3) or 0)))
+                    elif _fn != 6:
+                        continue
+                    else:
+                        _ef = _ppl(_pfp(_blk))
+                        _f610[int(_ef.get(1))] = int(_ef.get(2))
+            finally:
+                _fp._MISSIONS.pop(9004, None)
+                _mm._MM_MISSION_DETAILS.pop(9004, None)
+            check('J10 war 守方红线进 f6（2881042/2717391=守方 3，来向'
+                  '1164235=攻方 2，空闲 3386581 不发）',
+                  _f610.get(2881042) == 3 and _f610.get(2717391) == 3
+                  and _f610.get(1164235) == 2
+                  and _f610.get(3386581) is None,
+                  f'{_f610}')
+            _d_ap10 = wardb.assault_ap_decision(204, 9004,
+                                                prefer=[1164235],
+                                                strict=True)[0]
+            check('J10 war f4 逐 AT 挂线（攻 AT=来向 1164235，守 AT=O 锚'
+                  f'{_d_ap10}）',
+                  (2, 1164235) in _f410
+                  and all(ap == _d_ap10 for f, ap in _f410 if f == 3),
+                  f'{_f410}')
+
+            # J12 边线归属 = 相邻城市归属（Tatabánya 真实拓扑：105→
+            # Komárno=攻2，101/102/104→守方占城=3，103→Székesfh=中立0；
+            # 2026-09-15 实锤：来向线被夺回后须过滤，陈旧来向作废。
+            # 本文件头部把 wardb 两表 monkeypatch 成合成拓扑，此处临时
+            # 还原真实表再算）
+            import war_campaign.common as _wc
+            _own12 = {703985954: 3, 421999695: 2, 176056349: 3,
+                      781602986: 3, 436884145: 3, 591550748: 0}
+            _saved12 = (wardb.accesspoints, wardb.supplylines,
+                        _wc._ADJACENCY_CACHE)
+            try:
+                wardb.accesspoints = lambda: [
+                    {'id': int(r.get(1, 0) or 0), 'mapid': 0,
+                     'template': int(r.get(3, 0) or 0),
+                     'battlefield': int(r.get(4, 0) or 0)}
+                    for r in wardb._parse_wardb_table('accesspoint')]
+                wardb.supplylines = lambda: [
+                    {'id': int(r.get(1, 0) or 0), 'mapid': 0,
+                     'ap1': int(r.get(3, 0) or 0),
+                     'ap2': int(r.get(4, 0) or 0), 'template_id': 0}
+                    for r in wardb._parse_wardb_table('supplyline')]
+                _wc._ADJACENCY_CACHE = None
+                _lo12 = _mm._lane_ownership(
+                    703985954, _own12,
+                    {a['id']: a['template'] for a in wardb.accesspoints()})
+            finally:
+                (wardb.accesspoints, wardb.supplylines,
+                 _wc._ADJACENCY_CACHE) = _saved12
+            check('J12 Tatabánya 边线归属（105=攻2，101/102/104=守3，'
+                  '103=中立0）',
+                  _lo12.get(105) == 2 and _lo12.get(101) == 3
+                  and _lo12.get(102) == 3 and _lo12.get(104) == 3
+                  and _lo12.get(103) == 0, f'{_lo12}')
+
+            # J11 war 守方被包围（红线 0 条）→ 一条守方线都不开，不兜底
+            _fp._MISSIONS[9005] = {
+                'mode': 'war', 'attacker': 2, 'defender': 3,
+                'prefer_aps': [1164235], 'dfn_lanes': [],
+                'names_by_faction': {2: ['infantry'], 3: ['infantry']},
+                'names': ['infantry'], 'pool': {2: {1: 10}, 3: {1: 10}},
+                'war_ats': {2: [{'ap_tmpl': 1164235}],
+                            3: [{'ap_tmpl': 0}]}}
+            _mm._MM_MISSION_DETAILS[9005] = {'preset': 5}
+            _f611 = {}
+            try:
+                for _fn, _blk in _pst(_mm._msg_mission_details_response(
+                        9005, 1, 't', 'z', player_faction=2, gamemap_id=204)):
+                    if _fn != 6:
+                        continue
+                    _ef = _ppl(_pfp(_blk))
+                    _f611[int(_ef.get(1))] = int(_ef.get(2))
+            finally:
+                _fp._MISSIONS.pop(9005, None)
+                _mm._MM_MISSION_DETAILS.pop(9005, None)
+            check('J11 war 守方被包围（红线 0）→ f6 无守方线（仅来向'
+                  '1164235=攻方 2）',
+                  _f611 == {1164235: 2}, f'{_f611}')
         finally:
             _fp.composition_for_template = _prev_comp
             _fp.template_name = _prev_tn

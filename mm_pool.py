@@ -147,6 +147,14 @@ class MatchPool:
                          battle_id=battle_id)
         return None
 
+    def war_bucket(self, battle_id):
+        """war 会战桶内等待条目（FIFO 序）：详情简报"战局玩家列表"数据源
+        （本会战已排队、尚未成局的玩家；battle_id=0 / 无条目返回 ()）。"""
+        if not battle_id:
+            return ()
+        return tuple(e for e in self._by_mode.get(10, ())
+                     if int(e.battle_id) == int(battle_id))
+
     # ---- 内部 ----
     def _collect_group(self, entries, min_p, max_p):
         """以最早 entry 为锚点收集同图兼容组；不足 min_p 返回 None。

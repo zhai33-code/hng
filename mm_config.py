@@ -331,6 +331,10 @@ WAR_AUTO_ATTACK_TIMEOUT = _int_env('MM_WAR_AUTO_ATTACK_TIMEOUT', 330)  # 城攻�
 WAR_AUTO_PARADROP_TIMEOUT = _int_env('MM_WAR_AUTO_PARADROP_TIMEOUT', 330)  # 伞兵攻城
 WAR_AUTO_PARA_MIN = _int_env('MM_WAR_AUTO_PARA_MIN', 288)   # 伞兵攻城判定
 WAR_AUTO_TIE_HOURS = _float_env('MM_WAR_AUTO_TIE_HOURS', 6.0)  # tie 超时（小时）
+# 开战判定宽限（秒）：准备期结束（activationTimeStamp）只是战斗开始
+# （客户端切正向计时），系统判定再等此窗口（war1.md 野外口径"战斗开始
+# 后4分30秒判定"=270s；城攻/伞兵同口径顺延，避免准备期一到即结算）
+WAR_AUTO_BATTLE_GRACE = _int_env('MM_WAR_AUTO_BATTLE_GRACE', 270)
 # FPS 真人会战结算损耗系数（占参战 AT 当前 resources 比例；官服按局内
 # 死亡逐兵扣减，逐兵数据不可得，退化为按胜负比例扣，可校准）
 WAR_BATTLE_WINNER_LOSS = _float_env('MM_WAR_BATTLE_WINNER_LOSS', 0.15)
@@ -356,8 +360,9 @@ WAR_PRODUCTION_MIN_TICK = _int_env('MM_WAR_PRODUCTION_MIN_TICK', 60)
 WAR_SUPPLY_INSTANT_PARTIAL = bool(
     _int_env('MM_WAR_SUPPLY_INSTANT_PARTIAL', 1))
 # 补给队（Reserve，官服机制 §10.2 #6）：0=关闭（一律即时/库存入队，旧
-# 行为）；1=自动（AT 所在城市非己方领地 → 购买的兵员装上补给队从最近己方
-# 城市沿补给线机动，到达与父 AT 汇合后入编）；2=一律生成补给队。
-# 官服口径：客户端 AT_TEMPLATE_RESERVE(4) + parentCommandNodeInstanceId
-# 汇合链（AssaultTeamModel.updateArmyResources OnTheWay 汇总）。
-WAR_SUPPLY_COLUMN_MODE = _int_env('MM_WAR_SUPPLY_COLUMN_MODE', 1)
+# 行为）；1=自动（AT 所在城市非己方补给网才出队）；2=一律生成补给队。
+# 官服口径（默认 2）：客户端补编窗口缺口公式 templateCount - onTheWay -
+# current（AssaultTeamReinforcementWindowMediator）——购买的增援一律
+# OnTheWay 在途（AT_TEMPLATE_RESERVE(4) + parentCommandNodeInstanceId
+# 汇合链），与 AT 是否在补给网无关；同城（首都）出生即直接汇合。
+WAR_SUPPLY_COLUMN_MODE = _int_env('MM_WAR_SUPPLY_COLUMN_MODE', 2)

@@ -488,3 +488,90 @@ async def start_planes_rebase(store, war, at, target_bf, override_move=False,
         arrive_at=now + datetime.timedelta(seconds=seconds))
     await store.update_command_node(at['id'], state=1)
     return mv, RC_OK
+
+
+# ---- 交战撤退（war1.md §撤退：沿友方路线行军撤离，非闪现）----
+
+
+def _nearest_friendly_bf(from_bf, faction, owners):
+    """补给线 BFS 最近友方城（owner==faction，不含出发城）；无则 0。
+    （与 tick._nearest_friendly_bf 同判据；本模块不可反向 import tick）"""
+    from_bf = int(from_bf or 0)
+    adj = supplyline_adjacency()
+    seen = {from_bf}
+    queue = [from_bf]
+    while queue:
+        cur = queue.pop(0)
+        for edge in adj.get(cur, ()):
+            nb = edge[3]
+            if nb in seen:
+                continue
+            seen.add(nb)
+            if int((owners or {}).get(nb) or 0) == int(faction):
+                return nb
+            queue.append(nb)
+    return 0
+
+
+async def retreat_eval_field(store, war_id, at, owners=None):
+    """野外遭遇撤退落点（war1.md：可沿友军方向的遭遇战撤退）：以当前段
+    两端城市为候选出发地（方向随机），BFS 最近友方城。
+
+    返回 (dest_bf, encircled=False)；在途 movement 缺失/无从判定/
+    无友方可达 → (0, False)（调用方首都兜底）。"""
+    mv = await store.get_active_movement(int(at['id'] or 0))
+    if not mv:
+        return 0, False
+    segs = movement_segments(mv)
+    idx = current_segment_index(
+        segs, _ts_ms(datetime.datetime.now(datetime.timezone.utc)))
+    if idx < 0:
+        return 0, False
+    if owners is None:
+        try:
+            owners = dict(await store.get_war_cities(war_id))
+        except Exception:
+            owners = {}
+    fac = int(at.get('faction') or 0)
+    ends = []
+    for key in ('from_bf', 'to_bf'):
+        bf = int(segs[idx].get(key) or 0)
+        if bf and bf not in ends:
+            ends.append(bf)
+    random.shuffle(ends)          # 方向随机（war1.md 撤退方向随机）
+    for bf in ends:
+        target = _nearest_friendly_bf(bf, fac, owners)
+        if target:
+            return target, False
+    return 0, False
+
+
+async def start_retreat_movement(store, at, dest_bf):
+    """交战撤退移动：城战 AT 从驻城、野外遭遇 AT 从当前段起点城市出发，
+    沿补给线路径向 dest_bf 真实行军（segment/destination 行驱动撤退
+    动画）。行军中 state=1 自动脱离会战判定（automission 仅计
+    state==2），到达走 advance_movements 通用落位。
+
+    返回 (movement, error_code)；无法确定出发地/无航路 →
+    (None, RC_CANNOT_FIND_COMMANDNODE)（调用方回退旧行为）。"""
+    dest_bf = int(dest_bf or 0)
+    if not dest_bf:
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    cur_bf = at_current_battlefield(at)
+    if not cur_bf:
+        # 野外遭遇（AT 在补给线上）：出发地 = 当前段起点城市，
+        # 原行军中止后以该城为起点重新行军
+        mv = await store.get_active_movement(int(at['id'] or 0))
+        if not mv:
+            return None, RC_CANNOT_FIND_COMMANDNODE
+        segs = movement_segments(mv)
+        idx = current_segment_index(
+            segs, _ts_ms(datetime.datetime.now(datetime.timezone.utc)))
+        cur_bf = int(segs[idx].get('from_bf') or 0) if idx >= 0 else 0
+        if not cur_bf:
+            return None, RC_CANNOT_FIND_COMMANDNODE
+        await store.finish_movement(mv['id'], 2)
+        at = dict(at)
+        at['map_entity_type'] = MAP_ENTITY_BATTLEFIELD
+        at['map_entity_id'] = cur_bf
+    return await start_movement(store, at, dest_bf)

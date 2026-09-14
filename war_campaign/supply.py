@@ -192,9 +192,67 @@ async def _arrive_supply_column(store, war_id, col, mv, dest_bf, caps,
                                        caps)) + dels
 
 
+# 主城类型（battlefield f7 gamemap：70439=Town / 203=Factory；201=Mountain
+# 山地据点、204/205 机场不作补给队出发城——就近只认主城，2026-09-14 玩家口径）
+_MAIN_CITY_GAMEMAPS = (70439, 203)
+
+_MAIN_CITY_IDS = None
+
+
+def _main_city_ids():
+    """主城 battlefield id 集（Town/Factory，模块级缓存）。"""
+    global _MAIN_CITY_IDS
+    if _MAIN_CITY_IDS is None:
+        _MAIN_CITY_IDS = set()
+        for b in wardb.battlefields():
+            try:
+                if int(b.get('gamemap') or 0) in _MAIN_CITY_GAMEMAPS:
+                    _MAIN_CITY_IDS.add(int(b['id']))
+            except (TypeError, ValueError):
+                continue
+    return _MAIN_CITY_IDS
+
+
+def _nearest_supply_city(owners, fac, parent_bf):
+    """父 AT 位置出发 BFS 最近己方在网**主城**（补给队默认出生点）。
+
+    沿补给线拓扑逐跳外扩（途经敌城/中立城/据点只过不停），首个"归属
+    本方、在己方补给网内且为主城（Town/Factory）"的城市即最近出发城；
+    跳过父城本身（在网 AT 的补给保持 OnTheWay 出队语义，不因同城瞬并）。
+    无归属数据（owners 空，DB 异常）或全图无候选 → 0（调用方回退阵营
+    首都）。"""
+    try:
+        fac, parent_bf = int(fac or 0), int(parent_bf or 0)
+    except (TypeError, ValueError):
+        return 0
+    if not parent_bf or not owners:
+        return 0
+    cities = _main_city_ids()
+    adj = supplyline_adjacency()
+    seen = {parent_bf}
+    queue = [parent_bf]
+    while queue:
+        cur = queue.pop(0)
+        for edge in adj.get(cur, ()):
+            nb = edge[3]
+            if nb in seen:
+                continue
+            seen.add(nb)
+            try:
+                owned = int(owners.get(nb, 0) or 0) == fac
+            except (TypeError, ValueError):
+                owned = False
+            if (owned and nb in cities
+                    and bf_in_faction_supply(owners, fac, nb)):
+                return nb
+            queue.append(nb)
+    return 0
+
+
 async def column_route(store, war, parent_at, near_capital_bf=0):
     """补给队路线预检（纯读，不落库不扣款，购买侧拒单用）：确定出生点
-    （f6 己方在网城 → 阵营首都）并按全图补给线拓扑验证可达性。
+    （f6 己方在网城 → 最近己方在网主城 → 阵营首都兜底）并按全图补给线
+    拓扑验证可达性。
 
     返回 (spawn_bf, parent_bf, ok)：ok=False 表示无出生点/无父位置/
     地面不可达（真·孤岛：整张补给线拓扑无路，官服地图连通理论不达）。"""
@@ -209,7 +267,8 @@ async def column_route(store, war, parent_at, near_capital_bf=0):
     if spawn_bf and not bf_in_faction_supply(owners, fac, spawn_bf):
         spawn_bf = 0                    # 非己方在网（敌城/孤城）→ 自选
     if not spawn_bf:
-        spawn_bf = _faction_capital_bf().get(fac, 0)
+        spawn_bf = (_nearest_supply_city(owners, fac, parent_bf)
+                    or _faction_capital_bf().get(fac, 0))
     if not spawn_bf or not parent_bf:
         return 0, parent_bf, False
     if spawn_bf == parent_bf:
@@ -220,9 +279,10 @@ async def column_route(store, war, parent_at, near_capital_bf=0):
 
 async def spawn_supply_column(store, war, parent_at, resources,
                               near_capital_bf=0, now=None):
-    """生成补给队并寻路：阵营首都出生（官服口径：补给自首都出发；
-    near_capital_bf=f6 玩家指定出发城，须己方在网否则忽略），载
-    resources（{cat: n}），沿补给线机动到父 AT 所在城市。
+    """生成补给队并寻路：最近己方在网主城出生（官服口径：就近出发沿补给
+    线机动；near_capital_bf=f6 玩家指定出发城优先，须己方在网否则忽略；
+    全图无主城候选回退阵营首都），载 resources（{cat: n}），沿补给线机动
+    到父 AT 所在城市。
 
     返回 (column, events, error_code)：column=None 且 error_code≠0 为失败
     （RC_CANNOT_FIND_COMMANDNODE=无出生点或地面不可达（真·孤岛），购买侧

@@ -23,6 +23,7 @@ from .common import (
     BATTLE_TYPE_SKIRMISH,
     BATTLE_TYPE_ENCOUNTER,
     _ts_ms,
+    supplyline_adjacency,
     )
 from .lifecycle import (
     ensure_war,
@@ -63,6 +64,7 @@ from .at_movement import (
     movement_segments,
     current_segment_index,
     moving_ats_by_supplyline,
+    start_retreat_movement,
     )
 from .supply import (
     _arrive_supply_column,
@@ -146,10 +148,15 @@ async def advance_movements(store, war=None, now=None):
                         store, war_id, at, mv, dest_bf, caps, now=now))
                     continue
                 dest_ap = int(mv.get('dest_ap') or 0)
+                dest_bf = (segs[-1]['to_bf'] if not dest_ap
+                           else _ap_battlefield(dest_ap))
+                # 到达落位：官服口径——进攻 AT 一律站城市本体（图标
+                # 叠城，多线进攻不拆站出兵点；进攻方向差异体现在对局
+                # 详情兵线分配，见 force_pool.assign_lines）
                 if dest_ap:
                     ent, ent_type = dest_ap, MAP_ENTITY_ACCESSPOINT
                 else:
-                    ent, ent_type = segs[-1]['to_bf'], MAP_ENTITY_BATTLEFIELD
+                    ent, ent_type = dest_bf, MAP_ENTITY_BATTLEFIELD
                 await store.update_command_node(
                     at['id'], state=0, map_entity_id=ent,
                     map_entity_type=ent_type)
@@ -203,11 +210,9 @@ async def advance_movements(store, war=None, now=None):
                         # transportation"；非回阵营库存——玩家私有，
                         # 落地伞兵回机场补给时优先免费合并旧机重登机
                         # "re-use old transport planes"）
-                        dest_chk = (segs[-1]['to_bf'] if not dest_ap
-                                    else _ap_battlefield(dest_ap))
-                        if await _dest_hostile(store, war_id, at, dest_chk):
+                        if await _dest_hostile(store, war_id, at, dest_bf):
                             log(f'[war] paradrop onto hostile battlefield '
-                                f'{dest_chk}: AT {at["id"]} 以空中原型入战'
+                                f'{dest_bf}: AT {at["id"]} 以空中原型入战'
                                 f'（cat4+cat10，运输机结算时返航）')
                         elif int(_tpl_of(at).get('convert_to') or 0):
                             at, split_events = await land_paradrop_split(
@@ -221,8 +226,6 @@ async def advance_movements(store, war=None, now=None):
                     # 飞机作战到达：airbase 行/airbase_bf 保持原基地
                     # （作战后结算拖回机场，届时更新）
                 # ---- 会战成局桩：目标城市有敌对 AT 驻扎 ----
-                dest_bf = (segs[-1]['to_bf'] if not dest_ap
-                           else _ap_battlefield(dest_ap))
                 # 到达占城：无敌驻军/无进行中会战 → 城市易主（敌驻军
                 # → 会战成局，归属由结算决定）
                 events.extend(await _capture_city_events(
@@ -297,6 +300,51 @@ async def _dest_hostile(store, war_id, at, dest_bf):
                for o in others)
 
 
+async def _city_owner_faction(store, war_id, bf_id):
+    """城主阵营（war_cities.owner_faction），未知返回 0。"""
+    try:
+        owners = dict(await store.get_war_cities(int(war_id)))
+        return int(owners.get(int(bf_id)) or 0)
+    except Exception as e:
+        log(f'[war] get_war_cities({war_id}) failed: {e}')
+        return 0
+
+
+def _assault_sides(owner_faction, factions_in_battle):
+    """城战攻守口径（官方语义 2026-09-14 用户实测修正）：守方=城主
+    阵营，攻方=进攻城的一方（非城主阵营）；城主未知（0/未初始化）退
+    回既有简化：先到者（factions[0]，成局时到达 AT 在前）=攻方。
+    返回 (attacker, defender)。"""
+    facs = [int(f or 0) for f in factions_in_battle if int(f or 0) > 0]
+    if not facs:
+        return 0, 0
+    first = facs[0]
+    if int(owner_faction or 0) in facs:
+        owner = int(owner_faction)
+        return next(f for f in facs if f != owner), owner
+    return first, next((f for f in facs if f != first), 0)
+
+
+def _nearest_friendly_bf(from_bf, faction, city_owners):
+    """补给线 BFS 最近友方城（owner==faction），不含出发城；无则 0。
+    战败 AT 撤退落点（war1.md：撤退回最近友方城市）。"""
+    from_bf = int(from_bf or 0)
+    adj = supplyline_adjacency()
+    seen = {from_bf}
+    queue = [from_bf]
+    while queue:
+        cur = queue.pop(0)
+        for edge in adj.get(cur, ()):
+            nb = edge[3]
+            if nb in seen:
+                continue
+            seen.add(nb)
+            if int(city_owners.get(nb) or 0) == int(faction):
+                return nb
+            queue.append(nb)
+    return 0
+
+
 async def _check_battle_formation(store, war_id, at, dest_bf):
     """到达敌情检查（M1 会战桩 → M2 成局）：目标城市驻有敌对 AT →
     war_battles 登记 + war mission record 落库（任务列表可见）。
@@ -358,23 +406,46 @@ async def _check_battle_formation(store, war_id, at, dest_bf):
         events.append(('set', b'battle', msg_battle_row(wb)))
         # M2：会战 → war mission record（GetMissionList 展示，玩家加入成
         # 真人局；mission_id = mission_records serial id，battle_id 关联）。
-        # 攻方=到达的 AT 阵营，守方=首个敌 AT 阵营（M1 桩既有简化）。
+        # 攻守口径：城主=守方、非城主=攻方（_assault_sides，2026-09-14
+        # 用户实测修正：苏联驻守德军进攻曾反）；城主未知退回先到者=攻方。
         try:
             preset_pool = (mm_config.gamemode_cfg(10).get('fallback_presets')
                            or [])
+            atk_f, def_f = _assault_sides(
+                await _city_owner_faction(store, war_id, dest_bf),
+                [at.get('faction') or 0]
+                + [e.get('faction') or 0 for e in enemies])
             mid = await store.create_mission_record(
-                random.choice(preset_pool) if preset_pool else 0,
-                attacker_faction=int(at.get('faction') or 0),
-                defender_faction=int(enemies[0].get('faction') or 0),
+                _preset_for_battlefield(preset_pool, dest_bf),
+                attacker_faction=atk_f,
+                defender_faction=def_f,
                 name=f'war battle {wb["id"]} battlefield {dest_bf}',
                 map_entity_id=int(dest_bf),
                 battle_id=int(wb['id']))
             log(f'[war] battle {wb["id"]} formed → mission record id={mid} '
-                f'bf={dest_bf} atk={at.get("faction")} '
-                f'def={enemies[0].get("faction")}')
+                f'bf={dest_bf} atk={atk_f} def={def_f}')
         except Exception as e:
             log(f'[war] create war mission record failed: {e}')
     return events
+
+
+def _preset_for_battlefield(preset_pool, bf_id):
+    """按战场 gamemap 从池内选同图 preset（据点成局地图类型修复，
+    2026-09-14 用户实测：机场城成局随机选到城镇图）。
+
+    战场 gamemap 经出兵点模板映射（wardb.gamemap_for_battlefield，
+    1438 战场零冲突实锤）；池内无同图 preset / 未知图 → 回退随机。"""
+    try:
+        gm = wardb.gamemap_for_battlefield(bf_id)
+        if gm:
+            matched = [p for p in (preset_pool or [])
+                       if int((wardb._load_preset(int(p)) or {}).get(3, 0)
+                              or 0) == gm]
+            if matched:
+                return random.choice(matched)
+    except Exception:
+        pass
+    return random.choice(preset_pool) if preset_pool else 0
 
 
 async def _check_field_encounters(store, war_id, now_ms=None):
@@ -490,7 +561,7 @@ async def _check_field_encounters(store, war_id, now_ms=None):
                     if idx >= 0:
                         near_bf = int(segs[idx].get('from_bf') or 0)
                 mid = await store.create_mission_record(
-                    random.choice(preset_pool) if preset_pool else 0,
+                    _preset_for_battlefield(preset_pool, near_bf),
                     attacker_faction=attacker,
                     defender_faction=defender,
                     name=f'war battle {wb["id"]} supplyline {sl_id}',
@@ -505,6 +576,84 @@ async def _check_field_encounters(store, war_id, now_ms=None):
     except Exception as e:
         log(f'[war] _check_field_encounters failed: {e}')
         return events
+
+
+async def rebuild_orphan_battle_missions(store):
+    """重启孤儿会战修复：活跃 war_battle 的 mission record 已死（启动
+    清理 close_stale_missions 只关 record 不动 war_battles）→ 重建
+    state=0 record。
+
+    battle→mission 链（详情 GetMissionDetails / 加入 _start_match / 增援
+    add_reinforcement_to_live_mission 统一走 get_mission_by_battle
+    states 0/1）断链期间：战图战斗标记仍可点但详情回 43 秒关、加入
+    战局直接退池。攻守口径与成局一致（factions 首行=攻、首异阵营=守）；
+    野外局简报落点 = 首个参战 AT 当前段起点城市。返回重建条数。"""
+    if store is None or getattr(store, 'pool', None) is None:
+        return 0
+    try:
+        war = await ensure_war(store)
+        if war is None:
+            return 0
+        now_ms = int(time.time() * 1000)
+        preset_pool = (mm_config.gamemode_cfg(10)
+                       .get('fallback_presets') or [])
+        repaired = 0
+        for wb in await store.list_active_war_battles(war['id']):
+            try:
+                if await store.get_mission_by_battle(int(wb['id'])):
+                    continue          # record 存活，无需重建
+            except Exception:
+                continue
+            facs = [int(f.get('faction') or 0)
+                    for f in (wb.get('factions') or [])]
+            btype = int(wb.get('battle_type') or BATTLE_TYPE_ASSAULT)
+            if btype == BATTLE_TYPE_ASSAULT:
+                # 城战攻守 = 城主守方 / 非城主攻方（与成局口径一致）
+                atk, dfn = _assault_sides(
+                    await _city_owner_faction(
+                        store, war['id'], wb.get('battlefield_id')), facs)
+            else:
+                atk = facs[0] if facs else 0
+                dfn = next((f for f in facs if f != atk), 0)
+            try:
+                if btype == BATTLE_TYPE_ASSAULT:
+                    mid = await store.create_mission_record(
+                        _preset_for_battlefield(
+                            preset_pool, wb.get('battlefield_id')),
+                        attacker_faction=atk, defender_faction=dfn,
+                        name=f'war battle {wb["id"]} battlefield '
+                             f'{wb["battlefield_id"]}',
+                        map_entity_id=int(wb.get('battlefield_id') or 0),
+                        battle_id=int(wb['id']))
+                else:
+                    near_bf = 0
+                    entries = wb.get('factions') or []
+                    if entries:
+                        mv = await store.get_active_movement(
+                            int(entries[0].get('at_id') or 0))
+                        if mv:
+                            segs = movement_segments(mv)
+                            idx = current_segment_index(segs, now_ms)
+                            if idx >= 0:
+                                near_bf = int(segs[idx].get('from_bf') or 0)
+                    mid = await store.create_mission_record(
+                        _preset_for_battlefield(preset_pool, near_bf),
+                        attacker_faction=atk, defender_faction=dfn,
+                        name=f'war battle {wb["id"]} supplyline '
+                             f'{wb["battlefield_id"]}',
+                        map_entity_id=near_bf,
+                        battle_id=int(wb['id']))
+                repaired += 1
+                log(f'[war] rebuilt mission record id={mid} for active '
+                    f'battle {wb["id"]} (restart orphan, atk={atk} '
+                    f'def={dfn})')
+            except Exception as e:
+                log(f'[war] rebuild mission record for battle '
+                    f'{wb["id"]} failed: {e}')
+        return repaired
+    except Exception as e:
+        log(f'[war] rebuild_orphan_battle_missions failed: {e}')
+        return 0
 
 
 async def _capture_city_events(store, war_id, faction, bf_id,
@@ -897,6 +1046,90 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                 events.extend(city_events)
                 log(f'[war] battle {battle_id}: attacker faction {winner} '
                     f'captured battlefield {dest_bf}')
+                # ③a 胜方驻守：占领后存活胜方 AT 从出兵点（进攻到达
+                # 站位，type=2）移入城市本体，官服"胜方驻守"口径
+                for entry in (wb.get('factions') or []):
+                    wat = await store.get_command_node(
+                        int(entry.get('at_id') or 0))
+                    if (not wat or not wat.get('is_deployed')
+                            or int(wat.get('faction') or 0) != winner
+                            or int(wat.get('state') or 0) != 0
+                            or int(wat.get('map_entity_type') or 0)
+                            != MAP_ENTITY_ACCESSPOINT
+                            or _ap_battlefield(int(
+                                wat.get('map_entity_id') or 0)) != dest_bf):
+                        continue    # 已歼灭 / 投降 / 非出兵点站位
+                    await store.update_command_node(
+                        wat['id'], map_entity_id=int(dest_bf),
+                        map_entity_type=MAP_ENTITY_BATTLEFIELD)
+                    wat = await store.get_command_node(wat['id'])
+                    events.append(('set', b'CommandNodeWarInstance',
+                                   msg_commandnode_instance_row(
+                                       wat, war_id, caps)))
+                    log(f'[war] battle {battle_id}: winner AT {wat["id"]} '
+                        f'{wat.get("name")!r} moved in from accesspoint '
+                        f'to battlefield {dest_bf}')
+
+        # ③b 城战败方撤退（官方 war1.md：战败方撤退离场、胜方驻守）：
+        #     败方 AT 原地释放会与胜方同城对峙 → D 修复立即重开新局 →
+        #     无限连环消耗编制（2026-09-14 用户实测：无人加入的局每
+        #     5.5 分钟结算一次反复扣兵、战局永不结束）。撤退落点优先
+        #     原路回退：本次进攻 movement 出发城仍己方 → 撤回出发城；
+        #     否则退最近友方城（补给线 BFS），无友方城回首都兜底。
+        if not is_field and dest_bf and winner:
+            city_owners = dict(await store.get_war_cities(war_id))
+            for entry in (wb.get('factions') or []):
+                at = await store.get_command_node(
+                    int(entry.get('at_id') or 0))
+                if (not at or not at.get('is_deployed')
+                        or int(at.get('faction') or 0) == winner
+                        or int(at.get('state') or 0) != 0
+                        or at_current_battlefield(at) != dest_bf):
+                    continue    # 胜方驻守 / 已歼灭 / 已投降撤回 / 已离场
+                f_at = int(at.get('faction') or 0)
+                # 原路撤退：最近一次 movement 出发城（path[0].from_bf，
+                # 改道保留前缀段 → 仍是原始出发点）仍己方 → 撤回出发城
+                omv = await store.get_last_movement(at['id'])
+                origin = int(((omv or {}).get('path') or [{}])[0]
+                             .get('from_bf') or 0)
+                if (origin and origin != dest_bf
+                        and int(city_owners.get(origin) or 0) == f_at):
+                    target = origin
+                else:
+                    target = _nearest_friendly_bf(
+                        dest_bf, f_at, city_owners) or caps.get(f_at)
+                if not target:
+                    continue
+                # 撤退走真实行军（segment/destination 行驱动动画，
+                # 与手动撤退一致，不再闪现）；行军中 state=1 自动脱离
+                # 会战判定，到达走 advance_movements 通用落位
+                rmv, rcode = await start_retreat_movement(store, at, target)
+                if rmv is None:
+                    # 行军发起失败（无航路等）：直接落位兜底
+                    await store.update_command_node(
+                        at['id'], map_entity_id=int(target),
+                        map_entity_type=MAP_ENTITY_BATTLEFIELD)
+                    at = await store.get_command_node(at['id'])
+                    events.append(('set', b'CommandNodeWarInstance',
+                                   msg_commandnode_instance_row(at, war_id, caps)))
+                else:
+                    at = await store.get_command_node(at['id'])
+                    rsegs = movement_segments(rmv)
+                    if rsegs:
+                        events.append(
+                            ('set', b'transport_commandnode_segment',
+                             msg_transport_segment_row(
+                                 at, war_id, rmv, rsegs[0])))
+                    events.append(
+                        ('set', b'transport_commandnode_destination',
+                         msg_transport_destination_row(
+                             at, war_id, rmv, rsegs, retreat=True)))
+                    events.append(
+                        ('set', b'CommandNodeWarInstance',
+                         msg_commandnode_instance_row(at, war_id, caps)))
+                log(f'[war] battle {battle_id}: defeated AT {at["id"]} '
+                    f'{at.get("name")!r} (faction {f_at}) retreated '
+                    f'from battlefield {dest_bf} to {target}')
 
         # ⑤b 缴获入账（war 局）：败方 AT 未投入的池剩余 → 胜方阵营库存，
         #     推送 HQ armyresource 行（在线客户端资源视图实时上涨）
@@ -930,17 +1163,22 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                 f'faction {victory} victorious')
             return events
 
-        # D 修复（会战生命周期审计 #4）：结算后再成局——胜方占城后城里
-        # 可能还驻有敌对 AT（连环三方局：美 vs 德打完 → 美胜占城 →
-        # 与苏 AT 同城对峙），以本场胜方 AT 为基准再跑一次成局判定，
-        # 否则两军永久僵持（谁也不打谁）。
+        # D 修复（会战生命周期审计 #4）：结算后再成局——城里可能还驻
+        # 有敌对 AT（连环三方局：美 vs 德打完 → 美胜占城 → 与苏 AT 同
+        # 城对峙），以非城主阵营 AT 为基准再跑一次成局判定，否则两军
+        # 永久僵持（谁也不打谁）。基准口径（2026-09-14 用户实测修正）：
+        # 攻方=非城主阵营（城主=守方）——原"胜方 AT 为基准"在守方胜
+        # 时把驻守方标成攻方 → 攻防反转；正常两方局败方已 ③b 撤退，
+        # 无候选自然不成新局（战局终结、战图标记消失）。
         if dest_bf:
+            owner_after = await _city_owner_faction(store, war_id, dest_bf)
             for entry in (wb.get('factions') or []):
                 at2 = await store.get_command_node(
                     int(entry.get('at_id') or 0))
                 if (at2 and int(at2.get('state') or 0) == 0
                         and at2.get('is_deployed')
-                        and int(at2.get('faction') or 0) == winner
+                        and (not owner_after
+                             or int(at2.get('faction') or 0) != owner_after)
                         and at_current_battlefield(at2) == dest_bf):
                     events.extend(await _check_battle_formation(
                         store, war_id, at2, dest_bf))

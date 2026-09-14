@@ -98,9 +98,11 @@ async def main():
     wb = {'id': 77, 'war_id': 1, 'battle_type': 1, 'battlefield_id': 20,
           'started_at': None,
           'factions': [{'faction': 1, 'at_id': 901}, {'faction': 2, 'at_id': 902}]}
+    # at1 用 JSON 字符串（真实 DB command_nodes.resources 口径，曾致
+    # HANDLER-ERR 'str' object has no attribute 'items'）；at2 用 dict
     at1 = {'id': 901, 'template_id': 104, 'state': 0, 'faction': 1,
            'owner_player_id': 42, 'name': 'Inf A',
-           'resources': {1: 90}}
+           'resources': '{"1": 90}'}
     at2 = {'id': 902, 'template_id': 204, 'state': 0, 'faction': 2,
            'owner_player_id': 43, 'name': 'Inf B',
            'resources': {1: 120}}
@@ -145,6 +147,28 @@ async def main():
               calls and calls[0][0] == 4242 and calls[0][1] is live_det,
               f'calls={[(m, d is live_det) for m, d in calls]}')
         del mm_handler._MM_MISSION_DETAILS[4242]
+
+        # T6: war_pending（攻守未凑齐、局未成）players = 会战桶排队名单
+        #     ——玩家点"加入战斗"后重开据点详情应看到自己名字
+        import mm_pool
+        entry = mm_pool.QueueEntry(player_id=42, char_id=7, faction=1,
+                                   gamemode_id=10, battle_id=77)
+        mm_handler.POOL.enqueue(entry)
+        mm_handler._MM_QUEUES[42] = {
+            'pmm_id': 1, 'mission_id': 0, 'gamemode': 10,
+            'ctx': {'gamertag': 'WarHero'}}
+        try:
+            calls.clear()
+            w = await _call(pb_int32(1, 0) + pb_int32(2, 77))
+            det = calls[0][1] if calls else {}
+            check('T6 war_pending players = 会战排队名单（加入战斗即可见）',
+                  [p['gamertag'] for p in det.get('players') or []]
+                  == ['WarHero'],
+                  f'players={det.get("players")}')
+            check('T6b 响应 f3 参战方含排队玩家名', b'WarHero' in w.buf)
+        finally:
+            mm_handler.POOL.remove(42)
+            mm_handler._MM_QUEUES.pop(42, None)
     finally:
         mm_handler._msg_mission_details_response_multi = orig_render
         state.STORE = orig_store

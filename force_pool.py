@@ -365,6 +365,14 @@ def init_mission_war(mission_id, attacker, defender, comps_by_faction,
         pools[int(fac)] = counts
     names_by_faction = {int(f): [str(n) for n in (v or [])]
                         for f, v in (names_by_faction or {}).items()}
+    # war 攻方进攻方向（激活线决策 prefer_aps，用户口径 2026-09-14：
+    # war 哪条线有进攻兵力就激活哪条）。成局时定格——增援不改（激活线
+    # 布局开局后不可变，改了会引发 f12/f6 布局重发噪音；增援 AT 来向
+    # 未激活时 assign_lines 蛇形补位）。
+    prefer_aps = sorted({
+        int((a or {}).get('ap_tmpl') or 0)
+        for a in (ats_by_faction or {}).get(int(attacker)) or []
+        if int((a or {}).get('ap_tmpl') or 0)})
     _MISSIONS[int(mission_id)] = {
         'mode': 'war',
         'names': list(names_by_faction.get(int(attacker)) or []),
@@ -373,6 +381,7 @@ def init_mission_war(mission_id, attacker, defender, comps_by_faction,
                     for f, v in (ats_by_faction or {}).items()},
         'attacker': int(attacker), 'defender': int(defender),
         'pool': pools,
+        'prefer_aps': prefer_aps,
         'lines': None, 'line_pool': None, 'ap_line': {},
     }
     log(f'[force_pool] mission={mission_id} mode=war (battle ATs) '
@@ -471,9 +480,16 @@ def consume(mission_id, faction, cat, n=1, ap=None):
 
 
 def assign_lines(mission_id, n_lines, ap_templates=()):
-    """攻方 AT 名单稳定分线（官方语义：每条攻击线兵力 = 部署在该线的
+    """攻方 AT 名单分线（官方语义：每条攻击线兵力 = 部署在该线的
     AT 之和，全线总量 = 1 份池，不随激活线数翻倍；守方不分线——
     全部守 O 锚，与官方守军集中防守一致）。
+
+    ★兵线按进攻方向（2026-09-14 用户核实官服口径：war 地图图标叠
+    城，方向差异体现在详情兵线）：AT 进攻 movement 末段出兵点 →
+    war accesspoint.template（= 对局图 accesspointtemplate.id，wardb
+    实锤 22 取值全命中）→ 分到对应该模板的线；无方向（空降/部署/
+    未知来向）或方向线未激活 → 蛇形随机补位（官方"伞兵生成路线随机
+    分布在 A-D 线"）。
 
     幂等：首次调用按 mission_id 播种洗牌蛇形均分并缓存；后续 f14 握手 /
     f2 轮询复用同一分法（布局按 mission_id 确定性 → 同局同 n_lines）。
@@ -491,8 +507,21 @@ def assign_lines(mission_id, n_lines, ap_templates=()):
     if rec.get('lines') is None:
         rng = random.Random(int(mission_id) ^ 0xA77)
         names = list(rec['names'])
-        rng.shuffle(names)
-        rec['lines'] = [names[i::n] for i in range(n)]
+        # 进攻方向分组：rec['names'][i] ↔ war_ats[attacker][i] 同序
+        # （init_mission_war / add_war_reinforcement 平行追加）
+        ap_line_idx = {int(ap): i for i, ap in enumerate(ap_templates)}
+        wats = (rec.get('war_ats') or {}).get(
+            int(rec.get('attacker') or 0)) or []
+        lines = [[] for _ in range(n)]
+        leftover = []
+        for i, name in enumerate(names):
+            at = wats[i] if i < len(wats) else {}
+            idx = ap_line_idx.get(int((at or {}).get('ap_tmpl') or 0), -1)
+            (lines[idx] if idx >= 0 else leftover).append(name)
+        rng.shuffle(leftover)
+        for name in leftover:            # 无方向 AT：蛇形填兵力最薄的线
+            lines[min(range(n), key=lambda i: len(lines[i]))].append(name)
+        rec['lines'] = lines
         rec['line_pool'] = []
         for line_names in rec['lines']:
             lc = {}
@@ -503,6 +532,109 @@ def assign_lines(mission_id, n_lines, ap_templates=()):
     for i, ap in enumerate(ap_templates):
         if i < n:
             rec['ap_line'][int(ap)] = i
+
+
+def attacker_ap_tmpls(mission_id):
+    """war 局攻方进攻方向模板集合（prefer_aps，成局时定格）——激活线
+    决策 assault_ap_decision(strict=True) 只开这些来向线。非 war 局 /
+    无方向返回空元组（激活决策回退随机旧语义）。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if not rec or rec.get('mode') != 'war':
+        return ()
+    return tuple(sorted(set(int(x) for x in (rec.get('prefer_aps') or ()))))
+
+
+def mission_factions(mission_id):
+    """war 局 (attacker, defender) 实际阵营；非 war 返回 (0, 0)。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if not rec or rec.get('mode') != 'war':
+        return (0, 0)
+    return (int(rec.get('attacker') or 0), int(rec.get('defender') or 0))
+
+
+def set_defender_lanes(mission_id, lanes):
+    """记录 war 局守方红线模板（成局时定格，_init_war_mission_resources
+    计算：目标城边线连向的相邻城市为守方占领 → 该线归属守方）。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if rec:
+        rec['dfn_lanes'] = sorted({int(x) for x in (lanes or ()) if int(x)})
+
+
+def defender_lanes(mission_id):
+    """war 局守方红线模板（可能有 0~n 条）；非 war 局 / 未计算返回空。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if not rec:
+        return ()
+    return tuple(rec.get('dfn_lanes') or ())
+
+
+def set_at_lanes(mission_id, lane_by_id):
+    """记录 war 局每个 AT（command_node id）的激活线模板。
+
+    多人版简报 f4 逐 AT 挂线用（war_pending 阶段简报走 war_at_rows，
+    行序与名单无关，按 AT 实例 id 反查比按名单序可靠）。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if rec:
+        rec['at_lanes'] = {int(k): int(v or 0)
+                           for k, v in (lane_by_id or {}).items()}
+
+
+def at_lane_by_id(mission_id, at_id):
+    """war 局 AT 实例（command_node id）的激活线模板（0=未分线/无方向）；
+    非 war 局 / 无记录返回 None。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if not rec:
+        return None
+    return int((rec.get('at_lanes') or {}).get(int(at_id), 0) or 0)
+
+
+def lane_counts_by_ap(mission_id):
+    """攻方各激活线分线池 {ap_tmpl: {cat: count}}（ap_line 映射）。
+
+    war 局大厅简报 f5 逐线分行用（用户口径 2026-09-15：大厅详情各
+    出兵点兵力按进攻方向分开，不整方挤一个点）。未分线返回 {}（调用
+    方回退整方挂一个点的旧口径）。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if not rec or not rec.get('ap_line') or not rec.get('line_pool'):
+        return {}
+    out = {}
+    for ap, idx in rec['ap_line'].items():
+        if 0 <= int(idx) < len(rec['line_pool']):
+            out[int(ap)] = dict(rec['line_pool'][int(idx)] or {})
+    return out
+
+
+def at_lane_aps(mission_id, faction):
+    """war 局名单每 AT 的激活线模板（按 names 顺序，未分线/无方向=0）。
+
+    大厅简报 f4 逐 AT 挂线用（2026-09-15 反编译实锤
+    BattlefieldUtilities.setupMissionAssaultTeamOnMap：图标位置 =
+    f4.accessPointTemplateId → 线入口据点，全员挂同锚 = 挤一条线根因）。
+    攻方 = 分线结果（ap_line 反查）；守方不分线全 0（调用方挂守方锚）。
+    非 war 局返回 None。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if not rec or rec.get('mode') != 'war':
+        return None
+    names = ((rec.get('names_by_faction') or {}).get(int(faction))
+             if faction is not None else rec.get('names')) or []
+    lines = rec.get('lines')
+    if not lines:
+        return None
+    if int(faction or 0) != int(rec.get('attacker') or 0):
+        # 分线只属于攻方（assign_lines 只分攻方名单）；守方/未知阵营
+        # 全 0（调用方挂守方锚），避免同名 AT 误配攻方线
+        return [0] * len(names)
+    line_ap = {int(i): int(ap)
+               for ap, i in (rec.get('ap_line') or {}).items()}
+    out = []
+    for _n in names:
+        ap = 0
+        for i, ln in enumerate(lines):
+            if _n in ln:
+                ap = line_ap.get(i, 0)
+                break
+        out.append(ap)
+    return out
 
 
 def line_counts(mission_id, line_idx):

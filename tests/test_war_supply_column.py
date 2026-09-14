@@ -83,13 +83,13 @@ _SYN_SLS = [
 ]
 _SYN_BFS = [
     {'id': 10, 'mapid': 1, 'title': 'A', 'sector': '', 'posx': 0.0,
-     'posy': 0.0, 'gamemap': 0},
+     'posy': 0.0, 'gamemap': 70439},      # Town 主城（首都 fac1）
     {'id': 20, 'mapid': 1, 'title': 'B', 'sector': '', 'posx': 300.0,
-     'posy': 400.0, 'gamemap': 0},
+     'posy': 400.0, 'gamemap': 70439},    # Town 主城
     {'id': 30, 'mapid': 1, 'title': 'C', 'sector': '', 'posx': 600.0,
-     'posy': 800.0, 'gamemap': 0},
+     'posy': 800.0, 'gamemap': 203},      # Factory 主城（首都 fac2）
     {'id': 40, 'mapid': 1, 'title': 'D', 'sector': '', 'posx': 900.0,
-     'posy': 1200.0, 'gamemap': 0},
+     'posy': 1200.0, 'gamemap': 201},     # Mountain 据点（不作出发城）
 ]
 
 wardb.accesspoints = lambda: list(_SYN_APS)
@@ -525,7 +525,7 @@ async def section_b():
               parent, war['id'], war_campaign._faction_capital_bf()))
           .get(3) == 0)
 
-    # B2 near_capital_bf：己方在网城生效；敌城/孤岛己方城拒绝回退首都
+    # B2 near_capital_bf：己方在网城生效；敌城/孤岛己方城忽略 → 就近选 20
     st2 = FakeStore()
     war2 = await _war(st2, {10: 1, 20: 1, 30: 2})
     p2 = _mk_at(st2, 21, deployed=True, map_entity_id=30)
@@ -537,13 +537,13 @@ async def section_b():
     col3, _e3, rc3 = await war_campaign.spawn_supply_column(
         st2, war2, p2, {1: 5}, near_capital_bf=30, now=_NOW)  # 30 敌领地
     mv3 = await st2.get_active_movement(col3['id'])
-    check('B2 near_capital 敌领地拒绝（回退阵营首都 10）',
-          rc3 == 0 and mv3 and mv3['path'][0]['from_bf'] == 10)
+    check('B2 near_capital 敌领地忽略（就近己方在网城 20）',
+          rc3 == 0 and mv3 and mv3['path'][0]['from_bf'] == 20)
     col3b, _e3b, rc3b = await war_campaign.spawn_supply_column(
         st2, war2, p2, {1: 5}, near_capital_bf=40, now=_NOW)  # 40 孤岛己方
     mv3b = await st2.get_active_movement(col3b['id'])
-    check('B2 near_capital 孤岛己方城拒绝（不在网 → 回退首都 10）',
-          rc3b == 0 and mv3b and mv3b['path'][0]['from_bf'] == 10)
+    check('B2 near_capital 孤岛己方城忽略（不在网 → 就近 20）',
+          rc3b == 0 and mv3b and mv3b['path'][0]['from_bf'] == 20)
 
     # B3 同城（出生点=父 AT 位置）→ 直接汇合不出队
     st3 = FakeStore()
@@ -733,10 +733,11 @@ async def section_e():
           and not st.adjust_log and not st.supply_queue
           and st.ats[cols[0]['id']]['parent_command_node_id'] == 500)
 
-    # E2 在途扣减：全额在途 → 103（客户端 getNumberOfInfantryMissing 口径）
+    # E2 在途扣减：全额在途 → ok no-op（C5 满编口径，2026-09-14：部署
+    # 窗口自动补编链仅 ok 关窗，103 会卡窗；不再重复购买语义不变）
     w, f = await _resupply(500)
-    check('E2 全额在途 → 103（不再重复购买）',
-          f.get(2) == war_campaign.RC_NO_RESUPPLY_ALREADY_FULL
+    check('E2 全额在途 → ok no-op（不再重复购买）',
+          f.get(2) == 1
           and len(_cols(st, 500)) == 1
           and len(st.spend_log) == 1, str(f))
 
@@ -755,15 +756,21 @@ async def section_e():
           and new_cols[0]['resources'] == {'1': 5}
           and st2.spend_log == [(100, 'warfunds', 500)], str(f))
 
-    # E3 在网（己方城市）→ 旧行为即时交付（动库存）
-    st3 = await _ewar({10: 1, 30: 2})
-    _mk_at(st3, 500, deployed=True, map_entity_id=10,
-           resources={'1': 2}, sold_free=True)
-    w, f = await _resupply(500)
-    check('E3 在网即时（满编 {1:12}/库存扣减/无补给队）',
-          f.get(2) == 1 and st3.ats[500]['resources'] == {'1': 12}
-          and not _cols(st3, 500)
-          and st3.adjust_log == [(1, 1, 1, -10)], str(f))
+    # E3 在网（己方城市）+ mode=1 → 旧行为即时交付（动库存）
+    # （全局默认已改 2=官服一律出队，此处显式钉 1 回归旧口径分支）
+    _m1_bak = mm_config.WAR_SUPPLY_COLUMN_MODE
+    try:
+        mm_config.WAR_SUPPLY_COLUMN_MODE = 1
+        st3 = await _ewar({10: 1, 30: 2})
+        _mk_at(st3, 500, deployed=True, map_entity_id=10,
+               resources={'1': 2}, sold_free=True)
+        w, f = await _resupply(500)
+        check('E3 mode=1 在网即时（满编 {1:12}/库存扣减/无补给队）',
+              f.get(2) == 1 and st3.ats[500]['resources'] == {'1': 12}
+              and not _cols(st3, 500)
+              and st3.adjust_log == [(1, 1, 1, -10)], str(f))
+    finally:
+        mm_config.WAR_SUPPLY_COLUMN_MODE = _m1_bak
 
     # E4 mode=0 → 一律旧行为（网络外也即时）
     _mode_bak = mm_config.WAR_SUPPLY_COLUMN_MODE
@@ -815,8 +822,8 @@ async def section_e():
     w, f = await _resupply(501, near_capital=30)         # 30 敌领地 → 忽略
     cols8 = [c for c in _cols(st7, 501) if c['state'] < 3]
     mv8 = await st7.get_active_movement(cols8[-1]['id'])
-    check('E7 f6=30 敌领地 → 忽略回退首都 10',
-          f.get(2) == 1 and mv8 and mv8['path'][0]['from_bf'] == 10,
+    check('E7 f6=30 敌领地 → 忽略就近己方在网城 20',
+          f.get(2) == 1 and mv8 and mv8['path'][0]['from_bf'] == 20,
           str(f))
 
     # E8 会战/移动状态门（101/116）不因补给队分支变化
@@ -840,15 +847,20 @@ async def section_e():
           and not st9.spend_log
           and not st9.adjust_log and not st9.supply_queue, str(f))
 
-    # E10 连通己方非首都城（用户 AT002 场景）→ 在网即时
-    st10 = await _ewar({10: 1, 20: 1, 30: 2})
-    _mk_at(st10, 500, deployed=True, map_entity_id=20,
-           resources={'1': 2}, sold_free=True)
-    w, f = await _resupply(500)
-    check('E10 连通己方非首都城 → 在网即时（无补给队/动库存）',
-          f.get(2) == 1 and st10.ats[500]['resources'] == {'1': 12}
-          and not _cols(st10, 500)
-          and st10.adjust_log == [(1, 1, 1, -10)], str(f))
+    # E10 连通己方非首都城（用户 AT002 场景）+ mode=1 → 在网即时
+    _m1_bak = mm_config.WAR_SUPPLY_COLUMN_MODE
+    try:
+        mm_config.WAR_SUPPLY_COLUMN_MODE = 1
+        st10 = await _ewar({10: 1, 20: 1, 30: 2})
+        _mk_at(st10, 500, deployed=True, map_entity_id=20,
+               resources={'1': 2}, sold_free=True)
+        w, f = await _resupply(500)
+        check('E10 mode=1 连通己方非首都城 → 在网即时（无补给队/动库存）',
+              f.get(2) == 1 and st10.ats[500]['resources'] == {'1': 12}
+              and not _cols(st10, 500)
+              and st10.adjust_log == [(1, 1, 1, -10)], str(f))
+    finally:
+        mm_config.WAR_SUPPLY_COLUMN_MODE = _m1_bak
 
     # E11 官服 #3：机械化部队补队人员/车辆分队
     st11 = await _ewar({10: 1, 30: 2})

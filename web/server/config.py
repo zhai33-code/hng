@@ -4,7 +4,9 @@
 （模板数据已固化在 templates_data.py，不依赖客户端 GAME_DIR/WarDatabase。）
 """
 import os
+import re
 import secrets
+import subprocess
 import sys
 
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,8 +34,31 @@ _load_dotenv(os.path.join(_REPO_DIR, '.env'))          # 与游戏服共用同�
 
 
 # ---- 数据库 ----
+def _wsl_docker_ip():
+    """Windows + Docker Desktop(WSL2)：localhost 端口转发对长连接不稳定，
+    直连 WSL VM IP 更可靠（与游戏服 store/base.py 同款探测）。返回 eth0 IPv4 或 None。"""
+    if sys.platform != 'win32':
+        return None
+    try:
+        out = subprocess.run(
+            ['wsl', '-d', 'docker-desktop', 'ip', '-4', 'addr', 'show', 'eth0'],
+            capture_output=True, text=True, timeout=10,
+            encoding='utf-8', errors='replace').stdout
+        m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', out)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
 DATABASE_URL = os.environ.get(
-    'HNG_DATABASE_URL', 'postgresql://hng:hng_password@localhost:15432/hng')
+    'HNG_DATABASE_URL', 'postgresql://hng:hng_password@localhost:5432/hng')
+
+# 用户未显式配置 HNG_DATABASE_URL 时，把默认 DSN 的 localhost/127.0.0.1
+# 替换为探测到的 WSL VM IP；探测不到（无 Docker / 原生 PG）保持原样
+if 'HNG_DATABASE_URL' not in os.environ:
+    _ip = _wsl_docker_ip()
+    if _ip:
+        DATABASE_URL = re.sub(r'@(localhost|127\.0\.0\.1):', f'@{_ip}:', DATABASE_URL)
 
 # ---- 监听（默认仅回环：公网不可达，远程走 SSH 隧道）----
 ADMIN_BIND = os.environ.get('HNG_ADMIN_BIND', '127.0.0.1').strip() or '127.0.0.1'

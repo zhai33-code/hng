@@ -268,6 +268,21 @@ class WarStoreMixin:
         d['path'] = _j.loads(d.pop('path_json') or '[]')
         return d
 
+    async def get_last_movement(self, commandnode_id):
+        """AT 最近一次移动（任意状态，取 id 最大；败方撤退原路回退用）。"""
+        import json as _j
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT id, commandnode_id, war_id, path_json, started_at, '
+                'arrive_at, state, dest_ap FROM commandnode_movements '
+                'WHERE commandnode_id = $1 ORDER BY id DESC LIMIT 1',
+                int(commandnode_id))
+        if not row:
+            return None
+        d = dict(row)
+        d['path'] = _j.loads(d.pop('path_json') or '[]')
+        return d
+
     async def list_active_movements(self, war_id):
         """本战争全部进行中移动（增量推进器轮询用）。"""
         import json as _j

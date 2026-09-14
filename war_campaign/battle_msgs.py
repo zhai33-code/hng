@@ -39,8 +39,10 @@ def msg_transport_segment_row(at, war_id, mv, seg):
     return m
 
 
-def msg_transport_destination_row(at, war_id, mv, segs, now_ms=None):
-    """transport_commandnode_destination 行（终落地 + 总时长估算）。"""
+def msg_transport_destination_row(at, war_id, mv, segs, now_ms=None,
+                                  retreat=False):
+    """transport_commandnode_destination 行（终落地 + 总时长估算）。
+    retreat：撤退行军旗标（f7，客户端按撤退方向渲染箭头/动画）。"""
     if segs:
         dest_bf = segs[-1]['to_bf']
         end_ms = segs[-1]['end_ms']
@@ -56,7 +58,7 @@ def msg_transport_destination_row(at, war_id, mv, segs, now_ms=None):
     m += pb_int64(4, int(mv.get('dest_ap') or 0))      # accesspointid
     m += pb_string(5, cached)                          # cachedpath
     m += pb_int64(6, war_id)                            # warid
-    m += pb_bool(7, False)                             # retreatFlag
+    m += pb_bool(7, retreat)                           # retreatFlag
     m += pb_float(8, total)                             # timeEstimate（秒）
     m += pb_float(9, 0.0)                              # beginPosition
     return m

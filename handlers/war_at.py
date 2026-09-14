@@ -137,7 +137,18 @@ async def _push_at_deploy_rows(sess, writer, at, war_id):
     unit 本就不在地图层），再 addInstance → join（CommandNodeDefinition
     原子表行未删，直接复用）→ ADD 分支含堆叠检查，图标正确收编。
     移动到达路径无需此处理：到达 AT 的 unit 已存在，stack 创建时
-    MultiMarker.setupMarker 直接对成员 inMultipleMarker()。"""
+    MultiMarker.setupMarker 直接对成员 inMultipleMarker()。
+
+    ★ 末尾必须再补推一次同值 WarInstance set 行（2026-09-14 实报
+    "部署成功后卡在部署界面"根因）：客户端部署窗口
+    AssaultTeamReinforcementWindowMediator 收到 ok 响应时无任何动作
+    （仅 226 入队才直接关窗），关窗/解锁完全依赖 WarInstance 的
+    UPDATE 事件，而 handleAssaultTeamUpdates 只认 UPDATE、忽略
+    ADD/DELETE → DELETE+ADD 序列永远解不开窗口禁用态。补推的 set
+    行到达时行已存在 → 派发 UPDATE → 窗口关窗 ✓；地图层无副作用：
+    hasChangedIsDeployed/hasChangedMapEntityOrType 按新旧行比较，
+    同值 UPDATE 均为 false，不会重复上图标/重定位 ✓；
+    AssaultTeamLocationMapping.addToEntityMapping 同位置早退 ✓。"""
     cmd = _view_cmd(sess)
     if not cmd:
         return
@@ -151,6 +162,10 @@ async def _push_at_deploy_rows(sess, writer, at, war_id):
                      war_campaign.msg_commandnode_morale_row(at, war_id))
     for p in war_campaign.msg_armyresource_rows(at, war_id):
         await _push_kvcs(writer, cmd, b'armyresource', p)
+    # 同值 set → 客户端 UPDATE 事件：解锁/关闭部署窗口（见上注）
+    await _push_kvcs(writer, cmd, b'CommandNodeWarInstance',
+                     war_campaign.msg_commandnode_instance_row(
+                         at, war_id, caps))
 
 
 async def _push_at_delete(sess, writer, at):
@@ -517,10 +532,13 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
                                     RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND)
                     if not code:
                         # 部署即补编（§10.2 #4/#5）：请求内计价 id 在此
-                        # 消费——Deploy All 路径客户端绝不发 resupply
+                        # 消费——Deploy All 路径客户端绝不发 resupply。
+                        # from_deploy=True：即时交付，禁走补给队出队
+                        # （此时 is_deployed 已置位，勿按其判定）
                         rcode, at = await _apply_resupply(
                             at, pid, war, currency,
-                            soldier_pricing, vehicle_pricing)
+                            soldier_pricing, vehicle_pricing,
+                            from_deploy=True)
                         if rcode == war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES:
                             code = rcode    # 226：入队提示（官服语义）
                         elif rcode:
@@ -649,9 +667,29 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
                             log(f'      [war_at] city owners read '
                                 f'failed: {e}')
                             owners = {}
-                        dest_bf, encircled = (
-                            await war_campaign.retreat_eval(
-                                STORE, war['id'], at, owners))
+                        caps = war_campaign._faction_capital_bf()
+                        fac = int(at.get('faction') or 0)
+                        cur_bf = war_campaign.at_current_battlefield(at)
+                        if cur_bf:
+                            dest_bf, encircled = (
+                                await war_campaign.retreat_eval(
+                                    STORE, war['id'], at, owners))
+                            if not dest_bf and not encircled:
+                                # 无友方邻城（未包围）：BFS 最近友方城 →
+                                # 首都兜底（保持部署行军撤退，不再撤回
+                                # 待命逼玩家重新部署）
+                                dest_bf = (war_campaign.
+                                           _nearest_friendly_bf(
+                                               cur_bf, fac, owners)
+                                           or caps.get(fac, 0))
+                        else:
+                            # 野外遭遇：沿友军方向撤退（当前段随机端点
+                            # BFS 最近友方城 → 首都兜底）
+                            dest_bf, encircled = (
+                                await war_campaign.retreat_eval_field(
+                                    STORE, war['id'], at, owners))
+                            if not dest_bf:
+                                dest_bf = caps.get(fac, 0)
                         if encircled and mm_config.WAR_ENCIRCLE_CHECK:
                             code = (war_campaign.
                                     RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND)
@@ -664,13 +702,62 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
                             log(f'      [war] AT 撤退溃散全歼 '
                                 f'node={node_id}')
                         else:
-                            # ---- 在途行军中止（移动中撤退清理 movement，
-                            #      否则孤儿行军到点会把已撤 AT 拉回地图）----
+                            if was_in_battle and dest_bf:
+                                # ---- 友方路线撤退：真实行军（segment/
+                                #      destination 行驱动撤退动画，非闪现），
+                                #      保持部署；行军中 state=1 自动脱离
+                                #      会战判定（automission 仅计
+                                #      state==2），到达走 advance_movements
+                                #      通用落位 ----
+                                old_mvs = [mv for mv in await
+                                           STORE.list_active_movements(
+                                               war['id'])
+                                           if (int(mv.get('commandnode_id')
+                                                   or 0)
+                                               == int(at['id']))]
+                                retreat_mv, rmcode = (
+                                    await war_campaign.
+                                    start_retreat_movement(
+                                        STORE, at, dest_bf))
+                                if retreat_mv is not None:
+                                    # 撤退行军已发起：补扣惩罚（编制/士气）
+                                    await STORE.update_command_node(
+                                        at['id'], **fields)
+                                    cmd = _view_cmd(sess)
+                                    if cmd:
+                                        # 野外遭遇原冻结行军行删除
+                                        for mv in old_mvs:
+                                            segs = (war_campaign.
+                                                    movement_segments(mv))
+                                            is_air = bool(
+                                                segs
+                                                and segs[0].get('air'))
+                                            await _push_kvcs_delete(
+                                                writer, cmd,
+                                                b'transport_commandnode_'
+                                                b'segment', mv['id'])
+                                            await _push_kvcs_delete(
+                                                writer, cmd,
+                                                b'air_transport'
+                                                if is_air else
+                                                b'transport_commandnode_'
+                                                b'destination',
+                                                mv['id'])
+                                    log(f'      [war] AT 交战撤退 '
+                                        f'node={node_id} -> 向友方城 '
+                                        f'bf={dest_bf} 行军')
+                            # ---- 在途行军中止（撤退行军未发起时：移动中
+                            #      撤退清理 movement，否则孤儿行军到点会
+                            #      把已撤 AT 拉回地图）----
                             for mv in await STORE.list_active_movements(
                                     war['id']):
                                 if (int(mv.get('commandnode_id') or 0)
                                         != int(at['id'])):
                                     continue
+                                if (retreat_mv is not None
+                                        and int(mv['id'])
+                                        == int(retreat_mv['id'])):
+                                    continue      # 撤退行军本体不中止
                                 await STORE.finish_movement(mv['id'], 2)
                                 cmd = _view_cmd(sess)
                                 if cmd:
@@ -687,17 +774,8 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
                                         b'air_transport' if is_air else
                                         b'transport_commandnode_destination',
                                         mv['id'])
-                            if was_in_battle and dest_bf:
-                                # 友方邻城落位：保持部署一跳转移
-                                await STORE.update_command_node(
-                                    at['id'], state=0,
-                                    map_entity_id=dest_bf,
-                                    map_entity_type=(war_campaign.
-                                                     MAP_ENTITY_BATTLEFIELD),
-                                    **fields)
-                                log(f'      [war] AT 交战撤退 node={node_id}'
-                                    f' -> 友方邻城 bf={dest_bf}')
-                            else:
+                            if not (was_in_battle and dest_bf
+                                    and retreat_mv is not None):
                                 # 非交战 / 无友方路线：撤回待命（M1 行为）；
                                 # 落地变体转回原型（待命=仓库，重新部署
                                 # 须恢复空降能力）
@@ -820,6 +898,24 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
             return
         # 响应先于行推送（客户端先收 ack 再应用行变更，理由同购买/部署）
         await _push_at_rows(sess, writer, at, at['war_id'])
+        if retreat_mv is not None and not auto_flown:
+            # 撤退行军行广播（全体战图订阅者）：segment/destination
+            # （retreatFlag=1，客户端按撤退方向渲染动画）+ instance 重钉
+            segs = war_campaign.movement_segments(retreat_mv)
+            evs = []
+            if segs:
+                evs.append(('set', b'transport_commandnode_segment',
+                            war_campaign.msg_transport_segment_row(
+                                at, at['war_id'], retreat_mv, segs[0])))
+            evs.append(('set', b'transport_commandnode_destination',
+                        war_campaign.msg_transport_destination_row(
+                            at, at['war_id'], retreat_mv, segs,
+                            retreat=True)))
+            evs.append(('set', b'CommandNodeWarInstance',
+                        war_campaign.msg_commandnode_instance_row(
+                            at, at['war_id'],
+                            war_campaign._faction_capital_bf())))
+            await war_campaign.broadcast_war_events(evs)
         cmd = _view_cmd(sess)
         if not cmd:
             return
@@ -873,7 +969,7 @@ async def _pending_column_resources(war_id, at_id):
 
 async def _apply_resupply(at, pid, war, currency,
                           soldier_pricing, vehicle_pricing,
-                          near_capital=0):
+                          near_capital=0, from_deploy=False):
     """缺编补编公共链（deploy/resupply 共用，§10.2 #4/#5）：
     每侧首次免费（has_gotten_*_free 置位后转付费）→ 按模板 Pricing 计价
     扣款 → 交付：
@@ -883,7 +979,8 @@ async def _apply_resupply(at, pid, war, currency,
       即时交付 → 缺口入 war_supply_queue（supply_queue_tick 周期 FIFO
       交付）。
     - 网络外（MM_WAR_SUPPLY_COLUMN_MODE=1 自动 / 2 一律）：官服补给队
-      （Reserve）机制——购买兵员装上补给队从阵营首都沿补给线机动，
+      （Reserve）机制——购买兵员装上补给队从最近己方在网主城（无候选
+      回退阵营首都）沿补给线机动，
       到达与父 AT 汇合入编（war_campaign.spawn_supply_column /
       _arrive_supply_column）；此路径不动阵营库存、不入 226 队列。
 
@@ -946,13 +1043,18 @@ async def _apply_resupply(at, pid, war, currency,
         missing = {c: n for c, n in missing.items() if n > 0}
     if not missing:
         # 按落地编制已满编：在己方机场且运输机满编 → 补给=重新登机
-        # 转回空中原型（响应 ok 而非 103，玩家实报场景：资源满编的
-        # 落地伞兵点补给被拒）
+        # 转回空中原型；否则 ok（no-op）。★ 不回 103（2026-09-14 玩家
+        # 实报"部署成功后卡部署界面"根因）：单 AT 部署窗口的自动补编链
+        # （handleAssaultTeamUpdates → issueSupplyRequest，窗口快照价
+        # >0 时必发）在部署已按请求内计价 id 补满编后到达，回 103 会让
+        # requestSuppliesResponse 进错误态（仅 ok 关窗）→ 窗口永久卡住。
+        # 满编 ok 无扣款无行变更，no-op 安全（落地伞兵重整同款先例：
+        # 资源满编的落地伞兵点补给被 103 拒也曾实报改 ok）
         if proto is not None and air_bf:
             new_at = await _re_embark(at)
             if new_at is not None:
                 return 0, new_at
-        return war_campaign.RC_NO_RESUPPLY_ALREADY_FULL, at
+        return 0, at
     veh_cats = set(tpl.get('vehicle_cats') or set())
     if proto is not None and air_bf:
         # 计价拆分并入空中原型载具类（cat10 按客户端 vehiclePricing
@@ -965,11 +1067,19 @@ async def _apply_resupply(at, pid, war, currency,
               bool(at.get('has_gotten_soldier_free')))
     v_free = (m_veh > 0 and not
               bool(at.get('has_gotten_vehicle_free')))
-    # ---- 补给队模式判定（官服 §10.2 #6；置于扣款前——不可达直接
-    # 拒单不扣钱（RC_CANNOT_FIND_COMMANDNODE，真·孤岛理论不达））----
+    # ---- 补给队模式判定（官服 §10.2 #6：购买增援一律 OnTheWay 在途，
+    # 客户端补编窗口缺口 = templateCount - onTheWay - current；默认
+    # mode=2 一律出队，mode=1 退回"仅补给网外出队"旧口径；置于扣款前
+    # ——不可达直接拒单不扣钱（RC_CANNOT_FIND_COMMANDNODE，真·孤岛
+    # 理论不达））----
+    # ★ from_deploy（部署即补编）永不走补给队：部署 handler 先置
+    # is_deployed=True 再补编，若按 is_deployed 判定会误走出队分支
+    # （2026-09-14 玩家实报"刚部署就发补给队"）。官服部署口径是请求内
+    # 计价 id 即时交付（§10.2 #4/#5，Deploy All 绝无补编链），补给队
+    # 出队只针对已部署 AT 的后续购买增援（resupply_request）
     use_column = False
     mode = mm_config.WAR_SUPPLY_COLUMN_MODE
-    if mode and at.get('is_deployed'):
+    if mode and not from_deploy and at.get('is_deployed'):
         if mode >= 2:
             use_column = True
         else:
@@ -1116,7 +1226,8 @@ async def handle_resupply_request(sess, writer, cmd_id, req_type, proto):
     增援链（§10.2 #2/#6）：状态校验（101/116）后走 _apply_resupply 公共
     补编链（首次免费/计价扣款/阵营库存交付/缺口入队 226；AT 在补给
     网络外时改由补给队从己方城市机动汇合）。f6 为老客户端指定的
-    补给队出生城市（须己方领地，否则忽略走服务端就近选择）。客户端
+    补给队出生城市（须己方领地，否则忽略走服务端就近选择——最近
+    己方在网主城，全图无候选回退阵营首都）。客户端
     ReinforcementWindowMediator.issueSupplyRequest 发送，response=ok 关窗，
     否则错误反馈。"""
     node_id = soldier_pricing = vehicle_pricing = currency = 0
