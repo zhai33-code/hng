@@ -31,3 +31,6 @@ realtest_game.log.*.log
 # fs 同步 CAS 大文件（部署产物：改动过的客户端文件以 sha256-size_flag 命名放入，
 # 不入库，可从客户端原文件重新生成）
 cas/
+
+
+plink.exe

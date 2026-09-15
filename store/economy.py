@@ -110,7 +110,8 @@ class EconomyMixin:
         return True, n, n, int(row['c'])
 
     async def touch_daily_login(self, player_id):
-        """登录即记连续天数（subscribeplayerview 推 player 行前调用）：
+        """登录即记连续天数（subscribeplayerview 推 player 行前、以及
+        RedeemDailyLoginReward 领取前调用）：
         同日幂等；昨日已登录 → +1；断签 → 重置 1。返回连续天数。
         同时把 first_action_game_date（player f19）刷成当天——它是客户端
         DailyRewardsWindowMediator 连续奖励链的基准日（C = f8 +

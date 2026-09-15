@@ -58,6 +58,7 @@ from wardb import (
     _RIBBON_LEVEL_XP,
     _rank_from_combat_xp,
     ammo_wear_params,
+    campaign_mission_multipliers,
     commandnode_template,
     repair_base_price,
     vehicle_ammo_weapon_templates,
@@ -144,7 +145,7 @@ def _as_str(v):
 
 
 def _earnings_value(raw):
-    """BattleReportEarnings 嵌套消息 → valueEarned（f1；f2-f7 加成实测恒 0）。
+    """BattleReportEarnings 嵌套消息 → valueEarned（f1）。
 
     BattleReportCharacter f10 creditEarnings / f11 warfundEarnings 是嵌套消息
     （BattleReportEarnings，0x1807b3e58），不是整数——2026-08-26 结算崩溃
@@ -157,14 +158,27 @@ def _earnings_value(raw):
         return 0
 
 
+def _earnings_bonus(raw, field):
+    """BattleReportEarnings 嵌套消息 → 指定加成字段（f2 vet / f4 campaign /
+    f5 underdog 等，build_battle_report_spbc 实锤布局）；缺失返回 0。"""
+    if not isinstance(raw, (bytes, bytearray)) or not raw:
+        return 0
+    try:
+        return max(0, int(_get(_split_fields(raw), field, 0) or 0))
+    except Exception:
+        return 0
+
+
 def _report_ribbon_end(br_players):
-    """(playerId, characterId) → {ribbonTemplateId: endValue + xpBooster}。
+    """(playerId, characterId) → {ribbonTemplateId: endValue + 各加成}。
 
     f13 endValue = 战前值 + 基础经验（build_battle_report_spbc 0x1802C0350
-    反编译：fill_stat_requirements_spbc 不放大），勋带加成部分在 f5
-    xpBoosterBonus = (乘数-1)×基础经验 单独回报（sub_18038C790）——落库须
-    end + f5 才是放大后的战终值，与战报 UI 汇总口径一致（否则勋带加成
-    只在结算界面显示、士兵页实际进度不涨）。"""
+    反编译：fill_stat_requirements_spbc 不放大），勋带加成在 f4-f8 单独
+    回报（f4 xpVet / f5 xpBooster / f6 xpCampaign / f7 xpUnderdog /
+    f8 xpSquadVet）——落库须 end + f4..f8 才是放大后的战终值，与战报 UI
+    汇总口径一致（否则勋带加成只在结算界面显示、士兵页实际进度不涨）。
+    结算时已把本地兜底加成（会员 +25%、战役 +50%、underdog）写回 rb
+    字段，此处直接求和。"""
     out = {}
     for p in br_players:
         pid = int(p.get('player_id', 0) or 0)
@@ -172,8 +186,10 @@ def _report_ribbon_end(br_players):
             ends = {}
             for rb in ch.get('ribbons') or []:
                 if isinstance(rb, dict) and rb.get('id'):
-                    ends[int(rb['id'])] = int(rb.get('end', 0) or 0) + \
-                        max(0, int(rb.get('xpBooster', 0) or 0))
+                    ends[int(rb['id'])] = int(rb.get('end', 0) or 0) + sum(
+                        max(0, int(rb.get(k, 0) or 0)) for k in (
+                            'xpVet', 'xpBooster', 'xpCampaign',
+                            'xpUnderdog', 'xpSquadVet'))
             if ends:
                 out[(pid, int(ch.get('characterId', 0) or 0))] = ends
     return out
@@ -1061,15 +1077,37 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                             'endXp': int(_get(c, 3, 0) or 0),
                             # f5 xpBoosterBonus：客户端按 f35 下发的激活加成
                             # 模板查乘数 × 基础经验算出（endXp 不含，须服务端
-                            # 补加入账）；f4/f6-f8 本服无对应机制、f9 每日首战
-                            # 由服务端自行计算（consume_daily_bonus），均不取
+                            # 补加入账）；f9 每日首战由服务端自行计算
+                            # （consume_daily_bonus），不取线上值
                             'xpBoosterBonus': max(0, int(_get(c, 5, 0) or 0)),
                             'xpVetBonus': max(0, int(_get(c, 3, 0) or 0) -
                                               int(_get(c, 2, 0) or 0)) * 25 // 100,
+                            # f6-f8/f14-f16（官方加成字段，build_battle_report_
+                            # spbc 实锤）：战役/underdog/小队老兵/快速比赛/
+                            # 战争特别加成——战斗服按 BattleFieldSettings f17
+                            # isCampaignMission + faction 行 f3/f4 倍率计算
+                            # 上报；线上为 0 时结算按官方公式本地兜底
+                            'xpCampaignBonus': max(0, int(_get(c, 6, 0) or 0)),
+                            'xpUnderdogBonus': max(0, int(_get(c, 7, 0) or 0)),
+                            'xpSquadVetBonus': max(0, int(_get(c, 8, 0) or 0)),
+                            'xpAnyFactionQuickplayBonus':
+                                max(0, int(_get(c, 14, 0) or 0)),
+                            'xpQuickplayBonus':
+                                max(0, int(_get(c, 15, 0) or 0)),
+                            'xpWarBonus': max(0, int(_get(c, 16, 0) or 0)),
                             'creditEarned': credit,
                             'creditVetBonus': credit * 25 // 100,
+                            # f10 creditEarnings 加成位（f4 campaign /
+                            # f5 underdog——官方银币无 underdog，host 恒 0）
+                            'creditCampaignBonus':
+                                _earnings_bonus(_get(c, 10, b''), 4),
+                            'creditUnderdogBonus':
+                                _earnings_bonus(_get(c, 10, b''), 5),
                             'warfundEarned': warfund,
                             'warfundVetBonus': warfund * 25 // 100,
+                            # f11 warfundEarnings f5 underdogBonus
+                            'warfundUnderdogBonus':
+                                _earnings_bonus(_get(c, 11, b''), 5),
                             'stats': stats,
                             'ribbons': ribbons,
                             'factionId': faction_id,
@@ -1182,6 +1220,68 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
     except Exception as e:
         log(f'      [combat] factions_extra build failed: {e}')
 
+    # ---- 战役局加成兜底（官方公式，build_battle_report_spbc 实锤）：
+    # 战斗服本应按 BattleFieldSettings f17 isCampaignMission 计算上报
+    # campaign/underdog 加成；本服战斗服的会员模板解析不上报（f2 vet 实测
+    # 恒 0 的先例），故线上字段为 0 时按官方公式本地补齐——口径 =
+    # (ExperienceLevels 乘数-1) × 基础值 / (faction 行 underdog 倍率-1) ×
+    # 基础值，与 host 实算一致；线上已上报（>0）时信任线上值不重复加。
+    _is_campaign = False
+    _ud = {}
+    _pid_faction = {}       # player_id -> factionTemplateId（underdog 查表）
+    try:
+        _det = mm_state._MM_MISSION_DETAILS.get(int(mission_id)) or {} \
+            if mission_id else {}
+        _is_campaign = int(_det.get('battle_id') or 0) > 0
+        if _is_campaign:
+            _cxp_m, _crb_m, _ccr_m = campaign_mission_multipliers()
+            _ud = await war_campaign.current_underdog_mults(STORE)
+            for p in br_players:
+                pid = int(p.get('player_id', 0) or 0)
+                for ch in p.get('characters') or []:
+                    _pid_faction.setdefault(
+                        pid, int(ch.get('factionId', 0) or 0))
+                    base_xp = max(0, int(ch.get('endXp', 0) or 0) -
+                                  int(ch.get('startXp', 0) or 0))
+                    _uxp_m, _uwf_m = _ud.get(
+                        int(ch.get('factionId', 0) or 0), (1.0, 1.0))
+                    # XP：战役 +50% / underdog（会员 +25% 与勋带兜底见下）
+                    if base_xp:
+                        if not ch.get('xpCampaignBonus'):
+                            ch['xpCampaignBonus'] = \
+                                int(base_xp * (_cxp_m - 1.0))
+                        if not ch.get('xpUnderdogBonus') and _uxp_m > 1.0:
+                            ch['xpUnderdogBonus'] = \
+                                int(base_xp * (_uxp_m - 1.0))
+                    # 银币/战资 per-char 展示位兜底（入账在 pr 口径另算，
+                    # 与入账基础严格同源，见下方 currency_bonus）
+                    cr = int(ch.get('creditEarned', 0) or 0)
+                    if cr and not ch.get('creditCampaignBonus'):
+                        ch['creditCampaignBonus'] = int(cr * (_ccr_m - 1.0))
+                    wf = int(ch.get('warfundEarned', 0) or 0)
+                    if wf and not ch.get('warfundUnderdogBonus') and \
+                            _uwf_m > 1.0:
+                        ch['warfundUnderdogBonus'] = int(wf * (_uwf_m - 1.0))
+                    # 勋带：会员 +25%（与角色 XP 同策略）+ 战役 +50% +
+                    # underdog——写回 rb 字段，落库 floor 与战报回显同值
+                    for rb in ch.get('ribbons') or []:
+                        if not isinstance(rb, dict):
+                            continue
+                        earned = max(0, int(rb.get('end', 0) or 0) -
+                                     int(rb.get('start', 0) or 0))
+                        if not earned:
+                            continue
+                        if not rb.get('xpVet'):
+                            rb['xpVet'] = earned * 25 // 100
+                        if not rb.get('xpCampaign'):
+                            rb['xpCampaign'] = int(earned * (_crb_m - 1.0))
+                        if not rb.get('xpUnderdog') and _uxp_m > 1.0:
+                            rb['xpUnderdog'] = int(earned * (_uxp_m - 1.0))
+            log(f'      [combat] campaign bonuses: mults '
+                f'xp={_cxp_m} ribbon={_crb_m} credit={_ccr_m} ud={_ud}')
+    except Exception as e:
+        log(f'      [combat] campaign bonus fallback failed: {e}')
+
     # ---- PlayerBattleResult（f5）：货币 + 角色战斗明细
     currency_ops = []       # (player_id, credits, warfunds)
     char_results = []       # (player_id, char_dict)
@@ -1216,6 +1316,23 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
         f'winner={report["winner_faction_id"]} '
         f'time={report["mission_time_seconds"]}s '
         f'players={len(br_players)} results={len(char_results)}')
+
+    # 战役局货币加成（pr 口径，与入账基础严格同源）：战役银币 =
+    # (campaignMissionCreditMultiplier-1)×基础；战资 underdog =
+    # (faction 行 wf 倍率-1)×基础。官方银币无 underdog 位（host 恒 0），不补
+    currency_bonus = {}     # player_id -> (credit_bonus, warfund_bonus)
+    if _is_campaign:
+        try:
+            _ccr_m = campaign_mission_multipliers()[2]
+            for pid, credits, warfunds in currency_ops:
+                cr_b = int(credits * (_ccr_m - 1.0)) if credits > 0 else 0
+                _uwf_m = _ud.get(_pid_faction.get(pid, 0), (1.0, 1.0))[1]
+                wf_b = int(warfunds * (_uwf_m - 1.0)) \
+                    if warfunds > 0 and _uwf_m > 1.0 else 0
+                if cr_b or wf_b:
+                    currency_bonus[pid] = (cr_b, wf_b)
+        except Exception as e:
+            log(f'      [combat] currency bonus calc failed: {e}')
 
     # ---- 响应先行：战斗服 pending wait 立即完成（后续 DB/推送异常不再
     #      拖垮结算链路——2026-08-26 崩溃事故即解析异常导致无响应）
@@ -1298,16 +1415,24 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 log(f'      [DB] mark_first_action_game failed: {e}')
 
         for pid, credits, warfunds in currency_ops:
+            # 战役局加成（战役银币 / 战资 underdog，解析段已按官方公式
+            # 兜底）随基础值一并入账；vet 只乘基础值（官方公式：(会员乘数
+            # -1)×base，build_battle_report_spbc 实锤），不吃战役加成部分
+            cr_b, wf_b = currency_bonus.get(pid, (0, 0))
+            base_c, base_w = credits, warfunds
+            credits += cr_b
+            warfunds += wf_b
             if not (credits or warfunds) or not _is_settleable(pid):
                 continue
             try:
                 # 老兵会员 +25%（PlayerSettings f26 恒 2=会员模板 → 人人加成）
-                vet_c = credits * 25 // 100 if credits > 0 else 0
-                vet_w = warfunds * 25 // 100 if warfunds > 0 else 0
+                vet_c = base_c * 25 // 100 if base_c > 0 else 0
+                vet_w = base_w * 25 // 100 if base_w > 0 else 0
                 cur = await STORE.add_currency(pid, credits=credits + vet_c,
                                                warfunds=warfunds + vet_w)
-                log(f'      [DB] earnings player={pid} +{credits}cr(+{vet_c}vet) '
-                    f'+{warfunds}wf(+{vet_w}vet) '
+                log(f'      [DB] earnings player={pid} '
+                    f'+{base_c}cr(+{vet_c}vet+{cr_b}campaign) '
+                    f'+{base_w}wf(+{vet_w}vet+{wf_b}underdog) '
                     f'-> {cur["credits"]}cr/{cur["warfunds"]}wf')
             except Exception as e:
                 log(f'      [DB] add_currency({pid}) failed: {e}')
@@ -1332,12 +1457,20 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                         # XP 加成：客户端战报 f5（endXp 不含，须在此补加；
                         # 值来自 f35 下发模板的乘数 × 基础经验）
                         booster_xp = int(ch.get('xpBoosterBonus', 0) or 0)
-                        await STORE.add_combat_xp(pid, ch['characterId'],
-                                                  xp_delta + vet_xp + daily_xp +
-                                                  booster_xp)
+                        # 战役/underdog/小队老兵/快速比赛/战争特别加成
+                        # （官方字段 f6/f7/f8/f14/f15/f16，线上值或解析段
+                        # 官方公式兜底；官方入账 = 基础 + 全部加成位）
+                        bonus_xp = sum(int(ch.get(k, 0) or 0) for k in (
+                            'xpCampaignBonus', 'xpUnderdogBonus',
+                            'xpSquadVetBonus', 'xpAnyFactionQuickplayBonus',
+                            'xpQuickplayBonus', 'xpWarBonus'))
+                        await STORE.add_combat_xp(
+                            pid, ch['characterId'],
+                            xp_delta + vet_xp + daily_xp + booster_xp +
+                            bonus_xp)
                         log(f'      [DB] char {ch["characterId"]} '
                             f'+{xp_delta} xp(+{vet_xp}vet+{daily_xp}daily'
-                            f'+{booster_xp}booster)')
+                            f'+{booster_xp}booster+{bonus_xp}war)')
                 # 战斗通行证分数：计入玩家激活的赛季（客户端"激活"切换
                 # 语义：切到哪个赛季就涨哪个），未激活任何赛季回落当前
                 # 赛季（与官服一致：未购买也累计，奖励仅已购买行可领）
@@ -1666,41 +1799,43 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
         try:
             if solo is not None and not squad_db_id:
                 solo['mission_id'] = 0
-                # ★ 战斗结束解散假小队（2026-09-09）：单人成队（solo）与
-                #   散人凑队（auto squad）行一律删除、不重推——玩家打完
-                #   回大厅应回到"无小队"状态，再点匹配重建假小队。
-                #   删除顺序（同 handle_remove_squad 终版）：SquadSession
-                #   先删——客户端 onSquadSessionChange DELETE → resetSquad()
-                #   全量清理（isActive/isOwnedByPlayer 置 false，之后 PMS
-                #   DELETE 的 onLobbySignalUpdates 走 !isActive 分支安全）；
-                #   成员行后删（先删成员行会把 _squadSession 置空、
-                #   SquadSession DELETE 变 no-op → isOwnedByPlayer 残留 →
-                #   切屏卡"小队未准备好"）。
+                # ★ 战斗结束假小队重置（2026-09-16 改，取代 09-09 的删行）：
+                #   单人成队（solo）行重推 mission=0 + 成员 status=2
+                #   InLobby（与 abandon/取消匹配同口径，官服打完仗小队
+                #   保留可手动解散）；凑队（auto squad）行删除后重推 solo
+                #   行恢复单人视图（同 mission.py release 路径）。
+                #   ★★ 不可删 solo 行：客户端 wasThroughLoginProcessAnd-
+                #   HasSessions（登录数据加载完时一次性计算）为 true 后
+                #   假定 squadSession 永非 null——删行后切士兵/小队屏
+                #   SquadModel.activate() 置 isActive=true 并发信号 →
+                #   StatusMediator.onSquadStateUpdates 解引用
+                #   squadSession.missionId → TypeError #1009，activate
+                #   后半截被异常打断 → isActive=true/isOwnedByPlayer=
+                #   false 幽灵小队（面板无头像、解散按钮静默失败），且
+                #   onWarBattleFiltersValidated 首行早退 → 战争图点城市
+                #   右下角不出现加入战斗按钮（2026-09-16 Berlin 实锤，
+                #   重登后恢复）。
                 if mm_sess.get('auto_sq_id'):
-                    await matchmaking._push_kvcs_delete(
+                    await matchmaking._reset_auto_squad_rows(
                         flash.writer, flash.playerview_cmd,
-                        b'SquadSession', int(mm_sess.get('auto_sq_id') or 0))
-                    for rid in mm_sess.get('auto_sq_rows') or []:
-                        await matchmaking._push_kvcs_delete(
-                            flash.writer, flash.playerview_cmd,
-                            b'SquadMemberSession', int(rid))
-                    log(f'S->C cmd={flash.playerview_cmd:<4} '
-                        f'KeyValueChangeSet delete (auto squad '
-                        f'id={int(mm_sess.get("auto_sq_id") or 0)} + '
-                        f'{len(mm_sess.get("auto_sq_rows") or [])} member '
-                        f'rows ★battle end disband)')
-                # solo 行兜底删：凑队成员表内该行已在进局时删除
-                # （客户端对不存在的 id delete 是 no-op，无害）
-                await matchmaking._push_kvcs_delete(
-                    flash.writer, flash.playerview_cmd,
-                    b'SquadSession', solo['squad_row'])
-                await matchmaking._push_kvcs_delete(
-                    flash.writer, flash.playerview_cmd,
-                    b'SquadMemberSession', solo['member_row'])
+                        int(mm_sess.get('auto_sq_id') or 0),
+                        mm_sess.get('auto_sq_rows') or [])
+                await matchmaking._push_kvcs(
+                    flash.writer, flash.playerview_cmd, b'SquadSession',
+                    matchmaking._msg_solo_squad_session(
+                        solo['squad_row'], pid, solo['template'],
+                        solo['faction'], 0, solo.get('entered', 0)))
+                await matchmaking._push_kvcs(
+                    flash.writer, flash.playerview_cmd, b'SquadMemberSession',
+                    await matchmaking._msg_solo_squad_member_session(
+                        solo['member_row'], solo['squad_row'], pid,
+                        solo['gamertag'], solo['char_id'], solo['char_name'],
+                        solo['rank'], 2, solo.get('metrics_session_id', 0),
+                        solo['faction']))
                 log(f'S->C cmd={flash.playerview_cmd:<4} KeyValueChangeSet '
-                    f'delete (SquadSession id={solo["squad_row"]} + '
-                    f'SquadMemberSession id={solo["member_row"]} '
-                    f'★battle end disband solo squad)')
+                    f'(SquadSession id={solo["squad_row"]} mission=0 + '
+                    f'SquadMemberSession id={solo["member_row"]} status=2 '
+                    f'InLobby ★battle end solo squad reset)')
             await matchmaking._push_kvcs_delete(
                 flash.writer, flash.playerview_cmd,
                 b'PlayerMissionSession', pms_id)

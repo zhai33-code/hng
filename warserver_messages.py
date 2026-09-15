@@ -214,6 +214,11 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
                                                 #    1.0=+100%即两倍经验，商店文案
                                                 #    "小时内+{乘数×100}"），服务端
                                                 #    add_combat_xp 补加入账；0=无加成
+    # 36 soldierWarBonusXPPercentage：官方"战争特别加成"（WarBonusTemplate/
+    # PlayerWarBonus 按 warId 生效，如前一场战争胜利方玩家在下一场战争获得
+    # +N% XP）——战斗服据此填战报 f16 xpWarBonus = base×N%。本服无战争
+    # 奖励事件系统 → 恒 0（=官方无活动期行为）；入账/回传管线已通，
+    # 后续接入事件系统时改此处即可
     m += pb_int32(36, 0)                         # 36 soldierWarBonusXPPercentage
     m += pb_string(37, weapon_unlocks)           # 37 careerOrderStatus (逗号串)
     m += pb_string(38, '3,1,2,8,18,22,')         # 38 (逗号串)
@@ -615,13 +620,21 @@ def _msg_army_resource_list(preset_id=MISSION_PRESET_ID,
     return res_msgs
 
 
-def _msg_battlefield_settings_faction(faction_id, template_id):
-    """BattlefieldSettingsFaction 子消息（field 18 条目）。"""
+def _msg_battlefield_settings_faction(faction_id, template_id,
+                                      underdog_xp_mult=1.0,
+                                      underdog_wf_mult=1.0):
+    """BattlefieldSettingsFaction 子消息（field 18 条目）。
+
+    f3/f4 underdog 倍率（官方机制，build_battle_report_spbc 实锤）：战斗服
+    结算时 xpUnderdogBonus = (f3-1)×基础XP、warfund underdogBonus =
+    (f4-1)×基础战资。war 局由 game_server 传当前战争倍率（war_campaign.
+    current_underdog_mults，与 faction 行 f6/f7 同源）；staged 局恒 1.0。
+    """
     m = b''
     m += pb_int64(1, faction_id)       # factionId（本局 runtime id）
     m += pb_int64(2, template_id)      # factionTemplateId（1=US 2=GE 3=SU，玩家=3）
-    m += pb_float(3, 1.0)              # underdogBonusXpMultiplier
-    m += pb_float(4, 1.0)              # underdogBonusWarfundsMultiplier
+    m += pb_float(3, float(underdog_xp_mult))   # underdogBonusXpMultiplier
+    m += pb_float(4, float(underdog_wf_mult))   # underdogBonusWarfundsMultiplier
     return m
 
 
@@ -687,7 +700,11 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
                                         weather_condition=0,
                                         timeofday=None,
                                         counts_by_faction=None,
-                                        mission_id=None):
+                                        mission_id=None,
+                                        is_campaign=False,
+                                        days_since_war_started=0,
+                                        supply_line_id=0,
+                                        underdog_mults=None):
     """构建 ResponseBattleFieldSettings（31 字段，spbc 描述符 @0x1807B1120）。
 
     天气/时段：weather_time_of_day / weather_condition 取客户端枚举
@@ -785,17 +802,33 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     for r in res_msgs:                             # 14 armyResourceList ★动态构建
         m += pb_message(14, r)
     m += pb_int32(15, 0)                           # 15 battlefieldRotation
-    m += pb_int32(16, 0)                           # 16 daysSinceWarStarted
-    m += pb_bool(17, False)                        # 17 isCampaignMission
-    m += pb_message(18, _msg_battlefield_settings_faction(1, 1))  # 18 US
-    m += pb_message(18, _msg_battlefield_settings_faction(2, 2))  # 18 GE
-    m += pb_message(18, _msg_battlefield_settings_faction(3, 3))  # 18 SU（factions 表必须含 factionId=3，否则 AddTeam team=3 越界崩溃）
+    # f16/f17/f24（官方战役局标识，build_battle_report_spbc 实锤）：
+    # isCampaignMission 是战斗服战役加成的总开关——为真才产出
+    # xpCampaignBonus(+50%，ExperienceLevels.campaignMissionXpMultiplier-1)、
+    # 银币 campaignBonus(campaignMissionCreditMultiplier-1)、勋带 campaign
+    # 加成与 warfundsEarned 基础值；为假全部恒 0。仅 war 会战局置真
+    # （staged 局保持旧字节序列，f16=0/f17=False）。
+    if is_campaign:
+        m += pb_int32(16, int(days_since_war_started))  # 16 daysSinceWarStarted
+        m += pb_bool(17, True)                          # 17 isCampaignMission
+    else:
+        m += pb_int32(16, 0)                       # 16 daysSinceWarStarted
+        m += pb_bool(17, False)                    # 17 isCampaignMission
+    # f18 factions：f3/f4 underdog 倍率按阵营模板 id 取当前战争倍率
+    # （war 局；underdog_mults={templateId:(xp,wf)}），staged 局恒 1.0
+    ud = underdog_mults or {}
+    for _fac in (1, 2, 3):
+        _xp_m, _wf_m = ud.get(_fac, (1.0, 1.0))
+        m += pb_message(18, _msg_battlefield_settings_faction(
+            _fac, _fac, _xp_m, _wf_m))
+    # 18 US/GE/SU（factions 表必须含 factionId=3，否则 AddTeam team=3 越界崩溃）
     m += pb_int32(19, max_players)                 # 19 maxTotalPlayers
     m += pb_bool(20, enable_bots)                  # 20 enableBots（本地 bot：官方训练局路径）
     m += pb_int32(21, weather_time_of_day)         # 21 weatherTimeOfDay
     m += pb_int32(22, weather_condition)           # 22 weatherCondition
     m += pb_string(23, name)                       # 23 metricsMissionName
-    m += pb_int64(24, 0)                           # 24 supplyLineId
+    # 24 supplyLineId：野外遭遇局（补给线上的遭遇战）= 补给线 id；城战/普通局 0
+    m += pb_int64(24, int(supply_line_id or 0))
     m += pb_float(25, 0.0)                         # 25 supplyLineOffsetFromAP1
     # f29/f30 stagedPos：战斗内 SpawnMenu 的 IngameEuropeMapOverlay 缩放定位
     # （player.dll SpawnMenu/IngameEuropeMapOverlayBlend + WarMap/deployTarget）。

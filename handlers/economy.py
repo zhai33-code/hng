@@ -472,7 +472,15 @@ async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto
     一并发放 bonus（consecutive_daily_login_rewards 表），响应带两个
     VoucherPackInfo（客户端 BundleWindow 显示获得内容），并重推
     PlayerOfferMetrics / 货币 / 加成 / 会员 KVCS 行实时刷新。
-    当天已领：幂等不发（infos 省略）。"""
+    当天已领：幂等不发（infos 省略）。
+
+    ★ 领取前必跑 touch_daily_login（同日幂等）：touch 平时只在登录
+    （subscribeplayerview）执行，跨 UTC 零点持续在线的玩家 c/f19 快照
+    会过期——客户端签到窗口 C = f8 + (f19 != 今天 ? 1 : 0) 会把连登
+    链 2 天档顶成 TODAY 并镜像主签到已领（看着像"登 1 天就发 2 连登
+    奖励"），而服务端仍按旧 c 不发 bonus、last_login_date 滞留昨天
+    还会导致次日重登断签重置。领取时补 touch 让 c/f19 推进到当天，
+    bonus 按新 c 真发，与客户端显示一致。"""
     req_player_id = 0
     try:
         f = pb_parse(proto)
@@ -485,6 +493,10 @@ async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto
     day = 0
     consecutive = 0
     if pid is not None and STORE is not None:
+        try:
+            await STORE.touch_daily_login(int(pid))
+        except Exception as e:
+            log(f'      [DB] touch_daily_login (redeem) failed: {e}')
         try:
             ok, day, redeemed, consecutive = \
                 await STORE.claim_daily_reward(int(pid))
@@ -515,8 +527,10 @@ async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto
             await push_booster_rows(sess, writer, int(pid))
         if 'membership' in granted['push']:
             await push_membership_rows(sess, writer, int(pid))
-        if 'player' in granted['push']:
-            await _push_player_refresh(sess, writer)
+        # player 行无条件重推：f19 firstActionGameDate 可能刚被上面的
+        # touch 推进（跨零点在线领取），客户端签到窗口按它算连续天数；
+        # 货币变化时的刷新也一并覆盖（不再只看 'player' push 标记）
+        await _push_player_refresh(sess, writer)
         # 生涯军令 12 eRedeemDailyReward（客户端无上报点）+ 推行实时刷新
         from handlers.career import complete_order_and_push
         await complete_order_and_push(sess, writer, pid, 12)

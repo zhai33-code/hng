@@ -524,6 +524,35 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             weather_tod = 1
             weather_condition = 0
             timeofday = None
+        # ---- war 会战局战役标识（官方机制，build_battle_report_spbc 实锤）：
+        # f17 isCampaignMission 是战斗服战役加成总开关（+50% XP/勋带、+25%
+        # 银币、warfundsEarned 基础值）；f16 战争天数；f24 野外遭遇局补给线
+        # id；f18 faction 行 f3/f4 带当前战争 underdog 倍率（战斗服结算
+        # xpUnderdogBonus / 战资 underdogBonus 数据源）。
+        is_campaign = False
+        days_since_war = 0
+        supply_line_id = 0
+        underdog_mults = None
+        if det and int(det.get('battle_id') or 0):
+            is_campaign = True
+            if int(det.get('entity_type') or 0) == 3:  # MAP_ENTITY_SUPPLYLINE
+                supply_line_id = int(det.get('entity_id') or 0)
+            try:
+                from war_campaign import current_underdog_mults
+                underdog_mults = await current_underdog_mults(STORE)
+            except Exception as e:
+                log(f'[war] underdog mults for battle settings failed: {e}')
+            try:
+                war = await STORE.get_active_war()
+                bt = (war or {}).get('begintime')
+                if bt:
+                    from datetime import datetime, timezone
+                    if bt.tzinfo is None:
+                        bt = bt.replace(tzinfo=timezone.utc)
+                    days_since_war = max(
+                        0, (datetime.now(timezone.utc) - bt).days)
+            except Exception as e:
+                log(f'[war] days since war started failed: {e}')
         # f14 资源从本局资源池渲染（与匹配界面 f5 / 轮询 f2 同源同值）；
         # mission_id = Assault 出兵线随机激活种子（与大厅简报 f6 / 轮询
         # f3/f5 必须同值，wardb.assault_ap_decision 详见）
@@ -533,7 +562,15 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             weather_time_of_day=weather_tod, weather_condition=weather_condition,
             timeofday=timeofday,
             counts_by_faction=matchmaking.mission_resource_pool(missionid),
-            mission_id=missionid)
+            mission_id=missionid,
+            is_campaign=is_campaign,
+            days_since_war_started=days_since_war,
+            supply_line_id=supply_line_id,
+            underdog_mults=underdog_mults)
+        if is_campaign:
+            log(f'[war] campaign battle settings mission={missionid} '
+                f'days={days_since_war} supplyline={supply_line_id} '
+                f'underdog={underdog_mults}')
         resp = build_response(cmd_id, 'ResponseBattleFieldSettings', resp_proto)
         writer.write(resp)
         await writer.drain()

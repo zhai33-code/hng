@@ -276,36 +276,50 @@ def test_finish_sessions_pushes_maintenance_notification():
         _cleanup(mid, pms, 'ExitGuyE')
 
 
-def test_finish_sessions_disbands_solo_squad():
-    """战斗结束解散 solo 假小队（2026-09-09"战局结束没有退队"）。
+def test_finish_sessions_resets_solo_squad():
+    """战斗结束 solo 假小队重置（2026-09-16 改，取代 09-09 删行）。
 
-    旧版删凑队行后重推 solo 行（SquadSession/SquadMemberSession set）→
-    玩家打完回大厅仍在"自己是队长的单人小队"里。新语义：
-    - SquadSession delete 先（客户端 resetSquad 全量清理）
-    - SquadMemberSession delete 后（先删成员行会把 _squadSession 置空、
-      SquadSession DELETE 变 no-op → isOwnedByPlayer 残留）
-    - 均先于 PlayerMissionSession delete（onLobbySignalUpdates 在
-      isActive=false 分支安全）
-    - 不重推任何小队行；solo 注册表条目保留（下次排队复用行 id）、
+    旧版删 solo 行 → 客户端 wasThroughLoginProcessAndHasSessions=true 的
+    会话 squadSession 变 null → 切屏 SquadModel.activate() 发信号 →
+    StatusMediator.onSquadStateUpdates 解引用 squadSession.missionId
+    TypeError #1009 → isActive/isOwnedByPlayer 卡死（幽灵小队：面板无
+    头像、解散静默失败）→ onWarBattleFiltersValidated 早退 → 战争图点
+    城市不出现加入战斗按钮（2026-09-16 Berlin 实锤）。新语义与 abandon/
+    取消匹配一致：
+    - SquadSession set（missionId=0）先
+    - SquadMemberSession set（status=2 InLobby）后
+    - 均先于 PlayerMissionSession delete（onLobbySignalUpdates 读
+      squadSession 非 null 且 missionId=0 → BASE_STATE）
+    - 不删任何小队行；solo 注册表条目保留（下次排队复用行 id）、
       mission_id 归零
     """
     mid, pms = 987006, 987106
     writer = _setup(mid, pms, 5, 'ExitSoloGuy')
     mm_state._SOLO_SQUADS[5] = {
         'squad_row': 7001, 'member_row': 7002, 'mission_id': mid,
-        'faction': 1, 'template': 1, 'entered': 1}
+        'faction': 1, 'template': 1, 'entered': 1,
+        'gamertag': 'ExitSoloGuy', 'char_id': 25, 'char_name': 'ESG',
+        'rank': 5}
     try:
         asyncio.run(combat_handlers._finish_mission_sessions(mid, None))
         rows = _kvcs_rows(writer.sent)
         squad_rows = [(a, t) for a, t, _ in rows
                       if t in ('SquadSession', 'SquadMemberSession')]
-        assert squad_rows == [('delete', 'SquadSession'),
-                              ('delete', 'SquadMemberSession')], \
-            f'solo 假小队应删行不重推，实际 {squad_rows}'
+        assert squad_rows == [('set', 'SquadSession'),
+                              ('set', 'SquadMemberSession')], \
+            f'solo 假小队应重置不删行，实际 {squad_rows}'
+        ss = [r for a, t, r in rows
+              if a == 'set' and t == 'SquadSession'][0]
+        # f17 missionId=0 线格式锚点：tag 0x88 0x01（字段号≥16 多字节，
+        # _pb_fields 单字节 tag 解析不适用）+ value 0x00
+        assert b'\x88\x01\x00' in ss, 'SquadSession missionId 应归零'
+        sm = [r for a, t, r in rows
+              if a == 'set' and t == 'SquadMemberSession'][0]
+        assert _pb_fields(sm).get(12) == [2], '成员状态应为 2 InLobby'
         order = [t for _, t, _ in rows]
         assert order.index('SquadSession') < order.index('SquadMemberSession') \
             < order.index('PlayerMissionSession'), \
-            f'删除顺序错误：{order}'
+            f'重置顺序错误：{order}'
         solo = mm_state._SOLO_SQUADS.get(5)
         assert solo is not None and solo['mission_id'] == 0, \
             '注册表条目应保留且 mission_id 归零'
@@ -314,38 +328,49 @@ def test_finish_sessions_disbands_solo_squad():
         mm_state._SOLO_SQUADS.pop(5, None)
 
 
-def test_finish_sessions_disbands_auto_squad():
-    """凑队（auto squad）战斗结束整队解散：删凑队行（SquadSession 先 +
-    全体成员行）+ solo 行兜底删 + PMS delete，无任何 set。"""
+def test_finish_sessions_resets_auto_squad():
+    """凑队（auto squad）战斗结束：删凑队行（成员行先 + SquadSession 后，
+    同 mission.py release 路径）+ solo 行重置（set mission=0/InLobby）+
+    PMS delete。"""
     mid, pms = 987007, 987107
     writer = _setup(mid, pms, 6, 'ExitAutoGuy')
     mm_state.PMS_TO_SESSION[pms]['auto_sq_id'] = 9001
     mm_state.PMS_TO_SESSION[pms]['auto_sq_rows'] = [9101, 9102]
     mm_state._SOLO_SQUADS[6] = {
         'squad_row': 7003, 'member_row': 7004, 'mission_id': mid,
-        'faction': 2, 'template': 1, 'entered': 1}
+        'faction': 2, 'template': 1, 'entered': 1,
+        'gamertag': 'ExitAutoGuy', 'char_id': 26, 'char_name': 'EAG',
+        'rank': 4}
     try:
         asyncio.run(combat_handlers._finish_mission_sessions(mid, None))
         rows = _kvcs_rows(writer.sent)
         squad_rows = [(a, t) for a, t, _ in rows
                       if t in ('SquadSession', 'SquadMemberSession')]
-        assert squad_rows == [('delete', 'SquadSession'),
-                              ('delete', 'SquadMemberSession'),
+        assert squad_rows == [('delete', 'SquadMemberSession'),
                               ('delete', 'SquadMemberSession'),
                               ('delete', 'SquadSession'),
-                              ('delete', 'SquadMemberSession')], \
-            f'凑队应删凑队行+solo 兜底行，实际 {squad_rows}'
-        # 凑队 SquadSession（9001）先删，凑队成员行（9101/9102）随后
+                              ('set', 'SquadSession'),
+                              ('set', 'SquadMemberSession')], \
+            f'凑队删行+solo 重置序列错误，实际 {squad_rows}'
         import struct
-        assert rows[0] == ('delete', 'SquadSession',
-                           struct.pack('<q', 9001)), \
-            f'凑队 SquadSession 应最先删除，实际 {rows[0]}'
-        member_ids = [struct.unpack('<q', r)[0] for a, t, r in rows[:3]
+        member_ids = [struct.unpack('<q', r)[0] for a, t, r in rows[:2]
                       if t == 'SquadMemberSession']
         assert member_ids == [9101, 9102], member_ids
+        assert rows[2] == ('delete', 'SquadSession',
+                           struct.pack('<q', 9001)), \
+            f'凑队 SquadSession 应在成员行后删除，实际 {rows[2]}'
+        # solo 重置行内容：missionId=0 + 成员 status=2
+        ss = [r for a, t, r in rows
+              if a == 'set' and t == 'SquadSession'][0]
+        assert b'\x88\x01\x00' in ss, 'SquadSession missionId 应归零'
+        sm = [r for a, t, r in rows
+              if a == 'set' and t == 'SquadMemberSession'][0]
+        # f12 status=2 线格式锚点（成员行含多字节 tag 字段，
+        # _pb_fields 单字节 tag 解析会脱轨）
+        assert b'\x60\x02' in sm, '成员状态应为 2 InLobby'
         order = [t for _, t, _ in rows]
         assert order.index('PlayerMissionSession') > 4, \
-            f'PMS delete 应在小队行删除之后，实际 {order}'
+            f'PMS delete 应在小队行推送之后，实际 {order}'
     finally:
         _cleanup(mid, pms, 'ExitAutoGuy')
         mm_state._SOLO_SQUADS.pop(6, None)
@@ -357,6 +382,6 @@ if __name__ == '__main__':
     test_watch_proc_exit_normal_path_no_finish()
     test_finish_sessions_repush_earned_chars()
     test_finish_sessions_pushes_maintenance_notification()
-    test_finish_sessions_disbands_solo_squad()
-    test_finish_sessions_disbands_auto_squad()
+    test_finish_sessions_resets_solo_squad()
+    test_finish_sessions_resets_auto_squad()
     print('test_combat_exit_finish: 7 项全部通过')

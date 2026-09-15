@@ -11,12 +11,17 @@
      5. _grant_daily_reward：货币 / 随机缎带加成 / 会员 / 未知 day
   B. handler 流程（FakeStore + FakeSess）：
      6. 首次领取：响应带 VoucherPackInfo、发放调用、PlayerOfferMetrics 重推
+     6b. 连续第 2 天领取：主奖励 + bonus 双包
+     6c. 跨 UTC 零点在线领取：先 touch 再 claim，bonus 按新连续天数发，
+         player 行（f19）随响应重推
      7. 当天二领：幂等（day=0 不发放、响应无 f2）
   C. DB 级（直连，复用 test_realdb 模式）：
      8. 迁移：players 4 个新列存在
      9. claim_daily_reward：幂等 + 并发防双领
     10. touch_daily_login：同日幂等 / 昨日+1 / 断签重置 1
     11. mark_first_action_game 幂等；get_daily_metrics available/fagd
+    12. 跨 UTC 零点在线领取序列（touch → claim）：c/f19/last_login_date
+        全部推进到当天
 """
 import asyncio
 import os
@@ -81,7 +86,9 @@ class _FakeSess:
 
 
 class _FakeStore:
-    """记录发放调用；claim 结果可编程（ok, day, redeemed, consecutive）。"""
+    """记录发放调用；claim 结果可编程（ok, day, redeemed, consecutive）。
+
+    events 记录 touch/claim 调用次序（handler 必须先 touch 再 claim）。"""
 
     def __init__(self, metrics, claim_result=(True, 1, 1, 1)):
         self.metrics = metrics
@@ -90,12 +97,18 @@ class _FakeStore:
         self.currency_ops = []
         self.booster_ops = []
         self.membership_ops = []
+        self.events = []
 
     async def get_daily_metrics(self, pid):
         return self.metrics
 
+    async def touch_daily_login(self, pid):
+        self.events.append(('touch', pid))
+        return int(self.metrics['c']) if self.metrics else 1
+
     async def claim_daily_reward(self, pid):
         self.claim_calls += 1
+        self.events.append(('claim', pid))
         return self.claim_result
 
     async def add_currency(self, pid, credits=0, warfunds=0, gold=0):
@@ -359,6 +372,32 @@ def test_handler():
           store.currency_ops == [(42, 1000, 0, 0), (42, 2000, 0, 0)],
           str(store.currency_ops))
 
+    print('== 6c. 跨 UTC 零点在线领取（touch 先行 + bonus 按新 c 发）==')
+    # 场景：昨天 23:xx UTC 登录（c=1），跨零点未重登直接领取。
+    # 修复后 handler 先 touch（c/f19 推进到当天，DB 侧表现为 c=2）再
+    # claim —— claim_result=(True,2,2,2) 即 touch 后的 DB 返回。
+    store = _FakeStore({'n': 1, 'c': 2, 'available': True, 'fagd': '20260915'},
+                       claim_result=(True, 2, 2, 2))
+    w = _FakeWriter()
+    economy.STORE = store
+    career.complete_order_and_push = _noop_complete_order_and_push
+    try:
+        asyncio.run(economy.handle_redeem_daily_login_reward(
+            _FakeSess(), w, 123, 'RedeemDailyLoginRewardRequest', b''))
+    finally:
+        economy.STORE = old_store
+        career.complete_order_and_push = old_career
+    check('领取前先 touch 再 claim',
+          store.events[:2] == [('touch', 42), ('claim', 42)],
+          str(store.events))
+    check('bonus 按 touch 后 c=2 发 2000 银币',
+          store.currency_ops == [(42, 1000, 0, 0), (42, 2000, 0, 0)],
+          str(store.currency_ops))
+    kvcs = _parse_kvcs_frames(w.frames[:-1])
+    tables = [t for t, _ in kvcs]
+    check('重推 player 行（f19 同步客户端）', 'player' in tables)
+    check('重推 PlayerOfferMetrics 行', 'PlayerOfferMetrics' in tables)
+
     print('== 7. 当天二领（幂等）==')
     store = _FakeStore({'n': 1, 'c': 1, 'available': False, 'fagd': ''},
                        claim_result=(True, 0, 1, 1))
@@ -435,15 +474,18 @@ async def _db_main():
         f19 = await conn.fetchval(
             'SELECT to_char(first_action_game_date, \'YYYYMMDD\') '
             'FROM players WHERE id = $1', pid)
-    check('touch 同步 f19 = 当天', f19 == time.strftime('%Y%m%d'),
-          f'f19={f19}')
+        # 以 DB 的 CURRENT_DATE 为准（DB 时区 UTC，与本地日期可能差一天）
+        db_today = await conn.fetchval(
+            "SELECT to_char(CURRENT_DATE, 'YYYYMMDD')")
+    check('touch 同步 f19 = 当天', f19 == db_today, f'f19={f19}')
 
     print('== 11. mark_first_action_game / get_daily_metrics ==')
     await st.mark_first_action_game(pid)
     await st.mark_first_action_game(pid)      # 幂等
     m = await st.get_daily_metrics(pid)
     check('metrics 返回行', m is not None)
-    today = time.strftime('%Y%m%d')
+    # 以 DB 的 CURRENT_DATE 为准（DB 时区 UTC，与本地日期可能差一天）
+    today = await st.pool.fetchval("SELECT to_char(CURRENT_DATE, 'YYYYMMDD')")
     check('first_action_game_date = 今天（幂等不覆盖）',
           m['fagd'] == today, f'fagd={m["fagd"]} want={today}')
     check('available=False（刚 claim 过）', m['available'] is False)
@@ -452,6 +494,32 @@ async def _db_main():
     pid3 = await st.create_player(uname + '3', 'daily-test')
     m2 = await st.get_daily_metrics(pid3)
     check('未领账号 available=True', m2['available'] is True)
+
+    print('== 12. 跨 UTC 零点在线领取序列（touch → claim）==')
+    # handler 新路径的 DB 侧验证：昨天登录过（c=1），跨零点未重登直接
+    # 领取 —— 先 touch 推进 c/f19，claim 拿到新连续天数，last_login_date
+    # 刷到当天（次日重登不会断签重置）。
+    pid4 = await st.create_player(uname + '4', 'daily-test')
+    async with st.pool.acquire() as conn:
+        await conn.execute(
+            'UPDATE players SET last_login_date = CURRENT_DATE - 1, '
+            'consecutive_day_count = 1 WHERE id = $1', pid4)
+    c = await st.touch_daily_login(pid4)
+    check('跨零点 touch 推进（1 → 2）', c == 2)
+    ok, d, n, c2 = await st.claim_daily_reward(pid4)
+    check('领取成功且返回新连续天数 2', ok and d == 1 and c2 == 2,
+          f'ok={ok} day={d} c={c2}')
+    async with st.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            'SELECT last_login_date, '
+            'to_char(first_action_game_date, \'YYYYMMDD\') AS f19 '
+            'FROM players WHERE id = $1', pid4)
+        today_d = await conn.fetchval('SELECT CURRENT_DATE')
+    check('last_login_date 刷到当天（次日重登不断签）',
+          row['last_login_date'] == today_d)
+    # 以 DB 的 CURRENT_DATE 为准（DB 时区 UTC，与本地日期可能差一天）
+    check('f19 刷到当天（客户端 C 公式不再 +1 错位）',
+          row['f19'] == today_d.strftime('%Y%m%d'), f'f19={row["f19"]}')
 
     # 清理
     await st.close()

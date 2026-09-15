@@ -756,6 +756,33 @@ def _build_experience_levels():
 _EXPERIENCE_LEVELS = _build_experience_levels()
 
 
+def _build_campaign_multipliers():
+    """ExperienceLevels 战役乘数 → (xp, ribbonXp, credit)（fixed32 float）。
+
+    官方战争模式加成（build_battle_report_spbc/mult_campaign_xp 实锤）：
+    战役局各加成 = (乘数-1) × 基础值——xpCampaignBonus 用 f7、勋带
+    campaign 用 f8、银币 campaignBonus 用 f10。表缺失回退官方实录值
+    （1.5/1.5/1.25）。
+    """
+    import struct as _st
+    for f in _parse_wardb_table('ExperienceLevels'):
+        def _f(n, default):
+            raw = f.get(n)
+            if isinstance(raw, (bytes, bytearray)) and len(raw) == 4:
+                return _st.unpack('<f', bytes(raw))[0]
+            return default
+        return (_f(7, 1.5), _f(8, 1.5), _f(10, 1.25))
+    return (1.5, 1.5, 1.25)
+
+
+_CAMPAIGN_MULTIPLIERS = _build_campaign_multipliers()
+
+
+def campaign_mission_multipliers():
+    """战役局加成乘数 (xpMult, ribbonXpMult, creditMult)（WarDatabase 单源）。"""
+    return _CAMPAIGN_MULTIPLIERS
+
+
 def _rank_from_combat_xp(xp):
     """军衔等级：最大的 i 使 _EXPERIENCE_LEVELS[i] <= xp（与客户端 getCombatProgression 一致）。"""
     rank = 0
