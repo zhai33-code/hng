@@ -15,6 +15,7 @@ class BattleReportsMixin:
         report: {mission_session_id, mission_id, mission_preset_id,
                  winner_faction_id, defender_faction_id,
                  mission_time_seconds, battle_start_time,
+                 map_entity_id（本局地图实体快照，战报名/zoom 数据源，可缺省）,
                  capturepoints: [{id, owner}]（结算时据点终态，可缺省）,
                  factions_extra: {faction: {ats: [{name, tmpl}],
                                    destroyed: {cat: n}, captured: {cat: n}}}
@@ -35,14 +36,16 @@ class BattleReportsMixin:
                             'battle_start_time = EXCLUDED.battle_start_time, '
                             'capturepoints_json = EXCLUDED.capturepoints_json, '
                             'factions_json = EXCLUDED.factions_json, '
+                            'map_entity_id = EXCLUDED.map_entity_id, '
                             'created_at = now() ') if players else \
                            'ON CONFLICT (mission_session_id) DO NOTHING '
                 rid = await conn.fetchval(
                     'INSERT INTO battle_reports (mission_session_id, mission_id, '
                     'mission_preset_id, winner_faction_id, defender_faction_id, '
                     'mission_time_seconds, battle_start_time, capturepoints_json, '
-                    'factions_json) '
-                    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb) '
+                    'factions_json, map_entity_id) '
+                    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, '
+                    '$10) '
                     + conflict +
                     'RETURNING id',
                     int(report['mission_session_id']), int(report.get('mission_id', 0)),
@@ -54,7 +57,8 @@ class BattleReportsMixin:
                     json.dumps(report.get('capturepoints') or [],
                                ensure_ascii=False),
                     json.dumps(report.get('factions_extra') or {},
-                               ensure_ascii=False))
+                               ensure_ascii=False),
+                    int(report.get('map_entity_id', 0) or 0))
                 if rid is None:
                     # DO NOTHING 命中冲突：回查已存战报 id（供通知引用）
                     rid = await conn.fetchval(
@@ -86,7 +90,7 @@ class BattleReportsMixin:
                 'SELECT id, mission_session_id, mission_id, mission_preset_id, '
                 'winner_faction_id, defender_faction_id, mission_time_seconds, '
                 'battle_start_time, capturepoints_json, factions_json, '
-                'created_at '
+                'map_entity_id, created_at '
                 'FROM battle_reports WHERE id = $1',
                 report_id)
             if rep is None:

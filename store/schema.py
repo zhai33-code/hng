@@ -288,12 +288,15 @@ CREATE TABLE IF NOT EXISTS battle_reports (
     battle_start_time   INT NOT NULL DEFAULT 0,
     capturepoints_json  JSONB NOT NULL DEFAULT '[]',
     factions_json       JSONB NOT NULL DEFAULT '{}',
+    map_entity_id       BIGINT NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE battle_reports ADD COLUMN IF NOT EXISTS
     capturepoints_json JSONB NOT NULL DEFAULT '[]';
 ALTER TABLE battle_reports ADD COLUMN IF NOT EXISTS
     factions_json JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE battle_reports ADD COLUMN IF NOT EXISTS
+    map_entity_id BIGINT NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS battle_report_players (
     id          SERIAL PRIMARY KEY,
     report_id   INT NOT NULL REFERENCES battle_reports(id) ON DELETE CASCADE,
@@ -721,6 +724,18 @@ ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS parent_command_node_id BIGINT
 -- 换基地到达即记录；作战飞离保持原值 → 战局结束飞机据此飞回原机场
 -- （攻占敌方机场例外则更新为该机场）。0=无基地（非 airborne / 待命）。
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS airbase_bf BIGINT NOT NULL DEFAULT 0;
+-- 官方士气模型（快照+时间戳，客户端 CommandnodeSchema.getMorale 口径）：
+-- morale 是 morale_updated_at 时刻的快照，当前值=快照+0.15/分钟回复。
+-- 存量行按 created_at 一次性物化回复后重基线（此前客户端按 created_at
+-- 回算显示满士气、服务器按绝对值判降，两边分叉的根因）
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS morale_updated_at TIMESTAMPTZ;
+UPDATE command_nodes
+SET morale = LEAST(max_morale,
+                   morale + (EXTRACT(EPOCH FROM (now() - created_at))
+                             / 60 * 0.15)::int),
+    morale_updated_at = now()
+WHERE morale_updated_at IS NULL;
+ALTER TABLE command_nodes ALTER COLUMN morale_updated_at SET DEFAULT now();
 CREATE INDEX IF NOT EXISTS idx_command_nodes_war ON command_nodes(war_id);
 
 -- 旧库修正：rank 默认曾是 1（0 XP 新 AT 可直接升级的根因），存量行按

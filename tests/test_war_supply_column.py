@@ -97,6 +97,8 @@ wardb.supplylines = lambda: list(_SYN_SLS)
 wardb.battlefields = lambda: list(_SYN_BFS)
 wardb.capitals = lambda: [{'battlefield_id': 10, 'default_faction': 1},
                           {'battlefield_id': 30, 'default_faction': 2}]
+# 注：20 是普通 Town（非⭐主城）——补给队自动选城须跳过它选 10
+# （2026-09-15 ⭐城口径回归）
 wardb.commandnode_templates = lambda: {k: dict(v) for k, v in _TPLS.items()}
 wardb.morale_template = lambda: None
 wardb.armyresource_production = lambda: []
@@ -228,6 +230,8 @@ class FakeStore:
             'has_gotten_vehicle_free': False,
             'parent_command_node_id': int(parent_command_node_id or 0),
             'general_character_id': 0, 'morale': 100, 'max_morale': 100,
+            'morale_updated_at': datetime.datetime.now(
+                datetime.timezone.utc),
             'created_at': _NOW,
         }
         return copy.deepcopy(self.ats[nid])
@@ -367,6 +371,7 @@ def _mk_at(st, node_id, template=101, owner=100, faction=1, state=0,
         'has_gotten_vehicle_free': veh_free,
         'parent_command_node_id': parent,
         'general_character_id': 0, 'morale': 100, 'max_morale': 100,
+        'morale_updated_at': datetime.datetime.now(datetime.timezone.utc),
         'created_at': _NOW,
     }
     return st.ats[node_id]
@@ -396,6 +401,7 @@ def _cols(st, parent_id):
 class FakeSess:
     warmap_view_cmd = 777
     commandnode_view_cmd = None
+    playerview_cmd = None    # _push_player_refresh（2026-09-15 补给扣款推货币）
 
     async def ensure_player(self):
         return 100
@@ -525,7 +531,8 @@ async def section_b():
               parent, war['id'], war_campaign._faction_capital_bf()))
           .get(3) == 0)
 
-    # B2 near_capital_bf：己方在网城生效；敌城/孤岛己方城忽略 → 就近选 20
+    # B2 near_capital_bf：己方在网城生效；敌城/孤岛己方城忽略 → 自动选
+    # 最近己方在网⭐城 10（20 非⭐跳过，2026-09-15 ⭐城口径）
     st2 = FakeStore()
     war2 = await _war(st2, {10: 1, 20: 1, 30: 2})
     p2 = _mk_at(st2, 21, deployed=True, map_entity_id=30)
@@ -537,13 +544,13 @@ async def section_b():
     col3, _e3, rc3 = await war_campaign.spawn_supply_column(
         st2, war2, p2, {1: 5}, near_capital_bf=30, now=_NOW)  # 30 敌领地
     mv3 = await st2.get_active_movement(col3['id'])
-    check('B2 near_capital 敌领地忽略（就近己方在网城 20）',
-          rc3 == 0 and mv3 and mv3['path'][0]['from_bf'] == 20)
+    check('B2 near_capital 敌领地忽略（就近己方在网⭐城 10，跳过非⭐ 20）',
+          rc3 == 0 and mv3 and mv3['path'][0]['from_bf'] == 10)
     col3b, _e3b, rc3b = await war_campaign.spawn_supply_column(
         st2, war2, p2, {1: 5}, near_capital_bf=40, now=_NOW)  # 40 孤岛己方
     mv3b = await st2.get_active_movement(col3b['id'])
-    check('B2 near_capital 孤岛己方城忽略（不在网 → 就近 20）',
-          rc3b == 0 and mv3b and mv3b['path'][0]['from_bf'] == 20)
+    check('B2 near_capital 孤岛己方城忽略（不在网 → 就近⭐城 10）',
+          rc3b == 0 and mv3b and mv3b['path'][0]['from_bf'] == 10)
 
     # B3 同城（出生点=父 AT 位置）→ 直接汇合不出队
     st3 = FakeStore()
@@ -822,8 +829,8 @@ async def section_e():
     w, f = await _resupply(501, near_capital=30)         # 30 敌领地 → 忽略
     cols8 = [c for c in _cols(st7, 501) if c['state'] < 3]
     mv8 = await st7.get_active_movement(cols8[-1]['id'])
-    check('E7 f6=30 敌领地 → 忽略就近己方在网城 20',
-          f.get(2) == 1 and mv8 and mv8['path'][0]['from_bf'] == 20,
+    check('E7 f6=30 敌领地 → 忽略就近己方在网⭐城 10（跳过非⭐ 20）',
+          f.get(2) == 1 and mv8 and mv8['path'][0]['from_bf'] == 10,
           str(f))
 
     # E8 会战/移动状态门（101/116）不因补给队分支变化

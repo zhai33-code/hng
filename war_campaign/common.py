@@ -45,6 +45,31 @@ def morale_defaults():
     return dict(DEFAULT_MORALE)
 
 
+def current_morale(at, cfg=None, now=None):
+    """官方 CommandnodeSchema.getMorale 口径的当前士气（物化）：
+    DB morale 是 morale_updated_at 时刻的快照，当前值 =
+    快照 + floor(gainedPerMinute × 已过分钟)，夹在 [min, max_morale]。
+    服务器一切读取/判定/扣减士气前统一走此函数，与客户端显示保持一致；
+    变动后由调用方写回新快照并重置 morale_updated_at。"""
+    cfg = cfg or morale_defaults()
+    max_m = int(at.get('max_morale') or cfg['max'])
+    base = int(at.get('morale') or 0)
+    ts = at.get('morale_updated_at') or at.get('created_at')
+    regen = 0
+    if ts:
+        try:
+            ts = _as_dt(ts)
+            now = now or datetime.datetime.now(datetime.timezone.utc)
+            if now.tzinfo is None:       # naive（FakeStore）按 UTC
+                now = now.replace(tzinfo=datetime.timezone.utc)
+            minutes = (now - ts).total_seconds() / 60.0
+            if minutes > 0:
+                regen = int(float(cfg['gained_per_minute']) * minutes)
+        except (TypeError, ValueError, AttributeError):
+            regen = 0
+    return max(int(cfg['min']), min(max_m, base + regen))
+
+
 def _fmt_ts(dt):
     """DB TIMESTAMPTZ → 协议 STR 时间戳（紧凑 Zulu 'YYYYMMDDHHMMSSZ'，UTC）。
 

@@ -198,7 +198,8 @@ class WarStoreMixin:
         返回是否更新。"""
         allowed = {'name', 'abbreviation', 'rank', 'xp', 'battles',
                    'battles_won', 'resources', 'morale',
-                   'max_morale', 'state', 'map_entity_id', 'map_entity_type',
+                   'max_morale', 'morale_updated_at', 'state',
+                   'map_entity_id', 'map_entity_type',
                    'general_character_id', 'is_deployed', 'upgrade_level',
                    'owner_player_id', 'faction', 'template_id',
                    'has_gotten_soldier_free', 'has_gotten_vehicle_free',

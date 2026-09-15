@@ -34,36 +34,47 @@
 - `updatedWarInstance` 重钉进城要求 `hasChangedMapEntityOrType && !moving`——若 instance 信号先派发（set 块在前），moving 仍 true → 重钉跳过 → 单位卡在动画终点（城外出兵点偏移位）。2026-09-11 步兵小队卡城外的根因。
 - 批内 del 重钉（如 `groundAssaultTeamMoveEndedOnSupplyLine` 读 `mapEntityTypeId`）读到的是批后活态：type 已=1，不会误走补给线分支（`WarmapPositionUtilities.getPositionFromEntity` L137-138 对 `accessPointStatus` 无空检查，中立端点 + 线上有战斗即 NPE → `publishPendingTableUpdates` while 循环中断 → kvcs 管线冻结、全部后续信号死——到达后名字不显示、重登才恢复的根因）。
 
-**适用条件**：全 set / 全 del / 原本就"del 先 set 后"的序列，批内派发顺序与逐条推送一致（且更原子）；set-del **交错**的序列直接套用会被重排变序，不能用（除非 helper 加保序参数）。
+**适用条件**：全 set / 全 del / 原本就"del 先 set 后"的序列，批内派发顺序与逐条推送一致（且更原子）；set-del **交错**的序列直接套用会被重排变序，不能用——改用 `preserve_order=True` 保序模式（见 §2.1）。
+
+### 2.1 保序模式 `preserve_order=True`（2026-09-15 新增）
+
+只合并**相邻同 kind** 事件为一个 action 块，批内 action 块顺序 = 事件顺序（客户端 `updateTablesFromChangeset` 逐 subChunk 顺序解析，天然支持 del/set 交错多块；`publishPendingTableUpdates` FIFO 按应用顺序派发）。
+
+动机案例（到达推序，war 域 `broadcast_war_events` 已启用）：
+
+- 到达事件序列 = `del segment → set CommandNodeWarInstance → del destination`。
+- 地图重钉要求 del segment 先于 set instance 派发（清 `moving`）；AT 列表 `status`（所在城市名）由 `onDestinationUpdates` 在 destination del 派发时重算为 `location`——要求 set instance（`updateAssaultTeamMapEntity` 更新 location）**先于** destination del 派发。
+- 若按 §2 强制 dels-first 重排成 `del segment → del destination → set instance`，status 在 location 还是在途旧值（补给线=""）时被算成空，且**交战中的 AT 无任何后续事件触发重算**（非交战 AT 靠 armyresource/queue 更新自愈）→ 部队列表不显示所在城市名。
 
 ## 3. 现有批量入口
 
 - `war_campaign/tick.py broadcast_war_events`：war 域全部事件（到达/换段/撤退/占城/成战/结算…）已走 `_push_kvcs_batch`，推给全部 warmapview 订阅会话。
 - 其余模块仍是单行推送（见 §4 审计）。
+- 结构契约单测：`tests/test_kvcs_batch.py`（2026-09-15 补，21 项）——锁定 §1-§2 的正确性基础：单帧、dels-first 块序、同表多行=重复表块且每表块 1 行、delete 行 8 字节 LE id、批内相对顺序、单行助手形态对拍。改动 `_push_kvcs*` 前必跑。
 
-## 4. 批量候补审计（2026-09-11，未实施）
+## 4. 批量候补审计（2026-09-11，未实施；行号 2026-09-15 复核）
 
 ### A. 可安全批（同 cmd、全 set 或全 del、行间独立、派发顺序不变）
 
 | 位置 | 内容 | 备注 |
 |---|---|---|
-| `handlers/war_at.py` `_push_at_rows`（L102-115） | Definition+WarInstance+Morale+armyresource×N | 全 set；补给队多资源行时收益明显；部署/购买/补编/撤退多处调用 |
-| `handlers/war_at.py` `_push_at_delete`（L156-170） | 解散 del 行（instance/definition/morale/armyresource×N/airbase） | 全 del，批内保序 |
+| `handlers/war_at.py` `_push_at_rows`（L101-115） | Definition+WarInstance+Morale+armyresource×N | 全 set；补给队多资源行时收益明显；部署/购买/补编/撤退多处调用 |
+| `handlers/war_at.py` `_push_at_delete`（L170-184） | 解散 del 行（instance/definition/morale/armyresource×N/airbase） | 全 del，批内保序 |
 | `handlers/combat.py` 战后磨损物品行循环（~L1747-1752） | weapon/WeaponModifier/WeaponAmmo/Vehicle… 行 | 全 set 到 soldier_view_cmd，行数=武器+载具+弹药数，**收益最高** |
 | `handlers/combat.py` 维修通知（~L1718-1728） | NotificationData×N + Notification | 全 set；set 内保序天然满足"Data 先于 Notification"（渲染器 set data 时一次性读表） |
-| `mm_handler.py` faction×3 行循环（~L243-244） | 同表多行 set | 独立行 |
-| `matchmaking.py` faction 循环 + PlayerMatchMaking（~L995-1011） | 全 set | 独立行 |
+| `mm_handler.py` faction×3 行循环（~L295-300） | 同表多行 set | 独立行 |
+| `matchmaking.py` faction 循环 + PlayerMatchMaking（~L1373-1394） | 全 set | 独立行 |
 
 ### B. 可批但需谨慎（顺序调优过 / set-del 交错 / 客户端派发依赖）
 
 | 位置 | 风险点 |
 |---|---|
-| `handlers/combat.py` 战斗结束解散 auto squad/solo（~L1673-1697） | 注释明确"SquadSession 先删防切屏卡死"，实测调优顺序，行少收益低——**建议不动** |
-| `matchmaking.py` `_reset_auto_squad_rows`（~L1495-1534） | set/del 交错（member dels → sets → PMM del → sets）；helper 的 dels-first 重排会改变 PMM del 相对位置。若批需保序模式 |
-| `matchmaking.py` `_push_auto_squad_rows`（~L375-406） | 全 set 保序可批，但"session 先成员后"是调优结果（成员行 ADD 触发切换），需小队流程回归 |
-| `matchmaking.py` 成局推送（~L2102-2153：PMS+BattleInfo+每成员小队行） | 全 set 保序可批，但进局关键路径、客户端状态机敏感，最后做 |
-| `handlers/war_at.py` `_push_at_deploy_rows`（~L145-153） | del→set 混合，重排后顺序恰与现序一致；但批内 DELETE 信号派发时 set 行已应用（同 id 先重加再删再由 set 信号加回，净效果应相同）——需实测"部署第二个 AT 图标堆叠"场景验证（该场景历史 bug：UPDATE 分支无堆叠检查，见函数注释） |
-| `player_service.py` / `handlers/weapons.py` / `weapons_purchase.py` 购买维修改装流 | weapon+modifier+ammo 2-3 行到 soldier_view_cmd + 1 行 player 到 playerview_cmd（跨 cmd 只能部分批），收益 1-2 帧价值低；弹药多行循环（player_service ~L578/L665）收益稍高 |
+| `handlers/combat.py` 战斗结束解散 auto squad/solo（~L1673-1698） | 注释明确"SquadSession 先删防切屏卡死"，实测调优顺序，行少收益低——**建议不动** |
+| `matchmaking.py` `_reset_auto_squad_rows`（~L541-555） | 现函数体已是**全 del**（成员行先、SquadSession 后；2026-09-15 复核，原审计所述 set/del 交错已不存在），可批且批内保序；调用方随后重推 solo set 行是另一条消息，不受影响 |
+| `matchmaking.py` `_push_auto_squad_rows`（~L524-539） | 全 set 保序可批，但"session 先成员后"是调优结果（成员行 ADD 触发切换），需小队流程回归 |
+| `matchmaking.py` 成局推送（~L1880-1974：PMS+solo 小队行+PMM del+BattleInfo） | **非全 set**（2026-09-15 复核）：小队行 sets 与 BattleInfo set 之间夹 PMM delete，dels-first 重排会把 PMM del 提前；且 PMS Armed 在 5s 后单独推，整段不可批。若要批仅限"小队行+BattleInfo"段并需保序模式；进局关键路径、客户端状态机敏感，最后做 |
+| `handlers/war_at.py` `_push_at_deploy_rows`（~L117-167） | del→set 混合（末尾另有 2026-09-14 补推的同值 WarInstance set 行——部署窗口解锁依赖其 UPDATE 事件，见函数注释）；dels-first 重排后顺序恰与现序一致，但批内 DELETE 信号派发时 set 行已应用（同 id 先重加再删再由 set 信号加回，净效果应相同）——需实测"部署第二个 AT 图标堆叠"与"部署窗口关窗"两场景验证（堆叠场景历史 bug：UPDATE 分支无堆叠检查，见函数注释） |
+| `player_service.py` / `handlers/weapons.py` / `weapons_purchase.py` 购买维修改装流 | weapon+modifier+ammo 2-3 行到 soldier_view_cmd + 1 行 player 到 playerview_cmd（跨 cmd 只能部分批），收益 1-2 帧价值低；弹药多行循环（player_service WeaponAmmo ~L600/L617、VehicleAmmo ~L709/L718）收益稍高 |
 
 ### C. 不值得动
 

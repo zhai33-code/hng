@@ -136,12 +136,53 @@ def _msg_report_player(p):
     return m, (chars[0].get('factionId', 0) if chars else 0)
 
 
-def _msg_client_battle_report(rep, players):
-    """ClientBattleReport（战报行 + 玩家行列表）。"""
+async def _report_map_entity(rep):
+    """战报 f2/f3 (mapEntityId, mapEntityTypeId) 解析。
+
+    回退链：war 局 battle 行口径（城战=城市 battlefield id/1、野外遭遇=
+    补给线 id/3，battle_map_entity 与 battle 行 f3/f4 同源）→
+    record.map_entity_id/1 → 结算时快照 rep['map_entity_id']/1（正常匹配
+    局唯一来源，combat.py 结算时从 live det 快照入库）→ Benoit Village
+    常量（最旧 staged 口径）。客户端结算界面"赢得了 %c 之战"城市名与
+    地图 zoom 动画位置均由此解析。"""
+    from war_campaign.common import battle_map_entity
+    ent_id = ent_type = 0
+    rec = None
+    mid = int(rep['mission_id'] or 0)
+    if mid and STORE is not None:
+        try:
+            rec = await STORE.get_mission_record(mid)
+        except Exception as e:
+            log(f'      [DB] get_mission_record({mid}) failed: {e}')
+    if rec is not None:
+        bid = int(rec.get('battle_id') or 0)
+        if bid and STORE is not None:
+            try:
+                ent_id, ent_type = battle_map_entity(
+                    await STORE.get_war_battle(bid))
+            except Exception as e:
+                log(f'      [DB] get_war_battle({bid}) failed: {e}')
+        if not ent_id:
+            ent_id = int(rec.get('map_entity_id') or 0)
+            ent_type = 1 if ent_id else 0
+    if not ent_id:
+        ent_id = int(rep.get('map_entity_id') or 0)
+        ent_type = 1 if ent_id else 0
+    if not ent_id:
+        ent_id, ent_type = mm_state.MISSION_MAP_ENTITY_ID, 1
+    return ent_id, ent_type
+
+
+def _msg_client_battle_report(rep, players, entity_id=0, entity_type=0):
+    """ClientBattleReport（战报行 + 玩家行列表）。
+
+    entity_id/entity_type：f2/f3 地图实体（调用方 _report_map_entity 解析）；
+    缺省 0 回退 Benoit Village 常量（测试/兼容路径）。"""
     m = b''
     m += pb_int64(1, int(rep['id']))                    # missionBattleReportId
-    m += pb_int64(2, 1)                                 # mapEntityTypeId(1=battlefield)
-    m += pb_int64(3, mm_state.MISSION_MAP_ENTITY_ID)  # mapEntityId（Benoit Village）
+    m += pb_int64(2, int(entity_type or 1))             # mapEntityTypeId
+    m += pb_int64(3, int(entity_id
+                         or mm_state.MISSION_MAP_ENTITY_ID))  # mapEntityId
     m += pb_int64(4, int(rep['mission_preset_id']))
     m += pb_int64(6, int(rep['defender_faction_id']))
     m += pb_int64(7, int(rep['winner_faction_id']))
@@ -240,7 +281,9 @@ async def handle_get_battle_report(sess, writer, cmd_id, req_type, proto):
             if got is None:
                 continue
             rep, players = got
-            resp_proto += pb_message(2, _msg_client_battle_report(rep, players))
+            ent_id, ent_type = await _report_map_entity(rep)
+            resp_proto += pb_message(2, _msg_client_battle_report(
+                rep, players, ent_id, ent_type))
             count += 1
 
     resp = build_response(cmd_id, 'GetBattleReportResponse', resp_proto)

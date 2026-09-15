@@ -128,7 +128,12 @@ async def list_ats(pool, *, page: int, page_size: int, faction: int,
         rows = await conn.fetch(
             'SELECT c.id, c.name, c.abbreviation, c.template_id, c.faction, '
             'c.owner_player_id, p.username AS owner_name, c.upgrade_level, '
-            'c.rank, c.xp, c.morale, c.max_morale, c.state, c.map_entity_id, '
+            # 官方士气模型：DB morale 是 morale_updated_at 时刻快照，展示
+            # 与客户端同口径的物化当前值（+0.15/分钟回复）
+            'c.rank, c.xp, LEAST(c.max_morale, c.morale + (EXTRACT(EPOCH '
+            'FROM (now() - COALESCE(c.morale_updated_at, c.created_at))) '
+            '/ 60 * 0.15)::int) AS morale, '
+            'c.max_morale, c.state, c.map_entity_id, '
             'c.map_entity_type, c.is_deployed, c.resources, c.created_at '
             'FROM command_nodes c '
             'LEFT JOIN players p ON p.id = c.owner_player_id '

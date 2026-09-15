@@ -142,7 +142,8 @@ async def main():
               f'factions={_fp.mission_factions(4242)}')
         _fp.release(4242)
 
-        # T1f: 成局后复用 live det（真实 players 名单，mid 路由生效）
+        # T1f: 成局后复用 live det（真实 players 名单，mid 路由生效）；
+        #      渲染层 copy 合并排队玩家，不改 live det 本体（桶空时名单不变）
         live_det = {'battle_id': 77, 'preset': 3, 'players':
                     [{'player_id': 42, 'gamertag': 'p1', 'faction': 1}],
                     'attacker_faction': 1, 'defender_faction': 2,
@@ -151,8 +152,10 @@ async def main():
         calls.clear()
         w = await _call(pb_int32(1, 0) + pb_int32(2, 77))
         check('T1f 成局后复用 live det + mid 路由',
-              calls and calls[0][0] == 4242 and calls[0][1] is live_det,
-              f'calls={[(m, d is live_det) for m, d in calls]}')
+              calls and calls[0][0] == 4242
+              and calls[0][1].get('players') == live_det['players']
+              and calls[0][1] is not live_det,
+              f'calls={[(m, d.get("players")) for m, d in calls]}')
         del mm_handler._MM_MISSION_DETAILS[4242]
 
         # T6: war_pending（攻守未凑齐、局未成）players = 会战桶排队名单
@@ -196,6 +199,37 @@ async def main():
                 mm_handler._MM_QUEUES.pop(44, None)
             else:
                 mm_handler._MM_QUEUES[44] = orig_q44
+
+        # T7: 开打中 + 排队中并集（live det players ∪ war 桶，按 player_id
+        #     去重）——排队或开打，参与者都应出现在据点简报名单里
+        live_det = {'battle_id': 77, 'preset': 3, 'players':
+                    [{'player_id': 42, 'gamertag': 'p1', 'faction': 1}],
+                    'attacker_faction': 1, 'defender_faction': 2,
+                    'map_entity_id': 20}
+        mm_handler._MM_MISSION_DETAILS[4242] = live_det
+        mm_handler.POOL.enqueue(mm_pool.QueueEntry(
+            player_id=43, char_id=9, faction=2, gamemode_id=10,
+            battle_id=77))
+        mm_handler._MM_QUEUES[43] = {'pmm_id': 2, 'mission_id': 0,
+                                     'gamemode': 10,
+                                     'ctx': {'gamertag': 'QueuedOne'}}
+        try:
+            calls.clear()
+            w = await _call(pb_int32(1, 0) + pb_int32(2, 77))
+            det = calls[0][1] if calls else {}
+            check('T7 开打中简报名单 = 在局 + 排队并集',
+                  [p['gamertag'] for p in det.get('players') or []]
+                  == ['p1', 'QueuedOne'],
+                  f'players={det.get("players")}')
+            check('T7b 响应 f3 参战方同时含在局与排队玩家名',
+                  b'p1' in w.buf and b'QueuedOne' in w.buf)
+            check('T7c live det 本体不被渲染合并污染',
+                  live_det['players'] == [{'player_id': 42, 'gamertag': 'p1',
+                                           'faction': 1}])
+        finally:
+            del mm_handler._MM_MISSION_DETAILS[4242]
+            mm_handler.POOL.remove(43)
+            mm_handler._MM_QUEUES.pop(43, None)
     finally:
         mm_handler._msg_mission_details_response_multi = orig_render
         state.STORE = orig_store

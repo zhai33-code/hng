@@ -25,6 +25,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import matchmaking
+import mm_config
 import mm_pool
 import war_campaign
 import handlers.squad as squad_mod
@@ -262,6 +263,119 @@ def main():
         for pid in (LEAD_PID, MATE_PID):
             _MM_QUEUES.pop(pid, None)
             _MATCH_PMM_IDS.pop(pid, None)
+            POOL.remove(pid)
+
+    # ---- 会战结算排队清理（drop_war_battle_queue，2026-09-15）----
+    # automission 阈值判定不开 FPS 局直接结算战局：war 桶排队玩家必须
+    # 出池 + 删 PMM 行回大厅，否则客户端永卡"匹配中"。
+    solo = FakeFlash()
+    FLASH_SESSIONS['SoloWar'] = solo
+    e_solo = mm_pool.QueueEntry(player_id=LEAD_PID, char_id=LEAD_CHAR,
+                                faction=1, gamemode_id=10, battle_id=77)
+    e_other = mm_pool.QueueEntry(player_id=MATE_PID, char_id=MATE_CHAR,
+                                 faction=2, gamemode_id=10, battle_id=99)
+    POOL.enqueue(e_solo)
+    POOL.enqueue(e_other)
+    _MM_QUEUES[LEAD_PID] = {
+        'pmm_id': 777, 'mission_id': 0, 'gamemode': 10,
+        'ctx': {'writer': solo.writer, 'view_cmd': solo.playerview_cmd,
+                'gamertag': 'SoloWar'}}
+    _MM_QUEUES[MATE_PID] = {
+        'pmm_id': 888, 'mission_id': 0, 'gamemode': 10,
+        'ctx': {'gamertag': 'OtherBattle'}}
+    _MATCH_PMM_IDS[LEAD_PID] = 777
+    # 小队成员走 _cancel_squad_queue 口径（fake 记录，避免碰 DB）
+    cancelled = []
+
+    async def fake_cancel_squad(squad_db_id, exclude_pids=(), push_rows=True):
+        cancelled.append(int(squad_db_id))
+
+    e_sq = mm_pool.QueueEntry(player_id=86040, char_id=86041, faction=1,
+                              gamemode_id=10, battle_id=77)
+    POOL.enqueue(e_sq)
+    _MM_QUEUES[86040] = {
+        'pmm_id': 999, 'mission_id': 0, 'gamemode': 10,
+        'ctx': {'gamertag': 'SquadQueued', 'squad_db_id': 86050}}
+    old_cancel = matchmaking._cancel_squad_queue
+    matchmaking._cancel_squad_queue = fake_cancel_squad
+    try:
+        asyncio.run(matchmaking.drop_war_battle_queue(77))
+        check('W5. 结算清理：本会战散人出池 + 队列上下文清除',
+              POOL.get(LEAD_PID) is None
+              and _MM_QUEUES.get(LEAD_PID) is None
+              and _MATCH_PMM_IDS.get(LEAD_PID) is None)
+        check('W5b. 结算清理：散人收到 PMM delete（退匹配中）',
+              b'PlayerMatchMaking' in solo.writer.data)
+        check('W5c. 结算清理：整队成员走 _cancel_squad_queue 回大厅',
+              cancelled == [86050], f'cancelled={cancelled}')
+        check('W5d. 结算清理：跨会战（battle=99）不受影响',
+              POOL.get(MATE_PID) is not None
+              and _MM_QUEUES.get(MATE_PID) is not None)
+        # 幂等：模拟真实 _cancel_squad_queue 的出池效果后再调一次，
+        # 桶空 no-op（cancelled 不增长、不抛异常）
+        POOL.remove(86040)
+        _MM_QUEUES.pop(86040, None)
+        asyncio.run(matchmaking.drop_war_battle_queue(77))
+        check('W5e. 结算清理幂等（桶空 no-op）', cancelled == [86050])
+    finally:
+        matchmaking._cancel_squad_queue = old_cancel
+        FLASH_SESSIONS.pop('SoloWar', None)
+        for pid in (LEAD_PID, MATE_PID, 86040):
+            _MM_QUEUES.pop(pid, None)
+            _MATCH_PMM_IDS.pop(pid, None)
+            POOL.remove(pid)
+
+    # ---- 准备期成局门控（war_battle_formable / form_due_war_battles，
+    #      2026-09-15）：准备期未到不拉人进 FPS 局，war_tick 到点撮合 ----
+    import time as _time
+    tfa_calls = []
+
+    async def fake_tfa():
+        tfa_calls.append(1)
+
+    old_tfa2 = matchmaking._try_form_all
+    matchmaking._try_form_all = fake_tfa
+    # 攻守双方各一（不门控必成局的配置，确保拦下的是门控而非阵营规则）
+    eg1 = mm_pool.QueueEntry(player_id=LEAD_PID, char_id=LEAD_CHAR,
+                             faction=1, gamemode_id=10, battle_id=77)
+    eg2 = mm_pool.QueueEntry(player_id=MATE_PID, char_id=MATE_CHAR,
+                             faction=2, gamemode_id=10, battle_id=77)
+    POOL.enqueue(eg1)
+    POOL.enqueue(eg2)
+    try:
+        matchmaking._WAR_BATTLE_READY[77] = _time.time() + 3600
+        check('W6. 门控：未到点 try_form_war 不成局（攻守齐也等）',
+              POOL.try_form_war() is None and POOL.get(LEAD_PID) is not None)
+        asyncio.run(matchmaking.form_due_war_battles())
+        check('W6b. 门控：未到点 form_due 不撮合', not tfa_calls)
+        matchmaking._WAR_BATTLE_READY[77] = _time.time() - 1
+        asyncio.run(matchmaking.form_due_war_battles())
+        check('W6c. 门控：到点 form_due 触发撮合', len(tfa_calls) == 1,
+              f'calls={len(tfa_calls)}')
+        check('W6d. 未登记会战不门控（回退即成局旧口径）',
+              matchmaking.war_battle_formable(12345))
+        # W6f. WAR_SKIP_PREP=1（单人测试）：准备期未到也立即成局
+        matchmaking._WAR_BATTLE_READY[77] = _time.time() + 3600
+        old_skip = mm_config.WAR_SKIP_PREP
+        mm_config.WAR_SKIP_PREP = True
+        try:
+            m_skip = POOL.try_form_war()
+            check('W6f. SKIP_PREP=1：跳过准备期立即成局',
+                  m_skip is not None and m_skip.battle_id == 77
+                  and POOL.waiting_count() == 0,
+                  f'm={m_skip.battle_id if m_skip else None}')
+        finally:
+            mm_config.WAR_SKIP_PREP = old_skip
+        POOL.remove(LEAD_PID)
+        POOL.remove(MATE_PID)
+        asyncio.run(matchmaking.form_due_war_battles())
+        check('W6e. 桶空清门控缓存',
+              77 not in matchmaking._WAR_BATTLE_READY)
+    finally:
+        matchmaking._try_form_all = old_tfa2
+        matchmaking._WAR_BATTLE_READY.pop(77, None)
+        for pid in (LEAD_PID, MATE_PID):
+            _MM_QUEUES.pop(pid, None)
             POOL.remove(pid)
 
     failed = [l for l, ok in RESULTS[n0:] if not ok]

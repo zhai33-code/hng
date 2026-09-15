@@ -329,6 +329,8 @@ class FakeStore:
             'has_gotten_soldier_free': False,
             'has_gotten_vehicle_free': False,
             'general_character_id': 0, 'morale': 100, 'max_morale': 100,
+            'morale_updated_at': datetime.datetime.now(
+                datetime.timezone.utc),
             'created_at': _NOW,
         }
         return copy.deepcopy(self.ats[nid])
@@ -440,6 +442,7 @@ def _mk_at(st, node_id, template=501, owner=100, faction=1, state=0,
         'has_gotten_soldier_free': sold_free,
         'has_gotten_vehicle_free': veh_free,
         'general_character_id': gen, 'morale': 100, 'max_morale': 100,
+        'morale_updated_at': datetime.datetime.now(datetime.timezone.utc),
         'created_at': _NOW,
     }
     return st.ats[node_id]

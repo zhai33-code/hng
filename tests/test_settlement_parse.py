@@ -588,6 +588,57 @@ def test_battlereport_response_encodes_at_owner():
         assert int(ch.get(f, [0])[0]) == 0, f
 
 
+def test_battlereport_map_entity_resolution():
+    """战报 f2/f3 mapEntityId/TypeId：war 局按 battle 行口径解析（城战=
+    城市 bf/1、野外=补给线 id/3），不再恒回退 Benoit Village——客户端
+    结算界面"赢得了 %c 之战"城市名与地图 zoom 位置的数据源。"""
+    import asyncio
+    from handlers import battlereport as br
+
+    class _EntStore:
+        def __init__(self, rec, wb):
+            self._rec, self._wb = rec, wb
+
+        async def get_mission_record(self, mid):
+            return self._rec
+
+        async def get_war_battle(self, bid):
+            return self._wb
+
+    rep = {'id': 1, 'mission_id': 555}
+    old = br.STORE
+    try:
+        # 城战（battle_type=1）：entity = 城市 battlefield id / 1
+        br.STORE = _EntStore(
+            {'id': 555, 'battle_id': 77, 'map_entity_id': 111},
+            {'id': 77, 'battlefield_id': 222, 'battle_type': 1})
+        assert asyncio.run(br._report_map_entity(rep)) == (222, 1)
+        # 野外遭遇（battle_type=2）：entity = 补给线 id / 3
+        br.STORE = _EntStore(
+            {'id': 555, 'battle_id': 77, 'map_entity_id': 111},
+            {'id': 77, 'battlefield_id': 333, 'battle_type': 2})
+        assert asyncio.run(br._report_map_entity(rep)) == (333, 3)
+        # battle 行缺失：回退 record.map_entity_id / 1
+        br.STORE = _EntStore(
+            {'id': 555, 'battle_id': 77, 'map_entity_id': 111}, None)
+        assert asyncio.run(br._report_map_entity(rep)) == (111, 1)
+        # 正常匹配局（无 record）：用结算时快照 rep['map_entity_id'] / 1
+        br.STORE = _EntStore(None, None)
+        snap = dict(rep, map_entity_id=444)
+        assert asyncio.run(br._report_map_entity(snap)) == (444, 1)
+        # 无 record 且无快照（最旧 staged 战报）：回退 Benoit Village 常量 / 1
+        ent_id, ent_type = asyncio.run(br._report_map_entity(rep))
+        assert (ent_id, ent_type) == (br.mm_state.MISSION_MAP_ENTITY_ID, 1)
+    finally:
+        br.STORE = old
+    # builder 直通：f2/f3 用解析值而非写死常量
+    m = br._msg_client_battle_report(
+        {'id': 9, 'mission_preset_id': 10, 'defender_faction_id': 2,
+         'winner_faction_id': 3, 'mission_time_seconds': 1,
+         'battle_start_time': 1}, [], 222, 1)
+    assert pb_varint(2, 1) in m and pb_varint(3, 222) in m
+
+
 if __name__ == '__main__':
     test_earnings_value_crash_bytes()
     test_handle_earnings_no_crash_and_response_first()
@@ -601,4 +652,5 @@ if __name__ == '__main__':
     test_battlereport_response_encodes_faction_extras()
     test_factions_extra_war_at_ownership()
     test_battlereport_response_encodes_at_owner()
-    print('test_settlement_parse: 12 项全部通过')
+    test_battlereport_map_entity_resolution()
+    print('test_settlement_parse: 13 项全部通过')

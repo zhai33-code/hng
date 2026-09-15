@@ -1353,6 +1353,8 @@ async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
                      f'queue (battle={w_bid}, factions={squad_facs})')
                 war_bid = w_bid
                 gamemode_id = 10
+                # 准备期门控登记：到点（started_at+准备期）才成局
+                await register_war_battle_prep(w_bid)
             else:
                 # state=1 但局内会话已清（战斗服收尾中）：不可加入，忽略
                 _log(f'      [war] squad enqueue mission={w_mid} '
@@ -1493,6 +1495,98 @@ async def _drop_squad_queue(squad_db_id, gone_pid):
     """整队排队中成员掉线：全队出池、回 InLobby（不推掉线者连接）。"""
     await _cancel_squad_queue(squad_db_id, (int(gone_pid),))
     await _try_form_all()
+
+
+async def drop_war_battle_queue(battle_id):
+    """war 会战结算时清理该 battle 的排队玩家：出 war 桶、删 PMM 行
+    （客户端退"匹配中"）、整队回 InLobby。
+
+    automission 阈值判定不开 FPS 局直接结算战局，排队者不清会永卡
+    匹配 UI（record state 2/3 后 rejoin 也被忽略）。由
+    war_campaign.tick.settle_war_battle 调用。幂等：桶空/条目已被
+    其他路径收走（_MM_QUEUES 无或已成局）时 no-op。
+    """
+    _WAR_BATTLE_READY.pop(int(battle_id), None)     # 准备期门控缓存清除
+    entries = POOL.war_bucket(int(battle_id))
+    if not entries:
+        return
+    squads = set()
+    for e in entries:
+        pid = int(e.player_id)
+        q = _MM_QUEUES.get(pid)
+        if q is None or q.get('mission_id'):
+            continue                     # 已被其他路径收走 / 已成局不动
+        squad_db_id = int((q.get('ctx') or {}).get('squad_db_id') or 0)
+        if squad_db_id:
+            squads.add(squad_db_id)      # 整队走 _cancel_squad_queue 口径
+            continue
+        _cleanup_queued_player(pid)
+        POOL.remove(pid)
+        _MATCH_PMM_IDS.pop(pid, None)
+        ctx = q.get('ctx') or {}
+        w, vc = ctx.get('writer'), ctx.get('view_cmd')
+        if w is not None and vc is not None and q.get('pmm_id') is not None:
+            try:
+                await _push_kvcs_delete(w, vc, b'PlayerMatchMaking',
+                                        q['pmm_id'])
+            except Exception:
+                pass                     # 连接已断：drop_player 兜底
+        _log(f'mm: player {pid} dropped (war battle {battle_id} settled)')
+    for squad_db_id in squads:
+        await _cancel_squad_queue(squad_db_id)
+    await _push_queue_counts()
+
+
+# ---- war 会战准备期成局门控（battle_ready_in 集结倒计时口径）----
+# 会战成立（war_battles 行）后须等 started_at+准备期到点才把排队玩家
+# 拉进 FPS 局——此前入池即成局（try_form_war 无时间概念），玩家跳过
+# 准备阶段直接开打。门控装配在 POOL.war_ready（mm_pool 保持纯逻辑）。
+_WAR_BATTLE_READY = {}       # battle_id -> 可成局时刻（epoch 秒）
+
+
+def war_battle_formable(battle_id):
+    """try_form_war 门控（POOL.war_ready）：登记过成局时刻的会战须到点
+    才成局；未登记 = 不门控（回退入池即成局旧行为，防登记失败卡死）。
+    mm_config.WAR_SKIP_PREP=1（单人测试）时恒可成局，跳过准备期。"""
+    if mm_config.WAR_SKIP_PREP:
+        return True
+    ready = _WAR_BATTLE_READY.get(int(battle_id))
+    return ready is None or time.time() >= ready
+
+
+async def register_war_battle_prep(battle_id):
+    """war 桶入池时登记该会战的成局时刻（battle 行 started_at + 准备期，
+    与 activationTimeStamp 单一事实源同口径）。读库失败不缓存 = 不门控。"""
+    if state.STORE is None:
+        return
+    try:
+        from war_campaign.common import _ts_ms, battle_prep_seconds
+        wb = await state.STORE.get_war_battle(int(battle_id))
+        started = _ts_ms((wb or {}).get('started_at')) / 1000.0
+        if started > 0:
+            _WAR_BATTLE_READY[int(battle_id)] = started + battle_prep_seconds(
+                (wb or {}).get('battle_type'))
+    except Exception as e:
+        _log(f'[war] register prep(battle={battle_id}) failed: {e}')
+
+
+async def form_due_war_battles():
+    """准备期到点的会战撮合（war_tick 周期调用）：桶内有排队条目且到点
+    → _try_form_all 成局；桶空顺手清缓存（防无限增长）。"""
+    if not _WAR_BATTLE_READY:
+        return
+    due = False
+    for bid in list(_WAR_BATTLE_READY):
+        if not POOL.war_bucket(bid):
+            _WAR_BATTLE_READY.pop(bid, None)
+            continue
+        if war_battle_formable(bid):
+            due = True
+    if due:
+        await _try_form_all()
+
+
+POOL.war_ready = war_battle_formable
 
 
 async def _weather_details():

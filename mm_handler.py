@@ -33,7 +33,7 @@ from matchmaking import (
     _resolve_mapfilter_gamemode, _resolve_quickplay_gamemode,
     _revive_own_membership,
     _squad_eligible_members, _try_form_all, _zulu_activated, _zulu_now,
-    mission_resource_pool,
+    mission_resource_pool, register_war_battle_prep,
 )
 from mm_state import (
     MISSION_HOSTING_CENTER_ID, MISSION_MAP_ENTITY_ID,
@@ -122,6 +122,32 @@ async def _handle_join(sess, writer, cmd_id, proto):
     _log(f'      JoinMatchMaking: charId={char_id}, missionId={req_mission_id}, '
          f'warMissionFlag={war_flag}, gamemodeId={gamemode_id}, '
          f'quickplay={quickplay}, presets={list(staged_presets)}')
+
+    # 2026-09-15 兜底：据点详情开窗瞬间客户端先把 warBattleId 设成 battle
+    # 行 id（MissionDetailsMediator.onBattleChanged dispatch
+    # selectedBattle.id），详情响应返回后才覆盖成真实 missionId；玩家在
+    # 响应前抢先点"加入战局"时 missionId 实为 battleId。查不到 mission
+    # record 时按 battle id 解析回真实 missionId；仍查不到则维持原值，
+    # 走原有 43 校验。DB 异常时不做纠正，原逻辑兜底。
+    if req_mission_id:
+        try:
+            _rec = await state.STORE.get_mission_record(req_mission_id)
+        except Exception as e:
+            _log(f'[DB] get_mission_record({req_mission_id}) failed: {e}')
+        else:
+            if _rec is None:
+                try:
+                    _brec = await state.STORE.get_mission_by_battle(
+                        req_mission_id)
+                except Exception as e:
+                    _log(f'[DB] get_mission_by_battle({req_mission_id}) '
+                         f'failed: {e}')
+                    _brec = None
+                if _brec is not None:
+                    _log(f'      JoinMatchMaking: missionId={req_mission_id} '
+                         f'实为 battleId（详情响应前抢先点击），纠正为 '
+                         f'missionId={int(_brec["id"])}')
+                    req_mission_id = int(_brec['id'])
 
     pid = await sess.ensure_player()
     char_info = None
@@ -435,6 +461,8 @@ async def _handle_join(sess, writer, cmd_id, proto):
                 _log(f'[war] JoinMM mission={w_mid} -> war queue '
                      f'(battle={w_bid}, faction={faction})')
                 _MM_QUEUES[pid]['gamemode'] = 10
+                # 准备期门控登记：到点（started_at+准备期）才成局
+                await register_war_battle_prep(w_bid)
                 entry = mm_pool.QueueEntry(
                     player_id=pid, char_id=int(char_id), faction=faction,
                     gamemode_id=10, presets=staged_presets, battle_id=w_bid)
@@ -766,6 +794,19 @@ def _war_queue_players(battle_id):
     return players
 
 
+def _war_battle_players(battle_id, live_players=None):
+    """会战简报"战局玩家名单"全量口径：已进局 FPS（live det players）
+    + 排队中（war 桶）并集，按 player_id 去重（live 优先——成局后
+    _join_existing_mission 会把玩家从队列移进 det['players']，两源
+    不会长期重叠，但成局/掉线窗口期可能瞬时出现于两侧）。"""
+    players = list(live_players or [])
+    seen = {int(p.get('player_id', 0) or 0) for p in players}
+    for p in _war_queue_players(battle_id):
+        if p['player_id'] not in seen:
+            players.append(p)
+    return players
+
+
 async def _handle_mission_details(sess, writer, cmd_id, proto):
     """GetMissionDetailsRequest：返回 GetMissionDetailsResponse。
 
@@ -774,6 +815,12 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
     mid = int(f.get(1, 0))
     bid = int(f.get(2, 0))
     details = _MM_MISSION_DETAILS.get(mid)
+    if details is not None and int(details.get('battle_id', 0) or 0):
+        # war 会战 live 局：排队中未进局的玩家并入简报名单（copy 渲染，
+        # 不改 live det 本体；f9 pcount 口径随之含排队人数=全部参与者）
+        details = dict(details)
+        details['players'] = _war_battle_players(
+            int(details['battle_id']), details.get('players'))
     if details is None and mid == 0 and bid > 0:
         # ★ 战争图城市点击链（2026-09-08 修复）：有会战的城市点击 →
         # GetMissionDetailsRequest{f1=0, f2=battleId}（HandleWarBattleCommand
@@ -793,8 +840,11 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
             mid = int(wrec['id'])
             live = _MM_MISSION_DETAILS.get(mid)
             if live is not None:
-                # 局已开打：复用运行中详情（真实 players 名单/pcount）
-                details = live
+                # 局已开打：复用运行中详情（真实 players 名单/pcount）；
+                # 排队中未进局玩家并入名单（copy 渲染，不改 live det）
+                details = dict(live)
+                details['players'] = _war_battle_players(
+                    int(bid), live.get('players'))
             else:
                 details = {'battle_id': int(bid),
                            'preset': int(wrec.get('preset', 0) or 0),
@@ -804,7 +854,7 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
                            'defender_faction':
                                int(wrec.get('defender_faction', 0) or 0),
                            'war_pending': True,
-                           'players': _war_queue_players(int(bid))}
+                           'players': _war_battle_players(int(bid))}
                 _roster = await _war_pending_roster(int(bid))
                 if _roster:
                     (details['war_at_rows'], details['war_counts'],
@@ -835,7 +885,7 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
                        'defender_faction':
                            int(wrec.get('defender_faction', 0) or 0),
                        'war_pending': True,
-                       'players': _war_queue_players(
+                       'players': _war_battle_players(
                            int(wrec['battle_id']))}
             _roster = await _war_pending_roster(int(wrec['battle_id']))
             if _roster:

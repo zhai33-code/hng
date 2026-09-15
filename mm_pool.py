@@ -52,6 +52,10 @@ class MatchPool:
     def __init__(self):
         self._by_mode = {}       # gamemode_id -> list[QueueEntry]（FIFO 序）
         self._by_player = {}     # player_id -> QueueEntry（快速去重/移除）
+        # war 会战成局门控（可选 callable(battle_id)->bool）：False = 该
+        # 会战准备期未到，try_form_war 跳过（matchmaking 装配，客户端
+        # battle_ready_in 集结倒计时口径）；None = 不门控（纯逻辑单测）
+        self.war_ready = None
 
     # ---- 入池 / 出池 ----
     def enqueue(self, entry):
@@ -95,6 +99,14 @@ class MatchPool:
                                        key=lambda kv: -len(kv[1])):
             if not entries:
                 continue
+            # ★ war 会战桶条目（battle_id>0）只由 try_form_war 成局：
+            #   被普通撮合撮走会丢 battle_id（Match 无此字段来源），
+            #   _start_match 落成 staged 随机局（发新 mission id、攻守
+            #   掷硬币、镜像随机兵力池）——单人排队也能成局（gamemode 10
+            #   的 min_players 可被 MM_MIN_PLAYERS 压到 1）。
+            entries = [e for e in entries if not e.battle_id]
+            if not entries:
+                continue
             mcfg = mm_config.gamemode_cfg(mode_id)
             group = self._collect_group(entries, mcfg['min_players'],
                                         mcfg['max_players'])
@@ -109,6 +121,10 @@ class MatchPool:
     def force_form(self, cfg, gamemode_id):
         """超时 AI 补位：以该模式现有等待者强制成组（1 人也开）。"""
         entries = self._by_mode.get(gamemode_id, [])
+        if not entries:
+            return None
+        # war 会战桶条目不 AI 补位（同 try_form：battle_id 丢失会成随机局）
+        entries = [e for e in entries if not e.battle_id]
         if not entries:
             return None
         max_p = max(1, int(cfg.get('max_players', 18)))
@@ -127,6 +143,8 @@ class MatchPool:
         入池侧（mm_handler._handle_join war 路由）已保证只有该会战
         攻/守两阵营的玩家能入桶，桶内凑齐两阵营即可。war 局无 AI 补位
         （gamemode 10 ai_fill_after=0，凑不齐继续等）。
+        ★ mm_config.WAR_SOLO_FORM=1（单人测试）时放宽为桶内≥1 人即成局
+        （单方排队立即开局，对面留空，后续真人 late join 补入）。
         Match.preset_id 恒 0：地图/阵营来自 mission_records 行，
         _start_match war 分支按 battle_id 反查。
         """
@@ -137,9 +155,12 @@ class MatchPool:
         for e in entries:
             if e.battle_id:
                 buckets.setdefault(int(e.battle_id), []).append(e)
+        min_factions = 1 if mm_config.WAR_SOLO_FORM else 2
         for battle_id, group in buckets.items():
+            if self.war_ready is not None and not self.war_ready(battle_id):
+                continue                  # 准备期未到（集结倒计时中）
             factions = {int(e.faction) for e in group}
-            if len(factions) < 2:
+            if len(factions) < min_factions:
                 continue
             for e in group:
                 self.remove(e.player_id)

@@ -313,13 +313,21 @@ WAR_ENCIRCLE_CHECK = _int_env('MM_WAR_ENCIRCLE_CHECK', 1)
 # 会战准备期秒数（battle 行 activationTimeStamp = 成局 + 准备期；
 # war1.md：野外遭遇 5 分钟 / 城攻 5 分 30 秒；automission 超时以此起算）
 WAR_BATTLE_PREP_FIELD = _int_env('MM_WAR_BATTLE_PREP_FIELD', 300)
+WAR_BATTLE_PREP_ASSAULT = _int_env('MM_WAR_BATTLE_PREP_ASSAULT', 330)
+# war 会战单方成局开关：0=官服口径（try_form_war 要求攻守双方各≥1 真人
+# 才开局）；1=桶内≥1 人即成局（单方排队也立即拉起 FPS 局，对面留空，
+# 后续真人可 late join 补入）——单人测试用，线上保持 0。
+WAR_SOLO_FORM = bool(_int_env('MM_WAR_SOLO_FORM', 0))
+# war 会战跳过准备期开关（单人测试）：1=入池即成局，不等
+# started_at+准备期（跳过 battle_ready_in 集结倒计时）；0=到点才成局
+# （war_tick 周期撮合，见 matchmaking.war_battle_formable），线上保持 0。
+WAR_SKIP_PREP = bool(_int_env('MM_WAR_SKIP_PREP', 0))
 # rejoin 掉线保护窗口（秒）：hng.exe 游戏连接断开（崩溃/退出）后，
 # 玩家须在此窗口内重进战局，否则会话释放（PMS 清理 + 坑位回收）。
 # 客户端同源倒计时：ActionGameStatusModel.
 # DEFAULT_SECONDS_BEFORE_LOSING_PLAYER_MISSION_SESSION = 300（Admitted
 # 分支 timeAdmitted+300s−serverTime，到 0 转 GAME_TIMED_OUT）
 REJOIN_TIMEOUT = _int_env('MM_REJOIN_TIMEOUT', 300)
-WAR_BATTLE_PREP_ASSAULT = _int_env('MM_WAR_BATTLE_PREP_ASSAULT', 330)
 # ---- automission 阈值判定（war-gameplay-fix-plan §3/§4/§7/§8；war1.md
 # 社区口径 144/216/288/5:00/5:30/6h，客户端无证据，全部可配）----
 # 据点数 ≥ 此值判「三点图」（用 216 门槛），否则「单点图」（144）

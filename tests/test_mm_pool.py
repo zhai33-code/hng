@@ -13,6 +13,8 @@
 10. 训练模式单人直开（min=1）
 10b. 训练模式 4 人容量（小队+散人同局；超容另开新局）
 11. 整队原子性（锚点队超 max 整队成局不截断；装不下的队跳过留池）
+12. war 会战桶隔离（battle_id>0 条目不被 try_form/force_form 撮走，
+    只能由 try_form_war 成局；同阵营多人也不成局）
 """
 import os
 import sys
@@ -260,6 +262,86 @@ def main():
           f'players={[e.player_id for e in m.players] if m else None}')
     check('整队原子：超出散人留池', p.waiting_count() == 1 and
           p.get(4) is not None)
+
+    # ---- 12. war 会战桶隔离（battle_id>0 只由 try_form_war 成局）----
+    # 回归：war 条目曾被普通 try_form 撮走 → Match 丢 battle_id →
+    # _start_match 落成 staged 随机局（realtest_game.log 2026-09-15
+    # 21:11:39：battle=25 排队 → match formed mission=356004 preset=5
+    # players=1）。
+    p = mm_pool.MatchPool()
+    p.enqueue(entry(1, mode=10, presets=[5], faction=2))
+    p.enqueue(entry(2, mode=10, presets=[5], faction=2))
+    for e in (p.get(1), p.get(2)):
+        e.battle_id = 25                    # war 路由入池（battle=25）
+    check('war 隔离：同阵营 war 条目不被 try_form 撮走',
+          p.try_form() is None and p.waiting_count() == 2)
+    check('war 隔离：同阵营 try_form_war 也不成局（需攻守双方）',
+          p.try_form_war() is None and p.waiting_count() == 2)
+    check('war 隔离：force_form 不撮 war 条目',
+          p.force_form(mm_config.gamemode_cfg(10), 10) is None and
+          p.waiting_count() == 2)
+    # 对面阵营入局 → try_form 仍不撮，try_form_war 成局且带 battle_id
+    e3 = entry(3, mode=10, presets=[5], faction=1)
+    e3.battle_id = 25
+    p.enqueue(e3)
+    check('war 隔离：攻守齐后 try_form 仍不撮 war 条目',
+          p.try_form() is None and p.waiting_count() == 3)
+    m = p.try_form_war()
+    check('war 隔离：try_form_war 成局带 battle_id',
+          m is not None and m.battle_id == 25 and len(m.players) == 3 and
+          p.waiting_count() == 0,
+          f'battle_id={m.battle_id if m else None}, '
+          f'players={len(m.players) if m else None}')
+    # ---- 12b. WAR_SOLO_FORM=1（单人测试）：单方排队即成局 ----
+    old_solo = mm_config.WAR_SOLO_FORM
+    mm_config.WAR_SOLO_FORM = True
+    try:
+        p = mm_pool.MatchPool()
+        es = entry(1, mode=10, presets=[5], faction=2)
+        es.battle_id = 25
+        p.enqueue(es)
+        m = p.try_form_war()
+        check('war solo_form：单方排队即成局',
+              m is not None and m.battle_id == 25
+              and [e.player_id for e in m.players] == [1]
+              and p.waiting_count() == 0,
+              f'm={m.battle_id if m else None}')
+    finally:
+        mm_config.WAR_SOLO_FORM = old_solo
+    # 关回后恢复双方真人口径
+    p = mm_pool.MatchPool()
+    es = entry(1, mode=10, presets=[5], faction=2)
+    es.battle_id = 25
+    p.enqueue(es)
+    check('war solo_form=0：恢复双方真人口径（单方不成局）',
+          p.try_form_war() is None and p.waiting_count() == 1)
+    # ---- 12c. war_ready 准备期门控：未到点不成局、到点放行 ----
+    p = mm_pool.MatchPool()
+    eg1 = entry(1, mode=10, presets=[5], faction=1)
+    eg2 = entry(2, mode=10, presets=[5], faction=2)
+    eg1.battle_id = eg2.battle_id = 25
+    p.enqueue(eg1)
+    p.enqueue(eg2)
+    p.war_ready = lambda bid: False
+    check('war 门控：准备期未到不成局（攻守齐也等）',
+          p.try_form_war() is None and p.waiting_count() == 2)
+    p.war_ready = lambda bid: True
+    m = p.try_form_war()
+    check('war 门控：到点放行成局',
+          m is not None and m.battle_id == 25 and p.waiting_count() == 0,
+          f'm={m.battle_id if m else None}')
+    # war 条目与 staged 条目混池：只撮 staged，war 留池
+    p = mm_pool.MatchPool()
+    ew = entry(1, mode=10, presets=[5], faction=2)
+    ew.battle_id = 25
+    p.enqueue(ew)
+    p.enqueue(entry(2, mode=5, presets=[26]))
+    p.enqueue(entry(3, mode=5, presets=[26]))
+    m = p.try_form()
+    check('war 隔离：混池时普通撮合同模式 staged 条目',
+          m is not None and {e.player_id for e in m.players} == {2, 3})
+    check('war 隔离：war 条目单独留池',
+          p.waiting_count() == 1 and p.get(1) is not None)
 
     failed = [l for l, ok in RESULTS if not ok]
     print(f'\nMM_POOL: {"ALL PASS" if not failed else f"{len(failed)} FAILED: {failed}"} '

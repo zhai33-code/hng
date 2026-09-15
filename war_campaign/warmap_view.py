@@ -233,7 +233,8 @@ def msg_commandnode_morale_row(at, war_id):
     m += pb_int64(2, at.get('owner_player_id') or 0)  # playerId
     m += pb_int64(3, at['id'])                      # commandNodeWarInstanceId
     m += pb_int64(4, war_id)                         # warId
-    m += pb_string(5, _fmt_ts(at.get('created_at')))  # moraleStartTimeStamp
+    m += pb_string(5, _fmt_ts(at.get('morale_updated_at')
+                              or at.get('created_at')))  # moraleStartTimeStamp
     return m
 
 

@@ -962,6 +962,11 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
             int(getattr(sess, 'game_mission', 0) or 0)
 
     # ---- BattleReport（f4）
+    # 本局地图实体快照（战报"赢得了 %c 之战"城市名 + 结算界面地图 zoom
+    # 数据源，battlereport._report_map_entity）：正常匹配局不落
+    # mission_records，须在 det 存活期内从 live det 快照；war 局另有
+    # battle 行口径（城战=bf/1、野外=sl/3），解析时优先于本快照
+    _mdet = mm_state._MM_MISSION_DETAILS.get(int(mission_id or 0)) or {}
     br_players = []          # save_battle_report 的 players 行
     report = {
         'mission_session_id': mission_session_id,
@@ -970,6 +975,7 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
         'winner_faction_id': 0, 'defender_faction_id': 0,
         'mission_time_seconds': 0, 'battle_start_time': 0,
         'capturepoints': [],
+        'map_entity_id': int(_mdet.get('map_entity_id') or 0),
     }
     try:
         br_raw = _get(items, 4, b'')

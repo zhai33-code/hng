@@ -15,6 +15,7 @@ faction id 空间 = 1/2/3 恒等（project_rules 硬约束）。
 """
 
 import time
+import datetime
 
 from protocol import (
     build_response,
@@ -647,18 +648,26 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
                             war_campaign._as_resources(
                                 at.get('resources')),
                             mm_config.WAR_RETREAT_LOSS)
+                        # 官方快照+时间戳士气模型：先物化当前值（含随时
+                        # 间回复）再扣 20，重置 morale_updated_at 重基线
+                        _mcfg = war_campaign.morale_defaults()
                         morale = max(
-                            0, min(int(at.get('max_morale') or 100),
-                                   int(at.get('morale') or 0)
-                                   - mm_config.
-                                   WAR_MORALE_LOST_PER_BATTLE))
+                            int(_mcfg['min']),
+                            min(int(at.get('max_morale') or 100),
+                                war_campaign.current_morale(at, _mcfg)
+                                - mm_config.
+                                WAR_MORALE_LOST_PER_BATTLE))
+                        _morale_ts = datetime.datetime.now(
+                            datetime.timezone.utc)
                         if not any(v > 0 for v in new_res.values()):
                             # 编制扣空 = 撤退途中溃散（歼灭语义 state=3）
                             wiped = True
                             fields.update(state=3, resources={},
-                                          morale=morale)
+                                          morale=morale,
+                                          morale_updated_at=_morale_ts)
                         else:
-                            fields.update(resources=new_res, morale=morale)
+                            fields.update(resources=new_res, morale=morale,
+                                          morale_updated_at=_morale_ts)
                         # ---- 包围判定 + 友方路线落点（war1.md）----
                         try:
                             owners = dict(await STORE.get_war_cities(
@@ -1280,6 +1289,10 @@ async def handle_resupply_request(sess, writer, cmd_id, req_type, proto):
         # AT 模型中间态下任一监听器抛异常会卡死客户端请求管线
         # （_runningRequest 永久 true，之后所有请求都发不出，重登才恢复）
         await _push_at_rows(sess, writer, at, at['war_id'])
+        # 补编扣款（_apply_resupply spend_currency）后刷新客户端货币显示
+        # （同部署/升级口径；此前漏推，补给扣款后金币显示不更新，
+        # 2026-09-15 玩家实报）
+        await _push_player_refresh(sess, writer)
         # 空中重整（落地变体补给转回空中原型）：补 airbase 行
         # （§10.2 #7 同部署口径；普通空中单位重推同值行无副作用）
         cmd = _view_cmd(sess)

@@ -304,6 +304,9 @@ def _mk_at(store, war_id, at_id, faction, bf):
           'resources': {}, 'morale': 100, 'max_morale': 100,
           'state': 0, 'map_entity_id': bf, 'map_entity_type': 1,
           'general_character_id': 0, 'is_deployed': True,
+          # 官方士气模型：morale 是 morale_updated_at 时刻快照——置为当前
+          # 真实时间，快照即现值（否则 created_at=NOW 过去时触发回复）
+          'morale_updated_at': datetime.datetime.now(datetime.timezone.utc),
           'created_at': NOW, 'upgrade_level': 0}
     store.ats[at_id] = at
     return at
@@ -919,6 +922,125 @@ async def main():
           f"owners={storeR.city_owners[warR['id']]} "
           f"battles={len(storeR.battles)}")
 
+    # H7 途经敌驻军城市（无会战）→ 中止行军落位途经城 + 成局拦截
+    #    （2026-09-15 穿城 bug 修复：目的地在更远处、途经敌情城市此前
+    #    换段分支无 _check_battle_formation 直接穿城而过）
+    storeP = FakeStore()
+    warP = await war_campaign.ensure_war(storeP)
+    atkP = _mk_at(storeP, warP['id'], 301, 1, 10)
+    _defP = _mk_at(storeP, warP['id'], 302, 2, 20)      # 敌 AT 驻途经城 20
+    mvP, codeP = await war_campaign.start_movement(
+        storeP, atkP, 30, now=NOW)                      # 目的地 30，途经 20
+    evP = await war_campaign.advance_movements(
+        storeP, warP, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    tagsP = {(k, tag) for k, tag, _ in evP}
+    check('H7 途经敌驻军城市 中止行军 + 成局（不穿城）',
+          codeP == war_campaign.RC_OK
+          and storeP.movements[mvP['id']]['state'] == 1
+          and storeP.ats[301]['map_entity_id'] == 20
+          and storeP.ats[301]['map_entity_type'] == 1
+          and storeP.ats[301]['state'] == 2
+          and storeP.ats[302]['state'] == 2
+          and len(storeP.battles) == 1
+          and ('del', b'transport_commandnode_segment') in tagsP
+          and ('del', b'transport_commandnode_destination') in tagsP
+          and ('set', b'CommandNodeWarInstance') in tagsP
+          and ('set', b'battle') in tagsP,
+          f'mv={storeP.movements.get(mvP["id"])} at={storeP.ats[301]}')
+    evP2 = await war_campaign.advance_movements(
+        storeP, warP, now=NOW + datetime.timedelta(seconds=2 * SEG_SEC + 10))
+    check('H7b 中止后不再推进（无 segment 事件、AT 钉在 20）',
+          all(tag != b'transport_commandnode_segment'
+              for _, tag, _ in evP2)
+          and storeP.ats[301]['map_entity_id'] == 20)
+    # 相对顺序断言（每 tick 还会推在途 AT 的 instance 行，须按序找）
+    i_seg = next(i for i, (k, t, _) in enumerate(evP)
+                 if (k, t) == ('del', b'transport_commandnode_segment'))
+    i_ins = next(i for i, (k, t, _) in enumerate(evP)
+                 if i > i_seg
+                 and (k, t) == ('set', b'CommandNodeWarInstance'))
+    i_dst = next(i for i, (k, t, _) in enumerate(evP)
+                 if i > i_ins
+                 and (k, t) == ('del', b'transport_commandnode_destination'))
+    check('H7c 中止推序 del segment < set instance < del destination'
+          '（客户端 status 重算时机约束，2026-09-15 城市名修复）',
+          i_seg < i_ins < i_dst,
+          f'seg={i_seg} ins={i_ins} dst={i_dst}')
+
+    # H10 普通到达（无交战）推序同上：del destination 必须在 set
+    #     instance 之后派发，否则列表 status 按在途旧 location 冻结
+    storeU = FakeStore()
+    warU = await war_campaign.ensure_war(storeU)
+    atkU = _mk_at(storeU, warU['id'], 601, 1, 10)
+    await war_campaign.start_movement(storeU, atkU, 20, now=NOW)
+    evU = await war_campaign.advance_movements(
+        storeU, warU, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    i_segU = next(i for i, (k, t, _) in enumerate(evU)
+                  if (k, t) == ('del', b'transport_commandnode_segment'))
+    i_insU = next(i for i, (k, t, _) in enumerate(evU)
+                  if i > i_segU
+                  and (k, t) == ('set', b'CommandNodeWarInstance'))
+    i_dstU = next(i for i, (k, t, _) in enumerate(evU)
+                  if i > i_insU
+                  and (k, t) == ('del', b'transport_commandnode_destination'))
+    check('H10 普通到达推序 del segment < set instance < del destination',
+          storeU.ats[601]['map_entity_id'] == 20
+          and i_segU < i_insU < i_dstU,
+          f'seg={i_segU} ins={i_insU} dst={i_dstU}')
+
+    # H8 途经交战城市且我方阵营参战 → 中止行军 + 增援入战
+    storeQ = FakeStore()
+    warQ = await war_campaign.ensure_war(storeQ)
+    _usQ = _mk_at(storeQ, warQ['id'], 401, 1, 20)       # US 驻 20
+    geQ = _mk_at(storeQ, warQ['id'], 402, 2, 10)        # GE 攻 20
+    await war_campaign.start_movement(storeQ, geQ, 20, now=NOW)
+    await war_campaign.advance_movements(
+        storeQ, warQ, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    check('H8 前置：20 城会战成局', len(storeQ.battles) == 1
+          and storeQ.ats[401]['state'] == 2
+          and storeQ.ats[402]['state'] == 2)
+    us2Q = _mk_at(storeQ, warQ['id'], 403, 1, 10)       # US 第二队 10→30
+    t8 = NOW + datetime.timedelta(seconds=SEG_SEC + 10)
+    mvQ, _ = await war_campaign.start_movement(storeQ, us2Q, 30, now=t8)
+    evQ = await war_campaign.advance_movements(
+        storeQ, warQ,
+        now=t8 + datetime.timedelta(seconds=SEG_SEC + 5))   # 换段途经 20
+    tagsQ = {(k, tag) for k, tag, _ in evQ}
+    wbQ = list(storeQ.battles.values())[0]
+    check('H8 途经我方参战会战城 中止行军 + 增援入战',
+          storeQ.movements[mvQ['id']]['state'] == 1
+          and storeQ.ats[403]['map_entity_id'] == 20
+          and storeQ.ats[403]['state'] == 2
+          and any(f.get('at_id') == 403 for f in wbQ['factions'])
+          and len(storeQ.battles) == 1
+          and ('set', b'battle') in tagsQ,
+          f"factions={[f.get('at_id') for f in wbQ['factions']]} "
+          f"at={storeQ.ats[403]}")
+
+    # H9 途经第三方会战城市（我方不参战）→ 正常通过（两方制契约）
+    storeT = FakeStore()
+    warT = await war_campaign.ensure_war(storeT)
+    _geT = _mk_at(storeT, warT['id'], 501, 2, 20)       # GE 驻 20
+    suT = _mk_at(storeT, warT['id'], 502, 3, 10)        # SU 攻 20
+    await war_campaign.start_movement(storeT, suT, 20, now=NOW)
+    await war_campaign.advance_movements(
+        storeT, warT, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    check('H9 前置：20 城德苏会战成局', len(storeT.battles) == 1)
+    usT = _mk_at(storeT, warT['id'], 503, 1, 10)        # US 10→30 途经
+    t9 = NOW + datetime.timedelta(seconds=SEG_SEC + 10)
+    mvT, _ = await war_campaign.start_movement(storeT, usT, 30, now=t9)
+    await war_campaign.advance_movements(
+        storeT, warT,
+        now=t9 + datetime.timedelta(seconds=SEG_SEC + 5))   # 换段途经 20
+    wbT = list(storeT.battles.values())[0]
+    check('H9 第三方会战城正常通过（不停、不入 factions）',
+          storeT.movements[mvT['id']]['state'] == 0
+          and storeT.ats[503]['state'] == 1
+          and storeT.ats[503]['map_entity_id'] == 102
+          and {f['faction'] for f in wbT['factions']} == {2, 3},
+          f"at={storeT.ats[503]} "
+          f"factions={[f.get('at_id') for f in wbT['factions']]}")
+
     # ---- I. 会战生命周期（2026-09-08 审计 #1-#4：A 第三阵营不入战 /
     #      B 结算释放幸存 AT / C factioncount+excludedFactionId / D 再成局）----
     # I1 第三阵营 AT 到达交战城：不入战正常驻扎（两方制契约，防结算卡死）
@@ -1026,7 +1148,11 @@ async def main():
         storeC, warC, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
     wbC = list(storeC.battles.values())[0]
     # 士气 5（≤ surrender 25）→ 投降分支：state=0 + 回首都 + is_deployed=0
+    # （士气快照模型：settle 走 current_morale 物化，快照须配新时间戳，
+    #   否则按 created_at 回填 regen 直接回满，永远进不了投降分支）
     storeC.ats[211]['morale'] = 5
+    storeC.ats[211]['morale_updated_at'] = datetime.datetime.now(
+        datetime.timezone.utc)
     storeC.ats[211]['resources'] = {1: 100}
     storeC.ats[212]['resources'] = {1: 100}
     await war_campaign.settle_war_battle(storeC, 0, wbC['id'], 2)
@@ -1038,8 +1164,9 @@ async def main():
           f'deployed={storeC.ats[211]["is_deployed"]}')
     wardb.capitals = _orig_caps
 
-    # I5 败方原路撤退（③b 原路优先）：攻方战败 → 撤回进攻出发城
-    #    （path[0].from_bf 仍己方）；出发城已丢 → 回退最近友方城
+    # I5 败方撤退（③b 进攻路线优先）：攻方战败 → 撤回进攻路线上
+    #    最近的仍己方据点（路径尾段逐段回退）；路线城市已丢 → 继续
+    #    沿路线回退；全丢 → 回退最近友方城（BFS 兜底）
     _orig_caps_i5 = wardb.capitals
     wardb.capitals = lambda: [
         {'battlefield_id': 10, 'default_faction': 1},
@@ -1066,36 +1193,47 @@ async def main():
     await war_campaign.settle_war_battle(sti, 0, wb_i5['id'], 2)
     mv231 = next((m for m in sti.movements.values()
                   if m['commandnode_id'] == 231 and m['state'] == 0), None)
-    check('I5a 败方原路撤退 → 向出发城 10 撤退行军（保持部署，动画）',
+    check('I5a 败方撤退 → 向进攻路线上最近据点 20 撤退行军（非出发城）',
           mv231 is not None
-          and mv231['path'][-1]['to_bf'] == 10
+          and mv231['path'][-1]['to_bf'] == 20
           and sti.ats[231]['state'] == 1
           and sti.ats[231]['is_deployed'] is True,
           f'{mv231 and mv231["path"][-1]["to_bf"]}/{sti.ats[231]["state"]}')
     for _seg in mv231['path']:
         _seg['seconds'] = 0
     await war_campaign.advance_movements(sti, wari)
-    check('I5a2 撤退行军到达 → 出发城 10 落位（state=0 保持部署）',
-          sti.ats[231]['map_entity_id'] == 10
+    check('I5a2 撤退行军到达 → 据点 20 落位（state=0 保持部署）',
+          sti.ats[231]['map_entity_id'] == 20
           and sti.ats[231]['state'] == 0
           and sti.ats[231]['is_deployed'] is True,
           f'{sti.ats[231]["map_entity_id"]}/{sti.ats[231]["state"]}')
 
     sti, wari, wb_i5 = await _i5_run()
-    sti.city_owners[wari['id']][10] = 2      # 出发城 10 已被敌占
+    sti.city_owners[wari['id']][20] = 2      # 路线上最近据点 20 已被敌占
     await war_campaign.settle_war_battle(sti, 0, wb_i5['id'], 2)
     mv231 = next((m for m in sti.movements.values()
                   if m['commandnode_id'] == 231 and m['state'] == 0), None)
-    check('I5b 出发城已丢 → 向最近友方城 20 撤退行军（BFS 兜底）',
+    check('I5b 最近据点已丢 → 沿进攻路线继续回退到出发城 10',
           mv231 is not None
-          and mv231['path'][-1]['to_bf'] == 20,
+          and mv231['path'][-1]['to_bf'] == 10,
           f'{mv231 and mv231["path"][-1]["to_bf"]}')
     for _seg in mv231['path']:
         _seg['seconds'] = 0
     await war_campaign.advance_movements(sti, wari)
-    check('I5b2 撤退行军到达 → 友方城 20 落位',
-          sti.ats[231]['map_entity_id'] == 20,
+    check('I5b2 撤退行军到达 → 出发城 10 落位',
+          sti.ats[231]['map_entity_id'] == 10,
           f'{sti.ats[231]["map_entity_id"]}')
+
+    sti, wari, wb_i5 = await _i5_run()
+    sti.city_owners[wari['id']][10] = 2      # 进攻路线 10/20 全部失守
+    sti.city_owners[wari['id']][20] = 2
+    await war_campaign.settle_war_battle(sti, 0, wb_i5['id'], 2)
+    mv231 = next((m for m in sti.movements.values()
+                  if m['commandnode_id'] == 231 and m['state'] == 0), None)
+    check('I5c 路线全丢 → BFS 无友方城，回退首都 10 兜底',
+          mv231 is not None
+          and mv231['path'][-1]['to_bf'] == 10,
+          f'{mv231 and mv231["path"][-1]["to_bf"]}')
     wardb.capitals = _orig_caps_i5
 
     # ---- J. 野外遭遇成局（war-gameplay-fix-plan §2：encounter/skirmish、

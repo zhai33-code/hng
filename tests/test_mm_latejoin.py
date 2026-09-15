@@ -783,6 +783,74 @@ def main():
             mm_state._MM_QUEUES.pop(321, None)
             mm_state._MATCH_PMM_IDS.pop(321, None)
             mm_state._SOLO_SQUADS.pop(321, None)
+
+        # ---- 16d. 抢先点击兜底：missionId 实为 battle 行 id 的纠正 ----
+        # 据点详情开窗瞬间客户端先把 warBattleId 设成 selectedBattle.id
+        # （battle 行 id），详情响应返回后才覆盖成真实 missionId；玩家在
+        # 响应前点"加入战局"→ JoinMM.missionId=battleId。服务端查不到
+        # mission record 时按 battle id 解析回真实 missionId 进 war 桶；
+        # 解析不到（无此会战 mission）则维持原值照旧 43，不落普通池。
+        class Store16d:
+            _WAR = {'id': 900202, 'battle_id': 7, 'state': 0,
+                    'gamemode': 10, 'preset': 10, 'map_id': 9,
+                    'attacker_faction': 1, 'defender_faction': 3,
+                    'entity_id': 5001, 'entity_type': 1,
+                    'activation_time': '2026-09-15 20:00:00'}
+
+            async def get_mission_record(self, mid):
+                return dict(self._WAR) if int(mid) == 900202 else None
+
+            async def get_mission_by_battle(self, bid):
+                return dict(self._WAR) if int(bid) == 7 else None
+
+            async def list_characters(self, p):
+                return [{'id': 42, 'faction': 3, 'name': 'Rush',
+                         'combat_xp': 0, 'template': 1}]
+
+        old16d = (state.STORE, mm_handler._squad_eligible_members,
+                  mm_config.WAR_SOLO_FORM)
+        state.STORE = Store16d()
+        mm_handler._squad_eligible_members = fake_eligible16
+        # 本段测路由口径（双方真人规则下排队留存），与 .env 的
+        # MM_WAR_SOLO_FORM 单人测试开关解耦（state.py 会加载 .env）
+        mm_config.WAR_SOLO_FORM = False
+        try:
+            # 16d-i. f2=battleId(7) → 纠正为 missionId=900202 → war 桶排队
+            proto16d = pb_varint(1, 42) + pb_varint(2, 7)
+            w16d = FakeWriter()
+            asyncio.run(mm_handler._handle_join(Sess16(), w16d, 30, proto16d))
+            check('抢先点击：JoinMM 回 ok（f1=1）',
+                  w16d.data.endswith(b'\x08\x01'),
+                  f'data_tail={w16d.data[-4:]!r}')
+            check('抢先点击：进 war 桶（battle_id=7，gamemode=10）',
+                  any(int(e.player_id) == 321
+                      for e in mm_state.POOL.war_bucket(7))
+                  and mm_state._MM_QUEUES.get(321, {}).get('gamemode') == 10,
+                  f'bucket={mm_state.POOL.war_bucket(7)} '
+                  f'q={mm_state._MM_QUEUES.get(321)}')
+            mm_state.POOL.remove(321)
+            mm_state._MM_QUEUES.pop(321, None)
+            mm_state._MATCH_PMM_IDS.pop(321, None)
+            mm_state._SOLO_SQUADS.pop(321, None)
+            # 16d-ii. f2=无对应会战 mission 的 battleId → 照旧 43，不入池
+            proto16d2 = pb_varint(1, 42) + pb_varint(2, 999999)
+            w16d2 = FakeWriter()
+            asyncio.run(mm_handler._handle_join(Sess16(), w16d2, 30,
+                                                proto16d2))
+            check('未知 battleId：JoinMM 回 43（mission_not_found）',
+                  w16d2.data.endswith(b'\x08\x2b'),
+                  f'data_tail={w16d2.data[-4:]!r}')
+            check('未知 battleId：不入池',
+                  mm_state.POOL.get(321) is None
+                  and not mm_state.POOL.war_bucket(999999))
+        finally:
+            state.STORE = old16d[0]
+            mm_handler._squad_eligible_members = old16d[1]
+            mm_config.WAR_SOLO_FORM = old16d[2]
+            mm_state.POOL.remove(321)
+            mm_state._MM_QUEUES.pop(321, None)
+            mm_state._MATCH_PMM_IDS.pop(321, None)
+            mm_state._SOLO_SQUADS.pop(321, None)
             state.PLAYER_SELECTED_CHAR.pop(321, None)
 
         # ---- 17. 快速匹配模式解析（11/12/14 虚拟号 → 具体 staging 模式） ----

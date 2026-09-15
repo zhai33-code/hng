@@ -267,6 +267,9 @@ def _mk_at(st, node_id, template=501, owner=100, faction=1, state=0,
         'resources': dict(resources) if resources is not None else {},
         'has_gotten_soldier_free': False, 'has_gotten_vehicle_free': False,
         'general_character_id': 0, 'morale': morale, 'max_morale': max_morale,
+        # 官方士气模型：morale 是 morale_updated_at 时刻快照——fixture 置
+        # 为当前真实时间，快照即现值（否则 created_at=_NOW 过去时触发回复）
+        'morale_updated_at': datetime.datetime.now(datetime.timezone.utc),
         'created_at': _NOW,
     }
     return st.ats[node_id]
@@ -411,9 +414,16 @@ async def section_a():
 
     st = _setup()
     a6 = _mk_at(st, 306)
+    a6['morale_updated_at'] = _NOW          # 快照时刻 = _NOW
     row = pb_parse(war_campaign.msg_commandnode_morale_row(a6, 1))
-    check('A6 Morale 行 f5 Zulu（ISO → NaN → 0 士气回归）',
-          row.get(5) == b'20260901120000Z', str(row.get(5)))
+    a6b = _mk_at(st, 308)
+    del a6b['morale_updated_at']            # 无值回退 created_at
+    rowb = pb_parse(war_campaign.msg_commandnode_morale_row(a6b, 1))
+    check('A6 Morale 行 f5 Zulu（ISO → NaN → 0 士气回归；'
+          'morale_updated_at 优先，无值回退 created_at）',
+          row.get(5) == b'20260901120000Z'
+          and rowb.get(5) == b'20260901120000Z',
+          f'{row.get(5)} / {rowb.get(5)}')
 
     # A7：Definition f10 statUpdateTimeStamp（stats_updated_at 优先，
     # 无值回退 created_at；变化驱动客户端 statsHaveChanged 重拉 stats）
@@ -785,6 +795,42 @@ async def section_e():
           a['morale'] == 80 and a['resources'] == {1: 40}
           and a['battles'] == 0 and a['xp'] == 0 and st.funds_log == [],
           f'morale={a["morale"]} res={a["resources"]}')
+
+    # E9：官方士气模型（快照+时间戳）——结算先物化随时间回复再 ±，
+    #     投降判定用物化值；morale_updated_at 重置 + Morale 行重推
+    st = _setup()
+    _mk_at(st, 9, state=2, morale=50, resources={1: 100})
+    st.ats[9]['morale_updated_at'] = (
+        datetime.datetime.now(datetime.timezone.utc)
+        - datetime.timedelta(minutes=200))       # +0.15×200=+30 → 物化 80
+    _mk_battle(st, 1, ats=[(9, 1)])
+    events = await war_campaign.settle_war_battle(st, 0, 1, 2)   # 败
+    a = st.ats[9]
+    mrows = [p for kind, t, p in events
+             if kind == 'set' and t == b'CommandNodeMorale']
+    check('E9a 物化回复后扣减（50+30-20=60）+ morale_updated_at 重置',
+          a['morale'] == 60
+          and a['morale_updated_at'] > datetime.datetime.now(
+              datetime.timezone.utc) - datetime.timedelta(minutes=1),
+          f'morale={a["morale"]} ts={a.get("morale_updated_at")}')
+    check('E9b 结算重推 CommandNodeMorale 行', len(mrows) == 1,
+          f'rows={len(mrows)}')
+
+    # E9c：快照低于投降线但物化值已回满 → 不投降（玩家实报"满士气被
+    #      遣返"场景：旧代码拿 DB 绝对值 0 判 0<=25 直接撤回首都）
+    st = _setup()
+    _mk_at(st, 9, state=2, morale=0, deployed=True, resources={1: 100})
+    st.ats[9]['morale_updated_at'] = (
+        datetime.datetime.now(datetime.timezone.utc)
+        - datetime.timedelta(minutes=1000))      # +150 → 封顶 100
+    st.ats[9]['map_entity_id'] = 30
+    _mk_battle(st, 1, ats=[(9, 1)])
+    await war_campaign.settle_war_battle(st, 0, 1, 2)   # 败 → 100-20=80>25
+    a = st.ats[9]
+    check('E9c 物化值判投降（快照0但已回满 → 不撤回首都）',
+          a['morale'] == 80 and a['is_deployed'] and a['state'] == 0,
+          f'morale={a["morale"]} deployed={a["is_deployed"]} '
+          f'state={a["state"]}')
 
 
 # ------------------------------------------------------------- main

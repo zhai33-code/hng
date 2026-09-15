@@ -6,6 +6,7 @@
 
 import random
 import time
+import datetime
 from protocol import (
     pb_int64,
     pb_sfixed64,
@@ -15,6 +16,7 @@ import wardb
 from state import log
 from .common import (
     morale_defaults,
+    current_morale,
     _as_resources,
     MAP_ENTITY_BATTLEFIELD,
     MAP_ENTITY_ACCESSPOINT,
@@ -56,6 +58,7 @@ from .warmap_view import (
     _ap_battlefield,
     msg_commandnode_definition_row,
     msg_commandnode_instance_row,
+    msg_commandnode_morale_row,
     msg_armyresource_rows,
     msg_hq_resource_rows,
     )
@@ -119,13 +122,14 @@ async def advance_movements(store, war=None, now=None):
                             map_entity_type=MAP_ENTITY_BATTLEFIELD,
                             airbase_bf=dest_bf)
                         at = await store.get_command_node(at['id'])
-                        # 到达推序（批内 dels-first 派发，_push_kvcs_batch
-                        # 按 delete-先/set-后分组）：del air_transport 信号
-                        # 先派发（airAssaultTeamMoveEnded 清 moving），instance
-                        # 信号后派发走 updatedWarInstance 重钉。批内全部行
-                        # 应用后才派发——重钉读到的新 mapEntityId 已就位，
-                        # 不会钉回出发地（此前逐条单消息推送时反序钉回
-                        # 旧机场、重登才恢复——2026-09-11）。
+                        # 到达推序（空中：del air_transport 必须在 set
+                        # instance 前派发，airAssaultTeamMoveEnded 清
+                        # moving，updatedWarInstance 重钉才生效；批内
+                        # 全部行应用后才派发——重钉读到的新 mapEntityId
+                        # 已就位，不会钉回出发地。此前逐条单消息推送时
+                        # 反序钉回旧机场、重登才恢复——2026-09-11）。
+                        # 注：broadcast_war_events 走 preserve_order
+                        # 保序批次，此处事件顺序即派发顺序。
                         events.append(('del', b'transport_commandnode_segment',
                                        mv['id']))
                         events.append(('del', b'air_transport', mv['id']))
@@ -161,24 +165,35 @@ async def advance_movements(store, war=None, now=None):
                     at['id'], state=0, map_entity_id=ent,
                     map_entity_type=ent_type)
                 at = await store.get_command_node(at['id'])
-                # 到达推序（空/地统一，批内 dels-first 派发）：del
-                # segment/destination/air_transport 信号先派发——清
-                # moving（schema 级 commandnodeStoppedMoving + 组件级
-                # CampaignUnitBase.moving）；instance 信号后派发——
-                # updatedWarInstance 重钉要求 hasChangedMapEntityOrType
-                # && !moving，moving 未清则跳过重钉、单位卡在动画终点
-                # （出兵点偏移位）。批内全部行应用后才派发：del 重钉
-                # 读到的 mapEntityId/type 已是新值（type=1 不误走补给线
-                # 分支，accessPointStatus 无空检查的 NPE 雷区不会触发
-                # ——冻结 kvcs 管线、名字不刷新的根因，2026-09-11）。
+                # 到达推序（2026-09-11 重钉修复 + 2026-09-15 城市名修复）：
+                # 1) del segment 先派发——清 schema.moving
+                #    （commandnodeStoppedMoving），否则 instance 派发时
+                #    updatedWarInstance 重钉条件 hasChangedMapEntityOrType
+                #    && !moving 不满足，单位卡在动画终点（出兵点偏移位）。
+                # 2) set instance——location 更新为新城市（
+                #    updateAssaultTeamMapEntity）。
+                # 3) del destination 最后派发（仅地面；空中 air_transport
+                #    单表承载 moving+destination 两职责，只能 del 在前）
+                #    ——onDestinationUpdates→updateAssaultTeamStatus 重算
+                #    status=location，此时读到的已是新城市名。若 del
+                #    destination 先于 set instance，status 按在途旧值
+                #    （补给线=""）冻结：非交战 AT 靠后续 armyresource/
+                #    queue 事件自愈，交战中 AT 无任何触发 → 部队列表
+                #    不显示所在城市名。
                 events.append(('del', b'transport_commandnode_segment',
                                mv['id']))
-                events.append(
-                    ('del', b'air_transport' if is_air
-                     else b'transport_commandnode_destination', mv['id']))
-                events.append(('set', b'CommandNodeWarInstance',
-                               msg_commandnode_instance_row(
-                                   at, war_id, caps)))
+                if is_air:
+                    events.append(('del', b'air_transport', mv['id']))
+                    events.append(('set', b'CommandNodeWarInstance',
+                                   msg_commandnode_instance_row(
+                                       at, war_id, caps)))
+                else:
+                    events.append(('set', b'CommandNodeWarInstance',
+                                   msg_commandnode_instance_row(
+                                       at, war_id, caps)))
+                    events.append(('del',
+                                   b'transport_commandnode_destination',
+                                   mv['id']))
                 # ---- 落地伞兵走回己方机场：与停驻同机场的同主运输机队
                 # 自动重整（免费并机 + 转回空中原型，可再次空降）----
                 remounted = False
@@ -251,6 +266,34 @@ async def advance_movements(store, war=None, now=None):
                                msg_commandnode_instance_row(at, war_id, caps)))
                 if is_reserve(at):
                     continue        # 补给队途经不占城（补给线两端本方领地）
+                # ---- 换段敌情检查（途经城市 = 上一段终点）----
+                # 敌驻军/我方参战会战 → 中止行军落位途经城，成局/增援
+                # （修复：途经交战城市不停下直接穿城而过）；第三阵营
+                # 会战（我方不参战）正常通过（两方制契约）
+                pass_bf = int(segs[idx]['from_bf'] or 0)
+                if await _passthrough_hostile(store, war_id, at, pass_bf):
+                    await store.finish_movement(mv['id'], 1)
+                    await store.update_command_node(
+                        at['id'], state=0, map_entity_id=pass_bf,
+                        map_entity_type=MAP_ENTITY_BATTLEFIELD)
+                    at = await store.get_command_node(at['id'])
+                    # 中止落位推序同到达分支：del segment → set
+                    # instance → del destination（destination 的 del
+                    # 须在 instance 之后派发，否则客户端 AT 列表 status
+                    # 按在途旧 location="" 冻结，不显示途经城市名）
+                    events.append(('del', b'transport_commandnode_segment',
+                                   mv['id']))
+                    events.append(('set', b'CommandNodeWarInstance',
+                                   msg_commandnode_instance_row(
+                                       at, war_id, caps)))
+                    events.append(('del',
+                                   b'transport_commandnode_destination',
+                                   mv['id']))
+                    events.extend(await _check_battle_formation(
+                        store, war_id, at, pass_bf))
+                    log(f'[war] AT {at["id"]} 途经敌情城市 {pass_bf} '
+                        f'中止行军入战')
+                    continue
                 # 换段占城：AT 已抵达新段起点城市（=上一段终点），无敌
                 # 驻军/无进行中会战则易主（途经城市陆续占领）
                 events.extend(await _capture_city_events(
@@ -343,6 +386,29 @@ def _nearest_friendly_bf(from_bf, faction, city_owners):
                 return nb
             queue.append(nb)
     return 0
+
+
+async def _passthrough_hostile(store, war_id, at, bf):
+    """途经城市敌情判据（与 _check_battle_formation 同源）：
+    - 同城进行中会战且我方阵营参战 → 停（增援入战）；
+    - 无进行中会战且城内有敌驻军 → 停（成局拦截）；
+    - 第三阵营会战（我方不参战）→ 不停，正常通过（两方制契约）。"""
+    if not bf:
+        return False
+    my_faction = int(at.get('faction') or 0)
+    for wb in await store.list_active_war_battles(war_id):
+        if (int(wb.get('battle_type') or BATTLE_TYPE_ASSAULT)
+                == BATTLE_TYPE_ASSAULT
+                and int(wb.get('battlefield_id') or 0) == int(bf)):
+            return my_faction in {int(f.get('faction') or 0)
+                                  for f in (wb.get('factions') or [])}
+    others = await store.list_war_command_nodes(war_id)
+    return any(o['id'] != at['id'] and o.get('is_deployed')
+               and not is_reserve(o)
+               and int(o.get('state') or 0) < 3
+               and int(o.get('faction') or 0) != my_faction
+               and at_current_battlefield(o) == int(bf)
+               for o in others)
 
 
 async def _check_battle_formation(store, war_id, at, dest_bf):
@@ -723,7 +789,11 @@ async def _capture_city_events(store, war_id, faction, bf_id,
 async def broadcast_war_events(events):
     """战争事件广播：全部 warmapview 订阅会话（含敌我视角）。整批事件
     单条 KeyValueChangeSet 推送（原子性见 _push_kvcs_batch——到达等
-    跨行状态迁移要求 set 与 del 行在同一派发批内互相可见）。"""
+    跨行状态迁移要求 set 与 del 行在同一派发批内互相可见）。
+    preserve_order=True：到达/途经中止推序是 del segment → set
+    instance → del destination 的交错序列（客户端 AT 列表 status
+    重算时机依赖此序，2026-09-15 城市名修复），不能被 dels-first
+    重排；其余流程事件本身即 del 先 set 后，保序模式下派发不变。"""
     if not events:
         return
     from state import FLASH_SESSIONS
@@ -734,7 +804,7 @@ async def broadcast_war_events(events):
         if not cmd or not w:
             continue
         try:
-            await _push_kvcs_batch(w, cmd, events)
+            await _push_kvcs_batch(w, cmd, events, preserve_order=True)
         except Exception:
             pass          # 单会话故障不影响其他订阅者
 
@@ -762,6 +832,13 @@ async def war_tick(store):
     events.extend(await _cleanup_supply_columns(store))
     await _sweep_ended_war_leftovers(store)
     await automission_tick(store)
+    # 准备期到点的会战成局（排队玩家拉进 FPS 局；门控口径见
+    # matchmaking.war_battle_formable；延迟 import 防循环依赖）
+    try:
+        import matchmaking as _mm
+        await _mm.form_due_war_battles()
+    except Exception as e:
+        log(f'[war] form_due_war_battles failed: {e}')
     await production_tick(store)
     await supply_queue_tick(store)
     if events:
@@ -834,6 +911,14 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
         if wb is None or int(wb.get('state') or 0) != 0:
             return []
         war_id = int(wb['war_id'])
+        # 排队残留清理：本会战 war 桶内仍在排队的玩家出池回大厅
+        # （automission 结算不开 FPS 局，不清则客户端永卡"匹配中"）。
+        # 清理失败不阻断结算；延迟 import 防 war_campaign↔matchmaking 环
+        try:
+            import matchmaking as _mm
+            await _mm.drop_war_battle_queue(int(battle_id))
+        except Exception as ex:
+            log(f'[war] settle drop queue(battle={battle_id}) failed: {ex}')
         winner = int(winner_faction or 0)
         # 野外会战（encounter/skirmish）：battlefield_id=补给线 id（与城市
         # 不同 id 空间）→ 城市易主/结算后再成局均不适用；幸存 AT 的冻结
@@ -869,10 +954,15 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
             ratio = win_loss if won else lose_loss
             new_res = _scale_resources(
                 _as_resources(at.get('resources')), ratio)
-            morale = int(at.get('morale') or 0)
+            # ② 士气（官方快照+时间戳模型）：先物化当前值（含随时间
+            #    回复，客户端 getMorale 同口径）再 ±，写回新快照并重置
+            #    morale_updated_at —— 服务器判定与客户端显示不再分叉
+            now_dt = datetime.datetime.now(datetime.timezone.utc)
+            morale = current_morale(at, morale_cfg, now_dt)
             morale += (mm_config.WAR_MORALE_GAINED_PER_WIN if won
                        else -mm_config.WAR_MORALE_LOST_PER_BATTLE)
-            morale = max(0, min(int(at.get('max_morale') or 100), morale))
+            morale = max(int(morale_cfg['min']),
+                         min(int(at.get('max_morale') or 100), morale))
             # ⑤ warfunds（先行：与状态回写解耦，玩家不存在不阻断结算）；
             #    underdog 阵营（#1）按 f7 倍率放大每局/胜方加成；
             #    is_auto 系统判定不发放（war1.md）
@@ -897,7 +987,8 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
             if not any(v > 0 for v in new_res.values()):
                 # ---- 歼灭：编制扣空（state=3 软删，地图行删除）----
                 await store.update_command_node(
-                    at['id'], state=3, resources={}, morale=morale)
+                    at['id'], state=3, resources={}, morale=morale,
+                    morale_updated_at=now_dt)
                 events.append(('del', b'CommandNodeWarInstance', at['id']))
                 # 野外会战冻结的行军随歼灭中止（城战 AT 已到达无行军，
                 # get_active_movement None 自然跳过）
@@ -924,7 +1015,8 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
             #     is_auto 系统判定不提供经验（war1.md）：battles/won/xp/
             #     rank 保持原值不回写
             if is_auto:
-                fields = {'resources': new_res, 'morale': morale}
+                fields = {'resources': new_res, 'morale': morale,
+                          'morale_updated_at': now_dt}
                 rank_up = False
             else:
                 battles = int(at.get('battles') or 0) + 1
@@ -936,6 +1028,7 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                          + int((5 + (25 if won else 0)) * xp_mult))
                 rank = max(int(at.get('rank') or 0), rank_from_xp(xp))
                 fields = {'resources': new_res, 'morale': morale,
+                          'morale_updated_at': now_dt,
                           'battles': battles, 'battles_won': battles_won,
                           'xp': xp, 'rank': rank}
                 rank_up = rank > int(at.get('rank') or 0)
@@ -1006,6 +1099,10 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                                msg_commandnode_definition_row(at)))
             events.append(('set', b'CommandNodeWarInstance',
                            msg_commandnode_instance_row(at, war_id, caps)))
+            # 士气快照/时间戳已变 → 重推 Morale 行（客户端按
+            # moraleStartTimeStamp 本地回算当前士气，结算前未推会显示旧值）
+            events.append(('set', b'CommandNodeMorale',
+                           msg_commandnode_morale_row(at, war_id)))
             for cat, cnt in sorted(new_res.items()):
                 if cnt:
                     events.append(
@@ -1074,8 +1171,9 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
         #     败方 AT 原地释放会与胜方同城对峙 → D 修复立即重开新局 →
         #     无限连环消耗编制（2026-09-14 用户实测：无人加入的局每
         #     5.5 分钟结算一次反复扣兵、战局永不结束）。撤退落点优先
-        #     原路回退：本次进攻 movement 出发城仍己方 → 撤回出发城；
-        #     否则退最近友方城（补给线 BFS），无友方城回首都兜底。
+        #     进攻路线上最近的己方据点：沿本次进攻 movement 路径从
+        #     dest_bf 逐段回退，取路线上最近的仍己方城市；路线全丢或
+        #     无路径 → 最近友方城（补给线 BFS），无友方城回首都兜底。
         if not is_field and dest_bf and winner:
             city_owners = dict(await store.get_war_cities(war_id))
             for entry in (wb.get('factions') or []):
@@ -1087,15 +1185,23 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                         or at_current_battlefield(at) != dest_bf):
                     continue    # 胜方驻守 / 已歼灭 / 已投降撤回 / 已离场
                 f_at = int(at.get('faction') or 0)
-                # 原路撤退：最近一次 movement 出发城（path[0].from_bf，
-                # 改道保留前缀段 → 仍是原始出发点）仍己方 → 撤回出发城
+                # 进攻路线撤退：沿最近一次 movement 路径尾部通往 dest_bf
+                # 的连续段由近及远回退，取路线上最近的仍己方据点
+                # （多段进攻不再一路退回出发点）
                 omv = await store.get_last_movement(at['id'])
-                origin = int(((omv or {}).get('path') or [{}])[0]
-                             .get('from_bf') or 0)
-                if (origin and origin != dest_bf
-                        and int(city_owners.get(origin) or 0) == f_at):
-                    target = origin
-                else:
+                target = 0
+                expected = int(dest_bf)
+                for seg in reversed((omv or {}).get('path') or []):
+                    if int(seg.get('to_bf') or 0) != expected:
+                        continue    # 只认通往 dest_bf 的连续尾段
+                    hop = int(seg.get('from_bf') or 0)
+                    if not hop:
+                        break
+                    if int(city_owners.get(hop) or 0) == f_at:
+                        target = hop
+                        break
+                    expected = hop    # 该城已丢 → 沿路线继续回退
+                if not target:
                     target = _nearest_friendly_bf(
                         dest_bf, f_at, city_owners) or caps.get(f_at)
                 if not target:
