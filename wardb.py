@@ -1290,7 +1290,7 @@ def assault_ap_decision(gamemap_id, mission_id, prefer=(), strict=False):
     defender_ap = O_ANCHOR_AP_TEMPLATE
     if strict and key[2]:
         # war：只开有进攻兵力的来向线（命中本图模板的子集），不随机凑数
-        attacker_aps = [a for a in aps if a in set(key[2])]
+        attacker_aps = sorted(a for a in aps if a in set(key[2]))
     else:
         # randint(3, max(n,3)) 防 n<3 时 randint 下界>上界；min(...,n) →
         # 不足 3 线的图开全部
@@ -1299,7 +1299,11 @@ def assault_ap_decision(gamemap_id, mission_id, prefer=(), strict=False):
             # 留 1 条边线给守方简报（2026-09-15 用户口径：非战争局也给
             # 守方留一条线；Mill 等 2 线图无线可留维持原语义）
             atk_n = min(atk_n, n - 1)
-        attacker_aps = aps[:atk_n]
+        attacker_aps = sorted(aps[:atk_n])
+    # ★攻方线统一升序返回（2026-09-15：洗牌序只用于"选哪几条"，返回
+    #   必须排序——assign_lines 按 ap_templates 顺序建 line_pool/ap_line，
+    #   战斗侧 layout 按升序遍历；洗牌序直接进 assign_lines 会导致
+    #   line_pool 与 ap_line 线序错配、各线兵力挂错线）
     inactive_aps = [a for a in aps if a not in set(attacker_aps)]
     _AP_DECISION_CACHE[key] = (defender_ap, attacker_aps, inactive_aps)
     return _AP_DECISION_CACHE[key]

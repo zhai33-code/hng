@@ -365,6 +365,15 @@ def init_mission_war(mission_id, attacker, defender, comps_by_faction,
         pools[int(fac)] = counts
     names_by_faction = {int(f): [str(n) for n in (v or [])]
                         for f, v in (names_by_faction or {}).items()}
+    # ★per-AT 实际编制随 war_ats 携带（comp 与 ats 平行同序，2026-09-15：
+    #   分线池 line_pool 改按 AT 实际存量累加，与主池/简报总量同口径，
+    #   不再用模板满编 _AT_COMP——hover 单线数值 = 总面板数值的线拆分）
+    war_ats = {}
+    for _f, _v in (ats_by_faction or {}).items():
+        _comps = (comps_by_faction or {}).get(int(_f)) or []
+        war_ats[int(_f)] = [
+            dict(a, comp=_comps[_i]) if _i < len(_comps) else dict(a)
+            for _i, a in enumerate(_v or [])]
     # war 攻方进攻方向（激活线决策 prefer_aps，用户口径 2026-09-14：
     # war 哪条线有进攻兵力就激活哪条）。成局时定格——增援不改（激活线
     # 布局开局后不可变，改了会引发 f12/f6 布局重发噪音；增援 AT 来向
@@ -377,8 +386,7 @@ def init_mission_war(mission_id, attacker, defender, comps_by_faction,
         'mode': 'war',
         'names': list(names_by_faction.get(int(attacker)) or []),
         'names_by_faction': names_by_faction,
-        'war_ats': {int(f): [dict(a) for a in (v or [])]
-                    for f, v in (ats_by_faction or {}).items()},
+        'war_ats': war_ats,
         'attacker': int(attacker), 'defender': int(defender),
         'pool': pools,
         'prefer_aps': prefer_aps,
@@ -411,7 +419,9 @@ def add_war_reinforcement(mission_id, faction, comp, name, at=None):
         counts[int(cat)] = counts.get(int(cat), 0) + int(cnt)
     rec.setdefault('names_by_faction', {}).setdefault(fac, []).append(str(name))
     if at is not None:
-        rec.setdefault('war_ats', {}).setdefault(fac, []).append(dict(at))
+        # comp 随 AT 携带（分线池按实际存量累加，同 init_mission_war）
+        rec.setdefault('war_ats', {}).setdefault(fac, []).append(
+            dict(at, comp=comp))
     if fac == rec.get('attacker'):
         rec.setdefault('names', []).append(str(name))
         if rec.get('lines') is not None:
@@ -512,23 +522,39 @@ def assign_lines(mission_id, n_lines, ap_templates=()):
         ap_line_idx = {int(ap): i for i, ap in enumerate(ap_templates)}
         wats = (rec.get('war_ats') or {}).get(
             int(rec.get('attacker') or 0)) or []
+
+        def _comp_of(i, name):
+            # per-AT 实际存量优先（war_ats 携带 comp，2026-09-15 口径统一：
+            # 分线池合计 = 攻方主池，hover 单线 = 总面板的线拆分），
+            # 缺省回退模板满编
+            at = wats[i] if i < len(wats) else None
+            c = (at or {}).get('comp')
+            if isinstance(c, dict) and c:
+                return c
+            return _AT_COMP.get(name, {})
+
         lines = [[] for _ in range(n)]
+        line_pool = [dict() for _ in range(n)]
+
+        def _put(i, name, idx):
+            lines[idx].append(name)
+            lc = line_pool[idx]
+            for cat, cnt in _comp_of(i, name).items():
+                lc[int(cat)] = lc.get(int(cat), 0) + int(cnt)
+
         leftover = []
         for i, name in enumerate(names):
             at = wats[i] if i < len(wats) else {}
             idx = ap_line_idx.get(int((at or {}).get('ap_tmpl') or 0), -1)
-            (lines[idx] if idx >= 0 else leftover).append(name)
+            if idx >= 0:
+                _put(i, name, idx)
+            else:
+                leftover.append((i, name))
         rng.shuffle(leftover)
-        for name in leftover:            # 无方向 AT：蛇形填兵力最薄的线
-            lines[min(range(n), key=lambda i: len(lines[i]))].append(name)
+        for i, name in leftover:         # 无方向 AT：蛇形填兵力最薄的线
+            _put(i, name, min(range(n), key=lambda k: len(lines[k])))
         rec['lines'] = lines
-        rec['line_pool'] = []
-        for line_names in rec['lines']:
-            lc = {}
-            for name in line_names:
-                for cat, cnt in _AT_COMP.get(name, {}).items():
-                    lc[cat] = lc.get(cat, 0) + cnt
-            rec['line_pool'].append(lc)
+        rec['line_pool'] = line_pool
     for i, ap in enumerate(ap_templates):
         if i < n:
             rec['ap_line'][int(ap)] = i
@@ -627,11 +653,13 @@ def at_lane_aps(mission_id, faction):
     line_ap = {int(i): int(ap)
                for ap, i in (rec.get('ap_line') or {}).items()}
     out = []
+    rest = [list(ln) for ln in lines]   # 匹配即消耗：同名 AT 各归各线
     for _n in names:
         ap = 0
-        for i, ln in enumerate(lines):
+        for i, ln in enumerate(rest):
             if _n in ln:
                 ap = line_ap.get(i, 0)
+                ln.remove(_n)
                 break
         out.append(ap)
     return out

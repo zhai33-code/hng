@@ -134,6 +134,13 @@ async def main():
         check('T1e entity = battle 行口径（城战 bf/1）',
               det.get('entity_id') == 20 and det.get('entity_type') == 1,
               f'ent={det.get("entity_id")}/{det.get("entity_type")}')
+        # T1g: war_pending 简报必须建成 force_pool war rec（2026-09-15 修复：
+        # _build_war_rec 漏 await → rec 永不建 → 简报回退随机线+兵力堆单点）
+        import force_pool as _fp
+        check('T1g pending 简报建成 war rec（分线/红线数据源）',
+              _fp.mission_factions(4242) == (1, 2),
+              f'factions={_fp.mission_factions(4242)}')
+        _fp.release(4242)
 
         # T1f: 成局后复用 live det（真实 players 名单，mid 路由生效）
         live_det = {'battle_id': 77, 'preset': 3, 'players':
@@ -150,10 +157,15 @@ async def main():
 
         # T6: war_pending（攻守未凑齐、局未成）players = 会战桶排队名单
         #     ——玩家点"加入战斗"后重开据点详情应看到自己名字
+        #     （含跨会战不串 + 出池收缩；solo / 小队同口径，POOl.war_bucket）
         import mm_pool
         entry = mm_pool.QueueEntry(player_id=42, char_id=7, faction=1,
                                    gamemode_id=10, battle_id=77)
+        e3 = mm_pool.QueueEntry(player_id=44, char_id=8, faction=1,
+                                gamemode_id=10, battle_id=99)
         mm_handler.POOL.enqueue(entry)
+        mm_handler.POOL.enqueue(e3)
+        orig_q44 = mm_handler._MM_QUEUES.get(44)
         mm_handler._MM_QUEUES[42] = {
             'pmm_id': 1, 'mission_id': 0, 'gamemode': 10,
             'ctx': {'gamertag': 'WarHero'}}
@@ -166,9 +178,24 @@ async def main():
                   == ['WarHero'],
                   f'players={det.get("players")}')
             check('T6b 响应 f3 参战方含排队玩家名', b'WarHero' in w.buf)
+            check('T6c 跨会战不串（battle_id=99 不入 77 名单）',
+                  all(p['player_id'] != 44
+                      for p in det.get('players') or []))
+            # 出池（成局/取消）→ 名单自动收缩
+            mm_handler.POOL.remove(42)
+            calls.clear()
+            await _call(pb_int32(1, 0) + pb_int32(2, 77))
+            det = calls[0][1] if calls else {}
+            check('T6d 出池后名单收缩为空',
+                  det.get('players') == [], f'players={det.get("players")}')
         finally:
             mm_handler.POOL.remove(42)
+            mm_handler.POOL.remove(44)
             mm_handler._MM_QUEUES.pop(42, None)
+            if orig_q44 is None:
+                mm_handler._MM_QUEUES.pop(44, None)
+            else:
+                mm_handler._MM_QUEUES[44] = orig_q44
     finally:
         mm_handler._msg_mission_details_response_multi = orig_render
         state.STORE = orig_store

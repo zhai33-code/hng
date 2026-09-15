@@ -5,7 +5,6 @@ JoinMatchMaking / CancelJoinMatchMaking / GetMissionDetails 三个请求的
 （handle_request 返回 False 表示未处理，交由后续 handler）。
 从 matchmaking.py 拆出（2026-09-06 重构，纯移动行为不变）。
 """
-import random
 import uuid
 
 from protocol import (build_response, pb_parse, pb_parse_multi, pb_bool,
@@ -13,10 +12,8 @@ from protocol import (build_response, pb_parse, pb_parse_multi, pb_bool,
 from state import PLAYER_SELECTED_CHAR
 import state
 from wardb import (
-    _capturepoint_ap_map, _capturepoint_names, _load_objective_capturepoints,
-    _load_preset,
-    _missiontype_for_gamemap, _rank_from_combat_xp, assault_ap_decision,
-    battlefield_pos, character_resource_category, is_general_character,
+    _load_preset, _rank_from_combat_xp, battlefield_pos,
+    character_resource_category, is_general_character,
 )
 import mm_pool
 import force_pool
@@ -25,13 +22,14 @@ import mm_config
 
 from matchmaking import (
     AI_MISSIONPRESET, _arm_ai_fill, _assault_team_nodes, _cancel_squad_queue,
-    _char_vehicle_cats, _cleanup_queued_player, _enqueue_squad,
-    _find_joinable_mission, _find_player_active_mission,
+    _briefing_layout, _char_vehicle_cats, _cleanup_queued_player,
+    _enqueue_squad, _find_joinable_mission, _find_player_active_mission,
     _init_war_mission_resources, _join_existing_mission,
-    _mission_accesspoints, _mission_capturepoints,
+    _msg_briefing_f4_war, _msg_briefing_f5, _msg_briefing_f6,
+    _msg_briefing_f7,
     _msg_mission_details_response, _msg_player_matchmaking,
     _msg_solo_squad_member_session, _msg_solo_squad_session, _multi_first,
-    _pool_counts, _push_kvcs, _push_kvcs_delete,
+    _push_kvcs, _push_kvcs_delete,
     _resolve_mapfilter_gamemode, _resolve_quickplay_gamemode,
     _revive_own_membership,
     _squad_eligible_members, _try_form_all, _zulu_activated, _zulu_now,
@@ -614,45 +612,9 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     afid = FACTION_ROW_IDS[defender]
     preset = int(details.get('preset') or 0) or AI_MISSIONPRESET
     gamemap_id = int(_load_preset(preset).get(3, 0) or 0) or 13
-    aps = _mission_accesspoints(gamemap_id)   # 不截断（5 线图全参与）
-    ours_ap, theirs_ap = aps[0], aps[1]
-    # ★按 missiontype 分支（assault-map-spawn-investigation.md §9.2）：
-    # Assault 出兵线随机激活（wardb.assault_ap_decision，按 mission_id 播种，
-    # 与战斗侧 _accesspoint_layout/BattleFieldSettings f12 同源同值）：
-    # 守方 = O 锚 1234567890（引擎虚拟 AP：战斗侧 f12 收编 + f14 挂资源
-    # → 守方小队/坦克部署中心 O 区）、进攻方随机 2~3 条边线、★未激活线
-    # 不开启。Encounter（Mill 等无连线图）维持原有交替方案不改动
-    # （Mill 锚点 8=攻/15=守）。
-    assault = _missiontype_for_gamemap(gamemap_id) == 1
-    owner_map = None
-    d_ap = None
-    atk_aps = ()
-    dfn_lanes = []          # 守方激活边线（war=红线，非 war=兜底 1 条）
-    _war_mission = force_pool.mission_factions(mission_id) != (0, 0)
-    if assault:
-        # war 局按进攻方向激活（与 _accesspoint_layout/f12 同源同值）；
-        # 非 war 局方向为空 → 回退随机 3..n 旧语义
-        _pref = force_pool.attacker_ap_tmpls(mission_id)
-        d_ap, a_aps, _inactive = assault_ap_decision(
-            gamemap_id, mission_id, prefer=_pref, strict=bool(_pref))
-        # ★守方激活边线（官方规则同单人版 2026-09-15：war=红线——相邻
-        # 城市是守方占领的线，可能 0~n 条，被包围不兜底；非 war=空闲线
-        # 按 mission 确定性抽 1 条）
-        if _war_mission:
-            dfn_lanes = list(force_pool.defender_lanes(mission_id))
-        else:
-            _inactive_l = [int(t) for t in _inactive]
-            if _inactive_l:
-                dfn_lanes = [random.Random(
-                    f'dfnlane-{int(mission_id)}').choice(_inactive_l)]
-        theirs_ap = d_ap   # = O 锚（守方 f5 资源锚 + 守方 AT 图标，同战斗 f14）
-        ours_ap = min(a_aps) if a_aps else aps[0]
-        atk_aps = set(int(t) for t in a_aps)
-        owner_map = {int(d_ap): defender}       # O 锚不在边线 aps → f6 不下发
-        for t in a_aps:
-            owner_map[int(t)] = attacker
-        for t in dfn_lanes:
-            owner_map[int(t)] = defender
+    # 布局/锚点/f4(war)/f5/f6/f7 与单人版共用（matchmaking 简报共用段，
+    # 2026-09-15 抽取）；布局与战斗侧 _accesspoint_layout/f12 同源同值
+    L = _briefing_layout(mission_id, gamemap_id, attacker, defender)
     pos = battlefield_pos(int(details.get('map_entity_id') or 0)
                          or MISSION_MAP_ENTITY_ID)
     if pos is None:
@@ -679,125 +641,49 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     m += pb_message(3, dfd)
     # f4 突击队：war_pending 优先发 battle roster 真实 AT（f2=template_id、
     # f4=ownerPlayerId 真实属主——官服 war 局简报 AT 属主非 0）；已成局/
-    # staged 局走 force_pool 名单（无池回退官方锚点 ×2）。
-    # ★war 局逐 AT 挂真实激活线（同单人版口径 2026-09-15：图标位置 =
-    # f4.accessPointTemplateId → 线入口据点）；守方挂 O 锚（Brno 官服
+    # staged 局走 force_pool 名单（无池回退官方锚点 ×2）。war 局逐 AT
+    # 挂真实激活线（共用 _msg_briefing_f4_war）；守方挂 O 锚（Brno 官服
     # 参考图：守军红星在 O 区不在边线）；非 war 局维持旧锚口径
     war_ats = details.get('war_at_rows') or {}
-    defender_logo_ap = (ASSAULT_DEFENDER_LOGO_AP
-                        if assault else theirs_ap)
-    _dfn_anchor = int(d_ap) if assault else defender_logo_ap
     if war_ats:
         for node in war_ats.get(attacker, []):
             _lane = force_pool.at_lane_by_id(
                 mission_id, int(node.get('id') or 0))
             m += pb_message(4, pb_int64(1, rfid)
                             + pb_int64(2, int(node.get('template_id') or 0))
-                            + pb_int64(3, _lane or ours_ap)
+                            + pb_int64(3, _lane or L['atk_anchor'])
                             + pb_int64(4, int(node.get('owner_player_id')
                                               or 0)))
         for node in war_ats.get(defender, []):
             m += pb_message(4, pb_int64(1, afid)
                             + pb_int64(2, int(node.get('template_id') or 0))
-                            + pb_int64(3, _dfn_anchor)
+                            + pb_int64(3, L['dfn_ap_f4'])
                             + pb_int64(4, int(node.get('owner_player_id')
                                               or 0)))
-    elif _war_mission and assault:
-        # 无 war_at_rows（已成局 det）：同单人版按分线名单逐 AT 挂线
-        for _fac in (attacker, defender):
-            _rf = FACTION_ROW_IDS[_fac]
-            _nodes = _assault_team_nodes(_fac, mission_id)
-            _aps_n = force_pool.at_lane_aps(mission_id, _fac)
-            _anchor = ours_ap if _fac == attacker else _dfn_anchor
-            for _i, _cn in enumerate(_nodes):
-                _ap = _aps_n[_i] if _aps_n and _i < len(_aps_n) else 0
-                m += pb_message(4, pb_int64(1, _rf) + pb_int64(2, _cn) +
-                                pb_int64(3, _ap or _anchor) + pb_int64(4, 0))
+    elif L['war'] and L['assault']:
+        # 无 war_at_rows（已成局 det）：按分线名单逐 AT 挂线（同单人版）
+        m += _msg_briefing_f4_war(mission_id, attacker, defender,
+                                  L['atk_anchor'], L['dfn_ap_f4'])
     else:
+        defender_logo_ap = (ASSAULT_DEFENDER_LOGO_AP if L['assault']
+                            else L['dfn_pt'])
         for cmd_node in _assault_team_nodes(attacker, mission_id):
             m += pb_message(4, pb_int64(1, rfid) + pb_int64(2, cmd_node) +
-                            pb_int64(3, ours_ap) + pb_int64(4, 0))
+                            pb_int64(3, L['atk_anchor']) + pb_int64(4, 0))
         for cmd_node in _assault_team_nodes(defender, mission_id):
             m += pb_message(4, pb_int64(1, afid) + pb_int64(2, cmd_node) +
                             pb_int64(3, defender_logo_ap) + pb_int64(4, 0))
-    # f5 资源：从本局资源池渲染（与战斗内 f2/f14 同源同值，消耗后递减）；
-    # war_pending 无池 → 用 battle roster AT 当前编制合计（双方真实兵力，
-    # 非 FALLBACK 静态锚点）；每方每类一条挂该方出兵点（客户端跨点求和
-    # → 显示即池剩余量）；★war 局攻方逐线分行（分线池挂各来向线，同
-    # 单人版 2026-09-15 口径），守方挂守方线（第一条红线，无红线=O 锚）
+    # f5 资源（与单人版共用 _msg_briefing_f5）：从本局资源池渲染（与战斗
+    # 内 f2/f14 同源同值，消耗后递减）；war_pending 无池 → 用 battle
+    # roster AT 当前编制合计（双方真实兵力，非 FALLBACK 静态锚点）；
+    # war 局攻方逐线分行，守方挂红线首条/无红线 O 锚
     pool = mission_resource_pool(mission_id)
     if pool is None and details.get('war_counts'):
         pool = details['war_counts']
-    atk_counts = _pool_counts(pool, attacker)
-    dfd_counts = _pool_counts(pool, defender)
-    dfn_pt = (dfn_lanes[0] if dfn_lanes else int(d_ap)) if assault \
-        else theirs_ap
-    _lane_pool = (force_pool.lane_counts_by_ap(mission_id)
-                  if _war_mission else {})
-    for res_cat, res_air in force_pool.categories(counts_by_faction=pool):
-        if _lane_pool:
-            for _lap, _lp in _lane_pool.items():
-                m += pb_message(5, pb_int64(1, rfid) + pb_int64(2, res_cat) +
-                                pb_int64(3, int(_lap)) +
-                                pb_int64(4, int(_lp.get(res_cat, 0) or 0)) +
-                                pb_bool(5, res_air))
-        else:
-            m += pb_message(5, pb_int64(1, rfid) + pb_int64(2, res_cat) +
-                            pb_int64(3, ours_ap) +
-                            pb_int64(4, atk_counts.get(res_cat, 0)) +
-                            pb_bool(5, res_air))
-    for res_cat, res_air in force_pool.categories(counts_by_faction=pool):
-        m += pb_message(5, pb_int64(1, afid) + pb_int64(2, res_cat) +
-                        pb_int64(3, dfn_pt) +
-                        pb_int64(4, dfd_counts.get(res_cat, 0)) +
-                        pb_bool(5, res_air))
-    # f6 出兵点归属：Encounter 首个=进攻方、其余交替（Mill 实测 8=进攻,
-    # 15=防守；f2 为 factionTemplateId）；Assault 展示层只发★攻方激活线
-    # （官方简报守方仅拥有中心 O 点——由 f7 涂守方色 + f4 logo 画中心；
-    # 守方 O 锚为虚拟点不在边线 aps → 不进 f6）——与战斗侧
-    # _accesspoint_layout 同 mission_id 同源（战斗 f12 含守方 O 锚）
-    if owner_map is not None:
-        for ap in aps:
-            if int(ap) not in owner_map:
-                continue        # 未激活线：不开启不下发
-            m += pb_message(6, pb_int64(1, ap) +
-                            pb_int64(2, owner_map[int(ap)]))
-    else:
-        for i, ap in enumerate(aps):
-            m += pb_message(6, pb_int64(1, ap) +
-                            pb_int64(2, defender if i % 2 else attacker))
-    # f7 据点初始归属：Encounter 全 0 中立（他服私服实测 {3:120, 4:0}）；
-    # Assault 只发★O 点（守方）+ 攻方激活线入口据点（挂攻方 AP，攻方色）
-    # +★守方激活线整线据点（守方色，war=红线可多条 / 非 war=1 条兜底，
-    # 同单人版 2026-09-15 口径；★线中段据点也涂守方色——客户端按入口
-    # owner!=0 激活整线会画出中段（getAutoGeneratedActiveLines 首字母
-    # 判线 + setupMap 全线画点），f7 不发中段则显示中立色，官方观感
-    # 红线整条红）——客户端 auto 激活线判定见单人版注释：
-    # 未激活线据点不发 → 图上不画该线；O 点涂守方色=官方观感
-    obj_cps = set(_load_objective_capturepoints(gamemap_id)) if assault else set()
-    if assault:
-        cp_ap = _capturepoint_ap_map(gamemap_id)
-        _dfn_lane_set = set(int(t) for t in dfn_lanes)
-        # 守方线字母 = 入口据点名首字母（与客户端判线同源），
-        # 中段（A2/B2/...，f3=0 不挂 AP）按名首字母归线
-        _cp_names = _capturepoint_names(gamemap_id)
-        _dfn_letters = {_cp_names[c][:1] for c, a in cp_ap.items()
-                        if a in _dfn_lane_set and c in _cp_names}
-        for cp in _mission_capturepoints(gamemap_id):
-            if cp in obj_cps:
-                cp_owner = defender
-            elif cp_ap.get(cp) in atk_aps:
-                cp_owner = attacker
-            elif cp_ap.get(cp) in _dfn_lane_set:
-                cp_owner = defender
-            elif _cp_names.get(cp, '')[:1] in _dfn_letters:
-                cp_owner = defender      # 守方线中段据点：整条红线守方色
-            else:
-                continue        # 未激活线/攻方线中段：展示层不下发
-            m += pb_message(7, pb_int32(3, cp) + pb_int32(4, cp_owner))
-    else:
-        for cp in _mission_capturepoints(gamemap_id):
-            m += pb_message(7, pb_int32(3, cp) + pb_int32(4, 0))
+    m += _msg_briefing_f5(mission_id, attacker, defender, pool, L)
+    # f6 出兵点归属 / f7 据点初始归属（与单人版共用）
+    m += _msg_briefing_f6(L, attacker, defender)
+    m += _msg_briefing_f7(gamemap_id, L, attacker, defender)
     m += pb_float(8, pos[0])   # posX（battlefield 行坐标）
     m += pb_float(9, pos[1])   # posY
     return m
@@ -925,14 +811,15 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
                      details['activation'], _ent) = _roster
                     if _ent and _ent[0]:
                         details['entity_id'], details['entity_type'] = _ent
-            _build_war_rec(mid, wrec)
+            await _build_war_rec(mid, wrec)
     if details is None:
         # war 会战局回退（M2）：局尚未成（无人加入，_MM_MISSION_DETAILS
         # 未登记）但任务列表已展示 record 行 → 客户端点行拉详情。按 DB
-        # record 构造带空 'players' 的最小 det（走 multi 渲染 = 双方空
-        # 名单，官服成局前观感；此前漏 'players' 键走 AI 分支 KeyError
-        # 'player_id' → HandlerErrorResponse）；非 war record（battle_id=0）
-        # 维持 43。
+        # record 构造 war_pending det（走 multi 渲染；players = 该会战
+        # war 桶排队真人名单——2026-09-14 实装排队玩家进详情名单；此前
+        # 恒空名单是官服成局前观感的旧口径。曾漏 'players' 键走 AI 分支
+        # KeyError 'player_id' → HandlerErrorResponse）；非 war record
+        # （battle_id=0）维持 43。
         wrec = None
         try:
             wrec = await state.STORE.get_mission_record(mid)
@@ -956,7 +843,7 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
                  details['activation'], _ent) = _roster
                 if _ent and _ent[0]:
                     details['entity_id'], details['entity_type'] = _ent
-            _build_war_rec(mid, wrec)
+            await _build_war_rec(mid, wrec)
     if details is None:
         resp = build_response(cmd_id, 'GetMissionDetailsResponse', pb_int32(1, 43))
         writer.write(resp)
@@ -984,10 +871,6 @@ async def _handle_mission_details(sess, writer, cmd_id, proto):
             int(details['faction']))
         mode = 'AI mode'
     resp = build_response(cmd_id, 'GetMissionDetailsResponse', resp_proto)
-    # TODO(debug): 临时排查 war 简报图标堆叠——打印 f4/f5/f6/f7 段 hex，验证后删除
-    if mode == 'multi' and force_pool.mission_factions(mid) != (0, 0):
-        _log(f'[dbg] mission={mid} det keys={sorted(details.keys())} '
-             f'gmd_hex={resp_proto.hex()}')
     writer.write(resp)
     await writer.drain()
     _log(f'S->C cmd={cmd_id:<4} GetMissionDetailsResponse ({mode}, '

@@ -10,7 +10,8 @@ war1/war2.md 社区口径（客户端零证据，数值全部 mm_config 可配�
       三点图 WAR_AUTO_TP_MIN 216，否则单点图 WAR_AUTO_SP_MIN 144），步兵
       （_SOLDIER_CATS 编制合计）单向不足者败北；
   §4 城攻（assault，非伞兵攻方）：超时 WAR_AUTO_ATTACK_TIMEOUT（默认
-      330s）攻方步兵 < 216 → 攻方败北；足够 → 攻方胜（城易主）；
+      330s）攻方步兵 < 216 → 攻方败北；守方 < 216 → 攻方胜（城易主）；
+      双方满足 → tie（§8）；
   §7 伞兵攻城（assault 且攻方 AT 为伞兵族）：超时 WAR_AUTO_PARADROP_
       TIMEOUT（默认 330s）攻方伞兵（cat4）< WAR_AUTO_PARA_MIN(288) →
       攻方败北 + 伞兵落地变步兵（convert_to *_on_ground 变体）；守方
@@ -165,10 +166,14 @@ async def _judge_threshold(store, wb, mrec, now_s):
                 return atk_fac, []
             # 双方满足 → tie（§8）
         else:
-            # §4 城攻：攻方 <216 败北；足够 → 攻方胜（城易主）
+            # §4 城攻：攻方 <216 败北；守方 <216 → 攻方胜（城易主）；
+            # 双方满足 → tie（war1.md「双方都满足则等待6小时后比较兵力」，
+            # 与 §7 伞兵分支同构——此前漏掉守方检查，守方满编也被判负）
             if atk_inf < mm_config.WAR_AUTO_TP_MIN:
                 return def_fac, []
-            return atk_fac, []
+            if def_inf < mm_config.WAR_AUTO_TP_MIN:
+                return atk_fac, []
+            # 双方满足 → tie（§8）
     else:
         # §3 野外：据点数定门槛（三点 216 / 单点 144），单向不足者败
         thr = (mm_config.WAR_AUTO_TP_MIN

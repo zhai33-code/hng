@@ -62,9 +62,10 @@ class FakeFlash:
 
 
 class FakeStore:
-    def __init__(self):
+    def __init__(self, war_record=None):
         self.member_updates = []   # (member_id, status)
         self.flag_updates = []     # (squad_id, flag)
+        self.war_record = war_record
 
     async def update_squad_member(self, mid, status=None, **kw):
         self.member_updates.append((int(mid), status))
@@ -74,6 +75,9 @@ class FakeStore:
 
     async def list_vehicles(self, pid, char_id):
         return []
+
+    async def get_mission_record(self, mid):
+        return self.war_record
 
 
 def main():
@@ -176,6 +180,94 @@ def main():
     print(f'\nSQUAD_ENQUEUE: '
           f'{"ALL PASS" if not failed else f"{len(failed)} FAILED: {failed}"} '
           f'({len(RESULTS) - len(failed)}/{len(RESULTS)} passed)')
+    if failed:
+        return 1
+
+    # ---- 小队排 war 会战路由（2026-09-14：排队成员进会战详情名单）----
+    # 指定战局为 war record（battle_id>0, state=0）→ 整队改排 gamemode 10
+    # war 桶（battle_id 分桶）：此前 entries 无 battle_id 落普通撮合
+    # （war 桶永不撮合）且详情名单看不到排队成员。
+    n0 = len(RESULTS)
+    lead2, mate2, su = FakeFlash(), FakeFlash(), FakeFlash()
+    members2 = [
+        {'id': 86021, 'player_id': LEAD_PID, 'gamertag': 'SquadLead',
+         'char_name': 'LeadChar', 'combat_xp': 0, 'faction': 1,
+         'character_id': LEAD_CHAR, 'template': 1, 'status': 2},
+        {'id': 86022, 'player_id': MATE_PID, 'gamertag': 'SquadMate',
+         'char_name': 'MateChar', 'combat_xp': 0, 'faction': 1,
+         'character_id': MATE_CHAR, 'template': 4, 'status': 2},
+    ]
+    wrec = {'id': 4242, 'state': 0, 'battle_id': 77,
+            'attacker_faction': 1, 'defender_faction': 2}
+    store2 = FakeStore(war_record=wrec)
+
+    # 场景 A：整队阵营在攻守双方 → war 桶
+    # （重挂 mock：第一块的 finally 已还原；否则真实 _try_form_all 会把
+    #   刚入池的条目直接撮合成局抽走，单测断言不到排队态）
+    olds2 = (state.STORE,
+             war_campaign.current_underdog_mults,
+             matchmaking._try_form_all,
+             matchmaking._arm_ai_fill,
+             squad_mod.push_squad_rows_to_all_members)
+    war_campaign.current_underdog_mults = fake_underdog
+    matchmaking._try_form_all = fake_try_form_all
+    matchmaking._arm_ai_fill = fake_arm_ai_fill
+    squad_mod.push_squad_rows_to_all_members = fake_push_rows
+    FLASH_SESSIONS['SquadLead'] = lead2
+    FLASH_SESSIONS['SquadMate'] = mate2
+    state.STORE = store2
+    try:
+        asyncio.run(matchmaking._enqueue_squad(
+            squad, members2, 10, (), 4242))
+        e_lead, e_mate = POOL.get(LEAD_PID), POOL.get(MATE_PID)
+        check('W1. 整队入 war 桶（gamemode=10 + battle_id 分桶）',
+              e_lead is not None and e_mate is not None
+              and e_lead.gamemode_id == 10 and e_lead.battle_id == 77
+              and e_mate.battle_id == 77,
+              f'lead={e_lead and (e_lead.gamemode_id, e_lead.battle_id)} '
+              f'mate={e_mate and (e_mate.gamemode_id, e_mate.battle_id)}')
+        q_lead = _MM_QUEUES.get(LEAD_PID) or {}
+        check('W2. 排队上下文 gamemode=10（取消/计数路径一致）',
+              q_lead.get('gamemode') == 10,
+              f'gamemode={q_lead.get("gamemode")}')
+        # 详情名单口径（mm_handler._war_queue_players 消费端）
+        import mm_handler
+        players = mm_handler._war_queue_players(77)
+        tags = {p['gamertag']: p['faction'] for p in players}
+        check('W3. 排队成员进会战详情名单（war_bucket 圈定）',
+              tags == {'SquadLead': 1, 'SquadMate': 1}, f'tags={tags}')
+        # 场景 B：第三方阵营（SU=3）不在攻守双方 → 整队不入池
+        # （先清 A 场景残留，断言 gate 拒绝后确实没有新入池）
+        POOL.remove(MATE_PID)
+        _MM_QUEUES.pop(MATE_PID, None)
+        members3 = [
+            {'id': 86031, 'player_id': MATE_PID, 'gamertag': 'SquadMate',
+             'char_name': 'MateChar', 'combat_xp': 0, 'faction': 3,
+             'character_id': MATE_CHAR, 'template': 4, 'status': 2},
+        ]
+        FLASH_SESSIONS['SquadMate'] = su
+        asyncio.run(matchmaking._enqueue_squad(
+            squad, members3, 10, (), 4242))
+        check('W4. 阵营不在攻守双方 → 不入任何池',
+              POOL.get(MATE_PID) is None and POOL.get(LEAD_PID) is not None,
+              f'mate={POOL.get(MATE_PID)}')
+    finally:
+        state.STORE = olds2[0]
+        war_campaign.current_underdog_mults = olds2[1]
+        matchmaking._try_form_all = olds2[2]
+        matchmaking._arm_ai_fill = olds2[3]
+        squad_mod.push_squad_rows_to_all_members = olds2[4]
+        FLASH_SESSIONS.pop('SquadLead', None)
+        FLASH_SESSIONS.pop('SquadMate', None)
+        for pid in (LEAD_PID, MATE_PID):
+            _MM_QUEUES.pop(pid, None)
+            _MATCH_PMM_IDS.pop(pid, None)
+            POOL.remove(pid)
+
+    failed = [l for l, ok in RESULTS[n0:] if not ok]
+    print(f'SQUAD_WAR_ROUTE: '
+          f'{"ALL PASS" if not failed else f"{len(failed)} FAILED: {failed}"} '
+          f'({len(RESULTS) - n0} checks)')
     return 1 if failed else 0
 
 

@@ -1315,6 +1315,31 @@ async def main():
                 _fp._AT_COMP = _orig_atcomp
                 _fp._MISSIONS.pop(9001, None)
 
+            # J8b 分线池口径 = AT 实际存量（war_ats 携带 comp，2026-09-15
+            #     修复：不再用模板满编 _AT_COMP，分线合计 = 攻方主池）；
+            #     同名 AT 各归各线（at_lane_aps 匹配即消耗，不再全撞首线）
+            _fp._MISSIONS[9005] = {
+                'mode': 'war', 'names': ['inf', 'inf'],
+                'names_by_faction': {1: ['inf', 'inf']},
+                'war_ats': {1: [
+                    {'id': 11, 'ap_tmpl': 8, 'comp': {1: 33}},
+                    {'id': 12, 'ap_tmpl': 15, 'comp': {1: 55}},
+                ]},
+                'attacker': 1, 'defender': 2,
+                'pool': {1: {1: 88}, 2: {1: 60}},
+                'lines': None, 'line_pool': None, 'ap_line': {},
+            }
+            try:
+                _fp.assign_lines(9005, 2, [8, 15])
+                check('J8b 分线池=AT 实际存量（线0=33/线1=55，合计=主池88）',
+                      _fp._MISSIONS[9005]['line_pool'] == [{1: 33}, {1: 55}],
+                      f'{_fp._MISSIONS[9005]["line_pool"]}')
+                check('J8b 同名 AT 各归各线（at_lane_aps 匹配即消耗）',
+                      _fp.at_lane_aps(9005, 1) == [8, 15],
+                      f'{_fp.at_lane_aps(9005, 1)}')
+            finally:
+                _fp._MISSIONS.pop(9005, None)
+
             # J9 war 激活线按进攻方向（用户口径：不随机凑 2-3 条，哪条
             # 线有进攻兵力就开哪条）——strict=True 只开命中本图的来向线
             _j9 = wardb.assault_ap_decision(204, 9002, prefer=(1164235,),
@@ -1551,6 +1576,29 @@ async def main():
               and st3b.city_owners.get(_w3b['id'], {}).get(20) == 1,
               f"win={st3b.battles[wb3b['id']]['winning_faction']} "
               f"owner={st3b.city_owners.get(_w3b['id'], {}).get(20)}")
+
+        # K3c 城攻双方 ≥216 → tie（war1.md「双方都满足则等待6小时后比较
+        #    兵力」，与 §7 伞兵分支同构；修复前攻方直接胜、守方满编判负）：
+        #    6h 窗口内不结算城不易主，超时后兵力少者败（300 vs 250 → 攻胜
+        #    占城）
+        st3c, _w3c, wb3c, _m3c = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ASSAULT, {1: 300}, {1: 250},
+            started=RN - datetime.timedelta(hours=1))
+        await war_campaign.automission_tick(st3c)
+        k3c_wait = (st3c.battles[wb3c['id']]['state'] == 0
+                    and st3c.city_owners.get(_w3c['id'], {}).get(20) != 1)
+        st3c.battles[wb3c['id']]['started_at'] = (
+            RN - datetime.timedelta(hours=7))
+        await war_campaign.automission_tick(st3c)
+        check('K3c 城攻双方达标 → tie，6h 后兵力少者败（攻 300 胜占城）',
+              k3c_wait
+              and st3c.battles[wb3c['id']]['winning_faction'] == 1
+              and st3c.city_owners.get(_w3c['id'], {}).get(20) == 1
+              and st3c.ats[402]['resources'] == {1: 187},
+              f"wait={k3c_wait} "
+              f"win={st3c.battles[wb3c['id']]['winning_faction']} "
+              f"owner={st3c.city_owners.get(_w3c['id'], {}).get(20)} "
+              f"res={st3c.ats[402]['resources']}")
 
         # K4 伞兵攻城：攻方伞兵（tpl 108）cat4 100 < 288 → 攻方败 +
         #    落地变步兵（convert_to 114 *_on_ground）
