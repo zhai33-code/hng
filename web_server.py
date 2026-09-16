@@ -959,7 +959,14 @@ def _handle_online_api(handler):
 class HttpHandler(SimpleHTTPRequestHandler):
     """Serve /status, /settings.js, and static files from the game directory."""
 
-    protocol_version = 'HTTP/1.0'
+    # HTTP/1.1 keep-alive：三方消费方已逆向实锤安全（hngsync/player.dll 同一份
+    # common\net\http.cpp：精确读 Content-Length/chunked，绝不 read-until-EOF；
+    # SWF 走 flash.net.URLLoader 标准栈）——证据见 docs/server-optimization-2026-09-16.md §1.3。
+    # 前提：所有响应必须带 Content-Length（否则 keep-alive 连接挂死）。
+    protocol_version = 'HTTP/1.1'
+    # keep-alive 连接空闲超时：超时后关闭连接，防止死连接长期占用 handler 线程
+    # （handle_one_request 捕获 socket.timeout 后自动置 close_connection）
+    timeout = 30
 
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=GAME_DIR, **kw)
@@ -1017,6 +1024,7 @@ class HttpHandler(SimpleHTTPRequestHandler):
             # 直接回 200，避免落入静态处理器把 GAME_DIR 根目录列表泄露给公网扫描器
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', '2')
             self.end_headers()
             self.wfile.write(b'OK')
             return
@@ -1026,10 +1034,12 @@ class HttpHandler(SimpleHTTPRequestHandler):
             # IP 直连版 swf（isGame=false）需 >400 才判开服，回 200 反而弹维护屏
             host = (self.headers.get('Host') or '').lower()
             ok = 'hng-group.com' in host
+            body = b'OK' if ok else b'Not Found'
             self.send_response(200 if ok else 404)
             self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            self.wfile.write(b'OK' if ok else b'Not Found')
+            self.wfile.write(body)
             return
         if path == '/api/captcha/get' or path == '//api/captcha/get':
             _handle_captcha_get(self)
@@ -1040,6 +1050,7 @@ class HttpHandler(SimpleHTTPRequestHandler):
         if path == '/settings.js' or path == '//settings.js':
             self.send_response(200)
             self.send_header('Content-Type', 'application/javascript')
+            self.send_header('Content-Length', str(len(SETTINGS_JS)))
             self.end_headers()
             self.wfile.write(SETTINGS_JS)
             return
@@ -1098,11 +1109,15 @@ class HttpHandler(SimpleHTTPRequestHandler):
                     body = f.read()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/octet-stream')
+                # 与全文件其余实体端点对齐（HTTP/1.0 靠连接关闭能工作，
+                # 但补上 Content-Length 消除定界歧义，也是未来 keep-alive 的前提）
+                self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
                 log(f'[HTTP] served /WarDatabase/{table_name} ({len(body)}B)')
             else:
                 self.send_response(404)
+                self.send_header('Content-Length', '0')
                 self.end_headers()
                 log(f'[HTTP] 404 /WarDatabase/{table_name} (not found)')
             return
@@ -1140,6 +1155,7 @@ class HttpHandler(SimpleHTTPRequestHandler):
             if body:
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/xml')
+                self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
                 log(f'[HTTP] served /undefined -> HnG_Strategy_en.xml ({len(body)}B)')

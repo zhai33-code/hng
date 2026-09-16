@@ -226,8 +226,16 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         # CommandNodeMorale → armyresource；battle/transport 段 M1 无数据）。
         # 必须在 subscriberesponse 之前发送（客户端收 response 即触发
         # viewSubscribedSignal 开始按表取数渲染）。
+        # player_id：reserve AT（补给队/运输机队）的 armyresource 行只推
+        # 属主（他人收到会在开战争图时触发客户端 #1009 卡死，见
+        # warmap_view.build_warmap_snapshot docstring）。
         sess.warmap_view_cmd = cmd_id
-        snapshot = await war_campaign.build_warmap_snapshot(STORE)
+        try:
+            pid = await sess.ensure_player()
+        except Exception:
+            pid = None
+        snapshot = await war_campaign.build_warmap_snapshot(
+            STORE, player_id=pid)
         for table_tag, row in snapshot:
             await _push_kvcs(writer, cmd_id, table_tag, row)
         n_tables = len({tag for tag, _ in snapshot})

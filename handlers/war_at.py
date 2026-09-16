@@ -597,7 +597,7 @@ async def _merge_parked_planes(at, proto, air_bf, war_id):
     take, events = await war_campaign.at_ops.merge_parked_planes(
         STORE, at, proto, air_bf, war_id)
     if events:
-        await war_campaign.broadcast_war_events(events)
+        await war_campaign.broadcast_war_events(events, STORE)
     return take
 
 
@@ -924,7 +924,7 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
                         war_campaign.msg_commandnode_instance_row(
                             at, at['war_id'],
                             war_campaign._faction_capital_bf())))
-            await war_campaign.broadcast_war_events(evs)
+            await war_campaign.broadcast_war_events(evs, STORE)
         cmd = _view_cmd(sess)
         if not cmd:
             return
@@ -1148,7 +1148,7 @@ async def _apply_resupply(at, pid, war, currency,
                         f'spawn failed: {ecode}')
                     continue
                 col_ids.append(col['id'] if col else 0)
-                await war_campaign.broadcast_war_events(events)
+                await war_campaign.broadcast_war_events(events, STORE)
             at = await STORE.get_command_node(at['id'])
             log(f'      [war] AT 补编(补给队) node={at["id"]} '
                 f'infantry={m_sold} vehicles={m_veh} '
@@ -1669,7 +1669,7 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                                     events.extend(
                                         await war_campaign.advance_movements(
                                             STORE, war))
-                                await war_campaign.broadcast_war_events(events)
+                                await war_campaign.broadcast_war_events(events, STORE)
                                 log(f'      [war] 运输机队换防 node={node_id}'
                                     f' -> bf={dest_bf}')
                                 code = (
@@ -1729,7 +1729,7 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                                     events.extend(
                                         await war_campaign.advance_movements(
                                             STORE, war))
-                                await war_campaign.broadcast_war_events(events)
+                                await war_campaign.broadcast_war_events(events, STORE)
                                 log(f'      [war] 空中单位飞行 node={node_id}'
                                     f' -> bf={dest_bf} attack={atk}')
                                 code = (
@@ -1775,7 +1775,7 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                                 for p in war_campaign.msg_armyresource_rows(
                                         at, war['id']):
                                     events.append(('set', b'armyresource', p))
-                                await war_campaign.broadcast_war_events(events)
+                                await war_campaign.broadcast_war_events(events, STORE)
                                 log(f'      [war] AT 空运 node={node_id} '
                                     f'-> bf={dest_bf} '
                                     f'({mm_config.WAR_AIR_TRANSIT_SECONDS}s)')
@@ -1811,7 +1811,7 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                                 events.extend(
                                     await war_campaign.advance_movements(
                                         STORE, war))
-                            await war_campaign.broadcast_war_events(events)
+                            await war_campaign.broadcast_war_events(events, STORE)
                             log(f'      [war] AT {"改道" if mv_cur is not None else "移动"} '
                                 f'node={node_id} '
                                 f'-> bf={dest_bf} segs={len(segs)}')
@@ -1877,6 +1877,11 @@ async def handle_get_assault_team_stats_request(sess, writer, cmd_id, req_type,
     n = 0
     if STORE is not None:
         for node_id in node_ids:
+            # HQ 实例 id 是 63 位随机数（mm_factions.FACTION_SUPREME
+            # COMMANDS，每次重启重生成），客户端把 CommandNodeDefinition
+            # 全表 id 发来时会带上 → int32 越界直接跳过（非错误路径）
+            if not (0 < node_id <= 0x7FFFFFFF):
+                continue
             at = None
             try:
                 at = await STORE.get_command_node(node_id)

@@ -707,7 +707,7 @@ async def main():
     # ---- F. war_tick 冒烟 ----
     broadcast_calls = []
 
-    async def _fake_broadcast(events):
+    async def _fake_broadcast(events, store=None):
         broadcast_calls.append(events)
 
     # 拆包后 monkeypatch 须打定义子模块 tick（__init__ re-export 不回流）
@@ -1820,6 +1820,32 @@ async def main():
               and st9.ats[401]['resources'] == {1: 40},
               f"win={st9.battles[wb9['id']]['winning_faction']} "
               f"res={st9.ats[401]['resources']}")
+
+        # K10 tie 持平收局（缺口 1，war-para-battle-briefing-investigation
+        #     .md）：双方兵力持平 → winner=0 + 伞兵照常落地（tpl 108→114）
+        #     + settle ③b 攻方（非城主）撤退、守方（城主）留守、不再成局
+        #     （修复前 tie 双方原地释放 → D 修复立即再成局 → battle churn =
+        #     城市信息图反复被自动关掉的根因）
+        st10, w10, wb10, _m10 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ASSAULT, {4: 300}, {1: 300},
+            atk_tpl=108, started=RN - datetime.timedelta(hours=7))
+        st10.city_owners[w10['id']] = {10: 1, 20: 2}
+        await war_campaign.automission_tick(st10)
+        r10 = await st10.get_last_movement(401)
+        check('K10 tie 持平：伞兵落地（tpl 114）+ 攻方撤退守方留守',
+              st10.ats[401]['template_id'] == 114
+              and st10.ats[401]['state'] == 1
+              and r10 and r10['path'][-1]['to_bf'] == 10
+              and st10.ats[402]['state'] == 0
+              and st10.ats[402]['map_entity_id'] == 20,
+              f"tpl={st10.ats[401]['template_id']} "
+              f"atk={st10.ats[401]['state']} def={st10.ats[402]['state']}")
+        check('K10b tie：battle 收局 winner=0 且不再成局（无 churn）',
+              st10.battles[wb10['id']]['state'] == 1
+              and st10.battles[wb10['id']]['winning_faction'] == 0
+              and len(st10.battles) == 1,
+              f"win={st10.battles[wb10['id']]['winning_faction']} "
+              f'battles={len(st10.battles)}')
     finally:
         wardb._load_preset = _orig_preset_loader
         wardb._load_capturepoint_templates = _orig_cp_loader
@@ -1913,6 +1939,217 @@ async def main():
               f'atk={atk_f4} dfd={dfd_f4}')
     finally:
         _st_l.STORE = _prev_store_l
+
+    # ---- M. war-para-battle-briefing-investigation.md §6 修复回归
+    #      （缺口 1 tie 撤退 / 缺口 2 第三阵营再成局 / 缺口 3 成局回滚）----
+    # M1 tie（winner=0）城战结算：攻方（非城主）撤退回出发城、守方
+    #     （城主）留守原地、无再成局（修复前 tie 双方原地释放 → D 修复
+    #     立即再成局 → formed/settled 无限循环 = 简报反复被关的根因）
+    stM1 = FakeStore()
+    warM1 = await war_campaign.ensure_war(stM1)
+    stM1.city_owners[warM1['id']] = {10: 1, 20: 2}
+    m1a = _mk_at(stM1, warM1['id'], 511, 1, 10)         # US 从 10 攻 20
+    m1d = _mk_at(stM1, warM1['id'], 512, 2, 20)         # GE 城主驻 20
+    await war_campaign.start_movement(stM1, m1a, 20, now=NOW)
+    await war_campaign.advance_movements(
+        stM1, warM1, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    wbM1 = next(iter(stM1.battles.values()))
+    stM1.ats[511]['resources'] = {1: 100}
+    stM1.ats[512]['resources'] = {1: 100}
+    await war_campaign.settle_war_battle(stM1, 0, wbM1['id'], 0)
+    rmv1 = await stM1.get_last_movement(511)
+    check('M1 tie：攻方撤退行军（state=1 回城 10）、守方城主留守',
+          stM1.ats[511]['state'] == 1
+          and rmv1 and rmv1['path'][-1]['to_bf'] == 10
+          and stM1.ats[512]['state'] == 0
+          and stM1.ats[512]['map_entity_id'] == 20,
+          f"atk={stM1.ats[511]['state']} def={stM1.ats[512]['state']}")
+    check('M1b tie：battle 收局 winning_faction=0 且不再成局（无 churn）',
+          stM1.battles[wbM1['id']]['state'] == 1
+          and stM1.battles[wbM1['id']]['winning_faction'] == 0
+          and len(stM1.battles) == 1,
+          f"win={stM1.battles[wbM1['id']]['winning_faction']} "
+          f'battles={len(stM1.battles)}')
+
+    # M2 战斗期间到场的第三阵营 AT：结算后 D 修复候选扩为全城非城主
+    #     state=0 AT（缺口 2）→ 以 SU 为基准再成局；修复前只扫 wb.factions
+    #     → SU 永不再成局（城上挂 AT 图标但永远没有会战）
+    stM2 = FakeStore()
+    warM2 = await war_campaign.ensure_war(stM2)
+    stM2.city_owners[warM2['id']] = {10: 2, 20: 1}
+    m2us = _mk_at(stM2, warM2['id'], 521, 1, 20)        # US 城主驻 20
+    m2ge = _mk_at(stM2, warM2['id'], 522, 2, 10)        # GE 从 10 攻 20
+    await war_campaign.start_movement(stM2, m2ge, 20, now=NOW)
+    await war_campaign.advance_movements(
+        stM2, warM2, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    m2su = _mk_at(stM2, warM2['id'], 523, 3, 30)        # SU 第三方到场
+    await war_campaign.start_movement(stM2, m2su, 20, now=NOW)
+    await war_campaign.advance_movements(
+        stM2, warM2,
+        now=NOW + datetime.timedelta(seconds=2 * SEG_SEC + 10))
+    wbM2 = next(iter(stM2.battles.values()))
+    check('M2 前置：GE vs US 成局 + SU 第三方到场不入战（两方制）',
+          {f['faction'] for f in wbM2['factions']} == {1, 2}
+          and stM2.ats[523]['state'] == 0
+          and stM2.ats[523]['map_entity_id'] == 20,
+          f"su={stM2.ats[523]['state']} "
+          f"factions={[f['faction'] for f in wbM2['factions']]}")
+    stM2.ats[521]['resources'] = {1: 100}
+    stM2.ats[522]['resources'] = {1: 100}
+    await war_campaign.settle_war_battle(stM2, 0, wbM2['id'], 1)
+    newM2 = [b for b in stM2.battles.values() if b['id'] != wbM2['id']]
+    check('M2 第三阵营再成局（D 候选扩全城）：SU 与城主 US 立即开新战',
+          len(newM2) == 1
+          and {f['faction'] for f in newM2[0]['factions']} == {1, 3}
+          and stM2.ats[521]['state'] == 2
+          and stM2.ats[523]['state'] == 2,
+          f'battles={[(b["id"], [f["faction"] for f in b["factions"]]) for b in stM2.battles.values()]}')
+    rmv2 = await stM2.get_last_movement(522)
+    check('M2b 败方 GE 撤退回出发城 10（winner>0 原行为不回归）',
+          stM2.ats[522]['state'] == 1
+          and rmv2 and rmv2['path'][-1]['to_bf'] == 10
+          and stM2.battles[wbM2['id']]['winning_faction'] == 1,
+          f"ge={stM2.ats[522]['state']}")
+
+    # M3 城战成局 mission record 落库失败 → 整体回滚（缺口 3）：battle
+    #     关闭 + 双方回待命 + 不推 battle 行（修复前"有 battle 无 mission"
+    #     半态 → 战图标记可点但 GetMissionDetails 恒 43 → 简报秒关）
+    stM3 = FakeStore()
+    warM3 = await war_campaign.ensure_war(stM3)
+    m3us = _mk_at(stM3, warM3['id'], 541, 1, 20)
+    m3ge = _mk_at(stM3, warM3['id'], 542, 2, 10)
+
+    async def _raise_mission(*_a, **_kw):
+        raise RuntimeError('db down')
+    stM3.create_mission_record = _raise_mission
+    await war_campaign.start_movement(stM3, m3ge, 20, now=NOW)
+    evM3 = await war_campaign.advance_movements(
+        stM3, warM3, now=NOW + datetime.timedelta(seconds=SEG_SEC + 5))
+    check('M3 城战成局失败回滚：battle 关闭 + 双方回待命、无 mission',
+          len(stM3.battles) == 1
+          and next(iter(stM3.battles.values()))['state'] == 1
+          and next(iter(stM3.battles.values()))['winning_faction'] == 0
+          and stM3.ats[541]['state'] == 0
+          and stM3.ats[542]['state'] == 0
+          and not stM3.mission_records,
+          f"us={stM3.ats[541]['state']} ge={stM3.ats[542]['state']}")
+    check('M3b 不推 battle 行（客户端无交战标记 → 简报不秒关）',
+          all(e[1] != b'battle' for e in evM3),
+          f'{[(e[0], e[1]) for e in evM3]}')
+
+    # M4 野外遭遇成局失败回滚（缺口 3 同源）：battle 关闭 + 双方恢复行军
+    #     （state=1）+ movement 仍 active + 不推 battle 行
+    _orig_tpls_m4 = wardb.commandnode_templates
+    wardb.commandnode_templates = lambda: {
+        901: {'id': 901, 'resources': {1: 100}, 'speed': 1.0},
+    }
+    try:
+        stM4 = FakeStore()
+        warM4 = await war_campaign.ensure_war(stM4)
+        m4a = _mk_at(stM4, warM4['id'], 551, 1, 10)
+        m4b = _mk_at(stM4, warM4['id'], 552, 2, 20)
+        m4a['template_id'] = 901
+        m4b['template_id'] = 901
+        mvM4a, _ = await war_campaign.start_movement(
+            stM4, m4a, 20, now=NOW)
+        mvM4b, _ = await war_campaign.start_movement(
+            stM4, m4b, 10, now=NOW)
+        stM4.create_mission_record = _raise_mission
+        evM4 = await war_campaign.advance_movements(
+            stM4, warM4, now=NOW + datetime.timedelta(seconds=SEG_SEC / 2))
+        check('M4 野外成局失败回滚：battle 关闭 + 双方恢复行军（state=1）',
+              len(stM4.battles) == 1
+              and next(iter(stM4.battles.values()))['state'] == 1
+              and stM4.ats[551]['state'] == 1
+              and stM4.ats[552]['state'] == 1
+              and stM4.movements[mvM4a['id']]['state'] == 0
+              and stM4.movements[mvM4b['id']]['state'] == 0
+              and not stM4.mission_records,
+              f"a={stM4.ats[551]['state']} b={stM4.ats[552]['state']}")
+        check('M4b 不推 battle 行',
+              all(e[1] != b'battle' for e in evM4),
+              f'{[(e[0], e[1]) for e in evM4]}')
+    finally:
+        wardb.commandnode_templates = _orig_tpls_m4
+
+    # ---- N. reserve AT armyresource 行属主过滤（2026-09-15 19:31 卡死）----
+    # 客户端链：非属主收到他人 reserve（补给队/空降拆分运输机队）资源行 →
+    # updateArmyResources 写 _reservesThatRequireParentUpdate（parent 永不在
+    # 本人列表）→ 开战争图 handleReservesMissingParentInfo 把 null parent
+    # 直传 addReserveResourcesToParentAssaultTeam → param2.templateId #1009。
+    # 修复：快照与广播两层均只把 reserve 资源行发给属主。
+    check('N0 _armyresource_row_at_id set/del 行归属解析',
+          war_campaign.tick._armyresource_row_at_id(
+              war_campaign.msg_armyresource_rows(
+                  {'id': 238, 'resources': {'10': 3}}, 1)[0]) == 238
+          and war_campaign.tick._armyresource_row_at_id(238 * 1000 + 10) == 238
+          and war_campaign.tick._armyresource_row_at_id(b'\x10\x01') is None)
+
+    stN = FakeStore()
+    warN = await war_campaign.ensure_war(stN)
+    own = _mk_at(stN, warN['id'], 91, 1, 10)      # owner_player_id=191
+    own['template_id'] = 104                      # reserve（4=补给队/机队族）
+    own['resources'] = {'10': 2}
+    inf = _mk_at(stN, warN['id'], 92, 1, 10)
+    inf['template_id'] = 103                      # 非 reserve 步兵
+    inf['resources'] = {'1': 90}
+
+    def _res_ids(snap):
+        return {int(pb_parse(p)[1]) for t, p in snap if t == b'armyresource'}
+
+    snap_own = await war_campaign.build_warmap_snapshot(
+        stN, warN, player_id=191)
+    snap_foreign = await war_campaign.build_warmap_snapshot(
+        stN, warN, player_id=999)
+    snap_anon = await war_campaign.build_warmap_snapshot(stN, warN)
+    check('N1 快照 reserve 资源行仅属主可见（匿名/他人全隐藏）',
+          _res_ids(snap_own) == {91 * 1000 + 10, 92 * 1000 + 1}
+          and _res_ids(snap_foreign) == {92 * 1000 + 1}
+          and _res_ids(snap_anon) == {92 * 1000 + 1})
+
+    class _FakeSessN:
+        def __init__(self, pid):
+            self.player_id = pid
+            self.warmap_view_cmd = 777
+            self.writer = object()
+
+        async def ensure_player(self):
+            return self.player_id
+
+    import state as state_mod
+    import messages as messages_mod
+    _fs_orig, _pb_orig = state_mod.FLASH_SESSIONS, messages_mod._push_kvcs_batch
+    captured = []
+
+    async def _fake_batch(w, cmd, evs, preserve_order=False):
+        captured.append(list(evs))
+
+    messages_mod._push_kvcs_batch = _fake_batch
+    state_mod.FLASH_SESSIONS = {1: _FakeSessN(191), 2: _FakeSessN(999),
+                                3: _FakeSessN(None)}
+    try:
+        evN = [('set', b'CommandNodeDefinition', b''),
+               ('set', b'armyresource',
+                war_campaign.msg_armyresource_rows(own, warN['id'])[0]),
+               ('set', b'armyresource',
+                war_campaign.msg_armyresource_rows(inf, warN['id'])[0]),
+               ('del', b'armyresource', 91 * 1000 + 10)]
+        await war_campaign.tick.broadcast_war_events(evN, stN)
+
+        def _ar_at_ids(c):
+            return [war_campaign.tick._armyresource_row_at_id(e[2])
+                    for e in c if e[1] == b'armyresource']
+
+        check('N2 广播 reserve set+del 行仅属主会话收到，非 armyresource 行全推',
+              len(captured) == 3
+              and _ar_at_ids(captured[0]) == [91, 92, 91]
+              and _ar_at_ids(captured[1]) == [92]
+              and _ar_at_ids(captured[2]) == [92]
+              and all(any(e[1] == b'CommandNodeDefinition' for e in c)
+                      for c in captured))
+    finally:
+        messages_mod._push_kvcs_batch = _pb_orig
+        state_mod.FLASH_SESSIONS = _fs_orig
 
     fails = [l for l, ok in RESULTS if not ok]
     print(f'\n{"="*50}\nwar_movement 回归：{len(RESULTS)-len(fails)}/{len(RESULTS)} PASS')

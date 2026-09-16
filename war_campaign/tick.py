@@ -469,11 +469,15 @@ async def _check_battle_formation(store, war_id, at, dest_bf):
     for e in enemies:
         await store.update_command_node(e['id'], state=2)
     if wb:
-        events.append(('set', b'battle', msg_battle_row(wb)))
         # M2：会战 → war mission record（GetMissionList 展示，玩家加入成
         # 真人局；mission_id = mission_records serial id，battle_id 关联）。
         # 攻守口径：城主=守方、非城主=攻方（_assault_sides，2026-09-14
         # 用户实测修正：苏联驻守德军进攻曾反）；城主未知退回先到者=攻方。
+        # 缺口 3（war-para-battle-briefing-investigation.md）：mission
+        # record 创建失败不能只记日志——"有 battle 无 mission"半态下
+        # 战图交战标记可点但 GetMissionDetails 恒 43 → 简报窗口秒关
+        # （点不开）；回滚整个成局（关会战 + 释放 AT 回待命，battle
+        # 行不推送），下次到达/D 修复重试。
         try:
             preset_pool = (mm_config.gamemode_cfg(10).get('fallback_presets')
                            or [])
@@ -490,8 +494,17 @@ async def _check_battle_formation(store, war_id, at, dest_bf):
                 battle_id=int(wb['id']))
             log(f'[war] battle {wb["id"]} formed → mission record id={mid} '
                 f'bf={dest_bf} atk={atk_f} def={def_f}')
-        except Exception as e:
-            log(f'[war] create war mission record failed: {e}')
+            events.append(('set', b'battle', msg_battle_row(wb)))
+        except Exception as ex:
+            log(f'[war] create war mission record failed: {ex} '
+                f'(battle {wb["id"]} rolled back)')
+            try:
+                await store.end_war_battle(int(wb['id']), 0)
+                await store.update_command_node(at['id'], state=0)
+                for e in enemies:
+                    await store.update_command_node(e['id'], state=0)
+            except Exception as ex2:
+                log(f'[war] rollback battle {wb["id"]} failed: {ex2}')
     return events
 
 
@@ -608,8 +621,10 @@ async def _check_field_encounters(store, war_id, now_ms=None):
                 await store.update_command_node(a['id'], state=2)
             if not wb:
                 continue
-            events.append(('set', b'battle', msg_battle_row(wb)))
-            field_battles[sl_id] = wb
+            # 缺口 3 同源（war-para-battle-briefing-investigation.md）：
+            # mission record 创建失败回滚整个成局（关会战 + 恢复行军
+            # state=1，battle 行不推送），避免"有 battle 无 mission"半态
+            # （战图标记可点但简报恒 43 秒关）
             try:
                 preset_pool = (mm_config.gamemode_cfg(10)
                                .get('fallback_presets') or [])
@@ -636,8 +651,18 @@ async def _check_field_encounters(store, war_id, now_ms=None):
                 log(f'[war] field battle {wb["id"]} formed on supplyline '
                     f'{sl_id} type={btype} pos={position:.2f} '
                     f'factions={sorted(facs)} → mission {mid}')
-            except Exception as e:
-                log(f'[war] create field mission record failed: {e}')
+                events.append(('set', b'battle', msg_battle_row(wb)))
+                field_battles[sl_id] = wb
+            except Exception as ex:
+                log(f'[war] create field mission record failed: {ex} '
+                    f'(battle {wb["id"]} rolled back)')
+                try:
+                    await store.end_war_battle(int(wb['id']), 0)
+                    for a in group:
+                        await store.update_command_node(a['id'], state=1)
+                except Exception as ex2:
+                    log(f'[war] rollback field battle {wb["id"]} '
+                        f'failed: {ex2}')
         return events
     except Exception as e:
         log(f'[war] _check_field_encounters failed: {e}')
@@ -786,25 +811,90 @@ async def _capture_city_events(store, war_id, faction, bf_id,
         return []
 
 
-async def broadcast_war_events(events):
+def _armyresource_row_at_id(payload):
+    """armyresource 事件行的归属 AT id：set 行解析 proto f1（id=at*1000+cat）
+    前导 varint；del 行 payload 即行 id。解析失败（HQ base|cat 行等）返回
+    None（调用方按"非 reserve AT"放行）。"""
+    try:
+        if isinstance(payload, (bytes, bytearray)):
+            if not payload or payload[0] != 0x08:      # field 1, varint
+                return None
+            val = shift = 0
+            for i in range(1, len(payload)):
+                b = payload[i]
+                val |= (b & 0x7F) << shift
+                if not (b & 0x80):
+                    return val // 1000
+                shift += 7
+            return None
+        return int(payload) // 1000
+    except Exception:
+        return None
+
+
+async def _reserve_owner_map(store):
+    """当前战争 reserve AT 归属表 {at_id: owner_player_id}（广播过滤用）。
+
+    查询失败返回 {}（等同不过滤，维持可用性——快照/属主路径不受影响）。"""
+    try:
+        war = await ensure_war(store)
+        if war is None:
+            return {}
+        ats = await store.list_war_command_nodes(war['id'])
+        return {int(a['id']): int(a.get('owner_player_id') or 0)
+                for a in ats if is_reserve(a)}
+    except Exception as e:
+        log(f'[war] reserve owner map failed: {e}')
+        return {}
+
+
+async def broadcast_war_events(events, store=None):
     """战争事件广播：全部 warmapview 订阅会话（含敌我视角）。整批事件
     单条 KeyValueChangeSet 推送（原子性见 _push_kvcs_batch——到达等
     跨行状态迁移要求 set 与 del 行在同一派发批内互相可见）。
     preserve_order=True：到达/途经中止推序是 del segment → set
     instance → del destination 的交错序列（客户端 AT 列表 status
     重算时机依赖此序，2026-09-15 城市名修复），不能被 dels-first
-    重排；其余流程事件本身即 del 先 set 后，保序模式下派发不变。"""
+    重排；其余流程事件本身即 del 先 set 后，保序模式下派发不变。
+
+    reserve AT（补给队/空降拆分运输机队）的 armyresource 行只对属主
+    会话可见（官方口径）：非属主客户端 updateArmyResources 把"他人
+    reserve 的 parent 不在本人 AT 列表"写进 _reservesThatRequireParent
+    Update，开战争图 handleReservesMissingParentInfo 把 null parent
+    直传 addReserveResourcesToParentAssaultTeam → param2.templateId
+    Error #1009 卡死（2026-09-15 19:31 VPS 实锤）。store=None 时退化为
+    不过滤（兼容无 store 的旧调用面）。"""
     if not events:
         return
     from state import FLASH_SESSIONS
     from messages import _push_kvcs_batch
+    restricted = {}
+    if (store is not None and getattr(store, 'pool', None) is not None
+            and any(e[1] == b'armyresource' for e in events)):
+        restricted = await _reserve_owner_map(store)
     for sess in list(FLASH_SESSIONS.values()):
         cmd = getattr(sess, 'warmap_view_cmd', None)
         w = getattr(sess, 'writer', None)
         if not cmd or not w:
             continue
+        out = events
+        if restricted:
+            try:
+                pid = sess.ensure_player and await sess.ensure_player()
+            except Exception:
+                pid = None
+            pid = int(pid) if pid is not None else 0
+            out = []
+            for e in events:
+                if e[1] == b'armyresource':
+                    at_id = _armyresource_row_at_id(e[2])
+                    owner = restricted.get(at_id) if at_id else None
+                    # pid=0（未知/未登录）：宁缺毋错，reserve 行全部丢弃
+                    if owner is not None and (not pid or owner != pid):
+                        continue
+                out.append(e)
         try:
-            await _push_kvcs_batch(w, cmd, events, preserve_order=True)
+            await _push_kvcs_batch(w, cmd, out, preserve_order=True)
         except Exception:
             pass          # 单会话故障不影响其他订阅者
 
@@ -842,7 +932,7 @@ async def war_tick(store):
     await production_tick(store)
     await supply_queue_tick(store)
     if events:
-        await broadcast_war_events(events)
+        await broadcast_war_events(events, store)
     # ★ 直接占领触发胜负判定（2026-09-08 补）：到达/换段/空运占城（尤其
     # 敌方主城）后立即 check_victory——此前仅会战结算路径检查，直接占领
     # 最后主城后战争挂起直到下一次会战结算才结束（用户报"占了对面主城
@@ -1167,23 +1257,33 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                         f'{wat.get("name")!r} moved in from accesspoint '
                         f'to battlefield {dest_bf}')
 
-        # ③b 城战败方撤退（官方 war1.md：战败方撤退离场、胜方驻守）：
+        # ③b 城战非胜方撤退（官方 war1.md：战败方撤退离场、胜方驻守）：
         #     败方 AT 原地释放会与胜方同城对峙 → D 修复立即重开新局 →
         #     无限连环消耗编制（2026-09-14 用户实测：无人加入的局每
         #     5.5 分钟结算一次反复扣兵、战局永不结束）。撤退落点优先
         #     进攻路线上最近的己方据点：沿本次进攻 movement 路径从
         #     dest_bf 逐段回退，取路线上最近的仍己方城市；路线全丢或
         #     无路径 → 最近友方城（补给线 BFS），无友方城回首都兜底。
-        if not is_field and dest_bf and winner:
+        #     tie（winner=0）同样撤退（2026-09-16 缺口 1，
+        #     war-para-battle-briefing-investigation.md）：原 `and winner`
+        #     门控下 tie 双方原地释放（state=0 留同城）→ D 修复立即
+        #     再成局 → formed/settled 无限循环（battle 行 churn = 战图
+        #     交战标记反复消失重建、客户端"城市信息图"反复被自动关掉）。
+        #     留守口径：有胜方 = 胜方留守（原行为）；tie = 城主（守方）
+        #     留守、攻方撤退；城主未知（0）时 tie 全撤（宁撤不循环）。
+        if not is_field and dest_bf:
             city_owners = dict(await store.get_war_cities(war_id))
+            stay = ({int(winner)} if winner
+                    else {int(city_owners.get(int(dest_bf)) or 0)}
+                    - {0})
             for entry in (wb.get('factions') or []):
                 at = await store.get_command_node(
                     int(entry.get('at_id') or 0))
                 if (not at or not at.get('is_deployed')
-                        or int(at.get('faction') or 0) == winner
+                        or int(at.get('faction') or 0) in stay
                         or int(at.get('state') or 0) != 0
                         or at_current_battlefield(at) != dest_bf):
-                    continue    # 胜方驻守 / 已歼灭 / 已投降撤回 / 已离场
+                    continue    # 胜方/城主驻守 / 已歼灭 / 已投降撤回 / 已离场
                 f_at = int(at.get('faction') or 0)
                 # 进攻路线撤退：沿最近一次 movement 路径尾部通往 dest_bf
                 # 的连续段由近及远回退，取路线上最近的仍己方据点
@@ -1233,9 +1333,10 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                     events.append(
                         ('set', b'CommandNodeWarInstance',
                          msg_commandnode_instance_row(at, war_id, caps)))
-                log(f'[war] battle {battle_id}: defeated AT {at["id"]} '
+                log(f'[war] battle {battle_id}: AT {at["id"]} '
                     f'{at.get("name")!r} (faction {f_at}) retreated '
-                    f'from battlefield {dest_bf} to {target}')
+                    f'from battlefield {dest_bf} to {target}'
+                    + ('' if winner else '（tie 攻方撤退）'))
 
         # ⑤b 缴获入账（war 局）：败方 AT 未投入的池剩余 → 胜方阵营库存，
         #     推送 HQ armyresource 行（在线客户端资源视图实时上涨）
@@ -1276,19 +1377,26 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
         # 攻方=非城主阵营（城主=守方）——原"胜方 AT 为基准"在守方胜
         # 时把驻守方标成攻方 → 攻防反转；正常两方局败方已 ③b 撤退，
         # 无候选自然不成新局（战局终结、战图标记消失）。
+        # 候选从 wb.factions 扩为全城驻军（2026-09-16 缺口 2，
+        # war-para-battle-briefing-investigation.md）：战斗期间到场的
+        # 第三阵营 AT 被两方制排除、不在 factions 名单 → 只扫 factions
+        # 时其与城主的对峙永不再成局（城上长期挂 AT 图标但永远没有
+        # 会战 → 点击只能开"未有交战"的城市信息图）；候选口径与
+        # _check_battle_formation enemies 判据同源（已部署/非补给队/
+        # state=0 驻城/非城主）。
         if dest_bf:
             owner_after = await _city_owner_faction(store, war_id, dest_bf)
-            for entry in (wb.get('factions') or []):
-                at2 = await store.get_command_node(
-                    int(entry.get('at_id') or 0))
-                if (at2 and int(at2.get('state') or 0) == 0
-                        and at2.get('is_deployed')
-                        and (not owner_after
-                             or int(at2.get('faction') or 0) != owner_after)
-                        and at_current_battlefield(at2) == dest_bf):
-                    events.extend(await _check_battle_formation(
-                        store, war_id, at2, dest_bf))
-                    break
+            candidates = sorted(
+                (o for o in await store.list_war_command_nodes(war_id)
+                 if o.get('is_deployed') and not is_reserve(o)
+                 and int(o.get('state') or 0) == 0
+                 and (not owner_after
+                      or int(o.get('faction') or 0) != owner_after)
+                 and at_current_battlefield(o) == int(dest_bf)),
+                key=lambda o: int(o['id']))
+            if candidates:
+                events.extend(await _check_battle_formation(
+                    store, war_id, candidates[0], dest_bf))
         return events
     except Exception as e:
         log(f'[war] settle_war_battle({battle_id}) failed: {e}')

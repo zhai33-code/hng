@@ -1621,7 +1621,7 @@ async def _settle_war_mission(mission_id, report):
     try:
         events = await war_campaign.settle_war_battle(
             STORE, int(mission_id), battle_id, winner, captured=captured)
-        await war_campaign.broadcast_war_events(events)
+        await war_campaign.broadcast_war_events(events, STORE)
     except Exception as e:
         log(f'      [war] settle battle {battle_id} (mission={mission_id}) '
             f'failed: {e}')

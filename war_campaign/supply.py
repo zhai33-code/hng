@@ -471,7 +471,7 @@ async def supply_queue_tick(store):
                            msg_commandnode_instance_row(at, war['id'], caps)))
             for p in msg_armyresource_rows(at, war['id']):
                 events.append(('set', b'armyresource', p))
-        await broadcast_war_events(events)
+        await broadcast_war_events(events, store)
         windows = await supply_windows(store, war)
         queue_rows = mm_factions._msg_faction_queue_rows(windows)
         cons = mm_factions._msg_faction_resource_rows(windows)[1]

@@ -193,7 +193,13 @@ async def _judge_threshold(store, wb, mrec, now_s):
     if def_inf > atk_inf:
         extra = await _paras_land(store, atk_ats) if is_para else []
         return def_fac, extra
-    return 0, []
+    # 持平无胜方收局（winner=0）：伞兵照常落地（缺口 1，
+    # war-para-battle-briefing-investigation.md）——否则空中原型
+    # （cat4+cat10）悬在敌城，settle tie 分支撤退后下一 tick 到达
+    # 判定又反复入战；settle_war_battle ③b 对 tie 攻方（非城主）
+    # 撤退、守方留守，不再成局循环
+    extra = await _paras_land(store, atk_ats) if is_para else []
+    return 0, extra
 
 
 async def _power_winner(store, wb):
@@ -252,7 +258,7 @@ async def automission_tick(store):
                     loss_ratios=(mm_config.WAR_AUTOMISSION_WINNER_LOSS,
                                  mm_config.WAR_AUTOMISSION_LOSER_LOSS),
                     is_auto=True)
-                await broadcast_war_events(events)
+                await broadcast_war_events(events, store)
                 continue
             # ---- 准备期阈值判定（§3/§4/§7/§8）----
             judged = await _judge_threshold(store, wb, mrec, now_s)
@@ -272,6 +278,6 @@ async def automission_tick(store):
                 winner,
                 loss_ratios=(0.0, mm_config.WAR_AUTO_LOSS),
                 is_auto=True)      # 系统判定不提供经验（war1.md）
-            await broadcast_war_events(list(extra) + list(events))
+            await broadcast_war_events(list(extra) + list(events), store)
     except Exception as e:
         log(f'[war] automission_tick failed: {e}')

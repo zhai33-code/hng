@@ -533,8 +533,12 @@ class WarStoreMixin:
 
     async def enqueue_war_supply(self, war_id, faction, command_node_id,
                                  items):
-        """AT 增援缺口入队（FIFO）：items={category_id: count}，逐行写
-        queue_number = 阵营内 COALESCE(MAX,0)+1 单调分配。返回入队行数。"""
+        """AT 增援缺口入队（FIFO）：items={category_id: count}，
+        queue_number = 阵营内单调递增，返回入队行数。
+        并发安全（2026-09-16 审计 §2）：事务级咨询锁按 (war_id, faction)
+        串行化取号——原实现每行 INSERT 内嵌 MAX() 子查询，两个并发事务
+        互相看不到未提交行会取到相同 MAX → queue_number 重复、FIFO 出队
+        乱序；锁在事务结束自动释放，无需手工解锁。"""
         rows = [(int(war_id), int(faction), int(command_node_id),
                  int(cat), int(cnt)) for cat, cnt in (items or {}).items()
                 if int(cnt) > 0]
@@ -542,15 +546,23 @@ class WarStoreMixin:
             return 0
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                for wid, fac, cnid, cat, cnt in rows:
-                    await conn.execute(
-                        'INSERT INTO war_supply_queue '
-                        '(war_id, faction, command_node_id, category_id, '
-                        'count, queue_number) VALUES '
-                        '($1, $2, $3, $4, $5, COALESCE('
-                        '(SELECT MAX(queue_number) FROM war_supply_queue '
-                        ' WHERE war_id = $1 AND faction = $2), 0) + 1)',
-                        wid, fac, cnid, cat, cnt)
+                await conn.execute(
+                    'SELECT pg_advisory_xact_lock($1::int, $2::int)',
+                    int(war_id), int(faction))
+                row = await conn.fetchrow(
+                    'SELECT COALESCE(MAX(queue_number), 0) AS m '
+                    'FROM war_supply_queue '
+                    'WHERE war_id = $1 AND faction = $2',
+                    int(war_id), int(faction))
+                base = int(row['m'])
+                await conn.executemany(
+                    'INSERT INTO war_supply_queue '
+                    '(war_id, faction, command_node_id, category_id, '
+                    'count, queue_number) VALUES '
+                    '($1, $2, $3, $4, $5, $6)',
+                    [(wid, fac, cnid, cat, cnt, base + i + 1)
+                     for i, (wid, fac, cnid, cat, cnt)
+                     in enumerate(rows)])
         return len(rows)
 
     async def list_war_supply_queue(self, war_id, faction=None,

@@ -238,9 +238,17 @@ def msg_commandnode_morale_row(at, war_id):
     return m
 
 
-async def build_warmap_snapshot(store, war=None):
+async def build_warmap_snapshot(store, war=None, player_id=None):
     """warmapview 全量快照行 [(xmlTag, row_proto), ...]（推送序=§4.3）。
 
+    player_id：订阅会话的 player id。他人 reserve AT（补给队/空降拆分
+    运输机队）的 armyresource 行只推属主（官方口径，player_id 不匹配或
+    未知一律不推）：非属主客户端 AssaultTeamModel.updateArmyResources 收到
+    他人 reserve 资源行即写 _reservesThatRequireParentUpdate（parent 是
+    他人 AT 永不在本人列表），开战争图 handleReservesMissingParentInfo 把
+    null parent 直传 addReserveResourcesToParentAssaultTeam →
+    param2.templateId Error #1009 客户端卡死（2026-09-15 19:31 VPS 实锤：
+    GE 伞兵空降拆分运输机队后 SU 玩家开战争图即崩）。
     DB 不可用/无战争返回 []（调用方仅回 subscriberesponse）。
     battle/transport 段 M1 无数据（会战成局 Phase 6）。"""
     from .at_movement import at_current_battlefield, movement_segments
@@ -276,6 +284,11 @@ async def build_warmap_snapshot(store, war=None):
             rows.append((b'CommandNodeMorale',
                          msg_commandnode_morale_row(at, war_id)))
         for at in ats:
+            # reserve AT 资源行仅属主可见（见函数 docstring #1009 崩溃链；
+            # player_id 未知（None）→ -1 永不匹配 → 宁缺毋错全隐藏）
+            if is_reserve(at) and int(at.get('owner_player_id') or 0) \
+                    != int(player_id if player_id is not None else -1):
+                continue
             for p in msg_armyresource_rows(at, war_id):
                 rows.append((b'armyresource', p))
         # 已部署空中半径单位（§10.2 #6/#7）：airbase 行（客户端
