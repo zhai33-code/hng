@@ -239,16 +239,27 @@ def main():
 
             # ---- E. push_relogin_rejoin：保护期内推 / 过期不推 ----
             w_e = FakeWriter()
-            check('E1 保护期内重登 → 推 REJOIN 行（返回 True）',
+            check('E1 保护期内重登（无 deadline）→ 推 REJOIN 行（返回 True）',
                   asyncio.run(matchmaking.push_relogin_rejoin(
                       w_e, 105, 700003)) is True and
                   b'PlayerMissionSession' in w_e.data)
+            # E2：有 deadline → timeAdmitted 回溯掉线时刻（deadline − 300），
+            #     客户端倒计时显示真实剩余窗口，不从 300s 重新起算
+            dl_e = time.time() + 180            # 已掉线 120s、剩 180s
+            mm_state.PMS_TO_SESSION[610004]['rejoin_deadline'] = dl_e
+            w_e2 = FakeWriter()
+            ok_e2 = asyncio.run(matchmaking.push_relogin_rejoin(
+                w_e2, 105, 700003)) is True
+            want_ta = time.strftime(
+                '%Y%m%d%H%M%S', time.gmtime(dl_e - 300)).encode() + b'Z'
+            check('E2 有 deadline → timeAdmitted=掉线时刻（倒计时真实剩余）',
+                  ok_e2 and want_ta in w_e2.data)
             mm_state.PMS_TO_SESSION[610004]['rejoin_deadline'] = \
                 time.time() - 1
-            w_e2 = FakeWriter()
-            check('E2 掉线超时后重登 → 不推（正常进大厅）',
+            w_e3 = FakeWriter()
+            check('E3 掉线超时后重登 → 不推（正常进大厅）',
                   asyncio.run(matchmaking.push_relogin_rejoin(
-                      w_e2, 105, 700003)) is False and w_e2.data == b'')
+                      w_e3, 105, 700003)) is False and w_e3.data == b'')
 
             # ---- F. on_game_client_closed：崩溃/被杀路径 ----
             mm_state.PMS_TO_SESSION[610004].pop('rejoin_deadline', None)

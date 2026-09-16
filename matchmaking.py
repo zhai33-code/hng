@@ -559,6 +559,11 @@ def _zulu_now():
     return time.strftime('%Y%m%d%H%M%S', time.gmtime()) + 'Z'
 
 
+def _zulu_from_ts(ts):
+    """时间戳 → 客户端可解析的 UTC 时间字符串（timeAdmitted 回溯推算用）。"""
+    return time.strftime('%Y%m%d%H%M%S', time.gmtime(ts)) + 'Z'
+
+
 def _zulu_activated(offset_sec=3600):
     """MissionInfo.activationTimeStamp 专用：取过去时间。
 
@@ -2598,8 +2603,14 @@ async def push_relogin_rejoin(writer, view_cmd, pid):
       +资产同步后才置 true，PMS 行在 missionview 订阅响应中到达必然
       早于该时刻 → 不拉起，走倒计时分支弹出战局详情（与优雅退出后
       300s 倒计时弹窗同一代码路径，已实测）；
-    - timeAdmitted 刷新为当前（该字段同时是 Admitted 分支 300s 会话
-      丢失倒时基，推旧值会秒判 GAME_TIMED_OUT）；
+    - ★ timeAdmitted = 掉线时刻（2026-09-16 修正，官服语义=席位保护窗口
+      从掉线时刻连续计算）：该字段是 Admitted 分支 300s 会话丢失倒计时基点，
+      客户端算 剩余 = timeAdmitted + 300s − serverTime。有 rejoin_deadline
+      时推 deadline − REJOIN_TIMEOUT（= 掉线时刻），倒计时显示真实剩余
+      窗口；推当前时刻会让倒计时从 300s 重新起算、且与服务端 sweep 的
+      释放时刻脱节（客户端还在倒数、服务端已删行）。推比掉线时刻更旧的
+      值则秒判 GAME_TIMED_OUT。无 deadline（hng.exe 仍在线的 Flash 重连）
+      回退当前时刻；
     - 附带 BattleInfo 'set'（同局同 id 幂等）：PMS 行在而 BattleInfo
       缺失时客户端不连 game server（见 _push_player_into_mission）；
     - ★ 小队行重推（2026-09-08 四修）：临时凑的小队只存内存
@@ -2635,12 +2646,22 @@ async def push_relogin_rejoin(writer, view_cmd, pid):
     game_connect = _game_connect_for(inst)   # 该局所在主机对外地址:端口
     pos = battlefield_pos(int(det.get('map_entity_id') or 0)
                           or MISSION_MAP_ENTITY_ID)
+    # ★ timeAdmitted：有掉线保护 → 回溯掉线时刻（deadline − REJOIN_TIMEOUT），
+    #   客户端倒计时显示真实剩余窗口（与服务端 sweep 释放时刻同步走零），
+    #   不从 300s 重新起算；无 deadline 回退当前时刻。
+    dl = rec.get('rejoin_deadline')
+    if dl:
+        time_admitted = _zulu_from_ts(float(dl) - mm_config.REJOIN_TIMEOUT)
+        remain = max(0, int(float(dl) - time.time()))
+    else:
+        time_admitted = _zulu_now()
+        remain = None
     await _push_kvcs(writer, view_cmd, b'PlayerMissionSession',
                      _msg_player_mission_session(
                          pms_id, int(rec['player_id']), gamertag,
                          int(rec.get('char_id', 0) or 0),
                          int(rec.get('faction', 3) or 3),
-                         char_name, rank, mission_id, _zulu_now(),
+                         char_name, rank, mission_id, time_admitted,
                          game_connect,
                          metrics_uid=rec.get('metrics_uid') or str(uuid.uuid4()),
                          metrics_session_id=int(
@@ -2653,7 +2674,9 @@ async def push_relogin_rejoin(writer, view_cmd, pid):
                      _msg_battle_info(mission_id, pos[0], pos[1]))
     _log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet (PlayerMissionSession '
          f'id={pms_id}, player={rec.get("player_id")}, '
-         f'mission={mission_id}, state=2 Admitted ★relogin rejoin)')
+         f'mission={mission_id}, state=2 Admitted ★relogin rejoin, '
+         f'timeAdmitted=drop-time'
+         f'{f" (~{remain}s left)" if remain is not None else ""})')
     # ★ 四修（2026-09-08）：小队行重推——临时凑的小队（_MM_MISSION_SQUADS
     # 内存登记，非 DB）重登后无人推 → 客户端 SquadSession/SquadMemberSession
     # 表全空，小队面板不恢复（大厅看不到同队队友）。按入局时同一套逻辑推：
