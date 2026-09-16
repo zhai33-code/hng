@@ -1602,7 +1602,13 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
             at, code = await _load_at(pid, node_id, war)
             mv_cur = None          # 在途移动（state=1 改道用）
             if not code:
-                if not at.get('is_deployed'):
+                if war_campaign.is_reserve(at):
+                    # reserve（补给队 / 空降拆分运输机队）：无飞行员，
+                    # 官服口径不能手动拖动移动——补给队自动机动或在出生
+                    # 机场原地等本体来合并；停驻机队只能自动返航或被
+                    # re-use 合并
+                    code = war_campaign.RC_COMMANDNODE_NOT_DEPLOYABLE
+                elif not at.get('is_deployed'):
                     code = war_campaign.RC_COMMANDNODE_NOT_DEPLOYABLE
                 elif int(at.get('state') or 0) == 2:
                     code = war_campaign.RC_COMMANDNODE_IN_BATTLE
@@ -1629,52 +1635,7 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                         code = war_campaign.RC_FAIL
                     if not code and not dest_bf:
                         code = war_campaign.RC_FAIL
-                    if not code and war_campaign.is_parked_planes_at(at):
-                        # ---- 独立运输机队（空降拆分产物，reserve 模板 +
-                        #      airbase_bf>0）：官服口径只能飞己方机场
-                        #      （交战机场亦可，reserve 例外）；不走补给线
-                        #      BFS、不消耗 cat10（本身是运输机）。
-                        #      判定先于 radius 分支——停驻机队语义更
-                        #      specific（到达走 paradrop_return 落位，
-                        #      非 radius 到达/补给队汇合）----
-                        if override_ap:
-                            # airborne 单位不可落出兵点
-                            code = war_campaign.RC_CANNOT_FIND_COMMANDNODE
-                        else:
-                            pmv, pcode = (
-                                await war_campaign.start_planes_rebase(
-                                    STORE, war, at, dest_bf,
-                                    override_move=override_move))
-                            if pcode != war_campaign.RC_OK or pmv is None:
-                                code = pcode
-                            else:
-                                at = await STORE.get_command_node(at['id'])
-                                segs = war_campaign.movement_segments(pmv)
-                                caps = war_campaign._faction_capital_bf()
-                                events = [
-                                    ('set', b'air_transport',
-                                     war_campaign.msg_air_transport_row(
-                                         at, war['id'], pmv, segs[0])),
-                                    ('set', b'CommandNodeWarInstance',
-                                     war_campaign.
-                                     msg_commandnode_instance_row(
-                                         at, war['id'], caps))]
-                                for p in war_campaign.msg_armyresource_rows(
-                                        at, war['id']):
-                                    events.append(
-                                        ('set', b'armyresource', p))
-                                if override_move:
-                                    # 瞬移：立即推进入途到达（落位机场 +
-                                    # airbase_bf 更新含在内）
-                                    events.extend(
-                                        await war_campaign.advance_movements(
-                                            STORE, war))
-                                await war_campaign.broadcast_war_events(events, STORE)
-                                log(f'      [war] 运输机队换防 node={node_id}'
-                                    f' -> bf={dest_bf}')
-                                code = (
-                                    war_campaign.RC_RELOCATING_TO_NEW_AIRBASE)
-                    elif not code and war_campaign.is_radius_unit(at):
+                    if not code and war_campaign.is_radius_unit(at):
                         # ---- 空中半径单位（§10.2 #6/#7）：不走补给线，
                         # 按攻击/运输半径直达（CommandnodeArrow 半径规则）；
                         # 不消耗 cat10 运输机（空运回退仅地面 AT）----

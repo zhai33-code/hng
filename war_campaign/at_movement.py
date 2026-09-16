@@ -30,7 +30,6 @@ from .at_ops import (
     is_aircraft,
     _tpl_of,
     is_reserve,
-    is_parked_planes_at,
     )
 from .warmap_view import (
     _ap_battlefield,
@@ -429,65 +428,6 @@ async def start_radius_move(store, war, at, target_bf, override_move=False,
         arrive_at=now + datetime.timedelta(seconds=seconds))
     await store.update_command_node(at['id'], state=1)
     return mv, RC_OK, is_attack
-
-
-async def start_planes_rebase(store, war, at, target_bf, override_move=False,
-                              now=None):
-    """独立运输机队换防（is_parked_planes_at）：只能飞己方机场（交战机场
-    亦可——reserve 例外），单段 air 无限半径（reserve 模板半径 -1）。
-    移速 = 母伞兵 AT 模板速度（paratroopers 2.7 / pathfinders 3.0——
-    运输机 cat10 的巡航速度，split_aircraft_back 返航同款口径）；
-    reserve 模板自身 speed=1.0 是地面补给队口径，直接用会拖慢 ~3 倍。
-    段带 paradrop_return 旗标 → 到达走运输机队落位分支
-    （不汇合/不追击/不占城/不成战）并更新 airbase_bf（旧机 re-use
-    合并以 airbase_bf 匹配）。
-
-    返回 (movement, error_code)；目标非机场/非己方 → RC_CANNOT_FIND_COMMANDNODE。"""
-    cur_bf = at_current_battlefield(at)
-    target_bf = int(target_bf or 0)
-    if (not cur_bf or not target_bf or cur_bf == target_bf
-            or not is_parked_planes_at(at)):
-        return None, RC_CANNOT_FIND_COMMANDNODE
-    if not is_airfield(target_bf):
-        return None, RC_CANNOT_FIND_COMMANDNODE
-    try:
-        owners = dict(await store.get_war_cities(war['id']))
-    except Exception:
-        owners = {}
-    if int(owners.get(target_bf, 0) or 0) != int(at.get('faction') or 0):
-        return None, RC_CANNOT_FIND_COMMANDNODE
-    # 移速：伞兵空中原型速度（用户实报"用伞兵部队的空中速度"）——
-    # 优先母 AT；母 AT 是落地变体（*_on_ground 地面速度 0.48，机队
-    # 换防最常见场景：伞兵落地步行中机队调防）→ 取其 convert_to
-    # 空中原型速度；母 AT 已不在（理论不达：汇合软删时机队已并入）
-    # 回退自身模板速度
-    speed = at_speed(at)
-    try:
-        parent = await store.get_command_node(
-            int(at.get('parent_command_node_id') or 0))
-    except Exception:
-        parent = None
-    if parent:
-        ptpl = wardb.commandnode_templates().get(
-            int(parent.get('template_id') or 0)) or {}
-        if str(ptpl.get('name') or '').endswith('_on_ground'):
-            ptpl = (wardb.commandnode_templates().get(
-                int(ptpl.get('convert_to') or 0)) or ptpl)
-        try:
-            speed = float(ptpl.get('speed') or 0) or 1.0
-        except (TypeError, ValueError):
-            speed = 1.0
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    seconds = (0 if override_move
-               else segment_seconds(cur_bf, target_bf, speed, air=True))
-    seg = {'from_bf': cur_bf, 'to_bf': target_bf, 'sl_id': 0,
-           'from_ap': 0, 'to_ap': 0, 'seconds': seconds, 'air': True,
-           'paradrop_return': True}
-    mv = await store.create_movement(
-        at['id'], at['war_id'], [seg], started_at=now,
-        arrive_at=now + datetime.timedelta(seconds=seconds))
-    await store.update_command_node(at['id'], state=1)
-    return mv, RC_OK
 
 
 # ---- 交战撤退（war1.md §撤退：沿友方路线行军撤离，非闪现）----

@@ -355,8 +355,9 @@ async def release_player_mission_sessions(pid, writer=None, view_cmd=None,
     """释放玩家全部战局会话（abandon 收尾 / rejoin 掉线超时清理共用核心，
     2026-09-08 从 handle_abandon_mission 提取，行为不变）。
 
-    - mission_records → state=3（有记录的局；sweep 超时同 abandon 口径，
-      防 GetMissionList 空壳局）
+    - mission_records → state=3 仅随「全员离场」（下方 players 清空分支；
+      个人 abandon 不动——多人局一人退出整局从 GetMissionList 消失 /
+      war 局城市详情全灭，2026-09-16 remote-log 实锤）
     - PMS DELETE + 小队重置（writer/view_cmd 给定 = Flash 在线时推送；
       离线只清内部状态，重登登录序列自然回大厅）
     - PMS_TO_SESSION/PMS_TO_MISSION/_MM_QUEUES 清理 + 好友列表刷新
@@ -364,15 +365,6 @@ async def release_player_mission_sessions(pid, writer=None, view_cmd=None,
     """
     if pid is None:
         return
-    if STORE is not None:
-        try:
-            for mid, det in list(_MM_MISSION_DETAILS.items()):
-                if _detail_has_player(det, pid):
-                    await STORE.set_mission_state(mid, 3)
-                    log(f'      [DB] mission {mid} abandoned '
-                        f'(player={pid}, {source})')
-        except Exception as e:
-            log(f'      [DB] abandon mission failed: {e}')
 
     # PMS DELETE + 内部会话状态清理（按 pid 收集本玩家全部会话；
     # 同玩家重复 join 未 abandon 时可能残留多个，取最新推 DELETE，
@@ -472,12 +464,35 @@ async def release_player_mission_sessions(pid, writer=None, view_cmd=None,
                                   if int(p.get('player_id', 0)) != int(pid)]
                 if not det['players']:
                     _MM_MISSION_DETAILS.pop(mid, None)
+                    # ★ record 终态随「全员离场」而非个人 abandon。war 会战
+                    #   局除外——record 生命周期归 war 战役
+                    #   （settle_war_battle → state=2；会话消亡由 automission
+                    #   超时兜底结算），此处置 3 会让
+                    #   get_mission_by_battle(states=(0,1)) 查不到 →
+                    #   城市点击链 GetMissionDetails 恒 mission_not_found
+                    #   （2026-09-16 remote-log：mission 210 一人 abandon
+                    #   后 battle 207 详情全灭，局内尚有其他玩家）
+                    if STORE is not None and not int(
+                            det.get('battle_id', 0) or 0):
+                        try:
+                            await STORE.set_mission_state(mid, 3)
+                            log(f'      [DB] mission {mid} abandoned '
+                                f'(last player={pid}, {source})')
+                        except Exception as e:
+                            log(f'      [DB] abandon mission failed: {e}')
                     release_match(mid)
                     log(f'      [mission] mission {mid} empty, combat '
                         f'server released ({source})')
             elif int(det.get('player_id', 0)) == int(pid):
                 # 旧单人结构
                 _MM_MISSION_DETAILS.pop(mid, None)
+                if STORE is not None:
+                    try:
+                        await STORE.set_mission_state(mid, 3)
+                        log(f'      [DB] mission {mid} abandoned '
+                            f'(player={pid}, {source})')
+                    except Exception as e:
+                        log(f'      [DB] abandon mission failed: {e}')
                 release_match(mid)
 
 

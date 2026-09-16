@@ -31,7 +31,10 @@ from .at_ops import (
     RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND,
     template_resources,
     RC_CANNOT_FIND_COMMANDNODE,
+    is_air_family_at,
     is_reserve,
+    nearest_owned_airfield,
+    remount_on_ground_at_airfield,
     reserve_template_id,
     )
 from .warmap_view import (
@@ -136,6 +139,47 @@ async def _merge_column_events(store, war_id, col, parent, caps):
     log(f'[war] supply column {col["id"]} merged into AT {parent["id"] if parent else "?"} '
         f'resources={merged}')
     return events
+
+
+async def merge_waiting_columns(store, war_id, at, caps):
+    """本体到站取补给（官服「等本体飞过来合并就完成补给」）：父 AT 到达
+    （或已在）某城时，把同城**原地等待**的子补给队（reserve + 非停驻
+    机队 + 无在途移动）并入本体；合并后落地变体持满运输机 → 重新登机
+    转回空中原型（remount_on_ground_at_airfield）。
+
+    与 _arrive_supply_column 方向相反：地面补给队是队找 AT（机动追击
+    汇合），空军系补给队是 AT 找队（机场原地等待）。返回 (at, events)；
+    无可合并返回 (at, [])。"""
+    if is_reserve(at):
+        return at, []
+    bf = int(at_current_battlefield(at) or 0)
+    if not bf:
+        return at, []
+    try:
+        nodes = await store.list_player_command_nodes(
+            int(at.get('owner_player_id') or 0), int(war_id))
+    except Exception as e:
+        log(f'[war] waiting supply columns lookup failed: {e}')
+        return at, []
+    events = []
+    for n in sorted(nodes, key=lambda x: int(x.get('id') or 0)):
+        if (int(n.get('id') or 0) == int(at.get('id') or 0)
+                or int(n.get('parent_command_node_id') or 0)
+                != int(at.get('id') or 0)
+                or not is_reserve(n)
+                or int(n.get('airbase_bf') or 0) > 0   # 停驻机队走 remount
+                or int(n.get('state') or 0) >= 3
+                or not n.get('is_deployed')
+                or int(at_current_battlefield(n) or 0) != bf):
+            continue
+        if await store.get_active_movement(n['id']):
+            continue            # 在途地面队：_arrive_supply_column 处理
+        events.extend(await _merge_column_events(store, war_id, n, at, caps))
+        at = await store.get_command_node(at['id'])
+    if events:
+        at, re_ev = await remount_on_ground_at_airfield(store, war_id, at)
+        events.extend(re_ev)
+    return at, events
 
 
 async def _arrive_supply_column(store, war_id, col, mv, dest_bf, caps,
@@ -254,8 +298,14 @@ async def column_route(store, war, parent_at, near_capital_bf=0):
     （f6 己方在网城 → 最近己方在网带⭐主城 → 阵营首都兜底）并按全图
     补给线拓扑验证可达性。
 
-    返回 (spawn_bf, parent_bf, ok)：ok=False 表示无出生点/无父位置/
-    地面不可达（真·孤岛：整张补给线拓扑无路，官服地图连通理论不达）。"""
+    空军系父 AT（is_air_family_at：飞行中队/伞兵族含落地变体）出生点
+    改为锚定城附近最近的**己方机场**（官服 war2.md「补给只发生在主城
+    附近的机场」），补给队原地等待本体来合并，不验证地面可达（敌后
+    伞兵地面补给线本就到不了）。
+
+    返回 (spawn_bf, parent_bf, ok)：ok=False 表示无出生点（空军系=
+    无己方机场）/无父位置/地面不可达（真·孤岛：整张补给线拓扑无路，
+    官服地图连通理论不达）。"""
     fac = int(parent_at.get('faction') or 0)
     try:
         owners = dict(await store.get_war_cities(war['id']))
@@ -271,6 +321,10 @@ async def column_route(store, war, parent_at, near_capital_bf=0):
                     or _faction_capital_bf().get(fac, 0))
     if not spawn_bf or not parent_bf:
         return 0, parent_bf, False
+    if is_air_family_at(parent_at):
+        # owners 空（存储异常）→ None 回退不查归属就近机场（宁部署不错杀）
+        air_bf = nearest_owned_airfield(spawn_bf, owners or None, fac)
+        return (air_bf, parent_bf, True) if air_bf else (0, parent_bf, False)
     if spawn_bf == parent_bf:
         return spawn_bf, parent_bf, True
     return spawn_bf, parent_bf, \
@@ -282,7 +336,9 @@ async def spawn_supply_column(store, war, parent_at, resources,
     """生成补给队并寻路：最近己方在网带⭐主城出生（官服口径：就近出发
     沿补给线机动；near_capital_bf=f6 玩家指定出发城优先，须己方在网否则
     忽略；全图无⭐主城候选回退阵营首都），载 resources（{cat: n}），沿
-    补给线机动到父 AT 所在城市。
+    补给线机动到父 AT 所在城市。空军系父 AT（is_air_family_at）改在
+    锚定城附近己方机场出生**原地等待**（不派移动），本体到站由
+    merge_waiting_columns 合并。
 
     返回 (column, events, error_code)：column=None 且 error_code≠0 为失败
     （RC_CANNOT_FIND_COMMANDNODE=无出生点或地面不可达（真·孤岛），购买侧
@@ -327,6 +383,22 @@ async def spawn_supply_column(store, war, parent_at, resources,
     if spawn_bf == parent_bf:
         events.extend(await _merge_column_events(store, war_id, col,
                                                  parent_at, caps))
+        if is_air_family_at(parent_at):
+            # 落地变体在机场并入新买的运输机 → 重新登机转回空中原型
+            _p, re_ev = await remount_on_ground_at_airfield(
+                store, war_id,
+                await store.get_command_node(parent_at['id']))
+            events.extend(re_ev)
+        return col, events, 0
+    if is_air_family_at(parent_at):
+        # ---- 空军系：补给队在出生机场**原地等待**本体来合并（官服
+        #      「等本体飞过来合并就完成补给」；无飞行员不能自己跑，
+        #      敌后伞兵地面补给线亦不可达）----
+        events.append(('set', b'CommandNodeWarInstance',
+                       msg_commandnode_instance_row(col, war_id, caps)))
+        log(f'[war] air supply column {col["id"]} waiting for AT '
+            f'{parent_at["id"]} at airfield bf={spawn_bf} '
+            f'resources={dict(resources or {})}')
         return col, events, 0
     mv, code = await start_movement(store, col, parent_bf, now=now)
     if mv is None and code != RC_OK:

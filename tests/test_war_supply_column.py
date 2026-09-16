@@ -18,6 +18,10 @@
      mode=0 全关；mode=2 一律出队（同城即合）；在途载量扣减缺编（重复
      补给 103 / 部分在途折半）；首次免费置位；f6 nearCapitalBattlefieldId
      透传（在网城生效 / 敌城回退首都）；孤岛己方城出队；连通非首都城即时
+  F. 空军系补给（官服 war2.md「补给只发生在主城附近的机场……等本体
+     飞过来合并」）：伞兵补编两队出生锚定城附近己方机场原地等待（不
+     派移动）；本体到站合并满编；父已在机场立即合并；无己方机场拒单；
+     落地变体并入新买运输机后重新登机转回空中原型
 
 写法沿用 test_war_movement.py / test_war_at_supply.py：monkeypatch wardb
 合成拓扑 + FakeStore + importlib 加载 war_at，运行
@@ -69,6 +73,20 @@ _TPLS = {
     204: {'id': 204, 'name': 'reserve', 'faction': 2,
           'resources': {}, 'vehicle_cats': set(), 'size': 0,
           'general_character_template_id': 0, 'level': 0, 'speed': 1.0},
+    106: {'id': 106, 'name': 'Paratroopers AT', 'faction': 1, 'actionid': 13,
+          'resources': {4: 12, 10: 3}, 'soldier_cats': {4},
+          'vehicle_cats': {10}, 'size': 2,
+          'general_character_template_id': 0, 'level': 1, 'speed': 2.7,
+          'transportradius': 5700},
+    107: {'id': 107, 'name': 'Paratroopers AT_on_ground', 'faction': 1,
+          'actionid': 0, 'resources': {4: 12}, 'soldier_cats': {4},
+          'vehicle_cats': set(), 'size': 2, 'convert_to': 106,
+          'general_character_template_id': 0, 'level': 1, 'speed': 0.48},
+    108: {'id': 108, 'name': 'Fighter Squadron AT', 'faction': 1,
+          'actionid': 15, 'resources': {2: 6, 20: 6}, 'soldier_cats': {2},
+          'vehicle_cats': {20}, 'size': 2,
+          'general_character_template_id': 0, 'level': 1, 'speed': 3.0,
+          'transportradius': 3800},
 }
 
 _SYN_APS = [
@@ -90,6 +108,8 @@ _SYN_BFS = [
      'posy': 800.0, 'gamemap': 203},      # Factory 主城（首都 fac2）
     {'id': 40, 'mapid': 1, 'title': 'D', 'sector': '', 'posx': 900.0,
      'posy': 1200.0, 'gamemap': 201},     # Mountain 据点（不作出发城）
+    {'id': 50, 'mapid': 1, 'title': 'AF', 'sector': '', 'posx': 50.0,
+     'posy': 50.0, 'gamemap': 204},       # 机场（空军系补给出生点）
 ]
 
 wardb.accesspoints = lambda: list(_SYN_APS)
@@ -104,6 +124,7 @@ wardb.morale_template = lambda: None
 wardb.armyresource_production = lambda: []
 war_campaign.common._ADJACENCY_CACHE = None
 war_campaign.common._BF_POS_CACHE = None
+war_campaign.at_ops._AIRFIELD_CACHE = None
 
 mm_config.WAR_AUTO_CREATE = True
 
@@ -483,6 +504,14 @@ def section_a():
     check('A4 阵营首都映射（补给队出生点）',
           war_campaign._faction_capital_bf().get(1) == 10
           and war_campaign._faction_capital_bf().get(2) == 30)
+    check('A5 is_air_family_at（106 伞兵/108 战斗机/107 落地变体真；'
+          '101 步兵/102 机械化/104 补给队假）',
+          war_campaign.is_air_family_at({'template_id': 106})
+          and war_campaign.is_air_family_at({'template_id': 108})
+          and war_campaign.is_air_family_at({'template_id': 107})
+          and not war_campaign.is_air_family_at({'template_id': 101})
+          and not war_campaign.is_air_family_at({'template_id': 102})
+          and not war_campaign.is_air_family_at({'template_id': 104}))
 
 
 # ====================================================== B spawn_supply_column
@@ -905,12 +934,81 @@ async def section_e():
           and st12.spend_log == [(100, 'warfunds', 1000)], str(f))
 
 
+# ===================== F 空军系补给（机场原地等本体，官服 war2.md 口径）
+
+async def section_f():
+    # F1 伞兵 AT 驻敌城 30 补编 → 士兵/运输机两队出生在主城 10 附近
+    # 机场 50 **原地等待**（「等本体飞过来合并」：不派移动、无飞行员）
+    st = await _ewar({10: 1, 50: 1, 30: 2})
+    _mk_at(st, 500, template=106, deployed=True, map_entity_id=30,
+           resources={'4': 2}, sold_free=True, veh_free=True)
+    w, f = await _resupply(500)
+    cols = [c for c in _cols(st, 500) if c['state'] < 3]
+    loads = sorted(sorted(c['resources'].items()) for c in cols)
+    mvs = [await st.get_active_movement(c['id']) for c in cols]
+    check('F1 伞兵补编 → 两队出生机场 50 原地等待（state0/无移动）',
+          f.get(2) == 1 and len(cols) == 2
+          and loads == [[('10', 3)], [('4', 10)]]
+          and all(c['map_entity_id'] == 50 and c['state'] == 0
+                  for c in cols)
+          and not any(mvs), f'{loads} cols={[(c["id"], c["map_entity_id"], c["state"]) for c in cols]}')
+
+    # F2 本体飞到机场 50 → 到达合并两队 → 满编 {4:12, 10:3}
+    st.ats[500]['state'] = 1
+    await st.create_movement(
+        500, 1, [{'sl_id': 0, 'from_bf': 30, 'to_bf': 50, 'seconds': 100,
+                  'air': True}], started_at=_NOW)
+    ev = await war_campaign.advance_movements(
+        st, await st.get_active_war(),
+        now=_NOW + datetime.timedelta(seconds=101))
+    check('F2 本体到站合并（满编/两队软删/del armyresource 行）',
+          st.ats[500]['resources'] == {'4': 12, '10': 3}
+          and all(st.ats[c['id']]['state'] == 3 for c in cols)
+          and ('del', b'armyresource') in _events_tags(ev),
+          f"{st.ats[500]['resources']}")
+
+    # F3 父 AT 已在出生机场 50 → 立即合并不出队
+    st3 = await _ewar({10: 1, 50: 1, 30: 2})
+    _mk_at(st3, 500, template=106, deployed=True, map_entity_id=50,
+           resources={'4': 2}, sold_free=True, veh_free=True)
+    w, f = await _resupply(500)
+    cols3 = _cols(st3, 500)
+    check('F3 父在机场 → 立即合并满编（队软删/无在途）',
+          f.get(2) == 1 and len(cols3) == 2
+          and all(st3.ats[c['id']]['state'] == 3 for c in cols3)
+          and st3.ats[500]['resources'] == {'4': 12, '10': 3}, str(f))
+
+    # F4 无己方机场（50 中立）→ 扣款前拒单
+    st4 = await _ewar({10: 1, 30: 2})
+    _mk_at(st4, 500, template=106, deployed=True, map_entity_id=30,
+           resources={'4': 2}, sold_free=True, veh_free=True)
+    w, f = await _resupply(500)
+    check('F4 无己方机场 → 拒单 7（不出队/不扣款）',
+          f.get(2) == war_campaign.RC_CANNOT_FIND_COMMANDNODE
+          and not _cols(st4, 500)
+          and not st4.spend_log, str(f))
+
+    # F5 落地变体在机场补编（按空中原型计价买运输机）→ 立即合并 +
+    # 重新登机转回空中原型（remount 门槛：持满原型载具）
+    st5 = await _ewar({10: 1, 50: 1, 30: 2})
+    _mk_at(st5, 500, template=107, deployed=True, map_entity_id=50,
+           resources={'4': 12}, sold_free=True, veh_free=True)
+    w, f = await _resupply(500)
+    check('F5 落地变体并入新买运输机 → 重新登机转回 106',
+          f.get(2) == 1
+          and st5.ats[500]['template_id'] == 106
+          and st5.ats[500]['resources'] == {'4': 12, '10': 3}
+          and st5.ats[500].get('airbase_bf') == 50,
+          f"{f} {st5.ats[500]}")
+
+
 async def main():
     section_a()
     await section_b()
     await section_c()
     await section_d()
     await section_e()
+    await section_f()
     fails = [label for label, ok in RESULTS if not ok]
     print(f'\n{"="*50}\nsupply_column 回归：'
           f'{len(RESULTS) - len(fails)}/{len(RESULTS)} PASS')

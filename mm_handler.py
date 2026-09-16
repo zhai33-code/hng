@@ -75,12 +75,12 @@ async def _specified_mission_join_error(req_mission_id, faction, char_cat=0):
         w_dfd = int(wrec.get('defender_faction', 0) or 0)
         if w_atk > 0 and w_dfd > 0 and faction not in (w_atk, w_dfd):
             return 62
-        # state=1（战斗中）但局内会话已清（战斗服收尾中）→ 局实际已不可
-        # 加入（原 war 分支同样静默忽略 → 玩家永卡匹配中）
-        if (int(wrec.get('state', 0) or 0) == 1
-                and not (_MM_MISSION_DETAILS.get(mid)
-                         and mid in COMBAT_INSTANCES)):
-            return 43
+        # state=1（战斗中）但局内会话已清：war 会战仍可重新排队再开战斗
+        # 服（1b-1 war 路由有对应分支，_start_match 按 battle_id 复用
+        # record），不拦。战斗服结算收尾的瞬时窗口由 _start_match 内
+        # get_mission_by_battle 复查兜底。（此前这里回 43 → 2026-09-17
+        # 实测退出 FPS+解散小队后点城市"加入游戏"弹"无法找到战斗"，
+        # 城市仍显示交战）
         return None
     # 普通撮合局（内存口径，与 friendinfo 推送/late join 同源）
     det = _MM_MISSION_DETAILS.get(mid)
@@ -430,8 +430,9 @@ async def _handle_join(sess, writer, cmd_id, proto):
     #        - 局内会话存活（_MM_MISSION_DETAILS + COMBAT_INSTANCES）→
     #          同阵营 late join 直接回局（绕 JOIN_WINDOW：官服 war 会战
     #          开打后随时可加入）
-    #        - state 0（成局待开局）→ 带 battle_id 入 war 桶（try_form_war
-    #          按 battle_id 分桶，攻守双方阵营各 ≥1 即成局）
+    #        - state 0（成局待开局）或 state 1 无存活会话（战斗服已释放、
+    #          会战未结算）→ 带 battle_id 入 war 桶（try_form_war 按
+    #          battle_id 分桶，攻守双方阵营各 ≥1 即成局）
     if req_mission_id:
         wrec = None
         try:
@@ -469,9 +470,25 @@ async def _handle_join(sess, writer, cmd_id, proto):
                 POOL.enqueue(entry)
                 await _try_form_all()
                 return
-            # state=1 但局内会话已清（战斗服收尾中）：不可加入，忽略
-            _log(f'[war] JoinMM mission={w_mid} state={w_state} no live '
-                 f'session -> ignored')
+            # state=1 但局内会话已清：两种情况——①战斗服结算收尾中（瞬时，
+            # record 随即置 2）；②war 会战仍在打但战斗服已释放（全员退光
+            # 超过 rejoin 保护期 / 服务重启，record 按修复口径保持 state=1，
+            # automission 最长 1h 后才兜底结算）。②必须允许重新排队再开
+            # 战斗服（_start_match war 分支按 battle_id 复用 record、准备期
+            # 门控对早过点的会战直接放行），否则城市详情能开但永远"排不
+            # 进去"（2026-09-16 实测：battle 213 全员退出后点城市无响应）。
+            # ①的竞态由 _start_match 内 get_mission_by_battle 复查兜底
+            # （record 已清则退排队玩家回大厅）。
+            _log(f'[war] JoinMM mission={w_mid} state=1 no live session '
+                 f'-> re-queue war battle (battle={w_bid}, '
+                 f'faction={faction})')
+            _MM_QUEUES[pid]['gamemode'] = 10
+            await register_war_battle_prep(w_bid)
+            entry = mm_pool.QueueEntry(
+                player_id=pid, char_id=int(char_id), faction=faction,
+                gamemode_id=10, presets=staged_presets, battle_id=w_bid)
+            POOL.enqueue(entry)
+            await _try_form_all()
             return
 
     # 1c. 等待期中途加入：已有同模式、选图兼容、未满员的战局仍处于开局
@@ -763,9 +780,14 @@ async def _build_war_rec(mission_id, wrec):
     war rec 此前只在成局时构建——重启后旧战斗 / 未开战的 pending 简报
     查详情无 rec → multi 构造器走非 war 兜底（兵力挤一点、无守方红线、
     f5 不分线，用户实测 Tatabánya 简报仍错的原因）。幂等：同 roster
-    重建同数据，已成局 rec 被重建亦无害。"""
+    重建同数据。
+    ★已成局（live det 存在）必须跳过：init_mission_war 整体覆盖
+    _MISSIONS[mid]，详情轮询每 ~10s 触发一次会把出生消耗重置回满编
+    （2026-09-16 battle 205/mission 207 实锤：池永远满、死了不扣兵力）。"""
     if state.STORE is None or not wrec:
         return
+    if int(mission_id) in _MM_MISSION_DETAILS:
+        return                              # 已成局：池在消耗中，禁止重建
     try:
         await _init_war_mission_resources(
             int(mission_id), int(wrec.get('battle_id') or 0),

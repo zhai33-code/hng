@@ -343,22 +343,68 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
         if o and (o not in home_by_fac or int(tmpl) < home_by_fac[o]):
             home_by_fac[o] = int(tmpl)
     home_ap_default = int(layout[0][0]) if layout else 0
-    for s in mm_state.PMS_TO_SESSION.values():
-        fac = int(s.get('faction', 3) or 3)
-        home_ap = home_by_fac.get(fac, home_ap_default)
-        at = b''
-        at += pb_int64(1, int(s.get('battle_session_id', 0) or 0))  # assaultTeamId
-        at += pb_int64(2, int(s.get('player_id', 0) or 0))          # ownerPlayerId
-        at += pb_string(3, s.get('gamertag') or 'Player')           # ownerGamertag
-        at += pb_int64(4, fac)                                      # factionId(runtime)
-        at += pb_int64(5, commandnode_template(fac, 'infantry'))  # commandNodeTemplateId
-        at += pb_int64(6, mm_state.MISSION_MAP_ENTITY_ID)        # mapEntityId
-        at += pb_int64(7, 1)                                        # mapEntityTypeId(1=battlefield)
-        at += pb_bool(8, False)                                     # inTransit
-        at += pb_bool(14, True)                                     # inActiveMission
-        at += pb_int64(15, home_ap)                                 # accesspointTemplateId
-        resp_proto += pb_message(5, at)
-        at_count += 1
+    war_ats = force_pool.war_assault_teams(mid) if mid else None
+    if war_ats:
+        # ★ war 局：发真实参战 AT 行（中途增援到达并入池后下一轮轮询即
+        #   出现——"部队到达"的局内出生屏渲染数据源）。旧口径按在局玩家
+        #   会话伪造行（属主=在局玩家、模板恒步兵）：玩家 RTS 拉兵增援
+        #   到达后，客户端把到达部队挂到在局其他玩家的伪行上 → 局内显示
+        #   "别人的部队"（2026-09-16 实测：DoubleBird 的 AT 增援进
+        #   battle 207，局内显示成 HellsKitchen2005 的部队）。
+        #   f1 assaultTeamId = AT 实例 id（官服 = command node war
+        #   instance id）；f2/f3 = AT 所属玩家（部署将军可不在局）；
+        #   f5 = AT 真实模板；f15 = AT 来向线模板（无则阵营锚点）。
+        _owner_ids = {int(a.get('owner_player_id') or 0)
+                      for _ats in war_ats.values() for a in _ats}
+        _owner_ids.discard(0)
+        _tags = {}
+        if _owner_ids and STORE is not None:
+            try:
+                _rows = await STORE.pool.fetch(
+                    'SELECT id, username FROM players WHERE id = ANY($1)',
+                    sorted(_owner_ids))
+                _tags = {int(r['id']): r['username'] for r in _rows}
+            except Exception as e:
+                log(f'      [combat] f5 AT owner lookup failed: {e}')
+        _map_ent = int((det or {}).get('map_entity_id') or 0) \
+            or mm_state.MISSION_MAP_ENTITY_ID
+        for _fac, _ats in war_ats.items():
+            _fac = int(_fac)
+            for a in _ats:
+                oid = int(a.get('owner_player_id') or 0)
+                at = b''
+                at += pb_int64(1, int(a.get('id') or 0))      # assaultTeamId
+                at += pb_int64(2, oid)                        # ownerPlayerId
+                at += pb_string(3, _tags.get(oid) or 'Player')  # ownerGamertag
+                at += pb_int64(4, _fac)                       # factionId
+                at += pb_int64(5, int(a.get('template_id') or 0)
+                               or commandnode_template(_fac, 'infantry'))
+                at += pb_int64(6, _map_ent)                   # mapEntityId
+                at += pb_int64(7, 1)                          # 1=battlefield
+                at += pb_bool(8, False)                       # inTransit
+                at += pb_bool(14, True)                       # inActiveMission
+                at += pb_int64(15, int(a.get('ap_tmpl') or 0)
+                               or home_by_fac.get(_fac, home_ap_default))
+                resp_proto += pb_message(5, at)
+                at_count += 1
+    else:
+        # 非 war 局（staged/AI）：维持旧口径——每在局玩家一行伪 AT
+        for s in mm_state.PMS_TO_SESSION.values():
+            fac = int(s.get('faction', 3) or 3)
+            home_ap = home_by_fac.get(fac, home_ap_default)
+            at = b''
+            at += pb_int64(1, int(s.get('battle_session_id', 0) or 0))  # assaultTeamId
+            at += pb_int64(2, int(s.get('player_id', 0) or 0))          # ownerPlayerId
+            at += pb_string(3, s.get('gamertag') or 'Player')           # ownerGamertag
+            at += pb_int64(4, fac)                                      # factionId(runtime)
+            at += pb_int64(5, commandnode_template(fac, 'infantry'))  # commandNodeTemplateId
+            at += pb_int64(6, mm_state.MISSION_MAP_ENTITY_ID)        # mapEntityId
+            at += pb_int64(7, 1)                                        # mapEntityTypeId(1=battlefield)
+            at += pb_bool(8, False)                                     # inTransit
+            at += pb_bool(14, True)                                     # inActiveMission
+            at += pb_int64(15, home_ap)                                 # accesspointTemplateId
+            resp_proto += pb_message(5, at)
+            at_count += 1
 
     resp = build_response(cmd_id, 'ActiveMissionRequestEventListResponse', resp_proto)
     writer.write(resp)

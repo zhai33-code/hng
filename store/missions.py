@@ -25,6 +25,14 @@ class MissionsMixin:
                 int(map_entity_id or 0), int(battle_id or 0))
         return int(mid)
 
+    async def update_mission_preset(self, mission_id, preset):
+        """更新任务 preset（war 野外会战准备期结束定图回写）。返回是否更新。"""
+        async with self.pool.acquire() as conn:
+            n = await conn.execute(
+                'UPDATE mission_records SET preset = $2 WHERE id = $1',
+                int(mission_id), int(preset))
+        return _rowcount(n) > 0
+
     async def set_mission_state(self, mission_id, state):
         """更新任务状态：0 组队中 1 运行 2 结束 3 放弃。返回是否更新。"""
         async with self.pool.acquire() as conn:

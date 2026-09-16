@@ -72,6 +72,7 @@ from .at_movement import (
 from .supply import (
     _arrive_supply_column,
     _cleanup_supply_columns,
+    merge_waiting_columns,
     supply_queue_tick,
     )
 
@@ -109,12 +110,11 @@ async def advance_movements(store, war=None, now=None):
                 await store.finish_movement(mv['id'], 1)
                 if is_reserve(at):
                     if segs[-1].get('paradrop_return'):
-                        # 运输机队返航/换防到达（空降拆分产物 + 玩家
-                        # 换防 start_planes_rebase，reserve 模板但非补给
-                        # 队）：落位机场待命（不汇合/不追击/不占城/
-                        # 不成战），删在途行，airbase_bf 指向落位机场
-                        # （换防≠原机场时更新；旧机 re-use 合并以
-                        # airbase_bf 匹配）；落地伞兵回机场补给时免费
+                        # 运输机队返航到达（空降拆分产物自动返航，
+                        # reserve 模板但非补给队）：落位机场待命（不汇合/
+                        # 不追击/不占城/不成战），删在途行，airbase_bf
+                        # 指向落位机场（旧机 re-use 合并以 airbase_bf
+                        # 匹配）；落地伞兵回机场补给时免费
                         # re-use（_merge_parked_planes）
                         dest_bf = int(segs[-1]['to_bf'] or 0)
                         await store.update_command_node(
@@ -122,20 +122,24 @@ async def advance_movements(store, war=None, now=None):
                             map_entity_type=MAP_ENTITY_BATTLEFIELD,
                             airbase_bf=dest_bf)
                         at = await store.get_command_node(at['id'])
-                        # 到达推序（空中：del air_transport 必须在 set
-                        # instance 前派发，airAssaultTeamMoveEnded 清
-                        # moving，updatedWarInstance 重钉才生效；批内
-                        # 全部行应用后才派发——重钉读到的新 mapEntityId
-                        # 已就位，不会钉回出发地。此前逐条单消息推送时
-                        # 反序钉回旧机场、重登才恢复——2026-09-11）。
+                        # 到达推序（空中：del segment 先清 moving
+                        # （commandnodeStoppedMoving），set instance
+                        # 更新 location 后 del air_transport 才触发
+                        # onAirDestinationUpdates→updateAssaultTeamStatus
+                        # 重算 status=新城市名——反序则 status 按旧城市
+                        # 冻结到重登（2026-09-16 伞兵城市名卡上一城）；
+                        # 重钉不依赖派发序：批内全部行先应用（setObject
+                        # copyFromObject 原地改），onAirAssaultTeamMove
+                        # Ended→setStationaryPosition 读到的新
+                        # mapEntityId 已就位，不会钉回出发地。
                         # 注：broadcast_war_events 走 preserve_order
                         # 保序批次，此处事件顺序即派发顺序。
                         events.append(('del', b'transport_commandnode_segment',
                                        mv['id']))
-                        events.append(('del', b'air_transport', mv['id']))
                         events.append(('set', b'CommandNodeWarInstance',
                                        msg_commandnode_instance_row(
                                            at, war_id, caps)))
+                        events.append(('del', b'air_transport', mv['id']))
                         log(f'[war] 运输机队返航到达 node={at["id"]} '
                             f'-> airfield {dest_bf}')
                         # ---- 运输机找伞兵（反向自动重整）：落位机场
@@ -165,28 +169,32 @@ async def advance_movements(store, war=None, now=None):
                     at['id'], state=0, map_entity_id=ent,
                     map_entity_type=ent_type)
                 at = await store.get_command_node(at['id'])
-                # 到达推序（2026-09-11 重钉修复 + 2026-09-15 城市名修复）：
+                # 到达推序（2026-09-11 重钉修复 + 2026-09-15 城市名修复 +
+                # 2026-09-16 空中城市名修复）：
                 # 1) del segment 先派发——清 schema.moving
                 #    （commandnodeStoppedMoving），否则 instance 派发时
                 #    updatedWarInstance 重钉条件 hasChangedMapEntityOrType
                 #    && !moving 不满足，单位卡在动画终点（出兵点偏移位）。
                 # 2) set instance——location 更新为新城市（
                 #    updateAssaultTeamMapEntity）。
-                # 3) del destination 最后派发（仅地面；空中 air_transport
-                #    单表承载 moving+destination 两职责，只能 del 在前）
-                #    ——onDestinationUpdates→updateAssaultTeamStatus 重算
-                #    status=location，此时读到的已是新城市名。若 del
-                #    destination 先于 set instance，status 按在途旧值
-                #    （补给线=""）冻结：非交战 AT 靠后续 armyresource/
-                #    queue 事件自愈，交战中 AT 无任何触发 → 部队列表
-                #    不显示所在城市名。
+                # 3) del destination/air_transport 最后派发——
+                #    onDestinationUpdates/onAirDestinationUpdates→
+                #    updateAssaultTeamStatus 重算 status=location，此时
+                #    读到的已是新城市名。若 del 先于 set instance，status
+                #    按在途旧值冻结：非交战 AT 靠后续 armyresource/queue
+                #    事件自愈，交战中 AT 无任何触发 → 部队列表城市名卡
+                #    在上一城到重登（空中 air_transport 单表承载
+                #    moving+destination 两职责，但 moving 已被 del
+                #    segment 清掉、重钉由 onAirAssaultTeamMoveEnded 读
+                #    批内已应用的新 mapEntityId 完成，del 放最后是
+                #    安全的）。
                 events.append(('del', b'transport_commandnode_segment',
                                mv['id']))
                 if is_air:
-                    events.append(('del', b'air_transport', mv['id']))
                     events.append(('set', b'CommandNodeWarInstance',
                                    msg_commandnode_instance_row(
                                        at, war_id, caps)))
+                    events.append(('del', b'air_transport', mv['id']))
                 else:
                     events.append(('set', b'CommandNodeWarInstance',
                                    msg_commandnode_instance_row(
@@ -202,6 +210,12 @@ async def advance_movements(store, war=None, now=None):
                         store, war_id, at)
                     events.extend(remount_events)
                     remounted = bool(remount_events)
+                # ---- 本体到站取补给（官服：空军系补给的飞行员/飞机/伞兵/
+                #      运输机在出生机场原地等待，本体飞/走达后合并完成
+                #      补给；落地变体持满运输机一并重新登机）----
+                at, supply_wait_events = await merge_waiting_columns(
+                    store, war_id, at, caps)
+                events.extend(supply_wait_events)
                 # ---- 空中半径单位到达（§10.2 #6/#7）----
                 if is_radius_unit(at) and not remounted:
                     if not segs[-1].get('radius_attack'):
@@ -527,6 +541,19 @@ def _preset_for_battlefield(preset_pool, bf_id):
     return random.choice(preset_pool) if preset_pool else 0
 
 
+def _preset_for_field_battle(btype):
+    """野外会战（encounter/skirmish）选图：按 battle_type 取对应图池
+    （war1.md：双方纯步兵=encounter 池 / 含侦察·装甲=skirmish 池），
+    绝不用城内 assault 图池（2026-09-16 实测 Berlin-a 夺控战错发
+    assault 图——此前按邻近城市 gamemap 从 war assault 池选）。
+    准备期为临时值：roster 中途变化（增援入场改变构成）由
+    matchmaking._war_mission_preset 在准备期结束成局时定图修正。"""
+    pool = (mm_config.WAR_ENCOUNTER_PRESETS
+            if int(btype) == BATTLE_TYPE_ENCOUNTER
+            else mm_config.WAR_SKIRMISH_PRESETS)
+    return random.choice(pool) if pool else 0
+
+
 async def _check_field_encounters(store, war_id, now_ms=None):
     """野外遭遇成局（war-gameplay-fix-plan §2）：同一补给线段上出现
     ≥2 个敌对阵营的在途 AT → 会战。
@@ -626,8 +653,6 @@ async def _check_field_encounters(store, war_id, now_ms=None):
             # state=1，battle 行不推送），避免"有 battle 无 mission"半态
             # （战图标记可点但简报恒 43 秒关）
             try:
-                preset_pool = (mm_config.gamemode_cfg(10)
-                               .get('fallback_presets') or [])
                 attacker = int(group[0].get('faction') or 0)
                 defender = next(
                     (int(a.get('faction') or 0) for a in group
@@ -642,7 +667,7 @@ async def _check_field_encounters(store, war_id, now_ms=None):
                     if idx >= 0:
                         near_bf = int(segs[idx].get('from_bf') or 0)
                 mid = await store.create_mission_record(
-                    _preset_for_battlefield(preset_pool, near_bf),
+                    _preset_for_field_battle(btype),
                     attacker_faction=attacker,
                     defender_faction=defender,
                     name=f'war battle {wb["id"]} supplyline {sl_id}',
@@ -728,7 +753,7 @@ async def rebuild_orphan_battle_missions(store):
                             if idx >= 0:
                                 near_bf = int(segs[idx].get('from_bf') or 0)
                     mid = await store.create_mission_record(
-                        _preset_for_battlefield(preset_pool, near_bf),
+                        _preset_for_field_battle(btype),
                         attacker_faction=atk, defender_faction=dfn,
                         name=f'war battle {wb["id"]} supplyline '
                              f'{wb["battlefield_id"]}',

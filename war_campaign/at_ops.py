@@ -623,6 +623,24 @@ def is_paradrop_unit(at):
         return False
 
 
+def is_air_family_at(at):
+    """空军系 AT（飞行中队 + 伞兵族含落地变体）：补给的飞行员/飞机/
+    伞兵/运输机出生在主城附近机场**原地等待**本体来合并（官服 war2.md
+    「补给只发生在主城附近的机场……飞机与驾驶员分开补给，伞兵补给也
+    可用同样方法」+ 用户实报「等本体飞过来合并就完成补给」）。"""
+    if is_aircraft(at) or is_paradrop_unit(at):
+        return True
+    tpl = _tpl_of(at)
+    if str(tpl.get('name') or '').endswith('_on_ground'):
+        proto = wardb.commandnode_templates().get(
+            int(tpl.get('convert_to') or 0)) or {}
+        try:
+            return int(proto.get('actionid') or 0) in PARADROP_ACTIONIDS
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
 def bf_distance(from_bf, to_bf):
     """城市坐标直线距离；任一端无坐标返回 None（回退全允许）。"""
     p = _bf_pos()
@@ -812,8 +830,9 @@ async def remount_on_ground_at_airfield(store, war_id, at):
     有机可并时——免费并入（merge_parked_planes）+ 转回空中原型（恢复
     cat10/半径）+ airbase_bf 指向机场，可再次空降。
 
-    无机可并 / 非机场 / 非己方城 / 非落地变体返回 (at, []) 原样不动
-    （玩家仍可到站后手动补给买机，本函数不替代计价补给）。"""
+    无机可并时若 AT 已持满空中原型载具（计价补给队合并新买的运输机
+    后）同样转回原型；否则非机场 / 非己方城 / 非落地变体返回 (at, [])
+    原样不动（玩家仍可到站后手动补给买机，本函数不替代计价补给）。"""
     if is_reserve(at):
         return at, []
     tpl = _tpl_of(at)
@@ -838,7 +857,16 @@ async def remount_on_ground_at_airfield(store, war_id, at):
     if int(owners.get(bf, 0) or 0) != int(at.get('faction') or 0):
         return at, []
     take, events = await merge_parked_planes(store, at, proto, bf, war_id)
-    if not take:
+    if take:
+        at = await store.get_command_node(at['id'])
+    # 登机门槛：并入旧机 >0（旧口径）或 AT 已持满原型载具（计价补给
+    # 合并新买的运输机后重新登机——merge_waiting_columns 补给汇合路径）
+    res_now = _as_resources(at.get('resources'))
+    pv = {int(c) for c in (proto.get('vehicle_cats') or set())}
+    holds_full = all(
+        int(res_now.get(str(c), res_now.get(c, 0)) or 0) >= int(n)
+        for c, n in template_resources(proto).items() if int(c) in pv)
+    if not take and not holds_full:
         return at, []
     await store.update_command_node(at['id'], template_id=int(proto['id']),
                                     airbase_bf=int(bf))

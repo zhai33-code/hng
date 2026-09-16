@@ -12,6 +12,8 @@ PlayerMissionSession KVCS UPDATE（connectionState=2 Admitted），
 （注册内、能完成 pending wait；载荷为空不影响流程）。
 """
 
+import asyncio
+
 import matchmaking
 import mm_state
 from state import FLASH_SESSIONS, PUBLIC_HOST, STORE, log
@@ -90,27 +92,61 @@ async def handle_player_exit_batch(sess, writer, cmd_id, req_type, proto):
         #   客户端关 hng.exe 后 shouldAbandonGameOnSessionUpdate=true，等待
         #   PlayerMissionSession KVCS UPDATE connectionState=2 (Admitted) 才发
         #   AbandonMissionRequest；不推则客户端 UI 永卡"处理中"。
-        #   真实客户端是双连接：PlayerExitBatch 由 hng.exe 游戏连接上报
-        #   （playerview_cmd=None），必须按玩家名查 FLASH_SESSIONS 注册表
-        #   找到 Flash 连接再推（ZServer/游戏连接禁推 KVCS）；
-        #   单连接模拟（验证脚本）时请求连接本身就是 Flash 连接。
+        # ★ 延迟推（2026-09-16 竞态修复，真实客户端实测）：hng.exe 先发
+        #   PlayerExitBatch 再退进程，本地 HnG Sync SessionDone
+        #   （isGameRunning=false）滞后于上报；立即推会让客户端
+        #   MISSION_END_TIMER 首个 tick 判 isGameRunning=true 自杀
+        #   （ActionGameService.onPlayerMissionSessionEndTicks），REJOIN
+        #   弹窗有、倒计时数字永不赋值。延迟数秒等进程退净再推。
         if mm_sess:
-            flash = None
-            if (sess.playerview_cmd is not None
-                    and not getattr(sess, 'is_combat_server', False)
-                    and mm_sess.get('gamertag') == (sess.username or '')):
-                flash = sess
-            else:
-                cand = FLASH_SESSIONS.get(mm_sess.get('gamertag') or '')
-                if cand is not None and cand.playerview_cmd is not None:
-                    flash = cand
-            if flash is not None:
-                await _push_pms_admitted(flash, flash.writer, mm_sess)
-            else:
-                log(f'      [combat] leave-battle: no live Flash session for '
-                    f'{mm_sess.get("gamertag")!r}; PMS Admitted NOT pushed')
+            asyncio.get_running_loop().call_later(
+                _EXIT_PUSH_DELAY, _schedule_exit_push, sess, ex['msid'])
 
     await _ack_error(writer, cmd_id, f'PlayerExitBatch x{len(exits)} acknowledged')
+
+
+# PlayerExitBatch → PMS Admitted 推送延迟（秒），见 handler 内注释
+_EXIT_PUSH_DELAY = 3.0
+
+
+def _schedule_exit_push(sess, msid):
+    """call_later 同步回调：起协程做延迟推送（会话/Flash 复查在协程内）。"""
+    asyncio.ensure_future(_delayed_push_pms_admitted(sess, msid))
+
+
+async def _delayed_push_pms_admitted(sess, msid):
+    """延迟后的 PMS Admitted 推送（原 handler 内联逻辑，行为不变）。
+
+    推送前复查：
+    - 会话已释放（sweep/abandon 先行）→ 不推；
+    - rejoin_deadline 已清（玩家延迟窗口内已 PlayerJoined 重进）→ 不推，
+      避免对局中玩家收到多余 UPDATE（客户端 isGameRunning=true 时虽不
+      显示倒计时，但无意义推送一律抑制）。
+    真实客户端是双连接：PlayerExitBatch 由 hng.exe 游戏连接上报
+    （playerview_cmd=None），必须按玩家名查 FLASH_SESSIONS 注册表
+    找到 Flash 连接再推（ZServer/游戏连接禁推 KVCS）；
+    单连接模拟（验证脚本）时请求连接本身就是 Flash 连接。"""
+    mm_sess = _session_by_msid(msid)
+    if mm_sess is None:
+        return
+    if not mm_sess.get('rejoin_deadline'):
+        log(f'      [combat] leave-battle: msid={msid} deadline cleared '
+            f'(rejoined within {_EXIT_PUSH_DELAY}s); PMS Admitted skipped')
+        return
+    flash = None
+    if (sess.playerview_cmd is not None
+            and not getattr(sess, 'is_combat_server', False)
+            and mm_sess.get('gamertag') == (sess.username or '')):
+        flash = sess
+    else:
+        cand = FLASH_SESSIONS.get(mm_sess.get('gamertag') or '')
+        if cand is not None and cand.playerview_cmd is not None:
+            flash = cand
+    if flash is not None:
+        await _push_pms_admitted(flash, flash.writer, mm_sess)
+    else:
+        log(f'      [combat] leave-battle: no live Flash session for '
+            f'{mm_sess.get("gamertag")!r}; PMS Admitted NOT pushed')
 
 
 async def _push_pms_admitted(sess, writer, mm_sess):

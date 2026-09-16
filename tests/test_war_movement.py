@@ -823,6 +823,20 @@ async def main():
           p61['map_entity_id'] == 40 and p61['state'] == 2
           and store6.ats[62]['state'] == 2
           and store6.movements[amv3['id']]['state'] == 1)
+    # G6b 空中到达推序：del air_transport 必须在 set instance 之后
+    #     派发——onAirDestinationUpdates→updateAssaultTeamStatus 重算
+    #     status=location，反序则按旧城市名冻结到重登（2026-09-16
+    #     伞兵城市名卡上一城修复）
+    i_segA = next(i for i, (k, t, _) in enumerate(ev_air)
+                  if (k, t) == ('del', b'transport_commandnode_segment'))
+    i_insA = next(i for i, (k, t, _) in enumerate(ev_air)
+                  if i > i_segA
+                  and (k, t) == ('set', b'CommandNodeWarInstance'))
+    i_airA = next(i for i, (k, t, _) in enumerate(ev_air)
+                  if i > i_insA and (k, t) == ('del', b'air_transport'))
+    check('G6b 空运到达推序 del segment < set instance < del air_transport',
+          i_segA < i_insA < i_airA,
+          f'seg={i_segA} ins={i_insA} air={i_airA}')
 
     # G8 快照：无在途空运时无 air_transport 行
     store7 = FakeStore()

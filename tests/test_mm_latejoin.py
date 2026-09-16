@@ -686,9 +686,10 @@ def main():
             state.STORE = Store15({900201: {'battle_id': 7, 'state': 1,
                                             'attacker_faction': 1,
                                             'defender_faction': 2}})
-            check('war 局校验：state=1 无存活会话 → 43',
+            check('war 局校验：state=1 无存活会话 → None（war 桶重新排队，'
+                  '_start_match 按 battle_id 复用 record 再开战斗服）',
                   asyncio.run(mm_handler._specified_mission_join_error(
-                      900201, 1)) == 43)
+                      900201, 1)) is None)
             check('war 局校验：阵营非交战双方 → 62',
                   asyncio.run(mm_handler._specified_mission_join_error(
                       900201, 3)) == 62)

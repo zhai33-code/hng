@@ -1889,14 +1889,12 @@ async def section_r():
           and del_at[0][2] == pmv['id'],
           f'planes={planes[0]} del_at={del_at}')
 
-    # R3d 独立运输机队移动受限（官服口径：只能飞己方机场；修复
-    # "哪里都能去"——reserve 模板半径 -1 非 radius 单位，曾落地面
-    # BFS 分支任意行军）：504{10:9} 停 11（airbase_bf=11）
+    # R3d 独立运输机队/补给队（reserve 模板）**不能手动移动**（官服
+    # 口径：无飞行员——补给队自动机动或在出生机场等本体来合并；停驻
+    # 机队只能自动返航或被 re-use 合并）：504{10:9} 停 11（airbase_bf=11）
     st = _setup()
     war = await war_campaign.ensure_war(st)
     st.city_owners[1] = {10: 1, 11: 1, 12: 1, 13: 1}
-    # 母伞兵 AT 508（speed 2.7）：机队移速取母 AT 模板速度（返航/
-    # 换防同款运输机巡航口径），非 reserve 504 自身 speed 3.0
     _mk_at(st, 529, template=508, deployed=True, map_entity_id=11,
            resources={4: 36})
     _mk_at(st, 530, template=504, deployed=True, map_entity_id=11,
@@ -1904,64 +1902,28 @@ async def section_r():
     st.ats[530]['airbase_bf'] = 11
     st.ats[530]['parent_command_node_id'] = 529
     w, f = await _transport(530, target=12)       # 12 己方机场
-    r3d_mv = next((m for m in st.movements.values()
-                   if m['commandnode_id'] == 530), None)
-    r3d_seg = (war_campaign.movement_segments(r3d_mv)[0]
-               if r3d_mv else {})
-    # 期望带 air=True（2026-09-11 修复：机队换防与返航 split_aircraft_
-    # back 同口径——空中段不误用海上/中立地形减速）
-    r3d_expect = war_campaign.segment_seconds(11, 12, 2.7, air=True)
-    check('R3d1 运输机队 → 己方机场放行（21 + air 单段 + 母 AT 移速 2.7）',
-          f.get(3) == war_campaign.RC_RELOCATING_TO_NEW_AIRBASE
-          and st.ats[530]['state'] == 1
-          and r3d_mv is not None
-          and r3d_seg.get('air') and r3d_seg.get('paradrop_return')
-          and r3d_seg.get('from_bf') == 11 and r3d_seg.get('to_bf') == 12
-          and abs(r3d_seg.get('seconds', -1) - r3d_expect) < 1,
-          f'{f} at={st.ats[530]} seg={r3d_seg} expect={r3d_expect}')
+    check('R3d1 停驻运输机队手动移动 → 拒 152（不动不耗机）',
+          f.get(3) == war_campaign.RC_COMMANDNODE_NOT_DEPLOYABLE
+          and st.ats[530]['state'] == 0
+          and st.ats[530]['map_entity_id'] == 11
+          and st.ats[530]['resources'] == {10: 9}, str(f))
+    w2, f2 = await _transport(530, target=13)
+    check('R3d2 任意目标一律拒（非机场城 13 同 152）',
+          f2.get(3) == war_campaign.RC_COMMANDNODE_NOT_DEPLOYABLE
+          and st.ats[530]['state'] == 0, str(f2))
 
-    # R3d1b 到达 → 落位新机场 12 待命 + airbase_bf=12（旧机 re-use
-    # 匹配口径）；不占城不成战（12 本就己方，无 battle 行）
-    events = await war_campaign.advance_movements(
-        st, war, now=r3d_mv['arrive_at'] + datetime.timedelta(seconds=1))
-    del_at = [e for e in events if e[1] == b'air_transport']
-    check('R3d1b 换防到达 → 落位 12 + airbase_bf=12（state0）',
-          st.ats[530]['state'] == 0
-          and st.ats[530]['map_entity_id'] == 12
-          and st.ats[530]['airbase_bf'] == 12
-          and len(del_at) == 1 and del_at[0][0] == 'del'
-          and del_at[0][2] == r3d_mv['id'],
-          f'{st.ats[530]} del_at={del_at}')
-
-    # R3d2 己方非机场城（13）→ 拒 7（不走地面 BFS）
-    st = _setup()
-    await war_campaign.ensure_war(st)
-    st.city_owners[1] = {10: 1, 11: 1, 13: 1}
-    _mk_at(st, 531, template=504, deployed=True, map_entity_id=11,
-           resources={10: 9})
-    st.ats[531]['airbase_bf'] = 11
-    w, f = await _transport(531, target=13)
-    check('R3d2 运输机队 → 己方非机场城拒 7（不置在途/不耗机）',
-          f.get(3) == war_campaign.RC_CANNOT_FIND_COMMANDNODE
-          and st.ats[531]['state'] == 0
-          and st.ats[531]['resources'] == {10: 9}, str(f))
-
-    # R3d3 敌方机场（15）/ 中立机场（12 无主）→ 拒 7
-    st.city_owners[1][15] = 2
-    w, f = await _transport(531, target=15)
-    f2 = None
-    w2, f2 = await _transport(531, target=12)
-    check('R3d3 运输机队 → 敌方/中立机场拒 7',
-          f.get(3) == war_campaign.RC_CANNOT_FIND_COMMANDNODE
-          and f2.get(3) == war_campaign.RC_CANNOT_FIND_COMMANDNODE
-          and st.ats[531]['state'] == 0, f'{f} {f2}')
-
-    # R3d4 补给队（同 reserve 模板但 airbase_bf=0）不适用运输机队
-    # 分支（is_parked_planes_at 判负，仍走补给线寻路口径）
+    # R3d3 补给队（同 reserve 模板但 airbase_bf=0）同样不能手动移动
     _mk_at(st, 532, template=504, deployed=True, map_entity_id=10)
+    w3, f3 = await _transport(532, target=12)
+    check('R3d3 地面补给队手动移动 → 拒 152',
+          f3.get(3) == war_campaign.RC_COMMANDNODE_NOT_DEPLOYABLE
+          and st.ats[532]['state'] == 0, str(f3))
+
+    # R3d4 补给队非 parked planes 判定（is_parked_planes_at = reserve +
+    # airbase_bf>0）
     check('R3d4 补给队非 parked planes 判定',
           not war_campaign.is_parked_planes_at(st.ats[532])
-          and war_campaign.is_parked_planes_at(st.ats[531]))
+          and war_campaign.is_parked_planes_at(st.ats[530]))
 
     # R3b 伞兵换基地（11→17：1100×2=2200∈(1850,3600]）→ 保持 airborne
     st.city_owners[1][17] = 1
@@ -2178,49 +2140,27 @@ async def section_r():
           and st.ats[549]['resources'] == {'10': 2},
           f'548={st.ats[548]["state"]} 549={st.ats[549]["resources"]}')
 
-    # R5e 独立运输机队换防速度（用户实报"太慢"）：母 AT 落地变体
-    # （507 地面速度 0.48）时机队调防 → 仍按伞兵**空中**原型速度 2.7
-    # + air=True（不带地形减速）计算段时长
-    st = _setup()
-    war = await war_campaign.ensure_war(st)
-    st.city_owners[1] = {10: 1, 11: 1, 12: 1, 13: 1}
-    _mk_at(st, 550, template=507, deployed=True, map_entity_id=13,
-           resources={4: 36})
-    _mk_at(st, 551, template=504, deployed=True, map_entity_id=11,
-           resources={10: 9})
-    st.ats[551]['airbase_bf'] = 11
-    st.ats[551]['parent_command_node_id'] = 550
-    mv5e, code5e = await war_campaign.start_planes_rebase(
-        st, war, st.ats[551], 12)
-    exp = war_campaign.segment_seconds(11, 12, 2.7, air=True)
-    slow = war_campaign.segment_seconds(11, 12, 0.48, air=False)
-    check('R5e 机队换防速度 → 母 AT 落地仍按伞兵空中速度 2.7+air',
-          code5e == war_campaign.RC_OK
-          and mv5e['path'][0]['seconds'] == exp
-          and mv5e['path'][0]['seconds'] < slow
-          and st.ats[551]['state'] == 1,
-          f"sec={mv5e['path'][0]['seconds']} exp={exp} slow={slow}")
-
-    # R5f 运输机找伞兵（反向自动重整）：机队换防飞抵**伞兵（落地
+    # R5f 运输机找伞兵（反向自动重整）：机队自动返航飞抵**伞兵（落地
     # 变体）所在**机场 → 到达落位后免费并机 + 伞兵转回空中原型 +
     # 机队取尽软删（del 行齐全）。用 509（convert_to 508 空中含 cat10；
-    # 506/507 是无 cat10 的简化对，语义上不该并机）
+    # 506/507 是无 cat10 的简化对，语义上不该并机）。手动换防已按官服
+    # 禁用（无飞行员），此处以 split_aircraft_back 同款 paradrop_return
+    # 返航段构造在途机队
     st = _setup()
     war = await war_campaign.ensure_war(st)
     st.city_owners[1] = {10: 1, 11: 1, 12: 1, 13: 1}
     _mk_at(st, 560, template=509, deployed=True, map_entity_id=11,
            resources={4: 36})
     _mk_at(st, 561, template=504, deployed=True, map_entity_id=12,
-           resources={10: 9})
+           state=1, resources={10: 9})
     st.ats[561]['airbase_bf'] = 12
     st.ats[561]['parent_command_node_id'] = 560
-    mv5f, code5f = await war_campaign.start_planes_rebase(
-        st, war, st.ats[561], 11)
-    check('R5f 前置：机队 12→11 换防放行',
-          code5f == war_campaign.RC_OK, str(code5f))
+    mv5f = await st.create_movement(
+        561, 1, [{'sl_id': 0, 'from_bf': 12, 'to_bf': 11, 'seconds': 100,
+                  'air': True, 'paradrop_return': True}], started_at=_NOW)
     await war_campaign.advance_movements(
-        st, war, now=mv5f['arrive_at'] + datetime.timedelta(seconds=1))
-    check('R5f 机队到达并入 → 伞兵 508{4:36,10:9}+airbase_bf=11+机队软删',
+        st, war, now=_NOW + datetime.timedelta(seconds=101))
+    check('R5f 机队返航到达并入 → 伞兵 508{4:36,10:9}+airbase_bf=11+机队软删',
           st.ats[560]['template_id'] == 508
           and st.ats[560]['resources'] == {'4': 36, '10': 9}
           and st.ats[560]['airbase_bf'] == 11
@@ -2228,7 +2168,7 @@ async def section_r():
           f'560={st.ats[560]["template_id"]}/{st.ats[560]["resources"]} '
           f'561={st.ats[561]["state"]}')
 
-    # R5g 伞兵在**别的**机场（12），机队飞抵 11 → 无候选 → 照常落位
+    # R5g 伞兵在**别的**机场（12），机队返航落 11 → 无候选 → 照常落位
     # 不合并（机队保留待命）
     st = _setup()
     war = await war_campaign.ensure_war(st)
@@ -2236,15 +2176,14 @@ async def section_r():
     _mk_at(st, 562, template=507, deployed=True, map_entity_id=12,
            resources={4: 36})
     _mk_at(st, 563, template=504, deployed=True, map_entity_id=13,
-           resources={10: 9})
+           state=1, resources={10: 9})
     st.ats[563]['airbase_bf'] = 13
     st.ats[563]['parent_command_node_id'] = 562
-    mv5g, code5g = await war_campaign.start_planes_rebase(
-        st, war, st.ats[563], 11)
-    check('R5g 前置：机队 13→11 换防放行',
-          code5g == war_campaign.RC_OK, str(code5g))
+    mv5g = await st.create_movement(
+        563, 1, [{'sl_id': 0, 'from_bf': 13, 'to_bf': 11, 'seconds': 100,
+                  'air': True, 'paradrop_return': True}], started_at=_NOW)
     await war_campaign.advance_movements(
-        st, war, now=mv5g['arrive_at'] + datetime.timedelta(seconds=1))
+        st, war, now=_NOW + datetime.timedelta(seconds=101))
     check('R5g 伞兵不在该机场 → 不合并（机队落位 11 保留 {10:9}）',
           st.ats[562]['template_id'] == 507
           and st.ats[562]['resources'] == {4: 36}

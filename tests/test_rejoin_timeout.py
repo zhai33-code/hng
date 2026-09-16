@@ -285,19 +285,40 @@ def main():
 
             # ---- G. handle_player_exit_batch：优雅退出上报 ----
             # PlayerExitBatch { f1 repeated PlayerExit{ f1 msid } }
+            # 推送经 call_later 延迟 _EXIT_PUSH_DELAY 秒（2026-09-16
+            # isGameRunning 竞态修复）——同一事件循环内等定时器落地
             proto_g = pb_message(1, pb_varint(1, 610004))
             sess_g = types.SimpleNamespace(playerview_cmd=None,
                                            username='game-conn',
                                            is_game_client=True)
             w_g = seed_flash('RejoinC')
             mm_state.PMS_TO_SESSION[610004].pop('rejoin_deadline', None)
-            asyncio.run(combat_join.handle_player_exit_batch(
-                sess_g, w_g, 40, 'PlayerExitBatch', proto_g))
+
+            async def _run_g():
+                await combat_join.handle_player_exit_batch(
+                    sess_g, w_g, 40, 'PlayerExitBatch', proto_g)
+                await asyncio.sleep(combat_join._EXIT_PUSH_DELAY + 0.5)
+            asyncio.run(_run_g())
             check('G1 优雅退出上报 → 起 deadline',
                   'rejoin_deadline' in mm_state.PMS_TO_SESSION[610004])
-            check('G2 优雅退出上报 → Flash 连接收到 PMS Admitted 推送',
+            check('G2 优雅退出上报 → Flash 连接收到 PMS Admitted 推送（延迟落地）',
                   b'PlayerMissionSession' in w_g.data and
                   b'\x70\x02' in w_g.data)
+
+            # G3：延迟窗口内重进（deadline 被清）→ 推送抑制
+            mm_state.PMS_TO_SESSION[610004].pop('rejoin_deadline', None)
+            w_g3 = seed_flash('RejoinC')
+
+            async def _run_g3():
+                await combat_join.handle_player_exit_batch(
+                    sess_g, w_g3, 40, 'PlayerExitBatch', proto_g)
+                matchmaking.clear_rejoin_deadline(700003)  # 窗口内 PlayerJoined
+                await asyncio.sleep(combat_join._EXIT_PUSH_DELAY + 0.5)
+            asyncio.run(_run_g3())
+            check('G3 延迟窗口内重进 → 不推（deadline 已清）',
+                  b'PlayerMissionSession' not in w_g3.data)
+            mm_state.PMS_TO_SESSION[610004]['rejoin_deadline'] = \
+                time.time() + mm_config.REJOIN_TIMEOUT
 
             # ---- H. handle_player_joined：重进清 deadline ----
             proto_h = pb_varint(1, 610004)

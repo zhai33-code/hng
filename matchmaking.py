@@ -174,6 +174,47 @@ def _at_composition(node):
         int((node or {}).get('template_id', 0) or 0))
 
 
+async def _war_mission_preset(battle_id, war_rec):
+    """war 局 preset 定图（2026-09-16 野外会战错图修复）。
+
+    - 城战（assault）：record 成局值不变（成局时已按城市 gamemap 同图池选定）。
+    - 野外会战（encounter/skirmish）：官方口径准备期兵力未固定不生图，
+      准备期结束（成局此刻）按最终 roster 构成定图——双方纯步兵=
+      encounter 池 / 任一方含侦察·装甲=skirmish 池（war1.md §野外遭遇战）。
+      record 准备期临时 preset 不在对应池 → 重选并回写 record（简报/
+      automission 据点数判定同源）。读库/模板异常回退 record preset。"""
+    preset = int((war_rec or {}).get('preset') or 0) or AI_MISSIONPRESET
+    if state.STORE is None:
+        return preset
+    try:
+        wb = await state.STORE.get_war_battle(int(battle_id))
+        btype = int((wb or {}).get('battle_type') or 0)
+        if btype not in (war_campaign.BATTLE_TYPE_SKIRMISH,
+                         war_campaign.BATTLE_TYPE_ENCOUNTER):
+            return preset
+        from war_campaign.at_ops import is_infantry_at
+        at_ids = [int(f.get('at_id', 0) or 0)
+                  for f in ((wb or {}).get('factions') or [])]
+        nodes = (await state.STORE.get_command_nodes_by_ids(at_ids)
+                 if at_ids else [])
+        has_vehicle = any(not is_infantry_at(n) for n in nodes)
+        pool = (mm_config.WAR_SKIRMISH_PRESETS if has_vehicle
+                else mm_config.WAR_ENCOUNTER_PRESETS)
+        if pool and preset not in pool:
+            preset = random.choice(pool)
+            try:
+                await state.STORE.update_mission_preset(
+                    int(war_rec['id']), preset)
+            except Exception as ex:
+                _log(f'[war] battle {battle_id} preset writeback failed: {ex}')
+            _log(f'[war] battle {battle_id} field map finalized: '
+                 f'preset={preset} '
+                 f'({"skirmish" if has_vehicle else "encounter"})')
+    except Exception as ex:
+        _log(f'[war] battle {battle_id} field preset finalize failed: {ex}')
+    return preset
+
+
 async def _init_war_mission_resources(mission_id, battle_id, attacker,
                                       defender):
     """war 会战资源池（M2-3）：兵力 = 双方实际参战 AT 编制之和。
@@ -1641,7 +1682,8 @@ async def _start_match(match):
         mission_id = _next_match_id(_MM_MISSION_ID)
     match.mission_id = mission_id
     if battle_id:
-        preset = int(war_rec['preset'] or 0) or AI_MISSIONPRESET
+        # 野外会战准备期结束此刻定图（城战不变 = record 成局值）
+        preset = await _war_mission_preset(battle_id, war_rec)
     else:
         preset = int(match.preset_id)
     gamemode_id = int(match.players[0].gamemode_id) if match.players else 0

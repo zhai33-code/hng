@@ -695,6 +695,18 @@ def assault_team_names(mission_id, faction=None):
     return list(rec['names']) if rec.get('names') else None
 
 
+def war_assault_teams(mission_id):
+    """war 局参战 AT 实例名单 {faction: [{id, name, owner_player_id,
+    template_id, ap_tmpl, comp}, ...]}（战斗内 f5 assaultTeams 行数据源，
+    中途增援 add_war_reinforcement 并入即出现在下一轮轮询）；
+    非 war 局 / 无名单 → None。"""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if rec is None or rec.get('mode') != 'war':
+        return None
+    wats = rec.get('war_ats')
+    return wats or None
+
+
 def faction_stats(mission_id):
     """结算战报用：每方 {names, ats, initial, remaining}（资源类别 → 数量）。
 

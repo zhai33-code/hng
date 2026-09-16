@@ -314,6 +314,17 @@ WAR_ENCIRCLE_CHECK = _int_env('MM_WAR_ENCIRCLE_CHECK', 1)
 # war1.md：野外遭遇 5 分钟 / 城攻 5 分 30 秒；automission 超时以此起算）
 WAR_BATTLE_PREP_FIELD = _int_env('MM_WAR_BATTLE_PREP_FIELD', 300)
 WAR_BATTLE_PREP_ASSAULT = _int_env('MM_WAR_BATTLE_PREP_ASSAULT', 330)
+# war 野外会战地图池（war1.md §野外遭遇战：准备期兵力未固定不生图，
+# 准备期结束按最终构成定图——双方纯步兵=encounter 池 / 任一方含侦察·
+# 装甲=skirmish 池；绝不用城内 assault 图池，2026-09-16 实测 Berlin-a
+# 夺控战错发 assault 图）。池内均为有场景的官方图（Russian 东线系
+# 未上线缺场景不入池）：
+#   encounter = First Encounter 两图（Samrée Depot 9 / Colmar Mill 10，
+#               与 GAMEMODES[1] 同源；32/33 为同图别名不入池）
+#   skirmish  = 官方 Skirmish 三图（Forest/King of the Hill/Village，
+#               与 GAMEMODES[2] 同源；单点 13v13 ~ 三点 18v18）
+WAR_ENCOUNTER_PRESETS = [9, 10]
+WAR_SKIRMISH_PRESETS = [373394539, 373394540, 373394541]
 # war 会战单方成局开关：0=官服口径（try_form_war 要求攻守双方各≥1 真人
 # 才开局）；1=桶内≥1 人即成局（单方排队也立即拉起 FPS 局，对面留空，
 # 后续真人可 late join 补入）——单人测试用，线上保持 0。
