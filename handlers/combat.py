@@ -52,11 +52,13 @@ from messages import (
     _msg_weapon_modifier,
     _push_kvcs,
 )
-from player_service import _char_unlock_bits_for, _msg_player_for
+from player_service import (_char_unlock_bits_for, _msg_player_for,
+                            push_ribbon_unlock_notifications)
 from state import CURRENT_PID, FLASH_SESSIONS, STORE, log
 from wardb import (
     _RIBBON_LEVEL_XP,
     _rank_from_combat_xp,
+    _ribbon_level_from_xp,
     ammo_wear_params,
     campaign_mission_multipliers,
     commandnode_template,
@@ -1561,6 +1563,9 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 log(f'      [DB] battle player stats (pid={pid}) failed: {e}')
 
         ribbon_ends = _report_ribbon_end(br_players)
+        # 勋带等级提升差集（pid → [(char_id, ribbon_id, old_lv, new_lv)]）：
+        # 结算 DB 写入后按玩家推 UnlockNotification 行（解锁弹窗/角标）
+        ribbon_upgrades = {}
         for pid, ch in char_results:
             if not _is_settleable(pid) or not ch['characterId']:
                 continue
@@ -1580,6 +1585,12 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                 # 勋带达成（templateId, level）→ XP 补到该等级阈值下限；
                 # f13 报告里的 endValue（战后勋带 XP）优先，取两者较大值
                 report_ends = ribbon_ends.get((pid, ch['characterId']), {})
+                # 写入前快照勋带 XP（floor 前后等级差 = 新解锁区间）
+                try:
+                    _old_xps = await STORE.get_ribbon_xp(
+                        pid, ch['characterId'])
+                except Exception:
+                    _old_xps = {}
                 for ribbon_id, ribbon_lv in ch['ribbons']:
                     if ribbon_id and ribbon_lv:
                         floor_xp = _RIBBON_LEVEL_XP.get(int(ribbon_lv), 0)
@@ -1588,12 +1599,26 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
                         if floor_xp:
                             await STORE.set_ribbon_xp_floor(
                                 pid, ch['characterId'], int(ribbon_id), floor_xp)
+                            _old = int(_old_xps.get(int(ribbon_id), 0) or 0)
+                            _old_lv = _ribbon_level_from_xp(_old)
+                            _new_lv = _ribbon_level_from_xp(max(_old, floor_xp))
+                            if _new_lv > _old_lv:
+                                ribbon_upgrades.setdefault(int(pid), []).append(
+                                    (int(ch['characterId']), int(ribbon_id),
+                                     _old_lv, _new_lv))
                 # f13 有 endValue 但 f9 无达成等级的勋带也要落库
                 achieved = {int(r) for r, l in ch['ribbons'] if r}
                 for rid, end_v in report_ends.items():
                     if end_v and rid not in achieved:
                         await STORE.set_ribbon_xp_floor(
                             pid, ch['characterId'], rid, end_v)
+                        _old = int(_old_xps.get(int(rid), 0) or 0)
+                        _old_lv = _ribbon_level_from_xp(_old)
+                        _new_lv = _ribbon_level_from_xp(max(_old, end_v))
+                        if _new_lv > _old_lv:
+                            ribbon_upgrades.setdefault(int(pid), []).append(
+                                (int(ch['characterId']), int(rid),
+                                 _old_lv, _new_lv))
             except Exception as e:
                 log(f'      [DB] char result stats (pid={pid}) failed: {e}')
 
@@ -1640,7 +1665,7 @@ async def handle_announce_battlefield_earnings(sess, writer, cmd_id, req_type, p
         try:
             await _finish_mission_sessions(mission_id, report_id,
                                            earned_chars, repair_spent,
-                                           wear_rows)
+                                           wear_rows, ribbon_upgrades)
         except Exception as e:
             log(f'      [combat] finish mission sessions failed: {e}')
         await _settle_war_mission(mission_id, report)
@@ -1790,13 +1815,17 @@ def _build_wear_row_msg(kind, row, cond):
 
 
 async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
-                                   repair_spent=None, wear_rows=None):
+                                   repair_spent=None, wear_rows=None,
+                                   ribbon_upgrades=None):
     """战局正常结束（earnings 已入库）对局内每名玩家收尾。
 
     earned_chars：{player_id → {本局实际获 XP 的 characterId}}（来自战报
     BattleReportCharacter，实际参战角色——部署阶段换兵时会话 char_id
     不会回写）。None（_watch_proc_exit 路径，无 earnings）时退回
     mm_sess['char_id']。
+    ribbon_upgrades：{player_id → [(char_id, ribbon_id, old_lv, new_lv)]}
+    （earnings 结算段的勋带等级提升差集）——按玩家推 UnlockNotification
+    行（解锁弹窗/面包屑角标）；无 earnings 路径为 None 跳过。
 
     与 abandon（mission.py，玩家主动放弃路径）同款收尾序列，区别在触发方是
     服务器（战斗结束客户端不会发 AbandonMissionRequest——StatusMediator 卡
@@ -1817,6 +1846,7 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
     """
     my_pms = [pms for pms, mid in mm_state.PMS_TO_MISSION.items()
               if int(mid or 0) == int(mission_id)]
+    ribbon_upgrades = ribbon_upgrades or {}
     # 真实小队整队重置必须先于 PMS DELETE（StatusMediator 在 PMS DELETE 的
     # lobbySignal 里读 squadSession.missionId，非 0 → LOCKED_IN_COMBAT）：
     # 先预扫描收集本局涉及的小队，重置后再逐玩家推 PMS DELETE
@@ -1895,6 +1925,22 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
                 log(f'S->C cmd={flash.playerview_cmd:<4} KeyValueChangeSet '
                     f'(Notification NewBattleReport typeId={report_id} '
                     f'player={pid} ★结算界面触发)')
+            # 勋带升级解锁通知（UnlockNotification 行）：提升区间内每个新
+            # 解锁 uid 一行——客户端弹解锁窗（武器/徽章/指挥点…）+ 士兵
+            # 选择面包屑角标；已读回执后 misc.py 推 delete 行清表
+            for _rchar, _rrid, _rold, _rnew in ribbon_upgrades.get(int(pid), []):
+                try:
+                    _n = await push_ribbon_unlock_notifications(
+                        flash.writer, flash.playerview_cmd, pid, _rchar,
+                        _rrid, _rold, _rnew)
+                    if _n:
+                        log(f'S->C cmd={flash.playerview_cmd:<4} '
+                            f'KeyValueChangeSet (UnlockNotification x{_n} '
+                            f'char={_rchar} ribbon={_rrid} '
+                            f'lv {_rold}->{_rnew} ★解锁弹窗)')
+                except Exception as e:
+                    log(f'      [combat] unlock notification (pid={pid} '
+                        f'char={_rchar} ribbon={_rrid}) failed: {e}')
             # 自动维修消耗通知（type=6 ItemMaintenance，官服行为）：右上角
             # 托盘条目显示本场维修扣费。NotificationData 行必须先于
             # Notification 行推——渲染器 set data 时一次性读

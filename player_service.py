@@ -51,6 +51,7 @@ from messages import (
     _msg_tracer_effect,
     _msg_uniform_part,
     _msg_uniform_variant,
+    _msg_unlock_notification,
     _msg_vehicle,
     _msg_vehicle_ammo,
     _msg_vehicle_upgrade,
@@ -159,6 +160,40 @@ async def _push_player_refresh(sess, writer):
     if sess.playerview_cmd is not None:
         player_proto = await _msg_player_for(sess)
         await _push_kvcs(writer, sess.playerview_cmd, b'player', player_proto)
+
+
+# UnlockNotification 表行 id 自增（解锁通知，KVCS 推送）。独立于 combat 的
+# Notification 表发号器——不同表 id 空间互不相交，无冲突。
+_UNLOCK_NOTIF_SEQ = [0]
+
+
+async def push_ribbon_unlock_notifications(writer, view_cmd, pid, char_id,
+                                           ribbon_id, old_lv, new_lv):
+    """勋带等级提升（old_lv → new_lv）→ 提升区间内新解锁的每个
+    progressionUnlock uid 推一条 UnlockNotification 表行（2026-09-17 补齐：
+    此前服务端从不推该表，客户端解锁弹窗/面包屑角标全哑，misc.py 的
+    RespondToUnlockNotification 回执 handler 空转）。
+
+    解锁语义 = "购买/使用资格达成"（unlockMetaLevel 落入 (old_lv, new_lv]
+    的 uid），非"已拥有"——已拥有武器/载具的行客户端 checkIfWeaponIsOwned
+    自清不弹，eCharacterType 类 clearNotification 自清，服务端无需甄别。
+    玩家点掉弹窗 → RespondToUnlockNotificationRequest 回执 → 服务端推
+    delete 行清表（handlers/misc.py）。
+    生效点：combat.py 战斗结算（勋带 XP floor 前后等级差）、shop.py
+    AddRibbonLevel（购买勋带等级）。new_lv <= old_lv 时不推。
+    返回推送行数。"""
+    if view_cmd is None or new_lv <= old_lv:
+        return 0
+    n = 0
+    for (uid, meta_lv) in _RIBBON_META_LEVEL.get(str(int(ribbon_id)), ()):
+        if old_lv < meta_lv <= new_lv:
+            _UNLOCK_NOTIF_SEQ[0] += 1
+            await _push_kvcs(writer, view_cmd, b'UnlockNotification',
+                             _msg_unlock_notification(
+                                 _UNLOCK_NOTIF_SEQ[0], pid, char_id,
+                                 uid, int(ribbon_id), meta_lv))
+            n += 1
+    return n
 
 
 

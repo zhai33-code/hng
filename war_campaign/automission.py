@@ -2,8 +2,9 @@
 """automission 阈值/tie 判定（war-gameplay-fix-plan §3/§4/§7/§8）。
 
 承接原 production.automission_tick 主体改造：war battle 无人加入（mission
-record state==0 / 缺失）超时后不再统一按「AT 剩余资源总量比较」结算，改为
-war1/war2.md 社区口径（客户端零证据，数值全部 mm_config 可配）：
+record state==0 / 缺失）超时后不再统一按「AT 剩余资源 avgSize 加权强度
+比较」结算，改为 war1/war2.md 社区口径（客户端零证据，数值全部 mm_config
+可配）：
 
   §3 野外（encounter/skirmish）：准备期 WAR_BATTLE_PREP_FIELD（默认 300s）
       后无人加入 → 按本局 preset 据点数选门槛（≥WAR_AUTO_TP_CP 个据点 =
@@ -23,8 +24,8 @@ war1/war2.md 社区口径（客户端零证据，数值全部 mm_config 可配�
 士气；系统判定结算 is_auto=True：无 XP/rank/battles 计数与 warfunds
 （war1.md「系统判定胜负不提供经验」，settle_war_battle is_auto 分支）。
 真人局（mission state==1 且战斗会话存活）不触碰；会话已消亡的中途退场局
-与无攻守上下文的局保留旧「资源总量比较」长超时（WAR_AUTOMISSION_NORMAL）
-兜底。
+与无攻守上下文的局保留旧「资源 avgSize 加权比较」长超时
+（WAR_AUTOMISSION_NORMAL）兜底。
 """
 
 import time
@@ -203,17 +204,29 @@ async def _judge_threshold(store, wb, mrec, now_s):
 
 
 async def _power_winner(store, wb):
-    """旧口径胜负：双方参战 AT 剩余资源总量多者胜（持平/皆空 = 无胜方，
-    守方守住）。"""
+    """旧口径兜底胜负：双方参战 AT 剩余资源按 armyresourcecategory.avgSize
+    加权的强度多者胜（1 步兵=1 / 轻装甲=30 / 运输机=55；未知类别权重 1），
+    持平/皆空 = 无胜方，守方守住。
+
+    2026-09 升级（community-asset-diff-2026-09.md）：原实现把各类别资源
+    原始数量直接加总（= 1 名步兵等价 1 架运输机），证实库内 avgSize 与
+    官方快照一致后改为按类别加权。"""
+    avg = wardb.army_resource_avg_sizes()
     power = {}
     for entry in (wb.get('factions') or []):
         at = await store.get_command_node(int(entry.get('at_id') or 0))
         if not at or int(at.get('state') or 0) != 2:
             continue
         fac = int(at.get('faction') or 0)
-        power[fac] = power.get(fac, 0) + sum(
-            v for v in _as_resources(at.get('resources')).values()
-            if isinstance(v, (int, float)))
+        p = 0.0
+        for cat, v in _as_resources(at.get('resources')).items():
+            if not isinstance(v, (int, float)):
+                continue
+            try:
+                p += v * avg.get(int(cat), 1.0)
+            except (TypeError, ValueError):
+                continue
+        power[fac] = power.get(fac, 0.0) + p
     if power:
         best = max(power.values())
         tops = [f for f, p in power.items() if p == best]

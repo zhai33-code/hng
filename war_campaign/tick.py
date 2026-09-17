@@ -36,6 +36,7 @@ from .battle_msgs import (
     msg_transport_segment_row,
     msg_transport_destination_row,
     msg_battle_row,
+    msg_missionresource_row,
     )
 from .at_ops import (
     rank_from_xp,
@@ -331,6 +332,18 @@ async def _reinforce_live_battle(wb, at):
         log(f'[war] reinforce live battle {wb.get("id")} failed: {e}')
 
 
+async def _battle_mission(store, battle_id):
+    """会战关联的活任务记录（missionresource 行 missionid 数据源）。
+
+    get_mission_by_battle 只认 state 0/1（活任务）；孤儿会战（record
+    已死待重建）返回 None，调用方跳过推 missionresource 行——行缺时
+    客户端 isInBattle=false，重建后无行也不会误标，安全方向。"""
+    try:
+        return await store.get_mission_by_battle(int(battle_id))
+    except Exception:
+        return None
+
+
 async def _dest_hostile(store, war_id, at, dest_bf):
     """空降目标是否有敌情（敌驻军 / 同城进行中会战）——判据与
     _check_battle_formation 同源。
@@ -470,6 +483,13 @@ async def _check_battle_formation(store, war_id, at, dest_bf):
                 if wb2:
                     wb['factions'] = wb2.get('factions') or []
                 events.append(('set', b'battle', msg_battle_row(wb)))
+                # 增援 AT 入战：missionresource 行（新行 ADD，客户端
+                # isInBattle=true → 战图"撤退"入口出现）
+                mrec = await _battle_mission(store, wb['id'])
+                if mrec:
+                    events.append(('set', b'missionresource',
+                                   msg_missionresource_row(
+                                       at, mrec['id'], war_id)))
                 # 已开局的战斗服资源池同步并入增援编制
                 await _reinforce_live_battle(wb, at)
             # else：第三阵营 AT 到场 → 不入战，正常驻扎（两方制契约）
@@ -509,6 +529,11 @@ async def _check_battle_formation(store, war_id, at, dest_bf):
             log(f'[war] battle {wb["id"]} formed → mission record id={mid} '
                 f'bf={dest_bf} atk={atk_f} def={def_f}')
             events.append(('set', b'battle', msg_battle_row(wb)))
+            # 参战 AT 全部入战：missionresource 行（新行 ADD，客户端
+            # isInBattle=true；missionid=本次成局的 record id）
+            for mr_at in [at] + enemies:
+                events.append(('set', b'missionresource',
+                               msg_missionresource_row(mr_at, mid, war_id)))
         except Exception as ex:
             log(f'[war] create war mission record failed: {ex} '
                 f'(battle {wb["id"]} rolled back)')
@@ -606,6 +631,15 @@ async def _check_field_encounters(store, war_id, now_ms=None):
                         wb0['factions'] = wb2.get('factions') or []
                         events.append(
                             ('set', b'battle', msg_battle_row(wb0)))
+                        # 增援 AT 入战：missionresource 新行 ADD（客户端
+                        # isInBattle=true）；孤儿会战（record 已死）跳过
+                        mrec = await _battle_mission(store, wb0['id'])
+                        if mrec:
+                            for a in joined:
+                                events.append(
+                                    ('set', b'missionresource',
+                                     msg_missionresource_row(
+                                         a, mrec['id'], war_id)))
                         for a in joined:
                             await _reinforce_live_battle(wb0, a)
                     bypass = [a['id'] for a in group if a not in joined]
@@ -677,6 +711,12 @@ async def _check_field_encounters(store, war_id, now_ms=None):
                     f'{sl_id} type={btype} pos={position:.2f} '
                     f'factions={sorted(facs)} → mission {mid}')
                 events.append(('set', b'battle', msg_battle_row(wb)))
+                # 参战 AT 全部入战：missionresource 行（新行 ADD，客户端
+                # isInBattle=true；missionid=本次成局的 record id）
+                for a in group:
+                    events.append(('set', b'missionresource',
+                                   msg_missionresource_row(
+                                       a, mid, war_id)))
                 field_battles[sl_id] = wb
             except Exception as ex:
                 log(f'[war] create field mission record failed: {ex} '
@@ -919,7 +959,12 @@ async def broadcast_war_events(events, store=None):
                         continue
                 out.append(e)
         try:
-            await _push_kvcs_batch(w, cmd, out, preserve_order=True)
+            # 大事件批次达阈值整体 gzip（zipchunk，2026-09-17 P1）；
+            # combat 连接（ZServer）禁 zip——官方 warserver 从不给
+            # 专用服发 KVCS
+            await _push_kvcs_batch(
+                w, cmd, out, preserve_order=True,
+                allow_zip=not getattr(sess, 'is_combat_server', False))
         except Exception:
             pass          # 单会话故障不影响其他订阅者
 
@@ -1065,6 +1110,10 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
             at = await store.get_command_node(int(entry.get('at_id') or 0))
             if not at or int(at.get('state') or 0) != 2:
                 continue                      # 已解散/不在战中
+            # AT 离战：结算后必不留在 state=2（歼灭=3/投降·释放=0）→ 删
+            # missionresource 行（客户端 isInBattle=false，撤退入口消失；
+            # DELETE 分支按行 id=AT id 精确清 _assaultTeamsInBattle）
+            events.append(('del', b'missionresource', at['id']))
             won = bool(winner) and int(at.get('faction') or 0) == winner
             ratio = win_loss if won else lose_loss
             new_res = _scale_resources(

@@ -22,6 +22,7 @@
 import asyncio
 import datetime
 import os
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,6 +38,12 @@ RESULTS = []
 def check(label, ok, detail=''):
     RESULTS.append((label, ok))
     print(f'[{"PASS" if ok else "FAIL"}] {label}{("  " + detail) if detail else ""}')
+
+
+def _mr_id(row):
+    """missionresource 行主键 f1（int64 varint）→ AT id。
+    （曾误按 sfixed64/wt1 解，P3 conformance roundtrip 抓出后改正。）"""
+    return int(row[1])
 
 
 # ------------------------------------------------------------- 合成拓扑
@@ -136,7 +143,7 @@ class FakeStore:
         m = {'id': self.next_mission_id, 'state': 0, 'preset': preset}
         m.update(kw)
         self.mission_records[m['id']] = m
-        return dict(m)
+        return m['id']          # 与真实 store 契约一致（返回 mission id）
 
     async def update_war_production(self, war_id, production_ms):
         return True
@@ -639,6 +646,20 @@ async def main():
     check('battle 行 f2 warid / f3 mapEntityId / f9 factioncount',
           int(battle_row[2]) == war2['id'] and int(battle_row[3]) == 30
           and int(battle_row[9]) == 2)
+    # missionresource 行（isInBattle 唯一数据源）：双方各一行 ADD，
+    # 行 id=f1=AT id，f5 commandNodeWarInstanceId=AT id，
+    # f2 missionid=成局 record id
+    mr_rows3 = [pb_parse(p) for k, tag, p in ev3
+                if tag == b'missionresource']
+    mr_mid3 = next(m['id'] for m in store2.mission_records.values()
+                   if int(m.get('battle_id') or 0) == battles[0]['id'])
+    check('成局推 missionresource：双方各一行（id=AT id，f5=AT id，'
+          'f2=missionid）',
+          len(mr_rows3) == 2
+          and {_mr_id(r) for r in mr_rows3} == {21, 22}
+          and {int(r[5]) for r in mr_rows3} == {21, 22}
+          and {int(r[2]) for r in mr_rows3} == {mr_mid3},
+          f'{[(_mr_id(r), int(r[5]), int(r[2])) for r in mr_rows3]}')
 
     # 加入既有会战：不重复建战
     f3at = _mk_at(store2, war2['id'], 23, 1, 20)
@@ -650,6 +671,35 @@ async def main():
           and len(store2.battles) == 1
           and store2.ats[23]['state'] == 2
           and any(tag == b'battle' for _, tag, _ in evj))
+    mr_rowsj = [pb_parse(p) for k, tag, p in evj
+                if tag == b'missionresource']
+    check('增援推 missionresource：新行 ADD（AT 23，同战同 missionid）',
+          len(mr_rowsj) == 1
+          and _mr_id(mr_rowsj[0]) == 23
+          and int(mr_rowsj[0][2]) == mr_mid3,
+          f'{[(_mr_id(r), int(r[2])) for r in mr_rowsj]}')
+
+    # D-snap 快照 missionresource 行：进行中会战参战 AT 各一行（重登录
+    #      后 isInBattle/撤退入口数据源；2026-09-17 补）；中途撤退 AT
+    #      （state!=2，factions 残留）不发
+    snap_mr = {_mr_id(pb_parse(p)): pb_parse(p)
+               for tag, p in await war_campaign.build_warmap_snapshot(
+                   store2, war2)
+               if tag == b'missionresource'}
+    check('快照 进行中会战参战 AT missionresource 行（f5=AT id、'
+          'f2=missionid）',
+          set(snap_mr) == {21, 22, 23}
+          and all(int(r[5]) == aid and int(r[2]) == mr_mid3
+                  for aid, r in snap_mr.items()),
+          f'{sorted(snap_mr)}')
+    store2.ats[23]['state'] = 0          # 模拟中途撤退（factions 残留）
+    snap_mr2 = {_mr_id(pb_parse(p))
+                for tag, p in await war_campaign.build_warmap_snapshot(
+                    store2, war2)
+                if tag == b'missionresource'}
+    check('快照 离战 AT（state!=2）不发 missionresource 行',
+          snap_mr2 == {21, 22}, f'{sorted(snap_mr2)}')
+    store2.ats[23]['state'] = 2          # 还原（后续段只读 store2）
 
     # 出兵点到达落位 type=2
     store3 = FakeStore()
@@ -1113,6 +1163,9 @@ async def main():
     check('I2b 会战行终态 + del battle 事件',
           storeB.battles[wbB['id']]['state'] == 1
           and ('del', b'battle', wbB['id']) in evB)
+    check('I2b2 结算删 missionresource：全体参战 AT 离战行删（胜/歼同删）',
+          ('del', b'missionresource', 221) in evB
+          and ('del', b'missionresource', 222) in evB)
 
     # I2c excludedFactionId：两方局（factions 1,2）→ f9=2 / f10=3
     rowB = war_campaign.msg_battle_row(wbB)
@@ -1300,6 +1353,15 @@ async def main():
         check('J1d mission record 落库（map_entity=遭遇段起点城）',
               len(mrecJ) == 1 and mrecJ[0]['map_entity_id'] == 10,
               f'{[(m["id"], m["map_entity_id"]) for m in mrecJ]}')
+        mr_rowsJ = [pb_parse(p) for k, tag, p in evJ
+                    if tag == b'missionresource']
+        check('J1e 野外成局推 missionresource：双方各一行 ADD'
+              '（id=AT id，f2=missionid）',
+              len(mr_rowsJ) == 2
+              and {_mr_id(r) for r in mr_rowsJ} == {301, 302}
+              and {int(r[2]) for r in mr_rowsJ}
+              == {mrecJ[0]['id'] if mrecJ else -1},
+              f'{[(_mr_id(r), int(r[2])) for r in mr_rowsJ]}')
 
         # J2 冻结：会战中不推进不到达
         await war_campaign.advance_movements(
@@ -1315,12 +1377,16 @@ async def main():
         storeJ.ats[301]['resources'] = {1: 100}
         storeJ.ats[302]['resources'] = {1: 100}
         midJ = mrecJ[0]['id'] if mrecJ else 0
-        await war_campaign.settle_war_battle(storeJ, midJ, wbJ['id'], 1)
+        evJ3 = await war_campaign.settle_war_battle(
+            storeJ, midJ, wbJ['id'], 1)
         check('J3 野外结算：幸存双方 state=0 + 无城市易主',
               storeJ.ats[301]['state'] == 0
               and storeJ.ats[302]['state'] == 0
               and not storeJ.city_owners.get(warJ['id']),
               f'owners={storeJ.city_owners.get(warJ["id"])}')
+        check('J3c 野外结算删 missionresource：双方离战行删',
+              ('del', b'missionresource', 301) in evJ3
+              and ('del', b'missionresource', 302) in evJ3)
         check('J3b 冻结行军顺延恢复（started_at 后移，仍 active）',
               storeJ.movements[mvJ1['id']]['state'] == 0
               and storeJ.movements[mvJ1['id']]['started_at'] > NOW
@@ -1378,7 +1444,7 @@ async def main():
             storeM, m3, 20, now=NOW + datetime.timedelta(seconds=1))
         _ = await war_campaign.start_movement(
             storeM, m4, 20, now=NOW + datetime.timedelta(seconds=1))
-        await war_campaign.advance_movements(
+        evM6 = await war_campaign.advance_movements(
             storeM, warM, now=NOW + datetime.timedelta(seconds=SEG_SEC))
         check('J6 野外增援：交战阵营入战（state=2 + factions 追加）',
               wbM is not None
@@ -1388,6 +1454,17 @@ async def main():
               and len(storeM.battles) == 1,
               f"m3={storeM.ats[333]['state']} "
               f"n={len(storeM.battles)}")
+        mr_rowsM = [pb_parse(p) for k, tag, p in evM6
+                    if tag == b'missionresource']
+        mrecM = next((m for m in storeM.mission_records.values()
+                      if m.get('battle_id') == wbM['id']), None)
+        check('J6c 野外增援推 missionresource：新行 ADD（AT 333，'
+              '同战同 missionid）',
+              len(mr_rowsM) == 1
+              and _mr_id(mr_rowsM[0]) == 333
+              and mrecM is not None
+              and int(mr_rowsM[0][2]) == mrecM['id'],
+              f'{[(_mr_id(r), int(r[2])) for r in mr_rowsM]}')
         check('J6b 第三阵营照常行军不入战',
               storeM.ats[334]['state'] == 1
               and not any(f.get('at_id') == 334
@@ -1624,6 +1701,10 @@ async def main():
     _orig_preset_loader = wardb._load_preset
     _orig_cp_loader = wardb._load_capturepoint_templates
     _orig_tpls_k = wardb.commandnode_templates
+    _orig_avg_k = wardb.army_resource_avg_sizes
+    # P4-3 加权权重（armyresourcecategory.avgSize 官方值：步兵 1 / 运输机
+    # 55），K11 用；真实表 diff 佐证见 docs/community-asset-diff-2026-09.md
+    wardb.army_resource_avg_sizes = lambda: {1: 1.0, 10: 55.0}
     # preset 5 → gamemap 55（三点图 3 据点）/ preset 6 → gamemap 66（单点 1）
     wardb._load_preset = lambda pid: {3: 55 if int(pid or 0) == 5 else 66}
     wardb._load_capturepoint_templates = (
@@ -1660,7 +1741,7 @@ async def main():
         mid = await st.create_mission_record(
             preset, attacker_faction=1, defender_faction=2,
             battle_id=wb['id'])
-        return st, w, wb, int(mid['id'])
+        return st, w, wb, int(mid)
 
     try:
         # K1 野外单点图（preset 6 → 1 据点 → 门槛 144）：攻 100 < 144 ≤
@@ -1835,6 +1916,19 @@ async def main():
               f"win={st9.battles[wb9['id']]['winning_faction']} "
               f"res={st9.ats[401]['resources']}")
 
+        # K11 旧口径兜底按 avgSize 加权（P4-3）：攻运输机 {10:2}=2×55=110
+        #     vs 守步兵 {1:100}=100×1=100 → 攻方单位数更少仍胜（旧总量
+        #     口径 2 < 100 会误判守方胜）；守方 60% 损耗归 40
+        st11, _w11, wb11, m11 = await _mk_auto_battle(
+            war_campaign.BATTLE_TYPE_ASSAULT, {10: 2}, {1: 100})
+        st11.mission_records[m11]['state'] = 1
+        await war_campaign.automission_tick(st11)
+        check('K11 加权强度：运输机 2×55=110 > 步兵 100×1=100 攻方胜',
+              st11.battles[wb11['id']]['winning_faction'] == 1
+              and st11.ats[402]['resources'] == {1: 40},
+              f"win={st11.battles[wb11['id']]['winning_faction']} "
+              f"res={st11.ats[402]['resources']}")
+
         # K10 tie 持平收局（缺口 1，war-para-battle-briefing-investigation
         #     .md）：双方兵力持平 → winner=0 + 伞兵照常落地（tpl 108→114）
         #     + settle ③b 攻方（非城主）撤退、守方（城主）留守、不再成局
@@ -1864,6 +1958,7 @@ async def main():
         wardb._load_preset = _orig_preset_loader
         wardb._load_capturepoint_templates = _orig_cp_loader
         wardb.commandnode_templates = _orig_tpls_k
+        wardb.army_resource_avg_sizes = _orig_avg_k
 
     # ---- L. war_pending 简报兵力（大厅战局详情 f4/f5 = battle roster
     #      真实 AT，非 FALLBACK 静态锚点；2026-09-11 玩家报"成局战局
@@ -2135,7 +2230,7 @@ async def main():
     _fs_orig, _pb_orig = state_mod.FLASH_SESSIONS, messages_mod._push_kvcs_batch
     captured = []
 
-    async def _fake_batch(w, cmd, evs, preserve_order=False):
+    async def _fake_batch(w, cmd, evs, preserve_order=False, allow_zip=True):
         captured.append(list(evs))
 
     messages_mod._push_kvcs_batch = _fake_batch

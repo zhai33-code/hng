@@ -258,11 +258,23 @@ class FakeStore:
 
     async def create_mission_record(self, preset, attacker_faction=0,
                                     defender_faction=0, battle_id=0, **kw):
-        return {'id': 900000 + int(battle_id or 0), 'state': 0,
-                'preset': int(preset or 0),
-                'attacker_faction': int(attacker_faction or 0),
-                'defender_faction': int(defender_faction or 0),
-                'battle_id': int(battle_id or 0)}
+        # 与真实 store 契约一致：返回 mission id（int），record 落
+        # mission_records（get_mission_by_battle 查询用）
+        mid = 900000 + int(battle_id or 0)
+        if not hasattr(self, 'mission_records'):
+            self.mission_records = {}
+        self.mission_records[mid] = {
+            'id': mid, 'state': 0, 'preset': int(preset or 0),
+            'attacker_faction': int(attacker_faction or 0),
+            'defender_faction': int(defender_faction or 0),
+            'battle_id': int(battle_id or 0)}
+        return mid
+
+    async def get_mission_by_battle(self, battle_id):
+        for m in getattr(self, 'mission_records', {}).values():
+            if int(m.get('battle_id') or 0) == int(battle_id):
+                return dict(m)
+        return None
 
     # ---- movement（R 组）----
     async def create_movement(self, at_id, war_id, path, started_at=None,

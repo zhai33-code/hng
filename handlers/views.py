@@ -28,6 +28,7 @@ from wardb import (
 from messages import (
     _msg_war,
     _push_kvcs,
+    _push_kvcs_batch,
     msg_query_war_catalogue_response,
     )
 
@@ -236,8 +237,13 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
             pid = None
         snapshot = await war_campaign.build_warmap_snapshot(
             STORE, player_id=pid)
-        for table_tag, row in snapshot:
-            await _push_kvcs(writer, cmd_id, table_tag, row)
+        # 整快照单条批量 KVCS（跨行原子 + 达阈值整体 gzip 走 zipchunk，
+        # 2026-09-17 P1；此前逐行单帧 ×N 次写——全 set 顺序在批内保持，
+        # 客户端 FIFO 派发时序不变）。combat 连接禁 zip（ZServer 崩溃教训）
+        await _push_kvcs_batch(
+            writer, cmd_id,
+            [('set', tag, row) for tag, row in snapshot],
+            allow_zip=not getattr(sess, 'is_combat_server', False))
         n_tables = len({tag for tag, _ in snapshot})
         log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (warmap snapshot: '
             f'{len(snapshot)} rows / {n_tables} tables) ★warmapview fill')

@@ -15,6 +15,7 @@ Implements the wire protocol reverse-engineered from the AIR client
 本模块只含纯编解码原语与登录基础消息构建，无 I/O、无全局状态，
 供 realtest_server / game_server / matchmaking / handlers 共用。
 """
+import gzip
 import struct
 import time
 
@@ -81,6 +82,21 @@ def build_response(cmd_id, title, proto_bytes=b''):
     main = Chunk(struct.pack('<i', cmd_id))
     main.subs.append(Chunk(title.encode(), [Chunk(proto_bytes)]))
     return main.write(b'')
+
+
+def build_zipchunk(inner_frame_bytes, cmd_id=0):
+    """官方 zipchunk 压缩帧：一个完整内层帧（如 KVCS main 帧）标准 gzip
+    后装进 zipchunk proto（netsysmessages.zipchunk：required bytes
+    data=1，wire type 2），外层走标准 response 布局。
+
+    客户端契约（Chunk.as:94-103）：收到标题 "zipchunk" 的消息 → 取
+    subChunks[0]（proto 体）data 字段 → GZIPBytesEncoder.uncompress
+    ToByteArray 解压 → parseData 只解析**第一棵** Chunk 树 → 单个
+    zipchunk 只能装 1 个内层完整帧（多帧被丢弃，大批量靠 KVCS 批量
+    消息本身装多行）。外层 cmd_id 客户端丢弃，固定 0。官方流量同为
+    标准 gzip 流（hagcp wiresharkDecode 可直接 gunzip 验证）。"""
+    return build_response(cmd_id, 'zipchunk',
+                          pb_string(1, gzip.compress(inner_frame_bytes)))
 
 # ------------------------------------------------------------- protobuf wire
 

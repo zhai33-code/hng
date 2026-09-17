@@ -6,13 +6,19 @@ wardb 的静态数据（弹药满耐久/勋带等级阈值/解锁位图长度）
 被 handlers 各域模块与 realtest_server 复用。
 """
 import struct
+import time
 
 from protocol import (
-    Chunk,
+    Chunk, build_zipchunk,
     pb_string, pb_int32, pb_int64, pb_uint32, pb_float, pb_message, pb_packed_bool, pb_bool,
 )
 from state import CURRENT_PID, log
 from wardb import _prog_max, _AMMO_MAXCOND, _RIBBON_LEVEL_XP, _ribbon_level_from_xp
+
+# zipchunk 压缩阈值（B）：组好的 main 帧字节数 ≥ 阈值且 allow_zip 时整体
+# gzip 走 zipchunk 包装（客户端 Chunk.as:94-103 契约）；小帧 gzip 头/尾
+# 开销不划算保持明文。置 0 = 全量关闭（全明文，一键回滚开关）。
+ZIP_THRESHOLD = 1024
 
 
 def _cur_pid():
@@ -193,7 +199,8 @@ async def _push_kvcs_delete(writer, view_cmd, table_name, row_id):
         f'via cmd={view_cmd}')
 
 
-async def _push_kvcs_batch(writer, view_cmd, events, preserve_order=False):
+async def _push_kvcs_batch(writer, view_cmd, events, preserve_order=False,
+                           allow_zip=True):
     """将一组 ('set',table,proto)/('del',table,id) 打包进单个
     KeyValueChangeSet 消息推送：delete/set 各一个 action 块（delete 在前），
     表块按行重复（客户端 updateTablesFromChangeset 对 changeset.subChunks
@@ -213,7 +220,14 @@ async def _push_kvcs_batch(writer, view_cmd, events, preserve_order=False):
     此模式：onDestinationUpdates 重算 AT 列表 status=location，要求
     instance（location 更新为新城市）先于 destination del 派发，
     否则 status 按在途旧值（补给线=""）冻结、交战中 AT 无后续事件
-    自愈 → 部队列表不显示所在城市名（2026-09-15 修复）。"""
+    自愈 → 部队列表不显示所在城市名（2026-09-15 修复）。
+
+    allow_zip（2026-09-17 P1）：main 帧字节数 ≥ ZIP_THRESHOLD 时整体
+    gzip 走 zipchunk 包装（单 zipchunk 只装 1 个内层完整帧，客户端
+    parseData 只解析第一棵 Chunk 树；压缩后反而更大则回退明文）。
+    combat 连接（hng.exe/ZServer wardatacomm）禁用——调用侧拿会话
+    is_combat_server 显式传 False（官方 warserver 从不给专用服发
+    KVCS，ZServer 堆曾因乱推崩溃）。"""
     def _row_chunk(kind, table_name, payload):
         if kind == 'set':
             return Chunk(table_name, [Chunk(payload)])
@@ -237,10 +251,20 @@ async def _push_kvcs_batch(writer, view_cmd, events, preserve_order=False):
                for kind, chunks in groups]
     title_chunk = Chunk(b'KeyValueChangeSet', actions)
     main = Chunk(struct.pack('<i', view_cmd), [title_chunk])
-    writer.write(main.write(b''))
+    frame = main.write(b'')
+    n_set = sum(1 for e in events if e[0] == 'set')
+    n_del = len(events) - n_set
+    if allow_zip and ZIP_THRESHOLD > 0 and len(frame) >= ZIP_THRESHOLD:
+        zframe = build_zipchunk(frame)
+        if len(zframe) < len(frame):
+            writer.write(zframe)
+            await writer.drain()
+            log(f'      [kvcs] batch {n_set} set / {n_del} del '
+                f'via cmd={view_cmd} zip {len(frame)}B→{len(zframe)}B')
+            return
+    writer.write(frame)
     await writer.drain()
-    log(f'      [kvcs] batch {sum(1 for e in events if e[0] == "set")} set /'
-        f' {sum(1 for e in events if e[0] != "set")} del '
+    log(f'      [kvcs] batch {n_set} set / {n_del} del '
         f'via cmd={view_cmd}')
 
 
@@ -397,6 +421,35 @@ def _msg_ribbon(ribbon_template_id, total_xp):
     m += pb_int32(2, int(total_xp))        # currentValue (累计XP)
     m += pb_int32(3, lv)                   # currentLevel (XP 推导)
     m += pb_int32(4, next_xp)              # nextValue (下一级阈值)
+    return m
+
+
+def _msg_unlock_notification(notif_id, player_id, char_id, unlock_uid,
+                             ribbon_id, ribbon_level):
+    """构建 HnG_States.UnlockNotification proto（解锁通知行，2026-09-17
+    补齐——此前服务端从不推该表，解锁弹窗/面包屑角标/已读回执三件套
+    全哑：回执 handler 一直在等一条永远不会来的通知）。
+
+    客户端消费（UnlockNotificationModel.as）：
+    - 行 ADD/UPDATE → UnlockNotificationTable.newNotifications 非空 →
+      按 progressionUnlockId 查静态 ProgressionUnlockTable.unlockItemType
+      弹对应解锁窗（武器/载具/战斗徽章/指挥点/弹药/改装/军服共 12 种）；
+      玩家点掉/自动清理 → RespondToUnlockNotificationRequest 回执 →
+      服务端推 delete 行（handlers/misc.py）；
+    - 已拥有的武器/载具类行客户端 checkIfWeaponIsOwned 自清不弹，
+      eCharacterType 类 clearNotification 自清——按"解锁资格达成"语义
+      推送即可，无需服务端甄别物品类型。
+    unlockTimestamp 仅 debug 输出，Zulu 格式（YYYYMMDDHHMMSSZ）即可。"""
+    m = pb_int64(1, int(notif_id))             # id
+    m += pb_int64(2, int(player_id))           # playerId
+    m += pb_int64(3, int(char_id))             # characterId
+    m += pb_int64(4, int(unlock_uid))          # progressionUnlockId
+    m += pb_int64(5, int(ribbon_id))           # ribbonTemplateId（解锁来源勋带）
+    m += pb_int64(6, int(ribbon_level))        # ribbonLevel（达成等级）
+    m += pb_string(7, time.strftime(           # unlockTimestamp
+        '%Y%m%d%H%M%S', time.gmtime()) + 'Z')
+    m += pb_int32(8, 0)                        # notificationResponse（未读）
+    m += pb_bool(9, False)                     # markedForDelete
     return m
 
 

@@ -304,9 +304,28 @@ async def build_warmap_snapshot(store, war=None, player_id=None):
         # 活跃会战 battle 行（2026-09-08 补：成局后新登录/重订阅的客户端
         # 才能看到战斗标记；此前快照缺 battle 段 → 该城 BattleTable 无行
         # → 点击走"城市详情"分支而非"战局详情"分支，且战斗标记不显示）
-        from .battle_msgs import msg_battle_row
-        for wb in await store.list_active_war_battles(war_id):
+        from .battle_msgs import msg_battle_row, msg_missionresource_row
+        from .tick import _battle_mission
+        active_battles = await store.list_active_war_battles(war_id)
+        for wb in active_battles:
             rows.append((b'battle', msg_battle_row(wb)))
+        # 参战 AT 的 missionresource 行（2026-09-17 补：客户端 isInBattle
+        # 唯一数据源；增量推送已有、快照缺则重登录后 isInBattle=false、
+        # 撤退入口丢失）。行 id=AT id，仅 state=2（仍在战中；中途撤退的
+        # AT 残留 battle.factions 不发）；孤儿会战（record 已死）跳过，
+        # 与 tick 推送同口径
+        at_by_id = {int(a.get('id') or 0): a for a in ats}
+        for wb in active_battles:
+            mrec = await _battle_mission(store, wb['id'])
+            if not mrec:
+                continue
+            for entry in (wb.get('factions') or []):
+                mr_at = at_by_id.get(int(entry.get('at_id') or 0))
+                if (mr_at is not None
+                        and int(mr_at.get('state') or 0) == 2):
+                    rows.append((b'missionresource',
+                                 msg_missionresource_row(
+                                     mr_at, mrec['id'], war_id)))
         # 在途空运行（订阅时已起飞的 AT；§3.14 air_transport）
         for mv in await store.list_active_movements(war_id):
             segs = movement_segments(mv)

@@ -114,3 +114,33 @@ def msg_battle_row(wb):
     m += pb_float(11, float(wb.get('position') or 0.0))  # position
     m += pb_string(12, _fmt_ts(activation))            # activationTimeStamp
     return m
+
+
+def msg_missionresource_row(at, mission_id, war_id):
+    """missionresource 行（会战资源占用；客户端 isInBattle 的唯一数据源，
+    2026-09-17 KVCS 缺口审计补——此前从不推送，玩家 AT state=2 客户端
+    不知道在作战：撤退入口永不出现，服务端撤退 handler 白实现）。
+
+    字段语义（hagcp HnG_States.proto:2624 + 客户端消费链）：
+    - id（f1）：行主键，一 AT 一行（一个 AT 同时至多一会战）→ 取 AT id；
+    - commandNodeWarInstanceId（f5）：AT id——AssaultTeamModel 按此置
+      isInBattle（战争地图 AT 按钮"撤退"/AT 列表撤退角标）；
+    - missionid（f2）：mission_records id——撤退窗口 AssaultTeamRetreat-
+      WindowMediator.getBattleInformation 用它发 GetMissionDetailsRequest。
+    推送契约（AssaultTeamModel.as:340-390）：入战必须新行 ADD（changeSignal
+    的 UPDATE 分支直接 return，0→非0 无 handler）；离战用行 DELETE（DELETE
+    分支按旧行 commandNodeWarInstanceId 清 isInBattle）。
+    f7-f10 客户端无消费者，填中性默认。f1 官方 schema 为 int64（varint）
+    ——与 battle/battlefieldstatus 行的 sfixed64 不同（P3 conformance
+    roundtrip 抓出，勿再误套 wt1）。"""
+    m = pb_int64(1, at['id'])                        # id（=AT id，一 AT 一行）
+    m += pb_int64(2, int(mission_id or 0))             # missionid
+    m += pb_int64(3, war_id)                           # warid
+    m += pb_int64(4, at.get('faction') or 0)           # factionId
+    m += pb_int64(5, at['id'])                         # commandNodeWarInstanceId
+    m += pb_int64(6, at.get('template_id') or 0)       # commandNodeTemplateId
+    m += pb_int64(7, 0)                                # accesspointTemplateId
+    m += pb_bool(8, False)                             # locked
+    m += pb_bool(9, True)                              # allowedToLobby
+    m += pb_bool(10, False)                            # spawnInAir
+    return m

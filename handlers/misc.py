@@ -457,13 +457,22 @@ async def handle_respondtounlocknotificationrequest(sess, writer, cmd_id,
             f'responseCode={code}')
     except Exception as e:
         log(f'      RespondToUnlockNotification parse error: {e}')
+        notification_id = 0
 
-    # 本服务器不解锁通知重发逻辑，ack 即可；客户端本地移除通知条目
+    # ack + 推 delete 行清表（2026-09-17 起服务端会推 UnlockNotification 行：
+    # combat 结算/购买勋带等级 → player_service.push_ribbon_unlock_notifications。
+    # 客户端点掉弹窗/自动清理（>10 条）后发回执，服务端删行保持表干净，
+    # 重连 KVCS 全量重放时不会把已读行再进 newNotifications 重弹）
     resp = build_response(cmd_id, 'RespondToUnlockNotificationResponse',
                           pb_int32(1, 1))
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RespondToUnlockNotificationResponse (response=1 ok)')
+    if notification_id and sess.playerview_cmd is not None:
+        await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                b'UnlockNotification', int(notification_id))
+        log(f'S->C cmd={sess.playerview_cmd:<4} KeyValueChangeSet delete '
+            f'(UnlockNotification id={notification_id} ★已读清表)')
 
 
 async def handle_deploytoolrequest(sess, writer, cmd_id, req_type, proto):

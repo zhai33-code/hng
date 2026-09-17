@@ -626,6 +626,7 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
     code = war_campaign.RC_OK
     at = None
     wiped = False
+    was_in_battle = False
     if pid is None or STORE is None:
         code = war_campaign.RC_CHARACTER_NOT_FOUND
     else:
@@ -901,6 +902,13 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RetreatCommandNodeResponse (msg={code})')
     if at is not None and code == war_campaign.RC_OK:
+        if was_in_battle:
+            # 交战撤退成功 → AT 离战：missionresource 行删除广播（全体
+            # 战图订阅者 isInBattle=false，撤退入口消失；覆盖溃散/行军
+            # 撤退/撤回待命三条路径）。仅广播一源，避免与会话内推送
+            # 重复 DELETE（客户端按旧行清表，行已删时旧行为 null）
+            await war_campaign.broadcast_war_events(
+                [('del', b'missionresource', at['id'])], STORE)
         if wiped:
             # 溃散全歼：删行推送（与解散同表集合）
             await _push_at_delete(sess, writer, at)
@@ -1488,6 +1496,10 @@ async def handle_dissolve_commandnode(sess, writer, cmd_id, req_type, proto):
         else:
             at, code = await _load_at(pid, node_id, war)
             if not code:
+                # 在战 AT（state=2）此前推送过 missionresource 行 → 解散
+                # 须补行删除广播，否则客户端留孤儿行（isInBattle=true 但
+                # AT 已删；结算 settle 循环对已删 AT 直接 continue 不再删）
+                was_in_battle = int(at.get('state') or 0) == 2
                 tpl = commandnode_templates().get(
                     int(at.get('template_id') or 0)) or {}
                 refund = war_campaign.dissolve_refund(tpl)
@@ -1507,6 +1519,10 @@ async def handle_dissolve_commandnode(sess, writer, cmd_id, req_type, proto):
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} dissolve_commandnode_response (msg={code})')
     if at is not None and code == war_campaign.RC_OK:
+        # 在战解散：missionresource 行删除广播（全体订阅者，理由见上）
+        if was_in_battle:
+            await war_campaign.broadcast_war_events(
+                [('del', b'missionresource', at['id'])], STORE)
         # 响应先于行删除推送（理由同购买/部署/补编）
         await _push_at_delete(sess, writer, at)
         await _push_player_refresh(sess, writer)

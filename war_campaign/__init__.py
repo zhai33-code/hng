@@ -76,6 +76,7 @@ from .battle_msgs import (
     msg_transport_destination_row,
     msg_air_transport_row,
     msg_battle_row,
+    msg_missionresource_row,
     )
 from .at_ops import (
     RC_OK,
@@ -267,6 +268,7 @@ __all__ = [
     'msg_transport_destination_row',
     'msg_air_transport_row',
     'msg_battle_row',
+    'msg_missionresource_row',
     'RC_OK',
     'RC_CHARACTER_NOT_FOUND',
     'RC_NO_NAME',

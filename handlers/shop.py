@@ -39,6 +39,7 @@ from wardb import (
     _default_ammo_for,
     _parse_wardb_table,
     _rank_from_combat_xp,
+    _ribbon_level_from_xp,
     default_uniform_variant,
     vehicle_full_condition,
     MEMBERSHIP_DAYS_BY_ID,
@@ -63,6 +64,7 @@ from player_service import (
     _charge_player,
     _msg_player_for,
     _push_player_refresh,
+    push_ribbon_unlock_notifications,
     )
 
 from handlers.economy import (
@@ -829,8 +831,11 @@ async def handle_addribbonlevelrequest(sess, writer, cmd_id, req_type, proto):
         if info is not None:
             # 持久化勋带经验到角色（人物级；勋带单源 = total_xp，等级由阈值推导。
             # ResponseReadCharacterStats attributes 按角色显示 XP/等级/进度）
+            _old_xps = {}
             try:
                 min_xp = _RIBBON_LEVEL_XP.get(ribbon_level_id, 0)
+                # 写入前快照勋带 XP（floor 前后等级差 = 新解锁区间）
+                _old_xps = await STORE.get_ribbon_xp(pid, char_id)
                 await STORE.set_ribbon_xp_floor(pid, char_id,
                                                 ribbon_template_id, min_xp)
                 log(f'      AddRibbonLevel: char {char_id} ribbon {ribbon_template_id} '
@@ -846,6 +851,18 @@ async def handle_addribbonlevelrequest(sess, writer, cmd_id, req_type, proto):
 
     # 推送 player 刷新货币显示（购买扣款后）
     await _push_player_refresh(sess, writer)
+
+    # 解锁通知（UnlockNotification 行）：购买勋带等级的提升区间内每个新
+    # 解锁 uid 一行——客户端弹解锁窗 + 士兵选择面包屑角标；已读回执后
+    # misc.py 推 delete 行清表。重复购买低等级（等级未涨）不推
+    if info is not None and pid is not None:
+        _old = int(_old_xps.get(int(ribbon_template_id), 0) or 0)
+        _n = await push_ribbon_unlock_notifications(
+            writer, sess.playerview_cmd, pid, char_id, ribbon_template_id,
+            _ribbon_level_from_xp(_old), int(ribbon_level_id))
+        if _n:
+            log(f'      AddRibbonLevel: {_n} unlock notification(s) pushed '
+                f'(ribbon={ribbon_template_id} lv={ribbon_level_id})')
 
     # 重新推送目标角色（unlockBits 更新 + statUpdateTimeStamp 变化 → 客户端
     # CharacterModel.checkStatsWasUpdated 检测到 stats 过期 → 重新请求

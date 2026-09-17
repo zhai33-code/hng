@@ -1,0 +1,48 @@
+// vendored from Heroes-and-Generals-community-project (MIT)
+// packages/hagcp-network-client/src/protos/netsysmessages.proto
+// converted: syntax/proto2 header, required -> optional (wire equal)
+
+syntax = "proto2";
+
+package netsysmessages;
+
+import "Common.proto";
+message GetHandlerTypes {
+optional int32 dummy = 1;
+}
+
+message keepalive {
+optional int32 value = 1;
+}
+
+message keepaliverequest {
+optional int32 value = 1;
+}
+
+message keepaliveresponse {
+optional int32 value = 1;
+}
+
+message KeyValueSyncCmd_GetVersion {
+optional int32 dummy = 1;
+}
+
+message KeyValueSyncCmd_GetVersionResponse {
+optional uint64 version = 1;
+}
+
+message KeyValueSyncCmd_RequestSync {
+
+}
+
+message KeyValueSyncCmd_RequestSyncResponse {
+optional int32 dummy = 1;
+}
+
+message ResponseHandlerTypes {
+repeated string names = 1;
+}
+
+message zipchunk {
+optional bytes data = 1;
+}

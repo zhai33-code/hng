@@ -1457,6 +1457,35 @@ def army_resource_categories():
     return _ARMY_RESOURCE_CATEGORY_CACHE
 
 
+_ARMY_RES_AVG_SIZE_CACHE = None
+
+
+def army_resource_avg_sizes():
+    """armyresourcecategory 表 {类别 id: avgSize 平均编制规模}（缓存）。
+
+    avgSize = 该类别 1 单位资源的规模权重（infantryman 1 / armoured_car 15
+    / light_armor 30 / transport_plane 55 ...），automission 无人局旧口径
+    兜底结算按 Σ(数量×avgSize) 比兵力强度（community-asset-diff-2026-09.md
+    证实与官方快照 18/18 行含 avgSize 全一致）。f4 为 wt5 float32，
+    pb_parse 返回原始 4 字节需手动 unpack；查表失败返回 {}（调用方对
+    未知类别缺省权重 1.0 = 退化回旧总量口径）。"""
+    global _ARMY_RES_AVG_SIZE_CACHE
+    if _ARMY_RES_AVG_SIZE_CACHE is None:
+        out = {}
+        try:
+            for r in _parse_wardb_table('armyresourcecategory'):
+                rid = int(r.get(1, 0) or 0)
+                raw = r.get(4)
+                if not rid or not isinstance(raw, (bytes, bytearray)) \
+                        or len(raw) != 4:
+                    continue
+                out[rid] = struct.unpack('<f', bytes(raw))[0]
+        except Exception as e:
+            log(f'[!] armyresourcecategory avgSize parse failed: {e}')
+        _ARMY_RES_AVG_SIZE_CACHE = out
+    return _ARMY_RES_AVG_SIZE_CACHE
+
+
 def commandnode_template(faction, name):
     """阵营兵种的 commandNode 模板 id（commandnodetemplate 表 f2 名字 ×
     f3 factionTemplateId 匹配）。
