@@ -29,6 +29,7 @@ import time
 
 import game_server
 import handlers
+import irc_server
 import login_queue
 import matchmaking
 import mm_handler
@@ -135,6 +136,10 @@ async def handle_tcp(reader, writer):
         if sess in TCP_SESSIONS:
             TCP_SESSIONS.remove(sess)
         log(f'TCP DISCONNECT {addr} (fd={fd})')
+        # IRC 会话注销（postlogin 注册；未走 logout 的断线兜底）
+        _irc_sid = getattr(sess, 'irc_sid', None)
+        if _irc_sid is not None:
+            irc_server.unregister_session(_irc_sid)
         # Flash 连接注册表注销（仅当注册的就是本连接；重登录已被覆盖时不动）
         went_offline = False
         if sess.username and FLASH_SESSIONS.get(sess.username) is sess:
@@ -409,6 +414,7 @@ async def main():
         await asyncio.gather(_supervise('TCP', start_tcp),
                              _supervise('PING', start_ping_responder),
                              _supervise('STATS', statistics_server.start),
+                             _supervise('IRC', irc_server.start),
                              _supervise('REJOIN-SWEEP', rejoin_sweep_loop),
                              _war_ticker())
     finally:

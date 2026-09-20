@@ -181,6 +181,9 @@ async def handle_login2_response(sess, writer, cmd_id, req_type, proto):
     if hmac.compare_digest(digest, expected):
         code = RC['login_success']
         note = 'login_success=97'
+        # 保留会话密钥：login2_postlogin 用它注册 IRC 会话（IRC PASS 的
+        # HMAC 验签密钥，irc_server.register_session）
+        sess.session_key = session_key
     else:
         code = RC['wrong_password']
         note = 'wrong_password=98'
@@ -264,15 +267,25 @@ async def handle_login2_postlogin(sess, writer, cmd_id, req_type, proto):
     # post-login 请求，返回 login2_postlogin_result (result=97 login_success)
     # 客户端收到后设置 loggedIn=true, sessionID, 并调用 startWarDataDownload()
     # login2_postlogin_result { required int64 sessionid=1; required string platform=2; required string deleteDate=3; required int32 result=4; }
+    # sessionid 唯一分配（官方实测 PASS 前缀为 19 位随机 int64）：客户端把
+    # sessionID 拼进 IRC PASS `<sid>::<HMAC>`，服务端凭 sid 注册表验签
+    # （irc_server.SESSIONS，R19 身份贯通）
+    import irc_server
+    sid = secrets.randbits(63)
+    sess.irc_sid = sid
+    if getattr(sess, 'session_key', None) is not None:
+        irc_server.register_session(sid, int(sess.player_id or 1),
+                                    sess.username or 'player',
+                                    sess.session_key)
     resp_proto = b''
-    resp_proto += pb_int64(1, 1)              # sessionid
+    resp_proto += pb_int64(1, sid)            # sessionid
     resp_proto += pb_string(2, 'pc')          # platform
     resp_proto += pb_string(3, '')            # deleteDate (空=未标记删除)
     resp_proto += pb_int32(4, 97)             # result = 97 (login_success)
     resp = build_response(cmd_id, 'login2_postlogin_result', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} login2_postlogin_result (result=97 login_success)')
+    log(f'S->C cmd={cmd_id:<4} login2_postlogin_result (result=97 login_success, sid={sid})')
 
 
 
@@ -295,6 +308,12 @@ async def handle_logout(sess, writer, cmd_id, req_type, proto):
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} logoutresponse (msg=1)')
+    # IRC 会话注销（名下已连的 IRC 连接一并断开）
+    sid = getattr(sess, 'irc_sid', None)
+    if sid is not None:
+        import irc_server
+        irc_server.unregister_session(sid)
+        sess.irc_sid = None
     writer.close()
 
 
