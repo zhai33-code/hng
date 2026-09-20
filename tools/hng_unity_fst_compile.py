@@ -12,15 +12,48 @@ from fst_inspect import (
     bind_scene_nodes_to_transforms,
     locate_kinematics,
     map_kinematics_property_sets,
+    normalize_digest_a_blocks,
     parse_fst,
     parse_reference_graph,
     patch_kinematics_transform,
+    insert_cloned_instance,
 )
 from hng_unity_scene import parse_scene
 
 
 def quaternion_distance(a, b):
     return min(math.dist(a, b), math.dist(a, tuple(-value for value in b)))
+
+
+def quaternion_multiply(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def quaternion_rotate(quaternion, vector):
+    conjugate = (-quaternion[0], -quaternion[1], -quaternion[2], quaternion[3])
+    rotated = quaternion_multiply(
+        quaternion_multiply(quaternion, (*vector, 0.0)), conjugate
+    )
+    return rotated[:3]
+
+
+def compose_transform(position, quaternion, scale, relative):
+    local_position = tuple(
+        relative["relative_position"][index] * scale[index] for index in range(3)
+    )
+    rotated = quaternion_rotate(quaternion, local_position)
+    return (
+        tuple(position[index] + rotated[index] for index in range(3)),
+        quaternion_multiply(quaternion, relative["relative_quaternion"]),
+        tuple(scale[index] * relative["relative_scale"][index] for index in range(3)),
+    )
 
 
 def plan_changes(scene: Path, assets: Path, link_path: Path) -> dict[str, object]:
@@ -37,7 +70,7 @@ def plan_changes(scene: Path, assets: Path, link_path: Path) -> dict[str, object
     for instance_id, old in baseline.items():
         item = current.get(instance_id)
         if item is None:
-            if old["status"] == "matched":
+            if old["status"] in {"matched", "matched_offset"}:
                 deleted.append(instance_id)
             continue
         changed = (
@@ -58,10 +91,11 @@ def plan_changes(scene: Path, assets: Path, link_path: Path) -> dict[str, object
             "new_quaternion": item.hng_quaternion,
             "old_scale": old["fst_scale"],
             "new_scale": item.hng_scale,
+            "targets": old["candidates"],
             "record_indices": [value["record_index"] for value in old["candidates"]],
         }
         if (
-            old["status"] == "matched"
+            old["status"] in {"matched", "matched_offset"}
             and item.parent_file_id == old["parent_file_id"]
             and old["parent_name"] == "O1"
             and item.parent_name == "O1"
@@ -74,10 +108,12 @@ def plan_changes(scene: Path, assets: Path, link_path: Path) -> dict[str, object
             )
             unsupported_updates.append(change)
 
-    known_guids = {
-        item["prefab_guid"]
+    known_templates = {
+        item["prefab_guid"]: item
         for item in manifest["links"]
-        if item["status"] == "matched" and item["parent_name"] == "O1"
+        if item["status"] in {"matched", "matched_offset"}
+        and item["parent_name"] == "O1"
+        and item.get("addition_supported", True)
     }
     added = []
     unsupported_added = []
@@ -92,7 +128,41 @@ def plan_changes(scene: Path, assets: Path, link_path: Path) -> dict[str, object
             "quaternion": item.hng_quaternion,
             "scale": item.hng_scale,
         }
-        if item.parent_name == "O1" and item.prefab_guid in known_guids:
+        if item.parent_name == "O1" and item.prefab_guid in known_templates:
+            template = known_templates[item.prefab_guid]
+            representatives = {}
+            for candidate in template["candidates"]:
+                digest = candidate.get(
+                    "transform_digest_b", candidate["node_digest_b"]
+                )
+                previous = representatives.get(digest)
+                if previous is None or (
+                    candidate.get("clone_template_node_digest_b")
+                    and not previous.get("clone_template_node_digest_b")
+                ):
+                    representatives[digest] = candidate
+            value["template_components"] = [
+                {
+                    "node_digest_b": candidate.get(
+                        "clone_template_node_digest_b", candidate["node_digest_b"]
+                    ),
+                    "fst_name": candidate["fst_name"],
+                    **{
+                        key: candidate[key]
+                        for key in (
+                            "relative_position", "relative_quaternion", "relative_scale"
+                        )
+                    },
+                }
+                for candidate in representatives.values()
+            ]
+            # Retain the v1 single-template fields for old consumers.
+            first = value["template_components"][0]
+            value["template_node_digest_b"] = first["node_digest_b"]
+            value["template_relative_transform"] = {
+                key: first[key]
+                for key in ("relative_position", "relative_quaternion", "relative_scale")
+            }
             added.append(value)
         else:
             value["reason"] = "no verified O1 template for prefab GUID"
@@ -127,11 +197,10 @@ def _load_bindings(path: Path):
 
 
 def apply_update_plan(base_fst: Path, plan: dict[str, object], output: Path) -> None:
-    """Apply only audited O1 transform updates; additions/deletions stay blocked."""
+    """Apply audited O1 updates and cloneable single-component additions."""
     summary = plan["summary"]
     blocked = (
-        summary["added"]
-        + summary["deleted"]
+        summary["deleted"]
         + summary["unsupported_updates"]
         + summary["unsupported_added"]
     )
@@ -140,41 +209,87 @@ def apply_update_plan(base_fst: Path, plan: dict[str, object], output: Path) -> 
     encoded = base_fst.read_bytes()
     output.write_bytes(encoded)
     for update in plan["updates"]:
-        record_indices = update["record_indices"]
+        targets = update.get("targets")
+        if targets is None:
+            targets = [
+                {
+                    "record_index": index,
+                    "relative_position": (0.0, 0.0, 0.0),
+                    "relative_quaternion": (0.0, 0.0, 0.0, 1.0),
+                    "relative_scale": (1.0, 1.0, 1.0),
+                }
+                for index in update["record_indices"]
+            ]
         stream, graph, bindings = _load_bindings(output)
-        originals = [bindings[index].transform for index in record_indices]
-        anchor = originals[0]
-        for index, original in zip(record_indices, originals):
-            # Context twins deliberately differ by a few float ULPs. Preserve
-            # their component deltas so schema-731 digest_B values stay unique.
-            position = tuple(
-                update["new_position"][axis]
-                + original.position[axis]
-                - anchor.position[axis]
-                for axis in range(3)
-            )
-            quaternion = tuple(
-                update["new_quaternion"][axis]
-                + original.quaternion[axis]
-                - anchor.quaternion[axis]
-                for axis in range(4)
-            )
-            scale = tuple(
-                update["new_scale"][axis]
-                + original.scale[axis]
-                - anchor.scale[axis]
-                for axis in range(3)
-            )
+        # Multiple contextual SceneNode records commonly share one schema-731
+        # transform. Patch each distinct transform digest once; every referring
+        # SceneNode then observes the update through its existing PropertySet.
+        representatives = {}
+        for target in targets:
+            index = target["record_index"]
+            representatives.setdefault(bindings[index].transform.digest_b, target)
+        for target in representatives.values():
             stream, graph, bindings = _load_bindings(output)
+            position, quaternion, scale = compose_transform(
+                tuple(update["new_position"]),
+                tuple(update["new_quaternion"]),
+                tuple(update["new_scale"]),
+                target,
+            )
             encoded = patch_kinematics_transform(
                 stream,
                 graph,
-                bindings[index],
+                bindings[target["record_index"]],
                 position=position,
                 quaternion=quaternion,
                 scale=scale,
             )
             output.write_bytes(encoded)
+    for addition in plan["added"]:
+        components = addition.get("template_components")
+        if components is None:
+            components = [{
+                "node_digest_b": addition["template_node_digest_b"],
+                "fst_name": Path(addition["prefab_path"]).stem,
+                **addition.get("template_relative_transform", {
+                    "relative_position": (0.0, 0.0, 0.0),
+                    "relative_quaternion": (0.0, 0.0, 0.0, 1.0),
+                    "relative_scale": (1.0, 1.0, 1.0),
+                }),
+            }]
+        base_name = f"Unity_{addition['instance_file_id']}_{Path(addition['prefab_path']).stem}"
+        for component_index, component in enumerate(components, 1):
+            stream, graph, bindings = _load_bindings(output)
+            template_digest = bytes.fromhex(component["node_digest_b"])
+            template = next(
+                (item for item in bindings.values() if item.node_digest_b == template_digest),
+                None,
+            )
+            if template is None:
+                raise ValueError("addition template SceneNode digest is absent")
+            name = base_name
+            if len(components) > 1:
+                name = f"{base_name}__{component_index}_{component['fst_name']}"
+            position, quaternion, scale = compose_transform(
+                tuple(addition["position"]),
+                tuple(addition["quaternion"]),
+                tuple(addition["scale"]),
+                component,
+            )
+            encoded = insert_cloned_instance(
+                stream,
+                None,
+                graph,
+                template,
+                name=name,
+                position=position,
+                quaternion=quaternion,
+                scale=scale,
+            )
+            output.write_bytes(encoded)
+            if len(components) > 1:
+                normalized_stream = parse_fst(output)
+                output.write_bytes(normalize_digest_a_blocks(normalized_stream))
 
 
 def main() -> int:

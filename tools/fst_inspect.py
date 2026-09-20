@@ -849,6 +849,49 @@ def _reference_positions(graph: ReferenceGraph) -> dict[bytes, int]:
     return positions
 
 
+def normalize_digest_a_blocks(stream: FstStream) -> bytes:
+    """Stably group equal digest-A records and remap the full relation stream.
+
+    LoadStream deep-copies adjacent records sharing one serialized payload.
+    Rewriting a contextual parent during one clone can split such a block,
+    which prevents a later component clone from safely extending it.
+    """
+    transforms = locate_kinematics(stream)
+    graph = parse_reference_graph(stream, transforms)
+    old_index = 1
+    next_index = 1
+    index_map = {0: 0}
+    groups = []
+    for group in stream.groups:
+        buckets: dict[bytes, list[tuple[int, ObjectRecord]]] = {}
+        order: list[bytes] = []
+        for record in group.records:
+            if record.digest_a not in buckets:
+                buckets[record.digest_a] = []
+                order.append(record.digest_a)
+            buckets[record.digest_a].append((old_index, record))
+            old_index += 1
+        records = []
+        for digest_a in order:
+            for previous_index, record in buckets[digest_a]:
+                index_map[previous_index] = next_index
+                next_index += 1
+                records.append(record)
+        groups.append(ObjectGroup(group.schema_id, tuple(records)))
+    values = [index_map[value] for value in graph.relation_values]
+    entries, _reference_offset = parse_cache_entries(stream)
+    reference_bytes = b"".join(encode_uleb32(value) for value in values)
+    decompressed = rebuild_decompressed(
+        stream,
+        None,
+        entries,
+        0,
+        groups=tuple(groups),
+        reference_bytes=reference_bytes,
+    )
+    return b"FST\0" + zlib.compress(decompressed)
+
+
 def insert_cloned_instance(
     stream: FstStream,
     schema: SchemaFile,
