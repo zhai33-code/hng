@@ -104,34 +104,6 @@ _CAT_ORDER = (1, 6, 4, 5, 2,            # 士兵
               10, 20, 3, 21)            # 飞机
 _AIR_CATS = {2, 3, 4, 10, 20, 21}
 
-# 无池回退值（官方锚点池：步兵432/地形车60/摩托24）
-FALLBACK_COUNTS = {1: 432, 15: 60, 11: 24}
-
-# WarDatabase 解析失败时的编制兜底（与官方表同值，20 种 AT）
-_FALLBACK_COMP = {
-    'guard': {1: 36},
-    'motorized_guard': {1: 36, 11: 12},
-    'infantry': {1: 90},
-    'motorized_infantry': {1: 90, 15: 30},
-    'mechanized_infantry': {1: 100, 9: 10},
-    'recon': {6: 20},
-    'motorized_recon': {6: 24, 11: 12},
-    'mechanized_recon': {6: 28, 16: 14},
-    'paratroopers': {4: 72, 10: 18},
-    'pathfinders': {4: 36, 21: 9},
-    'paratroopers_on_ground': {4: 72},
-    'pathfinders_on_ground': {4: 36},
-    'fighter_squadron': {2: 24, 20: 24},
-    'heavy_fighter_squadron': {2: 24, 3: 24},
-    'fighter_recon': {2: 20, 21: 16},
-    'light_armor': {5: 20, 12: 16},
-    'medium_armor': {5: 20, 7: 18},
-    'medium_tank_destroyer': {5: 16, 8: 14},
-    'heavy_armor': {5: 16, 17: 14},
-    'heavy_tank_destroyer': {5: 12, 18: 10},
-}
-
-
 # commandnodetemplate 模板 id → AT 名（war 会战按 AT 实例 template_id 查编制）
 _TEMPLATE_NAMES = {}
 
@@ -175,7 +147,11 @@ def _load_at_compositions():
     return {nm: facs[min(facs)] for nm, facs in by_name.items()}
 
 
-_AT_COMP = _load_at_compositions() or dict(_FALLBACK_COMP)
+_AT_COMP = _load_at_compositions()
+
+if not _AT_COMP:
+    log('[force_pool] ERROR: no AT compositions loaded from WarDatabase; '
+        'missions requiring a force pool must not be started')
 
 _missing = [n for fam in AT_FAMILIES.values() for n in fam if n not in _AT_COMP]
 if _missing:
@@ -439,18 +415,18 @@ def pool(mission_id):
 
 
 def counts_for(mission_id, faction):
-    """某阵营各类剩余量；池/阵营缺失回退锚点值。"""
+    """某阵营各类剩余量；池/阵营缺失返回空表。"""
     rec = _MISSIONS.get(int(mission_id or 0))
     if rec and int(faction) in rec['pool']:
         return rec['pool'][int(faction)]
-    return dict(FALLBACK_COUNTS)
+    return {}
 
 
 def categories(mission_id=None, counts_by_faction=None):
     """渲染用有序类别表 [(cat, spawnInAir)]。
 
     优先取池内实际出现的类别（含坦克/载具等池内新增类别）；
-    无池回退锚点池类别（1/15/11）。
+    无池时返回空类别表，禁止伪造一组静态兵力。
     """
     counts = None
     if counts_by_faction:
@@ -460,7 +436,7 @@ def categories(mission_id=None, counts_by_faction=None):
         if rec:
             counts = next(iter(rec['pool'].values()))
     if not counts:
-        counts = FALLBACK_COUNTS
+        return []
     cats = [c for c in _CAT_ORDER if c in counts]
     cats += sorted(set(counts) - set(_CAT_ORDER))   # 未知类别兜底追加
     return [(c, c in _AIR_CATS) for c in cats]

@@ -23,7 +23,7 @@ ZIP_THRESHOLD = 1024
 
 def _cur_pid():
     """当前会话的数据库 player_id（客户端按它过滤自己拥有的行）。"""
-    return int(CURRENT_PID.get() or 1)
+    return int(CURRENT_PID.get() or 0)
 
 
 # ---- war_catalogue 构建（用于 query_war_catalogue_response）----
@@ -52,28 +52,10 @@ def _msg_war_catalogue_faction(fid, ftid, tag):
 
 
 def _msg_war_catalogue():
-    m = b''
-    m += pb_int64(1, 1)                   # id (与 player.war=1 匹配)
-    m += pb_string(2, 'Demo War')         # name
-    m += pb_string(3, '2026-08-15 04:00:00')  # wartime
-    m += pb_int32(4, 100)                 # pointsNeededForVictory
-    m += pb_int64(5, 0)                  # winningFactionId (0=进行中)
-    m += pb_int32(6, 1)                  # battlefieldCount
-    m += pb_int32(7, 3)                  # assaultTeamCount
-    m += pb_int32(8, 3)                  # playerCount
-    m += pb_int32(9, 0)                  # generalCount
-    m += pb_uint32(10, 100)              # infantryCount
-    m += pb_uint32(11, 10)               # tankCount
-    m += pb_uint32(12, 5)                # planeCount
-    m += pb_uint32(13, 10)               # vehicleCount
-    m += pb_int64(14, 0)                 # sequelWarId
-    m += pb_message(15, _msg_war_catalogue_faction(1, 1, 'US'))  # US
-    m += pb_message(15, _msg_war_catalogue_faction(2, 2, 'GE'))  # GE
-    m += pb_message(15, _msg_war_catalogue_faction(3, 3, 'SU'))  # SU
-    return m
+    raise RuntimeError('war catalogue rows must come from war_campaign/DB')
 
 
-def _msg_character(name='Soldier', faction=1, template=1, rank=0, char_id=1,
+def _msg_character(name='Soldier', faction=1, template=1, rank=0, char_id=0,
                    unlock_bits=None, combat_badge_0=0, combat_badge_1=0,
                    stat_update_ts=0, uniform_variant_id=0, headgear_id=0,
                    marked_deleted=0, previous_template=0, head_id=0,
@@ -623,43 +605,10 @@ def _msg_character_stats_entry(char_id, ribbons, combat_xp=0, cstats=None):
 
 
 def msg_query_war_catalogue_response():
-    m = b''
-    m += pb_message(1, _msg_war_catalogue())  # warcataloguedata (repeated)
-    m += pb_int64(2, 0)                        # bonusId (required)
-    return m
+    """无活动战争时的合法空目录；不再返回抓包的 Demo War。"""
+    return pb_int64(2, 0)                      # bonusId (required)
 
 
 # ---- war 消息（用于 KeyValueChangeSet 中的 "war" 表数据）----
 def _msg_war():
-    """构建 HnG_States.war proto，id=1 与 player.war 匹配"""
-    m = b''
-    m += pb_int64(1, 1)                    # id
-    m += pb_string(2, 'Demo War')          # name
-    m += pb_string(3, '2026-08-15 04:00:00')  # begintime
-    m += pb_string(4, '')                  # endtime (空=进行中)
-    m += pb_string(5, '')                  # web
-    m += pb_string(6, '0')                 # friendlyfire
-    m += pb_int64(7, 0)                    # winningfactionid (0=无获胜方)
-    m += pb_int32(8, 100)                  # pointsNeededForVictory
-    m += pb_uint32(9, 0)                   # automissionnormal
-    m += pb_uint32(10, 0)                  # automissionskirmish
-    m += pb_uint32(11, 0)                  # automissionsupply
-    m += pb_float(12, 1.0)                 # strategytimescale
-    m += pb_float(13, 1.0)                 # daycycletimescale
-    m += pb_uint32(14, 0)                  # disablestrategy
-    m += pb_int32(15, 100)                 # maxPlayerPerFaction
-    m += pb_int64(16, 0)                  # sequelwarid
-    m += pb_int64(17, 1)                  # mapid
-    m += pb_int32(18, 0)                   # cleanupStatus
-    m += pb_int32(19, 0)                   # fowGridSize
-    m += pb_int32(20, 0)                   # fowGridOriginX
-    m += pb_int32(21, 0)                   # fowGridOriginY
-    m += pb_int32(22, 0)                   # queueReinforcements (bool=false)
-    m += pb_int32(23, 0)                   # firstResourceFree (bool=false)
-    m += pb_uint32(24, 0)                  # moraleMinValue
-    m += pb_uint32(25, 100)                # moraleMaxValue
-    m += pb_uint32(26, 0)                  # moraleLostPerBattle
-    m += pb_uint32(27, 0)                  # moraleGainedPerWin
-    m += pb_float(28, 0.0)                 # moraleGainedPerMinute
-    m += pb_uint32(29, 0)                  # moraleSurrenderLimit
-    return m
+    raise RuntimeError('war rows must come from war_campaign/DB')

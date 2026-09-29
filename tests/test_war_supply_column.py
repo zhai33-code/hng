@@ -334,7 +334,7 @@ class FakeStore:
                     and (faction is None or k[1] == int(faction))}
             facs = (int(faction),) if faction is not None else (1, 2, 3)
             for fac in facs:
-                for cat in (1,):
+                for cat in (1, 2, 4, 10):
                     if (int(war_id), fac, cat) not in seen:
                         out.append({'war_id': int(war_id), 'faction': fac,
                                     'category_id': cat, 'count': 10 ** 9})
@@ -764,9 +764,9 @@ async def section_e():
           and st.ats[500]['resources'] == {'1': 2}
           and cols[0]['resources'] == {'1': 10}, str(f))
     mv = await st.get_active_movement(cols[0]['id'])
-    check('E1 队列从最近己方城 10 出发 + 库存/226 队列均不动',
+    check('E1 队列从最近己方城 10 出发 + 库存先扣减',
           mv is not None and mv['path'][0]['from_bf'] == 10
-          and not st.adjust_log and not st.supply_queue
+          and st.adjust_log == [(1, 1, 1, -10)] and not st.supply_queue
           and st.ats[cols[0]['id']]['parent_command_node_id'] == 500)
 
     # E2 在途扣减：全额在途 → ok no-op（C5 满编口径，2026-09-14：部署
@@ -827,20 +827,22 @@ async def section_e():
                resources={'1': 2}, sold_free=True)
         w, f = await _resupply(500)
         cols5 = _cols(st5, 500)
-        check('E5 mode=2 在网也出队（同城即合满编/col 软删/不动库存）',
+        check('E5 mode=2 在网也出队（同城合编/扣库存）',
               f.get(2) == 1 and st5.ats[500]['resources'] == {'1': 12}
               and len(cols5) == 1 and cols5[0]['state'] == 3
-              and not st5.adjust_log and not st5.supply_queue)
+              and st5.adjust_log == [(1, 1, 1, -10)]
+              and not st5.supply_queue)
     finally:
         mm_config.WAR_SUPPLY_COLUMN_MODE = _mode_bak
 
-    # E6 首次免费：网络外首补免单 + 置位
+    # E6 已部署 AT 增援不免费
     st6 = await _ewar({10: 1, 30: 2})
     _mk_at(st6, 500, deployed=True, map_entity_id=20, resources={})
     w, f = await _resupply(500)
-    check('E6 首次免费（免单/置位/出队载 12）',
-          f.get(2) == 1 and not st6.spend_log
-          and st6.ats[500]['has_gotten_soldier_free'] is True
+    check('E6 已部署增援付费（不置免费标志）',
+          f.get(2) == 1
+          and st6.spend_log == [(100, 'warfunds', 1200)]
+          and st6.ats[500]['has_gotten_soldier_free'] is False
           and _cols(st6, 500)[0]['resources'] == {'1': 12})
 
     # E7 f6 nearCapitalBattlefieldId 透传（在网城生效/敌城回退首都）

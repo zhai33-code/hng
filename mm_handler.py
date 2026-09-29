@@ -610,7 +610,10 @@ def _msg_mission_info_multi(mission_id, details, zulu):
     m = b''
     m += pb_int64(1, int(mission_id))              # missionId
     m += pb_int64(2, w_battle)                     # battleId
-    m += pb_int64(3, int(details.get('preset') or AI_MISSIONPRESET))
+    preset_id = int(details.get('preset') or 0)
+    if not preset_id:
+        raise LookupError(f'mission {mission_id} has no preset')
+    m += pb_int64(3, preset_id)
     # f5/f6 mapEntityId/TypeId：war 局优先 battle 行口径（城战=城市 bf/1、
     # 野外=补给线 id/3，det['entity_id']——修复野外遭遇简报城市名取段
     # 起点城市的问题 §三.5 B1/B2）；缺省回退 record.map_entity_id/1
@@ -655,8 +658,12 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     attacker, defender = _faction_pair(details)
     rfid = FACTION_ROW_IDS[attacker]
     afid = FACTION_ROW_IDS[defender]
-    preset = int(details.get('preset') or 0) or AI_MISSIONPRESET
-    gamemap_id = int(_load_preset(preset).get(3, 0) or 0) or 13
+    preset = int(details.get('preset') or 0)
+    if not preset:
+        raise LookupError(f'mission {mission_id} has no preset')
+    gamemap_id = int(_load_preset(preset).get(3, 0) or 0)
+    if not gamemap_id:
+        raise LookupError(f'mission preset {preset} has no gamemap')
     # 布局/锚点/f4(war)/f5/f6/f7 与单人版共用（matchmaking 简报共用段，
     # 2026-09-15 抽取）；布局与战斗侧 _accesspoint_layout/f12 同源同值
     L = _briefing_layout(mission_id, gamemap_id, attacker, defender)

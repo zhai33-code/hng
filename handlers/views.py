@@ -26,10 +26,8 @@ from wardb import (
     )
 
 from messages import (
-    _msg_war,
     _push_kvcs,
     _push_kvcs_batch,
-    msg_query_war_catalogue_response,
     )
 
 from player_service import (
@@ -89,19 +87,20 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
         # player 表数据设置 PlayerModel.currentPlayer
         # 两者在 subscriberesponse 触发 viewSubscribtionSynced 时处理
 
-        # 1. war 表数据（DB 战争状态机优先；DB 不可用回退静态 mock）
+        # 1. war 表数据只来自战争状态机。无活动战争时不伪造 Demo War。
         war_proto = await war_campaign.war_kvcs_proto(STORE)
-        if war_proto is None:
-            war_proto = _msg_war()
-        war_data_chunk = Chunk(war_proto)
-        war_table_chunk = Chunk(b'war', [war_data_chunk])
-        war_action_chunk = Chunk(b'set', [war_table_chunk])
-        war_title_chunk = Chunk(b'KeyValueChangeSet', [war_action_chunk])
-        war_cs_main = Chunk(struct.pack('<i', cmd_id), [war_title_chunk])
-        war_cs_bytes = war_cs_main.write(b'')
-        writer.write(war_cs_bytes)
-        await writer.drain()
-        log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (war data, {len(war_proto)}B)')
+        if war_proto is not None:
+            war_data_chunk = Chunk(war_proto)
+            war_table_chunk = Chunk(b'war', [war_data_chunk])
+            war_action_chunk = Chunk(b'set', [war_table_chunk])
+            war_title_chunk = Chunk(b'KeyValueChangeSet', [war_action_chunk])
+            war_cs_main = Chunk(struct.pack('<i', cmd_id), [war_title_chunk])
+            writer.write(war_cs_main.write(b''))
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet '
+                f'(war data, {len(war_proto)}B)')
+        else:
+            log(f'S->C cmd={cmd_id:<4} no active war row')
 
         # 2. player 表数据
         # ★ 每日签到：推 player 行前先记连续登录天数（同日幂等 / 昨日+1 /
@@ -115,16 +114,21 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
                     await STORE.touch_daily_login(int(tpid))
             except Exception as e:
                 log(f'      [DB] touch_daily_login failed: {e}')
-        player_proto = await _msg_player_for(sess)
-        data_chunk = Chunk(player_proto)
-        table_chunk = Chunk(b'player', [data_chunk])
-        action_chunk = Chunk(b'set', [table_chunk])
-        title_chunk = Chunk(b'KeyValueChangeSet', [action_chunk])
-        cs_main = Chunk(struct.pack('<i', cmd_id), [title_chunk])
-        cs_bytes = cs_main.write(b'')
-        writer.write(cs_bytes)
-        await writer.drain()
-        log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet (player data, {len(player_proto)}B)')
+        try:
+            player_proto = await _msg_player_for(sess)
+        except RuntimeError as e:
+            player_proto = None
+            log(f'      [views] player row omitted: {e}')
+        if player_proto is not None:
+            data_chunk = Chunk(player_proto)
+            table_chunk = Chunk(b'player', [data_chunk])
+            action_chunk = Chunk(b'set', [table_chunk])
+            title_chunk = Chunk(b'KeyValueChangeSet', [action_chunk])
+            cs_main = Chunk(struct.pack('<i', cmd_id), [title_chunk])
+            writer.write(cs_main.write(b''))
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} KeyValueChangeSet '
+                f'(player data, {len(player_proto)}B)')
 
         # 3. faction 表 3 行（US/GE/SU）：客户端 FactionTable(xmlTag='faction')
         #    只有收到 KVCS 才有数据。原先只在 JoinMM ok / 小队入队时推——排队前
@@ -194,8 +198,10 @@ async def handle_subscribe(sess, writer, cmd_id, req_type, proto):
             await _push_kvcs(writer, cmd_id, b'CommandNodeWarInstance', row)
         # 资源总览窗口的产量/消耗行（三阵营 × 全部分类）+ 增援队列窗口
         # （§3.12：消耗行 f8/f9 与 FactionResourceQueue 行同源）
-        windows = await war_campaign.supply_windows(STORE)
-        prods, cons = _msg_faction_resource_rows(windows)
+        war = await war_campaign.ensure_war(STORE)
+        windows = await war_campaign.supply_windows(STORE, war)
+        prods, cons = _msg_faction_resource_rows(
+            windows, int((war or {}).get('production_ms') or 0))
         for row in prods:
             await _push_kvcs(writer, cmd_id, b'FactionResourceProduction', row)
         for row in cons:
@@ -363,7 +369,7 @@ async def handle_unsubscribe(sess, writer, cmd_id, req_type, proto):
 
 
 async def handle_query_war_catalogue_request(sess, writer, cmd_id, req_type, proto):
-    # 战争目录查询：DB 聚合（war_campaign 状态机）优先，DB 不可用回退静态 mock
+    # 战争目录只返回数据库中的战争；无记录就是合法空目录。
     # f1 includeWarId：WarIsOver 终局链查结束战争的目录 → 该 war 行置首
     # （客户端取 warcataloguedata[0]，按默认序会拿到新续战 → 结算界面无数据）
     inc_war = 0
@@ -378,8 +384,8 @@ async def handle_query_war_catalogue_request(sess, writer, cmd_id, req_type, pro
             pb_message(1, row) for row in rows) + pb_int64(2, 0)
         n_wars = len(rows)
     else:
-        resp_proto = msg_query_war_catalogue_response()
-        n_wars = 1
+        resp_proto = pb_int64(2, 0)  # required bonusId
+        n_wars = 0
     resp = build_response(cmd_id, 'query_war_catalogue_response', resp_proto)
     writer.write(resp)
     await writer.drain()

@@ -370,11 +370,29 @@ WAR_FOW_GRID_ORIGIN_Y = _int_env('MM_WAR_FOW_GRID_ORIGIN_Y', 0)
 # 空运（§9.4）：BFS 不可达且 AT 编制含 transport_plane（cat 10）→ 空运，
 # 直达时长固定秒（官服耗时失传，可校准）
 WAR_AIR_TRANSIT_SECONDS = _int_env('MM_WAR_AIR_TRANSIT_SECONDS', 600)
+# WarDatabase 坐标缺失时的单段移动回退；仅用于损坏/不完整数据集。
+WAR_SEGMENT_FALLBACK_SECONDS = _int_env(
+    'MM_WAR_SEGMENT_FALLBACK_SECONDS', 300)
+# AT 会战经验，官服公式为参战基础值 + 胜利加成。
+WAR_AT_XP_PER_BATTLE = _int_env('MM_WAR_AT_XP_PER_BATTLE', 5)
+WAR_AT_XP_WIN_BONUS = _int_env('MM_WAR_AT_XP_WIN_BONUS', 25)
+# 专用服启动倒计时覆盖值；0 表示不覆盖客户端/引擎默认值。
+COMBAT_START_COUNTDOWN_OVERRIDE = _int_env(
+    'MM_COMBAT_START_COUNTDOWN_OVERRIDE', 10)
+# 非战役地图通常没有 battlefield 行。0 会让客户端不解析成无关城市；
+# 仅兼容特殊客户端时才显式设置一个真实 battlefield entity id。
+MISSION_MAP_ENTITY_FALLBACK = _int_env(
+    'MM_MISSION_MAP_ENTITY_FALLBACK', 0)
 
 # ---- M3 战争经济（docs/hng-rts-protocol.md §9 / §3.12.1）----
 # 阵营资源生产推进最小间隔秒（war_tick 内检查；产量节奏由模板 600s 决定，
 # 此游标只限制 DB 写频率与行重推频率）
 WAR_PRODUCTION_MIN_TICK = _int_env('MM_WAR_PRODUCTION_MIN_TICK', 60)
+# war f22/f23 and the server-side rules must come from the same snapshot.
+WAR_QUEUE_REINFORCEMENTS = bool(
+    _int_env('MM_WAR_QUEUE_REINFORCEMENTS', 1))
+WAR_FIRST_RESOURCE_FREE = bool(
+    _int_env('MM_WAR_FIRST_RESOURCE_FREE', 1))
 # 增援/部署受阵营库存约束时，库存可交付比例下限（0=有多少给多少，缺口入队）
 WAR_SUPPLY_INSTANT_PARTIAL = bool(
     _int_env('MM_WAR_SUPPLY_INSTANT_PARTIAL', 1))

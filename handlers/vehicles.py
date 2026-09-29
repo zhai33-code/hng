@@ -163,12 +163,12 @@ async def handle_setvehicleequipmentrequest(sess, writer, cmd_id, req_type, prot
     # 装备/卸下载具（VehicleDepotViewMediator.onVehicleItemClick equip/unEquip）
     # SetVehicleEquipmentRequest { int64 characterId=1; int64 vehicleId=2; int32 equipInSlot=3; }
     # SetVehicleEquipmentResponse { int32 msg = 1; }
-    ve_char_id = 1
+    ve_char_id = 0
     ve_vehicle_id = 0
     ve_slot = 0
     try:
         f = pb_parse(proto)
-        ve_char_id = f.get(1, 1)
+        ve_char_id = f.get(1, 0)
         ve_vehicle_id = f.get(2, 0)
         ve_slot = f.get(3, 0)
         log(f'      SetVehicleEquipment: charId={ve_char_id}, vehicleId={ve_vehicle_id}, '

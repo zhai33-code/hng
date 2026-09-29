@@ -72,7 +72,8 @@ AGENT_HTTP_TIMEOUT = 10
 #   （ZGameMode::CreateInstance @0x1802A4796）；正确覆盖方式是启动参数
 #   /R controllers.overrideStartCountdown=<秒>（ZOption group controllers），
 #   而非改 missionpreset f6（实测不生效）。
-COMBAT_START_COUNTDOWN_OVERRIDE = 10
+COMBAT_START_COUNTDOWN_OVERRIDE = (
+    mm_config.COMBAT_START_COUNTDOWN_OVERRIDE or None)
 
 # TTD 时间旅行录制（可选）：设环境变量 TTD_RECORD=1 后，combat server 由
 # WinDbg 自带 TTD.exe 包裹启动，崩溃后 work\ttd-traces\ 下生成 .run 轨迹，

@@ -32,6 +32,8 @@ from messages import _push_kvcs, _push_kvcs_delete
 from wardb import (
     _CUR_KEY,
     _PRICING_MAP,
+    _STORE_DISCOUNT_MAP,
+    _STORE_CAMPAIGN_MAP,
     COMMAND_POINT_UIDS,
     commandnode_templates,
     is_general_character,
@@ -193,6 +195,130 @@ def _currency_ok(currency):
 def _unit_price(pricing_id, currency_key):
     """Pricing 行单价（缺行/币种无价按 0，与 _charge_player 免单口径一致）。"""
     return int((_PRICING_MAP.get(_i(pricing_id)) or {}).get(currency_key) or 0)
+
+
+def _campaign_active(campaign_id):
+    row = _STORE_CAMPAIGN_MAP.get(_i(campaign_id))
+    if not row:
+        return False
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        start = datetime.datetime.strptime(
+            row.get('active_from') or '19700101000000', '%Y%m%d%H%M%S').replace(
+                tzinfo=datetime.timezone.utc)
+        end = datetime.datetime.strptime(
+            row.get('active_to') or '29990101000000', '%Y%m%d%H%M%S').replace(
+                tzinfo=datetime.timezone.utc)
+        return start <= now <= end
+    except ValueError:
+        return False
+
+
+def _validated_resupply_price(pricing_id, discount_id, expected_type,
+                              template_id, currency, count):
+    """Return (response_code, final side total) using the client's rounding."""
+    if count <= 0:
+        return 0, 0
+    price = _PRICING_MAP.get(_i(pricing_id))
+    if not price:
+        return war_campaign.RC_PRICE_NOT_FOUND, 0
+    if (price.get('type') != expected_type
+            or (int(price.get('object_id') or 0)
+                and int(price.get('object_id')) != int(template_id))):
+        return war_campaign.RC_PRICING_MISMATCH, 0
+    key = _CUR_KEY.get(_i(currency))
+    base = float(price.get(key) or 0)
+    if base <= 0:
+        return war_campaign.RC_PRICING_MISMATCH, 0
+    discount = None
+    if _i(discount_id):
+        discount = _STORE_DISCOUNT_MAP.get(_i(discount_id))
+        if not discount:
+            return war_campaign.RC_STORE_DISCOUNT_NOT_FOUND, 0
+        if (discount.get('object_type') != expected_type
+                or int(discount.get('object_id') or 0) != int(template_id)
+                or int(discount.get('currency') or 0) not in (0, int(currency))):
+            return war_campaign.RC_STORE_DISCOUNT_MISMATCH, 0
+        if not _campaign_active(discount.get('campaign_id')):
+            return war_campaign.RC_STORE_DISCOUNT_NOT_ACTIVE, 0
+    value = base * int(count)
+    if discount:
+        pct = float(discount.get('discount_value') or 0)
+        if pct >= 100:
+            return 0, 0
+        value *= max(0.0, 100.0 - pct) / 100.0
+    return 0, max(1, int(value))
+
+
+async def _enqueue_supply(war_id, faction, node_id, items, metadata):
+    try:
+        return await STORE.enqueue_war_supply(
+            war_id, faction, node_id, items, metadata=metadata)
+    except TypeError:                 # lightweight legacy test stores
+        return await STORE.enqueue_war_supply(war_id, faction, node_id, items)
+
+
+async def _refund_player(pid, currency_key, amount):
+    if amount <= 0 or not hasattr(STORE, 'add_currency'):
+        return
+    kwargs = {'credits': 0, 'warfunds': 0, 'gold': 0}
+    kwargs[currency_key] = int(amount)
+    await STORE.add_currency(int(pid), **kwargs)
+
+
+async def _commit_resupply_purchase(pid, key, total, war_id, faction, at,
+                                    give, queued, node_updates, metadata):
+    """Use the real store transaction, with compensation for test/legacy stores."""
+    if hasattr(STORE, 'commit_war_resupply_purchase'):
+        return await STORE.commit_war_resupply_purchase(
+            pid, key, total, war_id, faction, at['id'], give, queued,
+            node_updates, metadata)
+    paid = stock_reserved = node_changed = False
+    before_ids = set()
+    try:
+        before_ids = {int(r['id']) for r in await STORE.list_war_supply_queue(
+            war_id, command_node_id=at['id'])}
+        if total:
+            paid, balance = await STORE.spend_currency(pid, key, total)
+            if not paid:
+                return 'insufficient_currency', balance
+        if give:
+            await STORE.adjust_war_faction_resources(
+                war_id, faction, {c: -n for c, n in give.items()})
+            stock_reserved = True
+        if node_updates:
+            await STORE.update_command_node(at['id'], **node_updates)
+            node_changed = True
+        if queued:
+            await _enqueue_supply(
+                war_id, faction, at['id'], queued, metadata)
+        return 'ok', 0
+    except Exception:
+        if queued:
+            try:
+                after = await STORE.list_war_supply_queue(
+                    war_id, command_node_id=at['id'])
+                created = [int(r['id']) for r in after
+                           if int(r['id']) not in before_ids]
+                if created:
+                    await STORE.dequeue_war_supply(created)
+            except Exception:
+                pass
+        if node_changed:
+            restore = {name: at.get(name) for name in node_updates}
+            try:
+                await STORE.update_command_node(at['id'], **restore)
+            except Exception:
+                pass
+        if stock_reserved:
+            try:
+                await STORE.adjust_war_faction_resources(
+                    war_id, faction, give)
+            except Exception:
+                pass
+        if paid:
+            await _refund_player(pid, key, total)
+        raise
 
 
 def _at_missing_resources(at, tpl, air_proto=None):
@@ -475,12 +601,15 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
     hasGotten*ForFree），阵营库存不足入队回 226（官服"入队成功"提示）；
     补编失败（余额不足等）不回滚部署——部署动作本身免费。"""
     node_id = soldier_pricing = vehicle_pricing = near_capital = currency = 0
+    soldier_discount = vehicle_discount = 0
     try:
         f = pb_parse(proto)
         node_id = _i(f.get(1))
         soldier_pricing = _i(f.get(2))
         vehicle_pricing = _i(f.get(3))
         near_capital = _i(f.get(4))
+        soldier_discount = _i(f.get(5))
+        vehicle_discount = _i(f.get(6))
         currency = _i(f.get(7))
     except Exception as e:
         log(f'      [war_at] DeployCommandNode parse error: {e}')
@@ -539,6 +668,7 @@ async def handle_deploy_command_node_request(sess, writer, cmd_id, req_type,
                         rcode, at = await _apply_resupply(
                             at, pid, war, currency,
                             soldier_pricing, vehicle_pricing,
+                            soldier_discount, vehicle_discount,
                             from_deploy=True)
                         if rcode == war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES:
                             code = rcode    # 226：入队提示（官服语义）
@@ -986,6 +1116,7 @@ async def _pending_column_resources(war_id, at_id):
 
 async def _apply_resupply(at, pid, war, currency,
                           soldier_pricing, vehicle_pricing,
+                          soldier_discount=0, vehicle_discount=0,
                           near_capital=0, from_deploy=False):
     """缺编补编公共链（deploy/resupply 共用，§10.2 #4/#5）：
     每侧首次免费（has_gotten_*_free 置位后转付费）→ 按模板 Pricing 计价
@@ -996,10 +1127,9 @@ async def _apply_resupply(at, pid, war, currency,
       即时交付 → 缺口入 war_supply_queue（supply_queue_tick 周期 FIFO
       交付）。
     - 网络外（MM_WAR_SUPPLY_COLUMN_MODE=1 自动 / 2 一律）：官服补给队
-      （Reserve）机制——购买兵员装上补给队从最近己方在网主城（无候选
-      回退阵营首都）沿补给线机动，
-      到达与父 AT 汇合入编（war_campaign.spawn_supply_column /
-      _arrive_supply_column）；此路径不动阵营库存、不入 226 队列。
+      （Reserve）机制——已有阵营库存先装车，从最近己方在网主城沿补给线
+      机动并在到达后并入父 AT；库存不足部分保留在资源队列，生产到货后
+      再生成补给队。
 
     在途补给队载量先从缺编中扣除（防重复购买，同客户端计价口径）。
 
@@ -1080,9 +1210,12 @@ async def _apply_resupply(at, pid, war, currency,
     m_sold = sum(n for c, n in missing.items() if c not in veh_cats)
     m_veh = sum(n for c, n in missing.items() if c in veh_cats)
     key = _CUR_KEY.get(currency)
-    s_free = (m_sold > 0 and not
+    cfg = war.get('config') or {}
+    first_free = bool(cfg.get(
+        'firstResourceFree', mm_config.WAR_FIRST_RESOURCE_FREE))
+    s_free = (from_deploy and first_free and m_sold > 0 and not
               bool(at.get('has_gotten_soldier_free')))
-    v_free = (m_veh > 0 and not
+    v_free = (from_deploy and first_free and m_veh > 0 and not
               bool(at.get('has_gotten_vehicle_free')))
     # ---- 补给队模式判定（官服 §10.2 #6：购买增援一律 OnTheWay 在途，
     # 客户端补编窗口缺口 = templateCount - onTheWay - current；默认
@@ -1114,58 +1247,21 @@ async def _apply_resupply(at, pid, war, currency,
         if not ok:
             log('      [war_at] resupply rejected: column route unreachable')
             return war_campaign.RC_CANNOT_FIND_COMMANDNODE, at
-    # 客户端 PriceObject.finalFractionCost 口径：Math.floor(单价×数量)——
-    # 先乘后取整（金币 1.2222/架 × 9 = 10；逐架 int()=1×9=9 会少收且与
-    # 客户端显示总价不一致，玩家实报 2026-09-10 "补给不收钱"）
-    def _side_total(pricing_id, n):
-        price = float((_PRICING_MAP.get(_i(pricing_id)) or {}).get(key) or 0)
-        return int(price * n)
-
-    total = 0
+    total = soldier_total = vehicle_total = 0
     if m_sold and not s_free:
-        total += _side_total(soldier_pricing, m_sold)
+        code, soldier_total = _validated_resupply_price(
+            soldier_pricing, soldier_discount, 'reinforceSoldier',
+            tpl.get('id'), currency, m_sold)
+        if code:
+            return code, at
+        total += soldier_total
     if m_veh and not v_free:
-        total += _side_total(vehicle_pricing, m_veh)
-    if total > 0:
-        ok_pay, _bal = await STORE.spend_currency(int(pid), key, total)
-        if not ok_pay:
-            return war_campaign.RC_NOT_ENOUGH_WARFUNDS, at
-    if use_column:
-        upd = {}
-        if s_free:
-            upd['has_gotten_soldier_free'] = True
-        if v_free:
-            upd['has_gotten_vehicle_free'] = True
-        try:
-            if upd:
-                await STORE.update_command_node(at['id'], **upd)
-            # 官服 #3：机械化部队补队时人员/车辆分队（各一队 Reserve
-            # 分别承载，同城汇合/在途到达各自并入父 AT）
-            col_ids = []
-            for part, label in (
-                    ({c: n for c, n in missing.items() if c not in veh_cats},
-                     'soldier'),
-                    ({c: n for c, n in missing.items() if c in veh_cats},
-                     'vehicle')):
-                if not part:
-                    continue
-                col, events, ecode = await war_campaign.spawn_supply_column(
-                    STORE, war, at, part, near_capital_bf=near_capital)
-                if col is None and ecode:
-                    log(f'      [war_at] supply column ({label}) '
-                        f'spawn failed: {ecode}')
-                    continue
-                col_ids.append(col['id'] if col else 0)
-                await war_campaign.broadcast_war_events(events, STORE)
-            at = await STORE.get_command_node(at['id'])
-            log(f'      [war] AT 补编(补给队) node={at["id"]} '
-                f'infantry={m_sold} vehicles={m_veh} '
-                f'free={int(s_free) + int(v_free)} cost={total} {key} '
-                f'columns={col_ids}')
-        except Exception as e:
-            log(f'      [war_at] resupply column failed: {e}')
-            return war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND, at
-        return 0, at
+        code, vehicle_total = _validated_resupply_price(
+            vehicle_pricing, vehicle_discount, 'reinforceVehicle',
+            tpl.get('id'), currency, m_veh)
+        if code:
+            return code, at
+        total += vehicle_total
     # ---- M3-2 库存核算：即时交付 + 缺口入队 ----
     give, queued = {}, {}
     try:
@@ -1175,10 +1271,8 @@ async def _apply_resupply(at, pid, war, currency,
                      war['id'], fac)}
     except Exception as e:
         log(f'      [war_at] stock read failed: {e}')
-        stock = None    # 库存未知 → 全额即时交付（保守）
+        return war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND, at
     for cat, need in missing.items():
-        if stock is None:
-            continue    # 无库存数据 → 全部即时
         have = stock.get(cat, 0)
         if mm_config.WAR_SUPPLY_INSTANT_PARTIAL:
             g = min(need, have)
@@ -1188,6 +1282,114 @@ async def _apply_resupply(at, pid, war, currency,
             give[cat] = g
         if need - g > 0:
             queued[cat] = need - g
+    queue_enabled = bool(cfg.get(
+        'queueReinforcements', mm_config.WAR_QUEUE_REINFORCEMENTS))
+    if queued and not queue_enabled:
+        return war_campaign.RC_NO_RESUPPLY_INSUFFICIENT_RESOURCES, at
+    def _queue_metadata(items, as_column):
+        per = {}
+        for vehicle in (False, True):
+            parts = sorted((int(cat), int(count))
+                           for cat, count in items.items()
+                           if (int(cat) in veh_cats) == vehicle)
+            if not parts:
+                continue
+            pricing = vehicle_pricing if vehicle else soldier_pricing
+            discount = vehicle_discount if vehicle else soldier_discount
+            side_count = m_veh if vehicle else m_sold
+            side_total = vehicle_total if vehicle else soldier_total
+            target = (int(side_total * sum(n for _c, n in parts) / side_count)
+                      if side_count else 0)
+            allocated = 0
+            for index, (cat, count) in enumerate(parts):
+                paid = (target - allocated if index == len(parts) - 1 else
+                        int(side_total * count / side_count)
+                        if side_count else 0)
+                allocated += paid
+                per[cat] = {
+                    'pricing_id': pricing, 'discount_id': discount,
+                    'payment_currency': currency,
+                    'near_capital_battlefield_id': near_capital,
+                    'command_node_definition_id': at['id'],
+                    'paid_amount': paid, 'deliver_as_column': as_column,
+                }
+        return {'per_category': per}
+
+    async def _commit(give_items, queued_items, updates, as_column):
+        try:
+            status, _balance = await _commit_resupply_purchase(
+                int(pid), key or 'warfunds', total, war['id'], fac, at, give_items,
+                queued_items, updates,
+                _queue_metadata(queued_items, as_column))
+        except Exception as e:
+            log(f'      [war_at] atomic resupply commit failed: {e}')
+            return war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
+        if status == 'ok':
+            return 0
+        if status == 'insufficient_currency':
+            return war_campaign.RC_NOT_ENOUGH_WARFUNDS
+        if status == 'insufficient_stock':
+            return war_campaign.RC_NO_RESUPPLY_INSUFFICIENT_RESOURCES
+        return war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
+
+    if use_column:
+        upd = {}
+        if s_free:
+            upd['has_gotten_soldier_free'] = True
+        if v_free:
+            upd['has_gotten_vehicle_free'] = True
+        code = await _commit(give, queued, upd, True)
+        if code:
+            return code, at
+        col_ids, failed = [], {}
+        for part, label in (
+                ({c: n for c, n in give.items() if c not in veh_cats},
+                 'soldier'),
+                ({c: n for c, n in give.items() if c in veh_cats},
+                 'vehicle')):
+            if not part:
+                continue
+            try:
+                col, events, ecode = await war_campaign.spawn_supply_column(
+                    STORE, war, at, part, near_capital_bf=near_capital)
+            except Exception as e:
+                log(f'      [war_at] supply column ({label}) failed: {e}')
+                col, events, ecode = None, [], 1
+            if col is None and ecode:
+                failed.update(part)
+                continue
+            col_ids.append(col['id'] if col else 0)
+            try:
+                await war_campaign.broadcast_war_events(events, STORE)
+            except Exception as e:
+                # Column creation is already durable; a failed live push must
+                # not refund it or turn the purchase into a free entitlement.
+                log(f'      [war_at] supply column push failed: {e}')
+        if failed:
+            failed_metadata = _queue_metadata(failed, True)
+            try:
+                await STORE.adjust_war_faction_resources(
+                    war['id'], fac, failed)
+                await _enqueue_supply(
+                    war['id'], fac, at['id'], failed,
+                    failed_metadata)
+                for cat, amount in failed.items():
+                    queued[cat] = queued.get(cat, 0) + amount
+            except Exception as e:
+                failed_paid = sum(
+                    int(md.get('paid_amount') or 0) for md in
+                    failed_metadata.get('per_category', {}).values())
+                await _refund_player(pid, key, failed_paid)
+                log(f'      [war_at] failed column recovery error: {e}')
+                return war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND, at
+        if queued:
+            try:
+                await war_campaign.push_supply_queue_rows(STORE, war)
+            except Exception as e:
+                log(f'      [war_at] queue row push failed: {e}')
+        at = await STORE.get_command_node(at['id'])
+        return (war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES
+                if queued else 0), at
     res = {str(k): int(v) for k, v in
            war_campaign._as_resources(
                at.get('resources')).items()}
@@ -1198,31 +1400,23 @@ async def _apply_resupply(at, pid, war, currency,
         upd['has_gotten_soldier_free'] = True
     if v_free:
         upd['has_gotten_vehicle_free'] = True
-    try:
-        if give:
-            await STORE.adjust_war_faction_resources(
-                war['id'], fac,
-                {c: -n for c, n in give.items()})
-        await STORE.update_command_node(at['id'], **upd)
-        if queued:
-            await STORE.enqueue_war_supply(
-                war['id'], fac, at['id'], queued)
-            # AT 级队列行重推（§10.2 #3）：AssaultTeamModel.onQueueUpdates
-            # 消费 CommandNodeSupplyQueueItem；226 触发的 RESOURCE_VIEW
-            # 订阅在响应后，新订阅者由 views 快照覆盖
-            try:
-                await war_campaign.push_supply_queue_rows(STORE, war)
-            except Exception as e:
-                log(f'      [war_at] queue row push failed: {e}')
-        at = await STORE.get_command_node(at['id'])
-        log(f'      [war] AT 补编 node={at["id"]} '
-            f'infantry={m_sold} vehicles={m_veh} '
-            f'free={int(s_free) + int(v_free)} '
-            f'cost={total} {key} given={give} '
-            f'queued={queued}')
-    except Exception as e:
-        log(f'      [war_at] resupply failed: {e}')
-        return war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND, at
+    code = await _commit(give, queued, upd, False)
+    if code:
+        return code, at
+    if queued:
+        # AT 级队列行重推（§10.2 #3）：AssaultTeamModel.onQueueUpdates
+        # 消费 CommandNodeSupplyQueueItem；226 触发的 RESOURCE_VIEW
+        # 订阅在响应后，新订阅者由 views 快照覆盖
+        try:
+            await war_campaign.push_supply_queue_rows(STORE, war)
+        except Exception as e:
+            log(f'      [war_at] queue row push failed: {e}')
+    at = await STORE.get_command_node(at['id'])
+    log(f'      [war] AT 补编 node={at["id"]} '
+        f'infantry={m_sold} vehicles={m_veh} '
+        f'free={int(s_free) + int(v_free)} '
+        f'cost={total} {key} given={give} '
+        f'queued={queued}')
     code = (war_campaign.RC_COMMANDNODE_QUEUED_FOR_RESOURCES
             if queued else 0)
     if not queued and proto is not None and air_bf:
@@ -1248,12 +1442,15 @@ async def handle_resupply_request(sess, writer, cmd_id, req_type, proto):
     ReinforcementWindowMediator.issueSupplyRequest 发送，response=ok 关窗，
     否则错误反馈。"""
     node_id = soldier_pricing = vehicle_pricing = currency = 0
+    soldier_discount = vehicle_discount = 0
     near_capital = 0
     try:
         f = pb_parse(proto)
         node_id = _i(f.get(1))
         soldier_pricing = _i(f.get(2))
+        soldier_discount = _i(f.get(3))
         vehicle_pricing = _i(f.get(4))
+        vehicle_discount = _i(f.get(5))
         near_capital = _i(f.get(6))
         currency = _i(f.get(8))
     except Exception as e:
@@ -1282,6 +1479,7 @@ async def handle_resupply_request(sess, writer, cmd_id, req_type, proto):
                     code, at = await _apply_resupply(
                         at, pid, war, currency,
                         soldier_pricing, vehicle_pricing,
+                        soldier_discount, vehicle_discount,
                         near_capital=near_capital)
     code = code or war_campaign.RC_OK   # _load_at 成功返回 0 → 协议 ok=1
     resp = build_response(cmd_id, 'resupply_request_response',
@@ -1804,31 +2002,78 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
         f'(node={node_id} bf={dest_bf} msg={code})')
 
 
-# ------------------------------------------------------------- 补给队列（M1 桩）
+# ------------------------------------------------------------- 补给队列
 
 async def handle_leave_supply_queue_request(sess, writer, cmd_id, req_type,
                                             proto):
     """LeaveSupplyQueueRequest {f1 instance} → LeaveSupplyQueueResponse{f2 response}。
 
-    M1 无补给队列（faction 资源生产属 M3）→ commandnode_not_in_queue(111)。"""
+    Remove every resource row belonging to the AT and refund the still queued
+    paid portion recorded on those rows."""
+    node_id = _i(pb_parse(proto).get(1))
+    pid = await sess.ensure_player()
+    code = war_campaign.RC_COMMANDNODE_NOT_IN_QUEUE
+    deleted = []
+    if pid is not None and STORE is not None:
+        war = await war_campaign.ensure_war(STORE)
+        at = await STORE.get_command_node(node_id) if war else None
+        if at and int(at.get('owner_player_id') or 0) == int(pid):
+            if hasattr(STORE, 'cancel_war_supply'):
+                deleted, _refunds = await STORE.cancel_war_supply(
+                    war['id'], node_id, int(pid))
+            else:
+                rows = await STORE.list_war_supply_queue(
+                    war['id'], command_node_id=node_id)
+                refunds = {'credits': 0, 'warfunds': 0, 'gold': 0}
+                for row in rows:
+                    key = _CUR_KEY.get(int(row.get('payment_currency') or 0))
+                    if key:
+                        refunds[key] += int(row.get('paid_amount') or 0)
+                deleted = [int(row['id']) for row in rows]
+                if deleted:
+                    await STORE.dequeue_war_supply(deleted)
+                if deleted and hasattr(STORE, 'add_currency'):
+                    await STORE.add_currency(int(pid), **refunds)
+            if deleted:
+                code = war_campaign.RC_OK
     resp = build_response(
         cmd_id, 'LeaveSupplyQueueResponse',
-        pb_int32(2, war_campaign.RC_COMMANDNODE_NOT_IN_QUEUE))
+        pb_int32(2, code))
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} LeaveSupplyQueueResponse (111 not in queue)')
+    if deleted:
+        await war_campaign.push_supply_queue_deletes(deleted)
+        await war_campaign.push_supply_queue_rows(STORE, war)
+        await _push_player_refresh(sess, writer)
+    log(f'S->C cmd={cmd_id:<4} LeaveSupplyQueueResponse ({code})')
 
 
 async def handle_reorder_supply_queue_request(sess, writer, cmd_id, req_type,
                                               proto):
     """ReorderSupplyQueueRequest {f1 instance, f2 direction}
-    → ReorderSupplyQueueResponse{f2 response}。M1 桩同上。"""
+    → ReorderSupplyQueueResponse{f2 response}。"""
+    fields = pb_parse(proto)
+    node_id = _i(fields.get(1))
+    direction = _i(fields.get(2))
+    pid = await sess.ensure_player()
+    code = war_campaign.RC_COMMANDNODE_NOT_IN_QUEUE
+    war = None
+    if pid is not None and STORE is not None:
+        war = await war_campaign.ensure_war(STORE)
+        at = await STORE.get_command_node(node_id) if war else None
+        if at and int(at.get('owner_player_id') or 0) == int(pid):
+            if hasattr(STORE, 'reorder_war_supply'):
+                code = await STORE.reorder_war_supply(
+                    war['id'], int(at.get('faction') or 0), node_id,
+                    direction)
     resp = build_response(
         cmd_id, 'ReorderSupplyQueueResponse',
-        pb_int32(2, war_campaign.RC_COMMANDNODE_NOT_IN_QUEUE))
+        pb_int32(2, code))
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} ReorderSupplyQueueResponse (111 not in queue)')
+    if code == war_campaign.RC_OK:
+        await war_campaign.push_supply_queue_rows(STORE, war)
+    log(f'S->C cmd={cmd_id:<4} ReorderSupplyQueueResponse ({code})')
 
 
 # ------------------------------------------------------------- AT 统计 / 买等级

@@ -56,9 +56,13 @@ async def dispatch(sess, writer, cmd_id, req_type, proto):
     #   未登录连接保持默认 1。
     try:
         if sess.username:
-            CURRENT_PID.set(int(await sess.ensure_player() or 1))
-    except Exception:
-        pass
+            CURRENT_PID.set(int(await sess.ensure_player() or 0))
+        else:
+            CURRENT_PID.set(0)
+    except Exception as e:
+        CURRENT_PID.set(0)
+        from state import log
+        log(f'[auth] failed to bind CURRENT_PID: {e}')
     h = _EXACT.get(req_type)
     if h is not None:
         await h(sess, writer, cmd_id, req_type, proto)

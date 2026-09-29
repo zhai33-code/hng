@@ -43,6 +43,7 @@ from player_service import (
     _char_ribbon_level,
     _charge_player,
     _charge_player_multi,
+    _refund_player_charge,
     _msg_player_for,
     _unlock_need_for_char,
     _weapon_owner_id,
@@ -110,7 +111,7 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
     #   string weaponName=4; int64 weaponPricingId=5; int64 weaponVariantTemplateId=6;
     #   int64 weaponDiscountId=7; int64 variantPricingId=8; int64 variantDiscountId=9; int32 paymentCurrency=10; }
     # CreateWeaponVariantResponse { int32 response = 1; }
-    char_id = 1
+    char_id = 0
     weapon_id = 0
     weapon_template_id = 0
     weapon_name = 'Weapon'
@@ -119,7 +120,7 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
     variant_pricing_id = 0
     try:
         f = pb_parse(proto)
-        char_id = f.get(1, 1)
+        char_id = f.get(1, 0)
         weapon_id = f.get(2, 0)
         weapon_template_id = f.get(3, 0)
         weapon_name = f.get(4, b'')
@@ -184,15 +185,7 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
     # 客户端 WeaponDepotViewMediator 渲染时模板查不到 → Error #1009 崩溃卡住。
     is_skin_purchase = weapon_id > 0 and weapon_template_id == 0 and variant_template_id > 0
     if is_skin_purchase:
-        # 1. 返回 CreateWeaponVariantResponse (response=1 ok)
-        resp_proto = pb_int32(1, 1)
-        resp = build_response(cmd_id, 'CreateWeaponVariantResponse', resp_proto)
-        writer.write(resp)
-        await writer.drain()
-        log(f'S->C cmd={cmd_id:<4} CreateWeaponVariantResponse (response=1 ok, '
-            f'skin weaponId={weapon_id}, variantTemplate={variant_template_id})')
-
-        # 2. 创建 WeaponVariant 实例并推送（不自动装备；装备走 SetWeaponVariantRequest）
+        # 先持久化再返回成功；失败时退款，禁止生成仅本会话可见的假 id。
         spid = await sess.ensure_player()
         variant_id = None
         if spid is not None:
@@ -203,8 +196,20 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
             except Exception as e:
                 log(f'[DB] create_weapon_variant failed: {e}')
         if variant_id is None:
-            variant_id = getattr(sess, '_fallback_weapon_variant_id', 799) + 1
-            sess._fallback_weapon_variant_id = variant_id
+            await _refund_player_charge(sess, currency, cost_w)
+            resp = build_response(
+                cmd_id, 'CreateWeaponVariantResponse', pb_int32(1, 0))
+            writer.write(resp)
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} CreateWeaponVariantResponse '
+                f'(response=0 persistence_failed)')
+            return
+        resp = build_response(
+            cmd_id, 'CreateWeaponVariantResponse', pb_int32(1, 1))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} CreateWeaponVariantResponse (response=1 ok, '
+            f'skin weaponId={weapon_id}, variantTemplate={variant_template_id})')
         sess.weapon_variants = getattr(sess, 'weapon_variants', {})
         sess.weapon_variants[variant_id] = {
             'weapon_id': weapon_id, 'character_id': char_id,
@@ -248,7 +253,7 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
             await _push_kvcs(writer, sess.playerview_cmd, b'player', player_proto)
         return
 
-    # 分配武器实例 ID 并写入数据库（失败时用内存计数器兜底，仅本次会话可见）
+    # 分配武器实例 ID 并写入数据库；失败时退款并返回失败。
     pid = await sess.ensure_player()
     w_cond = None
     if pid is not None:
@@ -264,8 +269,14 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
     else:
         wid = None
     if wid is None:
-        wid = getattr(sess, '_fallback_weapon_id', 99) + 1
-        sess._fallback_weapon_id = wid
+        await _refund_player_charge(sess, currency, cost_w)
+        resp = build_response(
+            cmd_id, 'CreateWeaponVariantResponse', pb_int32(1, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} CreateWeaponVariantResponse '
+            f'(response=0 persistence_failed)')
+        return
     if w_cond is None:
         # 兜底路径：武器 condition 量纲 0~1（weapontemplate f61 maxCondition=1.0），
         # 推默认 100.0 会算出负损坏比例 → 客户端钳成 1 块钱维修费
@@ -278,14 +289,7 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
         'clip_count': 0, 'condition': w_cond,
     }
 
-    # 1. 返回 CreateWeaponVariantResponse (response=1 ok)，客户端显示购买成功弹窗并关闭商店
-    resp_proto = pb_int32(1, 1)
-    resp = build_response(cmd_id, 'CreateWeaponVariantResponse', resp_proto)
-    writer.write(resp)
-    await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} CreateWeaponVariantResponse (response=1 ok, weaponId={wid})')
-
-    # 2. 若购买了皮肤变体：创建真实 WeaponVariant 实例行（SetWeaponVariantRequest
+    # 若购买了皮肤变体：创建真实 WeaponVariant 实例行（SetWeaponVariantRequest
     #    装备校验查 weapon_variants 表，伪造 id 会导致 "not owned" 拒绝）并推送
     if variant_template_id and sess.soldier_view_cmd is not None:
         variant_id = None
@@ -297,9 +301,19 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
             except Exception as e:
                 log(f'[DB] create_weapon_variant failed: {e}')
         if variant_id is None:
-            variant_id = wid + 5000  # 无 DB 时内存兜底
-            sess._fallback_weapon_variant_id = max(
-                getattr(sess, '_fallback_weapon_variant_id', 799), variant_id)
+            try:
+                await STORE.delete_weapon(pid, wid)
+            except Exception as e:
+                log(f'[DB] cleanup weapon {wid} after variant failure failed: {e}')
+            sess.weapons.pop(wid, None)
+            await _refund_player_charge(sess, currency, cost_w)
+            resp = build_response(
+                cmd_id, 'CreateWeaponVariantResponse', pb_int32(1, 0))
+            writer.write(resp)
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} CreateWeaponVariantResponse '
+                f'(response=0 variant_persistence_failed)')
+            return
         sess.weapons[wid]['variant_id'] = variant_id
         sess.weapon_variants = getattr(sess, 'weapon_variants', {})
         sess.weapon_variants[variant_id] = {
@@ -314,6 +328,14 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
         await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponVariant',
                          _msg_weapon_variant(variant_id, char_id, wid, variant_template_id))
         log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (WeaponVariant id={variant_id})')
+
+    # 所有必需记录已落库后才向客户端确认成功。
+    resp = build_response(
+        cmd_id, 'CreateWeaponVariantResponse', pb_int32(1, 1))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} CreateWeaponVariantResponse '
+        f'(response=1 ok, weaponId={wid})')
 
     # 3. 通过 SOLDIER_VIEW 推送 weapon 数据（武器才会出现在士兵装备列表）
     if sess.soldier_view_cmd is not None:
@@ -354,13 +376,13 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
     #   int64 weaponId=4; int64 pricingId=5; int64 discountId=6; int32 paymentCurrency=7; }
     # CreateWeaponModifierResponse { int32 response = 2; }（★字段号 2，不同于 Variant/Ammo 的 1）
     mod_template_id = 0
-    mod_char_id = 1
+    mod_char_id = 0
     mod_weapon_id = 0
     pricing_id = 0
     try:
         f = pb_parse(proto)
         mod_template_id = f.get(2, 0)
-        mod_char_id = f.get(3, 1)
+        mod_char_id = f.get(3, 0)
         mod_weapon_id = f.get(4, 0)
         pricing_id = f.get(5, 0)
         currency = f.get(7, 0)
@@ -456,7 +478,7 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
         log(f'S->C cmd={cmd_id:<4} CreateWeaponModifierResponse (response=56 not_enough) cost={cost}')
         return
 
-    # 持久化配件实例（失败时用内存计数器兜底，仅本次会话可见）
+    # 持久化配件实例；失败时退款并返回失败。
     pid = await sess.ensure_player()
     mid_db = False     # 配件是否真实落库（互斥卸下只对落库路径生效）
     replaced_ids = []  # 被同槽位互斥卸下的旧配件（重推 weaponId=0）
@@ -473,9 +495,14 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
     else:
         mid = None
     if mid is None:
-        mid = getattr(sess, '_fallback_modifier_id', 199) + 1
-        sess._fallback_modifier_id = mid
-        mod_condition = 1.0  # 配件满耐久（WeaponModifierTemplate.maxCondition=1.0）
+        await _refund_player_charge(sess, currency, cost)
+        resp = build_response(
+            cmd_id, 'CreateWeaponModifierResponse', pb_int32(2, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} CreateWeaponModifierResponse '
+            f'(response=0 persistence_failed)')
+        return
 
     # 同槽位（分类）互斥（2026-09-13 买新镜子老镜子不卸下事故）：购买是
     # "创建即挂接"（create_weapon_modifier 直接写 weapon_id，不经过
@@ -570,7 +597,7 @@ async def handle_createweaponammorequest(sess, writer, cmd_id, req_type, proto):
         log(f'      CreateWeaponAmmo parse error: {e}')
 
     # 弹药归属角色：从会话武器数据取，否则查数据库
-    ammo_char_id = 1
+    ammo_char_id = 0
     w = getattr(sess, 'weapons', {}).get(ammo_weapon_id)
     if w:
         ammo_char_id = w['character_id']
@@ -630,8 +657,14 @@ async def handle_createweaponammorequest(sess, writer, cmd_id, req_type, proto):
         except Exception as e:
             log(f'[DB] create_weapon_ammo failed: {e}')
     if aid is None:
-        aid = getattr(sess, '_fallback_ammo_id', 299) + 1
-        sess._fallback_ammo_id = aid
+        await _refund_player_charge(sess, currency, cost)
+        resp = build_response(
+            cmd_id, 'CreateWeaponAmmoResponse', pb_int32(1, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} CreateWeaponAmmoResponse '
+            f'(response=0 persistence_failed)')
+        return
 
     # 1. 返回 CreateWeaponAmmoResponse (response=1 ok)
     resp_proto = pb_int32(1, 1)

@@ -44,6 +44,7 @@ from player_service import (
     _char_bits_for,
     _charge_player,
     _charge_player_multi,
+    _fail_persisted_purchase,
     _msg_player_for,
     _unlock_need_for_char,
     )
@@ -93,7 +94,7 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
     #   int64 vehicleVariantPricingId=3; int64 vehicleId=4; int64 extraVehicleVariantTemplateId=5;
     #   int64 extraVehicleVariantPricingId=6; int64 discountId=7; int32 paymentCurrency=8; }
     # CreateVehicleVariantResponse { int32 response = 1; }
-    vv_char_id = 1
+    vv_char_id = 0
     vv_vehicle_id = 0
     vv_template_id = 0
     vv_pricing_id = 0
@@ -101,7 +102,7 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
     vv_extra_pricing_id = 0
     try:
         f = pb_parse(proto)
-        vv_char_id = f.get(1, 1)
+        vv_char_id = f.get(1, 0)
         vv_template_id = f.get(2, 0)
         vv_pricing_id = f.get(3, 0)
         vv_vehicle_id = f.get(4, 0)
@@ -165,15 +166,7 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
 
     if is_skin_purchase:
         # 给已有载具购买皮肤：只创建 VehicleVariant 实例，不创建新载具、不送弹药。
-        # 1. 返回 CreateVehicleVariantResponse (response=1 ok)
-        resp_proto = pb_int32(1, 1)
-        resp = build_response(cmd_id, 'CreateVehicleVariantResponse', resp_proto)
-        writer.write(resp)
-        await writer.drain()
-        log(f'S->C cmd={cmd_id:<4} CreateVehicleVariantResponse (response=1 ok, '
-            f'skin vehicleId={vv_vehicle_id}, extraTemplate={vv_extra_template_id})')
-
-        # 2. 创建 VehicleVariant 实例并推送（客户端 onVehicleVariantUpdates ADD
+        # 先落库，成功后再确认；失败时退款，禁止生成会话假 id。
         #    会自动恢复购买按钮并标记已拥有；不自动装备，装备走 SetVehicleVariantRequest）
         spid = await sess.ensure_player()
         variant_id = None
@@ -185,8 +178,16 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
             except Exception as e:
                 log(f'[DB] create_vehicle_variant failed: {e}')
         if variant_id is None:
-            variant_id = getattr(sess, '_fallback_vehicle_variant_id', 999) + 1
-            sess._fallback_vehicle_variant_id = variant_id
+            await _fail_persisted_purchase(
+                sess, writer, cmd_id, 'CreateVehicleVariantResponse', 1,
+                currency, cost_v)
+            return
+        resp = build_response(
+            cmd_id, 'CreateVehicleVariantResponse', pb_int32(1, 1))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} CreateVehicleVariantResponse (response=1 ok, '
+            f'skin vehicleId={vv_vehicle_id}, extraTemplate={vv_extra_template_id})')
         if sess.soldier_view_cmd is not None:
             await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleVariant',
                              _msg_vehicle_variant(variant_id, vv_char_id, vv_vehicle_id,
@@ -216,7 +217,7 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
             await _push_kvcs(writer, sess.playerview_cmd, b'player', player_proto)
         return
 
-    # 分配载具实例 ID 并写入数据库（失败时用内存计数器兜底，仅本次会话可见）
+    # 分配载具实例 ID 并写入数据库；失败时退款并返回失败。
     pid = await sess.ensure_player()
     v_cond = None
     if pid is not None:
@@ -230,8 +231,10 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
     else:
         vid = None
     if vid is None:
-        vid = getattr(sess, '_fallback_vehicle_id', 399) + 1
-        sess._fallback_vehicle_id = vid
+        await _fail_persisted_purchase(
+            sess, writer, cmd_id, 'CreateVehicleVariantResponse', 1,
+            currency, cost_v)
+        return
     if v_cond is None:
         # DB 不可用/兜底路径：按模板满耐久下发，避免 100.0 默认值显示异常
         v_cond = vehicle_full_condition(vv_template_id)
@@ -349,7 +352,7 @@ async def handle_createvehicleupgraderequest(sess, writer, cmd_id, req_type, pro
         log(f'S->C cmd={cmd_id:<4} CreateVehicleUpgradeResponse (response=56 not_enough) cost={cost}')
         return
 
-    # 持久化载具升级实例（condition = 模板满耐久；失败时用内存计数器兜底）
+    # 持久化载具升级实例；失败时退款并返回失败。
     maxcond = _VEHICLE_UPGRADE_MAXCOND.get(int(vu_template_id), 100.0)
     pid2 = await sess.ensure_player()
     if pid2 is not None:
@@ -363,8 +366,10 @@ async def handle_createvehicleupgraderequest(sess, writer, cmd_id, req_type, pro
     else:
         uid = None
     if uid is None:
-        uid = getattr(sess, '_fallback_vehicle_upgrade_id', 499) + 1
-        sess._fallback_vehicle_upgrade_id = uid
+        await _fail_persisted_purchase(
+            sess, writer, cmd_id, 'CreateVehicleUpgradeResponse', 1,
+            vu_currency, cost)
+        return
 
     # 1. 返回 CreateVehicleUpgradeResponse (response=1 ok)，客户端显示购买成功并关闭确认窗
     resp_proto = pb_int32(1, 1)
@@ -446,7 +451,8 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
         log(f'S->C cmd={cmd_id:<4} CreateVehicleAmmoResponse (response=56 not_enough) cost={cost}')
         return
 
-    # 持久化载具弹药实例（condition = 模板满耐久；失败时用内存计数器兜底）。
+    # 持久化载具弹药实例（condition = 模板满耐久）。任一行失败则清理
+    # 已创建的部分行、退款并返回失败，避免半套弹药和会话假 id。
     # 一次购买按弹药仓槽数发满实例：客户端勋带页判定"已拥有"的条件是
     # 该载具上此弹药实例数 >= storageSlots（ProgressionOverviewWindowMediator
     # eWeaponAmmoMapping 载具分支），只发 1 份时多槽弹药仓（如 storage 2 的
@@ -465,8 +471,15 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
             except Exception as e:
                 log(f'[DB] create_vehicle_ammo failed: {e}')
         if va_id is None:
-            va_id = getattr(sess, '_fallback_vehicle_ammo_id', 599) + 1
-            sess._fallback_vehicle_ammo_id = va_id
+            if pid2 is not None and va_ids:
+                try:
+                    await STORE.delete_vehicle_ammo_rows(pid2, va_ids)
+                except Exception as e:
+                    log(f'[DB] cleanup partial vehicle ammo failed: {e}')
+            await _fail_persisted_purchase(
+                sess, writer, cmd_id, 'CreateVehicleAmmoResponse', 1,
+                va_currency, cost)
+            return
         va_ids.append(va_id)
 
     # 1. 返回 CreateVehicleAmmoResponse (response=1 ok)，客户端显示购买成功

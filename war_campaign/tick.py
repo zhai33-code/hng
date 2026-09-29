@@ -1187,9 +1187,11 @@ async def settle_war_battle(store, mission_id, battle_id, winner_faction,
                 battles_won = int(at.get('battles_won') or 0) + (1 if won else 0)
                 xp_mult, _ = ud_mults.get(
                     int(at.get('faction') or 0), (1.0, 1.0))
-                xp = max(battles * 5 + battles_won * 25,
+                base_xp = int(mm_config.WAR_AT_XP_PER_BATTLE)
+                win_xp = int(mm_config.WAR_AT_XP_WIN_BONUS)
+                xp = max(battles * base_xp + battles_won * win_xp,
                          int(at.get('xp') or 0)
-                         + int((5 + (25 if won else 0)) * xp_mult))
+                         + int((base_xp + (win_xp if won else 0)) * xp_mult))
                 rank = max(int(at.get('rank') or 0), rank_from_xp(xp))
                 fields = {'resources': new_res, 'morale': morale,
                           'morale_updated_at': now_dt,

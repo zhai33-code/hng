@@ -9,6 +9,7 @@ import asyncio
 import random
 
 import mm_pool
+import mm_config
 from wardb import squad_template_name
 
 # ---------------------------------------------------------------- 日志注入
@@ -51,10 +52,9 @@ METRICS_DEVICE_ID = 'Flash;HnG;WIN 32,0,0,170;mozilla/5.0 (windows; u; zh-cn) ap
 # 本服战争 id：战争是服务器侧运行时实体（客户端无本地表可查，任意值行为一致），
 # 每次服务器启动生成新 id = 开一场新战争；faction 表行 f5 war 与 PMS f15 warId 同源用它
 _WAR_ID = random.getrandbits(63)
-# mission_info f5 mapEntityId：必须是客户端 WarDatabase battlefield 表真实行 id
-# （112741325 = 'Benoit Village'）。Mill 等遭遇战图在 battlefield 表无行时用它兜底，
-# 客户端简报按它查战场名（battlefield_entity_for_gamemap 动态匹配的回退值）。
-MISSION_MAP_ENTITY_ID = 112741325
+# 非战役地图没有 battlefield 行时默认发 0，避免把普通匹配错误显示成
+# Benoit Village。特殊兼容需求可通过 MM_MISSION_MAP_ENTITY_FALLBACK 指定。
+MISSION_MAP_ENTITY_ID = int(mm_config.MISSION_MAP_ENTITY_FALLBACK)
 # mission_info f10 hostingCenterId：服务器侧基础设施 id（WarDatabase 无对应表，
 # 客户端仅存储不查表）→ 每次启动生成（原值为他服回放 id）
 MISSION_HOSTING_CENTER_ID = random.getrandbits(63)

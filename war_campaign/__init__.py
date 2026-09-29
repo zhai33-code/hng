@@ -87,11 +87,17 @@ from .at_ops import (
     RC_COMMANDNODE_TEMPLATE_NOT_FOUND,
     RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND,
     RC_COMMANDNODE_NOT_IN_QUEUE,
+    RC_COMMANDNODE_LAST_IN_QUEUE,
     RC_COMMANDNODE_LIMIT_REACHED,
     RC_COMMANDNODE_ALREADY_DEPLOYED,
     RC_NOT_ENOUGH_WARFUNDS,
     RC_INVALID_OWNER,
     RC_INVALID_CURRENCY,
+    RC_PRICE_NOT_FOUND,
+    RC_STORE_DISCOUNT_NOT_FOUND,
+    RC_STORE_DISCOUNT_NOT_ACTIVE,
+    RC_STORE_DISCOUNT_MISMATCH,
+    RC_PRICING_MISMATCH,
     RC_COMMANDNODE_ALREADY_EQUIPPED,
     RC_COMMANDNODE_ALREADY_UNEQUIPPED,
     RC_EQUIPMENT_NOT_ALLOWED,
@@ -199,6 +205,7 @@ from .supply import (
     msg_supply_queue_ticket_row,
     supply_queue_table_rows,
     push_supply_queue_rows,
+    push_supply_queue_deletes,
     _at_add_resources,
     )
 from .tick import (
@@ -217,8 +224,8 @@ from .automission import (
     automission_tick,
     )
 from .production import (
-    _PROD_INTERVAL_MS,
     _PROD_LAST_RUN,
+    _production_interval_ms,
     production_tick,
     )
 
@@ -277,6 +284,7 @@ __all__ = [
     'RC_COMMANDNODE_TEMPLATE_NOT_FOUND',
     'RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND',
     'RC_COMMANDNODE_NOT_IN_QUEUE',
+    'RC_COMMANDNODE_LAST_IN_QUEUE',
     'RC_COMMANDNODE_LIMIT_REACHED',
     'RC_COMMANDNODE_ALREADY_DEPLOYED',
     'RC_NOT_ENOUGH_WARFUNDS',
@@ -379,6 +387,7 @@ __all__ = [
     'msg_supply_queue_ticket_row',
     'supply_queue_table_rows',
     'push_supply_queue_rows',
+    'push_supply_queue_deletes',
     '_at_add_resources',
     'advance_movements',
     '_check_battle_formation',
@@ -391,7 +400,7 @@ __all__ = [
     'settle_war_battle',
     'rebuild_orphan_battle_missions',
     'automission_tick',
-    '_PROD_INTERVAL_MS',
     '_PROD_LAST_RUN',
+    '_production_interval_ms',
     'production_tick',
 ]

@@ -236,7 +236,7 @@ async def handle_login2_response(sess, writer, cmd_id, req_type, proto):
         except Exception as e:
             log(f'[DB] player war faction failed: {e}')
     resp_proto = msg_login2_result(sess.username or 'DemoPlayer', code,
-                                   pid=pid or 1, faction=faction,
+                                   pid=pid or 0, faction=faction,
                                    war=war['id'] if war is not None else 0,
                                    ban_reason=ban_reason or None,
                                    ban_expires=ban_expires)
@@ -271,12 +271,13 @@ async def handle_login2_postlogin(sess, writer, cmd_id, req_type, proto):
     # sessionID 拼进 IRC PASS `<sid>::<HMAC>`，服务端凭 sid 注册表验签
     # （irc_server.SESSIONS，R19 身份贯通）
     import irc_server
+    if not sess.player_id or getattr(sess, 'session_key', None) is None:
+        raise RuntimeError('post-login requested without an authenticated player')
     sid = secrets.randbits(63)
     sess.irc_sid = sid
-    if getattr(sess, 'session_key', None) is not None:
-        irc_server.register_session(sid, int(sess.player_id or 1),
-                                    sess.username or 'player',
-                                    sess.session_key)
+    irc_server.register_session(sid, int(sess.player_id),
+                                sess.username or 'player',
+                                sess.session_key)
     resp_proto = b''
     resp_proto += pb_int64(1, sid)            # sessionid
     resp_proto += pb_string(2, 'pc')          # platform

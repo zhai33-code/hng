@@ -363,6 +363,14 @@ class FakeStore:
         self.spend_log.append((int(pid), key, amount))
         return True, bal
 
+    async def add_currency(self, pid, credits=0, warfunds=0, gold=0):
+        for key, amount in (('credits', credits), ('warfunds', warfunds),
+                            ('gold', gold)):
+            if amount:
+                self.balances[(int(pid), key)] = self.balance(pid, key) + int(amount)
+        return {key: self.balance(pid, key)
+                for key in ('credits', 'warfunds', 'gold')}
+
     def balance(self, pid, key='warfunds'):
         return self.balances.get((int(pid), key), 3000)
 
@@ -403,17 +411,21 @@ class FakeStore:
         return 10 ** 9 if self.plentiful else 0
 
     async def enqueue_war_supply(self, war_id, faction, command_node_id,
-                                 items):
+                                 items, metadata=None):
+        metadata = metadata or {}
+        per_category = metadata.get('per_category') or {}
         n = 0
         for cat, cnt in (items or {}).items():
             if int(cnt) <= 0:
                 continue
-            self.supply_queue.append({
+            row = {
                 'id': len(self.supply_queue) + 1,
                 'war_id': int(war_id), 'faction': int(faction),
                 'command_node_id': int(command_node_id),
                 'category_id': int(cat), 'count': int(cnt),
-                'queue_number': len(self.supply_queue) + 1})
+                'queue_number': len(self.supply_queue) + 1}
+            row.update(dict(per_category.get(int(cat)) or {}))
+            self.supply_queue.append(row)
             n += 1
         return n
 
@@ -431,6 +443,39 @@ class FakeStore:
         self.supply_queue = [r for r in self.supply_queue
                              if r['id'] not in ids]
         return len(ids)
+
+    async def reorder_war_supply(self, war_id, faction, command_node_id,
+                                 direction):
+        rows = [r for r in self.supply_queue
+                if r['war_id'] == int(war_id)
+                and r['faction'] == int(faction)]
+        groups, by_node = [], {}
+        for row in sorted(rows, key=lambda r: r['queue_number']):
+            nid = row['command_node_id']
+            if nid not in by_node:
+                by_node[nid] = []
+                groups.append((nid, by_node[nid]))
+            by_node[nid].append(row)
+        idx = next((i for i, group in enumerate(groups)
+                    if group[0] == int(command_node_id)), -1)
+        if idx < 0:
+            return 111
+        if direction == 0:
+            if idx == 0:
+                return 112
+            groups[idx - 1], groups[idx] = groups[idx], groups[idx - 1]
+        elif direction == 1:
+            if idx == len(groups) - 1:
+                return 112
+            groups[idx], groups[idx + 1] = groups[idx + 1], groups[idx]
+        elif direction == 2:
+            groups.insert(0, groups.pop(idx))
+        else:
+            return 36
+        for qn, row in enumerate(
+                [row for _nid, group in groups for row in group], 1):
+            row['queue_number'] = qn
+        return 1
 
 
 def _setup(chars=None, balances=None):
@@ -568,6 +613,21 @@ async def _resupply(node, sp=9001, vp=9002, cur=2):
         FakeSess(), w, 900, b'resupply_request', _resupply_req(node, sp, vp,
                                                                cur))
     return w, _resp(w, 'resupply_request_response')
+
+
+async def _leave_supply_queue(node):
+    w = FakeWriter()
+    await war_at.handle_leave_supply_queue_request(
+        FakeSess(), w, 900, b'LeaveSupplyQueueRequest', pb_int64(1, node))
+    return w, _resp(w, 'LeaveSupplyQueueResponse')
+
+
+async def _reorder_supply_queue(node, direction):
+    w = FakeWriter()
+    await war_at.handle_reorder_supply_queue_request(
+        FakeSess(), w, 900, b'ReorderSupplyQueueRequest',
+        pb_int64(1, node) + pb_int32(2, direction))
+    return w, _resp(w, 'ReorderSupplyQueueResponse')
 
 
 async def _create(name='Alpha', abbr='ALT', tpl=501, pricing=8001, cur=2):
@@ -789,19 +849,20 @@ async def section_c():
           f.get(2) == 1 and st.ats[500]['resources'] == {'1': 12}
           and not st.spend_log, str(f))
 
-    # C6 首次免费：补满 + 置位 + 免单 + armyresource 推送
+    # C6 已部署 AT 的增援不消耗“初始部署免费”机会
     st = _setup()
     _mk_at(st, 500, template=501)
     w, f = await _resupply(500)
     res = [r for r in _rows(w, 'armyresource') if r.get(1) == 500001]
     inst = [r for r in _rows(w, 'CommandNodeWarInstance')
             if r.get(1) == 500]
-    check('C6 首次免费（补满/置位/免单/推送 f11=1）',
+    check('C6 已部署增援付费（免费标志不置位）',
           f.get(2) == 1 and st.ats[500]['resources'] == {'1': 12}
-          and st.ats[500]['has_gotten_soldier_free'] is True
-          and not st.spend_log and st.balance(100) == 3000
+          and st.ats[500]['has_gotten_soldier_free'] is False
+          and st.spend_log == [(100, 'warfunds', 1200)]
+          and st.balance(100) == 1800
           and res and res[-1].get(4) == 12
-          and inst and inst[-1].get(11) == 1, str(f))
+          and inst and inst[-1].get(11) in (None, 0), str(f))
 
     # C7 二次付费：100 × 12 = 1200
     st = _setup()
@@ -822,16 +883,17 @@ async def section_c():
           and st.ats[500]['has_gotten_soldier_free'] is True
           and st.balance(100) == 100 and not st.spend_log, str(f))
 
-    # C9 载具分侧免费：仅缺载具（cat7）→ 免单补满 + veh_free 置位
+    # C9 已部署载具增援同样付费
     st = _setup()
     _mk_at(st, 500, template=502, resources={'5': 20}, sold_free=True)
     w, f = await _resupply(500)
-    check('C9 载具侧首次免费（补满/置位/免单）',
+    check('C9 已部署载具增援付费',
           f.get(2) == 1
           and st.ats[500]['resources'] == {'5': 20, '7': 8}
-          and st.ats[500]['has_gotten_vehicle_free'] is True
+          and st.ats[500]['has_gotten_vehicle_free'] is False
           and st.ats[500]['has_gotten_soldier_free'] is True
-          and not st.spend_log and st.balance(100) == 3000, str(f))
+          and st.spend_log == [(100, 'warfunds', 2000)]
+          and st.balance(100) == 1000, str(f))
 
     # C10 双侧付费：100×20 + 250×8 = 4000
     st = _setup(balances={(100, 'warfunds'): 10000})
@@ -842,17 +904,19 @@ async def section_c():
           and st.ats[500]['resources'] == {'5': 20, '7': 8}
           and st.spend_log == [(100, 'warfunds', 4000)], str(f))
 
-    # C11 定价缺失免单（pricing 0 → 单价 0）
+    # C11 定价缺失必须拒单，不允许零价刷资源
     st = _setup()
     _mk_at(st, 500, template=501, sold_free=True)
     w, f = await _resupply(500, sp=0)
-    check('C11 定价缺失免单补满',
-          f.get(2) == 1 and st.ats[500]['resources'] == {'1': 12}
+    check('C11 定价缺失 → 193 且不交付',
+          f.get(2) == war_campaign.RC_PRICE_NOT_FOUND
+          and st.ats[500]['resources'] == {}
           and st.balance(100) == 3000 and not st.spend_log, str(f))
 
     # C12 响应字段位：resupply 走 f2（AS3 实锤），f1 无值
-    check('C12 响应 f2=1 且无 f1',
-          f.get(2) == 1 and f.get(1) is None, str(f))
+    check('C12 错误响应仍使用 f2 且无 f1',
+          f.get(2) == war_campaign.RC_PRICE_NOT_FOUND
+          and f.get(1) is None, str(f))
 
     # C13 M3-2 全额入队：库存 0 → 226 + 入队 + 扣款 + AT 编制不动
     st = _setup(balances={(100, 'warfunds'): 10000})
@@ -865,7 +929,12 @@ async def section_c():
           and [(r['category_id'], r['count']) for r in st.supply_queue]
           == [(1, 12)]
           and st.spend_log == [(100, 'warfunds', 1200)]
-          and st.balance(100) == 8800, str(f))
+          and st.balance(100) == 8800
+          and st.supply_queue[0].get('pricing_id') == 9001
+          and st.supply_queue[0].get('payment_currency') == 2
+          and st.supply_queue[0].get('paid_amount') == 1200
+          and st.supply_queue[0].get('command_node_definition_id') == 500,
+          str(f))
 
     # C14 M3-2 部分交付：库存 5 → 即时 5 + 缺口 7 入队 + 226 + 库存清 0
     st = _setup(balances={(100, 'warfunds'): 10000})
@@ -882,6 +951,61 @@ async def section_c():
           and st.spend_log == [(100, 'warfunds', 1200)]
           and bool([r for r in _rows(w, 'armyresource')
                     if r.get(1) == 500001 and r.get(4) == 5]), str(f))
+
+    # C15 库存读取失败：不可再按“库存无限”发兵，且不能先扣款
+    st = _setup(balances={(100, 'warfunds'): 10000})
+    _mk_at(st, 500, template=501, sold_free=True)
+
+    async def _stock_boom(*_args, **_kwargs):
+        raise RuntimeError('stock unavailable')
+
+    st.list_war_faction_resources = _stock_boom
+    _w, f = await _resupply(500)
+    check('C15 库存读取失败 → 107/不扣款/不发兵',
+          f.get(2) == war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
+          and st.balance(100) == 10000 and not st.spend_log
+          and st.ats[500]['resources'] == {}, str(f))
+
+    # C16 兼容存储的入队失败补偿：钱、库存、AT 必须全部恢复
+    st = _setup(balances={(100, 'warfunds'): 10000})
+    st.plentiful = False
+    st.stock[(1, 1, 1)] = 5
+    _mk_at(st, 500, template=501, sold_free=True)
+
+    async def _queue_boom(*_args, **_kwargs):
+        raise RuntimeError('queue unavailable')
+
+    st.enqueue_war_supply = _queue_boom
+    _w, f = await _resupply(500)
+    check('C16 入队失败 → 补偿退款/还库存/还原AT',
+          f.get(2) == war_campaign.RC_COMMANDNODE_WAR_INSTANCE_NOT_FOUND
+          and st.balance(100) == 10000
+          and st.stock[(1, 1, 1)] == 5
+          and st.ats[500]['resources'] == {}, str(f))
+
+    # C17 折扣必须校验目标/活动并按客户端“先乘后取整”计价
+    old_discounts = war_at._STORE_DISCOUNT_MAP
+    old_campaigns = war_at._STORE_CAMPAIGN_MAP
+    try:
+        war_at._STORE_DISCOUNT_MAP = {77: {
+            'object_type': 'reinforceSoldier', 'object_id': 501,
+            'currency': 2, 'discount_value': 25.0, 'campaign_id': 88}}
+        war_at._STORE_CAMPAIGN_MAP = {88: {
+            'active_from': '20200101000000',
+            'active_to': '20990101000000'}}
+        code, amount = war_at._validated_resupply_price(
+            9001, 77, 'reinforceSoldier', 501, 2, 12)
+        wrong, _ = war_at._validated_resupply_price(
+            9001, 77, 'reinforceSoldier', 999, 2, 12)
+        absent, _ = war_at._validated_resupply_price(
+            9001, 78, 'reinforceSoldier', 501, 2, 12)
+    finally:
+        war_at._STORE_DISCOUNT_MAP = old_discounts
+        war_at._STORE_CAMPAIGN_MAP = old_campaigns
+    check('C17 折扣校验（25%=900/目标不符252/未知249）',
+          code == 0 and amount == 900
+          and wrong == war_campaign.RC_STORE_DISCOUNT_MISMATCH
+          and absent == war_campaign.RC_STORE_DISCOUNT_NOT_FOUND)
 
 
 # ====================================================== F M3-2 队列交付
@@ -941,6 +1065,20 @@ async def section_f():
           st.stock[(1, 2, 1)] == 8
           and st.ats[500]['resources'] == {'1': 12}
           and not st.supply_queue, str(st.stock))
+
+    # F6 消耗行必须使用各资源类别自己的窗口，不可复用阵营总窗口
+    st = _setup()
+    await war_campaign.ensure_war(st)
+    _mk_at(st, 500, template=501)
+    _mk_at(st, 501, template=502)
+    await st.enqueue_war_supply(1, 1, 500, {1: 12})
+    await st.enqueue_war_supply(1, 1, 501, {5: 20})
+    await st.enqueue_war_supply(1, 1, 500, {1: 4})
+    windows = await war_campaign.supply_windows(st)
+    check('F6 队列窗口按资源分类（总1..4/cat1=1..4/cat5=2..3）',
+          windows[1]['overall'] == (1, 4)
+          and windows[1]['categories'][1] == (1, 4)
+          and windows[1]['categories'][5] == (2, 3), str(windows))
 
 
 # ================================================= G AT 级队列行推送
@@ -1023,12 +1161,64 @@ async def section_g():
           and not st.supply_queue
           and st.ats[500]['resources'] == {'1': 12}, f'{len(buf)}B')
 
-    # G6 DB-free 回退：无战争 → ([], [])；push 无会话不炸
+    # G6 死亡 AT 清队同样必须向客户端推 item/ticket DELETE
+    st = _setup()
+    st.plentiful = False
+    st.stock[(1, 1, 1)] = 20
+    _mk_at(st, 500, template=501, state=3)
+    await st.enqueue_war_supply(1, 1, 500, {1: 12})
+    sess_obj = SimpleNamespace(resource_view_cmd=555, writer=FakeWriter())
+    state_mod.FLASH_SESSIONS['g6'] = sess_obj
+    try:
+        await war_campaign.supply_queue_tick(st)
+    finally:
+        state_mod.FLASH_SESSIONS.pop('g6', None)
+    check('G6 死亡AT清队也推 DELETE×2',
+          bytes(sess_obj.writer.buf).count(b'delete') == 2
+          and not st.supply_queue)
+
+    # G7 DB-free 回退：无战争 → ([], [])；push 无会话不炸
     st = _setup()
     st.wars.clear()
     items, tickets = await war_campaign.supply_queue_table_rows(st)
-    check('G6 无战争回退（([], [])/push 静默）',
+    check('G7 无战争回退（([], [])/push 静默）',
           items == [] and tickets == [])
+
+
+# ======================================================== H 补给队列操作
+
+async def section_h():
+    # H1 退出队列：删除该 AT 全部类别，并按尚未交付的 paid_amount 退款
+    st = _setup(balances={(100, 'warfunds'): 5000})
+    await war_campaign.ensure_war(st)
+    _mk_at(st, 500, template=501)
+    await st.enqueue_war_supply(
+        1, 1, 500, {1: 7, 5: 2}, metadata={'per_category': {
+            1: {'payment_currency': 2, 'paid_amount': 700},
+            5: {'payment_currency': 2, 'paid_amount': 500}}})
+    _w, f = await _leave_supply_queue(500)
+    check('H1 退出补给队列 → 删除全部行并退款1200',
+          f.get(2) == war_campaign.RC_OK
+          and not st.supply_queue and st.balance(100) == 6200, str(f))
+
+    # H2/H3 队列重排：同一 AT 的非连续类别仍作为一个整体，置顶后顺序稳定
+    st = _setup()
+    await war_campaign.ensure_war(st)
+    for node in (500, 501, 502):
+        _mk_at(st, node, template=501)
+    await st.enqueue_war_supply(1, 1, 500, {1: 1})
+    await st.enqueue_war_supply(1, 1, 501, {1: 1})
+    await st.enqueue_war_supply(1, 1, 500, {5: 1})
+    await st.enqueue_war_supply(1, 1, 502, {1: 1})
+    _w, f = await _reorder_supply_queue(502, 2)
+    ordered = [r['command_node_id'] for r in sorted(
+        st.supply_queue, key=lambda row: row['queue_number'])]
+    check('H2 置顶重排 → 目标AT到首位/同AT类别保持成组',
+          f.get(2) == war_campaign.RC_OK
+          and ordered == [502, 500, 500, 501], str(ordered))
+    _w, f = await _reorder_supply_queue(502, 0)
+    check('H3 队首继续上移 → 112 last_in_queue',
+          f.get(2) == war_campaign.RC_COMMANDNODE_LAST_IN_QUEUE, str(f))
 
 
 # ======================================================== D 买壳/部署冒烟
@@ -2341,6 +2531,7 @@ async def main():
     await section_c()
     await section_f()
     await section_g()
+    await section_h()
     await section_d()
     await section_e()
     await section_r()

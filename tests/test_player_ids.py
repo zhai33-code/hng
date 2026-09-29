@@ -98,12 +98,11 @@ def test_msg_player_pid_and_faction():
 
 
 def test_msg_player_faction_fallback():
-    """faction=None（无角色/DB 不可用）回退 1，保持老行为。"""
+    """身份数据缺失时使用协议空值，不冒充玩家/阵营 1。"""
     p = read_fields(msg_player('Tester', pid=42))
-    assert p[11] == 1
-    # pid 缺省仍回退 1
+    assert p[11] == 0
     p2 = read_fields(msg_player('Tester'))
-    assert p2[1] == 1
+    assert p2[1] == 0
 
 
 # ---------- 2. msg_login2_result：currentplayer 携带 pid/faction ----------
@@ -188,6 +187,9 @@ class _FakeStore:
     async def save_battle_report(self, report, players):
         self.saved = (report, players)
         return 1
+
+    async def get_active_membership(self, player_id):
+        return {'template_id': 11} if int(player_id) == 1 else None
 
     async def add_currency(self, player_id, credits=0, warfunds=0):
         self.currency.append((player_id, credits, warfunds))
@@ -440,8 +442,8 @@ def test_subscribeplayerview_pushes_faction_rows():
         assert int(f.get(1, 0) or 0) == int(f.get(2, 0) or 0), \
             f'faction 行 id({f.get(1)}) != factiontemplateid({f.get(2)})'
 
-    # 回归：war/player 基础推送仍在且先于 faction（不因新增推送破坏原链路）
-    assert seq[:2] == ['war', 'player'], f'war/player 应最先推送，实际 {seq}'
+    # 无数据库身份/活动战争时不再伪造 war/player 行。
+    assert seq == ['faction', 'faction', 'faction'], seq
 
     # faction 推送必须先于 subscriberesponse（最后一帧为响应帧）
     last_root, _ = Chunk.parse(writer.frames[-1], 0)
@@ -502,3 +504,19 @@ def test_faction_resource_production_rows_heavy_armor_anchor():
             assert int(f[9]) == 225, f'US 重坦 f9 应 225，实际 {f[9]}'
             return
     raise AssertionError('未找到 US(faction=1) 重坦(cat=17) 生产行')
+
+
+def test_faction_resource_countdown_uses_persisted_cursor():
+    """重推资源表时倒计时应沿生产游标推进，不能每次重置成 now+600。"""
+    if not mm_factions.armyresource_production():
+        return
+    now = int(_time.time())
+    cursor = (now - 100) * 1000
+    prods, _ = mm_factions._msg_faction_resource_rows(
+        next_production_ms=cursor)
+    row = next(pb_parse_loose(raw) for raw in prods
+               if int(pb_parse_loose(raw)[2]) == 1
+               and int(pb_parse_loose(raw)[5]) == 1)
+    actual = calendar.timegm(
+        _time.strptime(row[7].decode(), '%Y%m%d%H%M%S'))
+    assert actual == now + 500, (actual, now)

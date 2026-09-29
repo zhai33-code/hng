@@ -46,6 +46,16 @@ class EquipmentVehiclesMixin:
                 player_id, vehicle_variant_template_id, character_id, float(condition))
             return dict(row)
 
+    async def delete_vehicle_ammo_rows(self, player_id, ammo_ids):
+        """Delete partially-created ammo rows when a multi-row purchase fails."""
+        ids = [int(v) for v in ammo_ids]
+        if not ids:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'DELETE FROM vehicle_ammo WHERE player_id = $1 '
+                'AND id = ANY($2::bigint[])', int(player_id), ids)
+
     async def set_vehicle_equipment(self, player_id, vehicle_id,
                                     character_id, equip_in_slot):
         """装备载具到角色槽位（equip_in_slot>0）或卸下（0）。返回受影响载具列表
@@ -350,4 +360,3 @@ class EquipmentVehiclesMixin:
         if row is None:
             return (0, 0)
         return (int(row['uvt'] or 0), int(row['upt'] or 0))
-

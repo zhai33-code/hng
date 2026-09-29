@@ -9,6 +9,8 @@ schema 来源：player.dll protobuf 描述符 @ RVA 0x7b3f78（逆向确认，40
 协议字段，描述符定义的是 hng.exe/player.dll 实际使用的 protobuf schema。
 请求解析与分发见 game_server.py；装备 DB 聚合见 player_service._load_db_loadout。
 """
+import hashlib
+import os
 import os
 import time
 import xml.etree.ElementTree as ET
@@ -27,6 +29,7 @@ from protocol import (
 from state import GAME_DIR, log
 
 import force_pool
+import mm_config
 from wardb import (
     _RIBBON_LEVEL_XP,
     _VEHICLE_VARIANT_PARENT,
@@ -102,6 +105,16 @@ from wardb import (
 #   mapEntityId / hostingCenterId → matchmaking 库引用常量（WarDatabase battlefield 行 id）
 
 
+def _runtime_entity_id(mission_id, kind, index=0):
+    """由本局身份稳定派生运行时实体 ID，避免跨并发战局共用固定 ID。"""
+    raw = f'{int(mission_id or 0)}:{kind}:{int(index)}'.encode('ascii')
+    value = int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), 'little')
+    value &= 0x7fffffffffffffff
+    if value == 0 or (value & 0xffffffff) == 0:
+        value += 1
+    return value
+
+
 def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
                          display_name='Player',
                          metrics_uid='',
@@ -111,7 +124,9 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
                          squad_slot=0,
                          faction=3,
                          db_chars=None, loadout=None,
-                         quickplay=None, first_action_game=None):
+                         quickplay=None, first_action_game=None,
+                         membership_benefit_id=0,
+                         tutorial_ids=None, career_order_status=''):
     """构建 PlayerSettings 响应（GetPlayerSettings 的应答）—— 2026-08-20 起全动态：
 
     f12 characterlist 直接由账号库角色 + 装备聚合构建（不再用回放字节做底、
@@ -155,12 +170,7 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     # f18 squadPoints ← 本次进局角色的 characters.squad_points
     squad_points = int(joined.get('squad_points', 0) or 0) if joined else 0
 
-    # field 28 triggeredTutorialTemplateIds: 私服 = [1,2,3,4,6,7,8,...,29] (跳过 5)
-    tutorial_ids = [1, 2, 3, 4] + list(range(6, 30))  # 28 个值
-
-    # field 37 careerOrderStatus: 私服 93 字符逗号分隔 0/1 串
-    weapon_unlocks = ('0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,1,1,0,1,1,1,1,1,1,1,1,1,'
-                      '0,1,1,1,1,0,1,1,1,0,1,1,1,0,0,1')
+    tutorial_ids = list(tutorial_ids or ())
 
     m = b''
     m += pb_int64(1, player_id)                 # 1 player_id — 必须等于 JWT sub
@@ -194,14 +204,14 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     m += pb_int64(23, metrics_session_id)        # 23 metricsSessionId（=PMS f18）
     m += pb_bool(24, bool(first_action_game))    # 24 firstActionGame（全角色 xp==0 → 首局）
     m += pb_int64(25, mission_session_id)        # 25 missionSessionId（=PMS f9 同源）
-    m += pb_int64(26, 2)                         # 26 playerMembershipBenefitTemplateId
-    m += pb_int64(27, 2)                         # 27 defaultMembershipBenefitTemplateId
+    m += pb_int64(26, int(membership_benefit_id or 0))
+    m += pb_int64(27, int(membership_benefit_id or 0))
     for tid in tutorial_ids:                     # 28 triggeredTutorialTemplateIds (repeated)
         m += pb_int32(28, tid)
     m += pb_string(29, 'HnG')                    # 29 platform
     m += pb_bool(30, bool(quickplay))            # 30 isQuickPlay（← 匹配请求）
     m += pb_bool(31, False)                      # 31 isQuickPlaySelectedFaction
-    m += pb_string(32, 'CN')                     # 32 countryCode
+    m += pb_string(32, os.environ.get('HNG_COUNTRY_CODE', ''))
     m += pb_int64(33, int(time.time()))           # 33 lastLoginTimestampInSecond
     m += pb_int32(34, 0)                          # 34 playerPartnerId
     m += pb_int64(35, int((loadout or {}).get('xp_booster_id', 0) or 0))
@@ -220,8 +230,8 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     # 奖励事件系统 → 恒 0（=官方无活动期行为）；入账/回传管线已通，
     # 后续接入事件系统时改此处即可
     m += pb_int32(36, 0)                         # 36 soldierWarBonusXPPercentage
-    m += pb_string(37, weapon_unlocks)           # 37 careerOrderStatus (逗号串)
-    m += pb_string(38, '3,1,2,8,18,22,')         # 38 (逗号串)
+    m += pb_string(37, str(career_order_status or ''))
+    m += pb_string(38, '')
     m += pb_bool(39, False)                      # 39 isChatModerator
     if eos_token:
         m += pb_string(999, eos_token)            # 999 eos_openid_token ★
@@ -478,30 +488,13 @@ def _msg_ribbon_progress(ribbon_template_id, total_xp):
 #
 # 换图：改 MISSION_PRESET_ID + start_server.bat 的 /M（两者必须对应同一张图）。
 #   preset 10 → T01M08_Mill | preset 29 → T02M01_Mountain | preset 26 → T02M04_Airfield
-MISSION_PRESET_ID = 10        # 与 matchmaking.AI_MISSIONPRESET 同源（客户端简报一致；撮合核心仍在 matchmaking）
+MISSION_PRESET_ID = mm_config.FALLBACK_PRESET
 BF_DEFENDER_FACTION_ID = 2    # 防守方 runtime factionId（必须在 battlefieldFactions 列表内）
 
 # f14 armyResourceList 资源类别（resourceCategoryId == WarDatabase/armyresourcecategory.f1）：
 #   1=infantryman 2=fighter_pilot 4=paratrooper 5=tank_crew 6=recon
 #   3=heavy_fighter_plane 10=transport_plane 20=fighter_plane 21=recon_plane
 # 空军类 spawnInAir=True。count=可用生命数。
-# 【无池回退静态表】有资源池（force_pool.init_mission 抽 AT 生成）时类别集
-# 与数值均由池驱动，本表仅作无池旧路径兜底（GMD f5 / 战斗服 f14 单一事实）。
-# 伞兵 spawnInAir=True（回放 pvt_gmd_response.bin 实锤：cat=4 count=72 spawnInAir=1，
-# 与 cat=10 transport_plane 成对 —— 伞兵从运输机跳伞出生）。
-BF_RES_CATS = (
-    (1, False, 1800),    # infantryman（主力生命池）
-    (6, False, 60),      # recon
-    (5, False, 60),      # tank_crew
-    (4, True, 60),       # paratrooper（运输机跳伞出生）
-    (2, True, 30),       # fighter_pilot
-    (3, True, 10),       # heavy_fighter_plane
-    (20, True, 10),      # fighter_plane
-    (21, True, 10),      # recon_plane
-    (10, True, 18),      # transport_plane（伞兵载机，4:1 比例配 60 伞兵）
-)
-
-
 def _accesspoint_layout(preset_id=MISSION_PRESET_ID,
                         defender_faction=BF_DEFENDER_FACTION_ID,
                         attacker_faction=3,
@@ -568,7 +561,7 @@ def _msg_army_resource_list(preset_id=MISSION_PRESET_ID,
     counts_by_faction：每局资源池 {factionTemplateId: {cat: count}}（
     force_pool.init_mission 抽 AT 生成），给定时类别集与数值均由池驱动
     （含坦克/载具等池内新增类别）—— 匹配界面 f5 / 战斗内 f2/f14 同源同值、
-    消耗后递减；None 回退静态 BF_RES_CATS 初始表。
+    消耗后递减；未提供资源池时不伪造静态资源。
     mission_id：Assault 随机布局种子（未激活线不进 layout → 此处自然不挂
     资源；须与 _accesspoint_layout 同值）。
 
@@ -608,7 +601,7 @@ def _msg_army_resource_list(preset_id=MISSION_PRESET_ID,
                         force_pool.categories(
                             counts_by_faction={0: pool_counts})]
         else:
-            cat_list = list(BF_RES_CATS)
+            cat_list = []
         for cat, in_air, cnt in cat_list:
             r = b''
             r += pb_int64(1, owner)        # factionTemplateId（1US/2GE/3SU）
@@ -756,15 +749,16 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     # 未开启线不在此）。
     # accesspointid 为运行时 id（真实局由 warserver 生成，私服固定自增段），
     # 低 32 位必须非零（sub_1803A7350 以低 32 位做非零校验后查 type25 树）。
+    battlefield_runtime_id = _runtime_entity_id(mission_id, 'battlefield')
     ap_msgs = []
     for i, (tmpl, owner) in enumerate(_accesspoint_layout(
             preset_id, defender_faction, attacker_faction,
             mission_id=mission_id)):
         ap = b''
         ap += pb_int64(1, owner)          # accesspointowner（factionId）
-        ap += pb_int64(2, 880001 + i)     # accesspointid ★动态构建（非回放值）
+        ap += pb_int64(2, _runtime_entity_id(mission_id, 'accesspoint', i))
         ap += pb_uint32(3, tmpl)          # accesspointtemplate（出生坐标来源）
-        ap += pb_int64(4, 1)              # accesspointbattlefieldid
+        ap += pb_int64(4, battlefield_runtime_id)
         ap_msgs.append(ap)
 
     # f14 armyResourceList（与 ActiveMissionRequestEventListResponse f2 同源；
@@ -775,7 +769,7 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
                                        mission_id=mission_id)
 
     m = b''
-    m += pb_int64(1, 1)                            # 1 battlefieldid（battlefield 表行 1）
+    m += pb_int64(1, battlefield_runtime_id)        # 1 battlefieldid（本局运行时）
     m += pb_int64(2, preset_id)                    # 2 missionPresetId ★地图链入口
     m += pb_int64(3, defender_faction)             # 3 defender（factionId）
     m += pb_float(4, 0.0)                          # 4 friendlyfire
@@ -792,8 +786,8 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     defence_msgs = _scene_defence_structures(preset_id)
     for i, (structure, transformation) in enumerate(defence_msgs):
         d = b''
-        d += pb_int64(1, 880101 + i)               # 1 id（运行时段，避开 AP 880001 段）
-        d += pb_int64(2, 880100)                   # 2 defencesetup（本局单组）
+        d += pb_int64(1, _runtime_entity_id(mission_id, 'defence', i))
+        d += pb_int64(2, _runtime_entity_id(mission_id, 'defencesetup'))
         d += pb_string(3, structure)               # 3 structure 模板名
         d += pb_string(10, transformation)         # 10 transformation 12 浮点矩阵
         m += pb_message(11, d)
@@ -835,7 +829,9 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     # 取本局 gamemap 对应 battlefield 行坐标（与简报 GMD f8/f9、大厅地图同源
     # 同值）；遭遇战图无行时 battlefield_entity_for_gamemap 回退 Benoit Village
     # 锚点。恒为 0.0 会让 overlay 缩放到欧洲地图左上角（与大厅位置不一致）。
-    gamemap_id = int(preset.get(3, 0) or 0) or 13
+    gamemap_id = int(preset.get(3, 0) or 0)
+    if not gamemap_id:
+        raise LookupError(f'mission preset {preset_id} has no gamemap')
     pos = battlefield_pos(battlefield_entity_for_gamemap(gamemap_id)) or (0.0, 0.0)
     m += pb_float(29, pos[0])                      # 29 stagedPosX
     m += pb_float(30, pos[1])                      # 30 stagedPosY

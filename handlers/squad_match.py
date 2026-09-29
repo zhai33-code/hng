@@ -74,32 +74,33 @@ async def handle_squad_request(sess, writer, cmd_id, req_type, proto):
                 mm_sess = _s
                 break
     if mm_sess is None:
-        # ★ 兜底圈定本局：f1（ZServer 自产 id）/f2（stale f16，如 rejoin
-        #   换队后 ZServer 缓存旧值）都未命中时，全局"最新会话"在多局
-        #   并行时会拿到别的局的玩家 → mission_id 错 → 登记表查不到 →
-        #   单槽默认 + 错误 faction（历史小队阵营错误同款路径）。
-        #   请求来自战斗服自己的连接，用握手记录的 combat_mission 圈定。
-        cm = int(getattr(sess, 'combat_mission', 0) or 0)
-        for _s in mm_state.PMS_TO_SESSION.values():
-            if cm and int(_s.get('mission_id', 0) or 0) != cm:
-                continue
-            mm_sess = _s          # dict 保序 → 本局最新进局会话
-        if mm_sess is None and not cm:
-            for _s in mm_state.PMS_TO_SESSION.values():
-                mm_sess = _s      # 无本局信息（理论不可达）→ 全局最新
-    if mm_sess is None:
-        log('      [WARN] SquadRequest: no PMS session, char ids zeroed')
-    sess_char_id = int(mm_sess['char_id']) if mm_sess else 0
-    sess_faction = int(mm_sess.get('faction', 3) or 3) if mm_sess else 3
+        writer.write(build_response(cmd_id, 'HandlerErrorResponse'))
+        await writer.drain()
+        log(f'GAME S->C cmd={cmd_id:<4} HandlerErrorResponse '
+            f'(SquadRequest has no exact PMS/squad binding)')
+        return True
+    sess_char_id = int(mm_sess['char_id'])
+    sess_faction = int(mm_sess.get('faction', 0) or 0)
+    if sess_faction not in (1, 2, 3):
+        writer.write(build_response(cmd_id, 'HandlerErrorResponse'))
+        await writer.drain()
+        log(f'GAME S->C cmd={cmd_id:<4} HandlerErrorResponse '
+            f'(invalid squad faction={sess_faction})')
+        return True
     team_runtime_faction_id = sess_faction   # ∈ BattleFieldSettings f18 factionId
-    squad_template_id = 1                # WarDatabase/SquadTemplate 第一行 id=1
+    squad_template_id = 0
     faction_template_id = sess_faction    # 1=US 2=GE 3=SU（与 f18 行对齐）
     # ★ f1 squadId 必须命中 ZServer squad 树里 PlayerSettings f16 注册的键：
     #   优先回显请求的 squadId（即客户端持有的 f16 值），无则用会话动态
     #   squad_id（与 PlayerSettings f16 同源生成），最后现场发号。
-    squad_runtime_id = int(requested_squad_id) if requested_squad_id else (
-        int(mm_sess.get('squad_id', 0) or 0) if mm_sess else 0) or \
-        mm_state._next_match_id(mm_state._MM_SQUAD_ID)
+    squad_runtime_id = int(requested_squad_id or
+                           mm_sess.get('squad_id', 0) or 0)
+    if not squad_runtime_id:
+        writer.write(build_response(cmd_id, 'HandlerErrorResponse'))
+        await writer.drain()
+        log(f'GAME S->C cmd={cmd_id:<4} HandlerErrorResponse '
+            f'(missing squad id)')
+        return True
 
     # ★ 局内小队定义：成局时 matchmaking 按分组登记（真实小队用大厅
     #   传入的队名/队长；单人匹配自动凑队，rank 最高任队长）。
@@ -115,8 +116,13 @@ async def handle_squad_request(sess, writer, cmd_id, req_type, proto):
         squad_leader_char_id = int(sq_info.get('leader_char_id', 0) or 0) \
             or (int(members[0]['char_id']) if members else sess_char_id)
         owner_char_id = squad_leader_char_id
-        # ★ f2 squadTemplateId 取成局登记的兵种小队模板（回退 1）
-        squad_template_id = int(sq_info.get('template', 1) or 1)
+        squad_template_id = int(sq_info.get('template', 0) or 0)
+        if not squad_template_id:
+            writer.write(build_response(cmd_id, 'HandlerErrorResponse'))
+            await writer.drain()
+            log(f'GAME S->C cmd={cmd_id:<4} HandlerErrorResponse '
+                f'(squad {squad_runtime_id} has no template)')
+            return True
         # ★ faction 以成局登记表为准（matchmaking 按 entry.faction 分组
         #   写入）：会话回退值在两人局可能是另一名玩家的 faction。
         if int(sq_info.get('faction', 0) or 0):
@@ -142,11 +148,11 @@ async def handle_squad_request(sess, writer, cmd_id, req_type, proto):
             for tid, idx in slot_rows)
         slot_count = len(slot_rows)
     else:
-        squad_name = 'PlayerSquad'
-        owner_char_id = sess_char_id
-        squad_leader_char_id = sess_char_id
-        slots = pb_message(5, pb_int64(1, 1) + pb_int32(2, 0))
-        slot_count = 1
+        writer.write(build_response(cmd_id, 'HandlerErrorResponse'))
+        await writer.drain()
+        log(f'GAME S->C cmd={cmd_id:<4} HandlerErrorResponse '
+            f'(unregistered squad={squad_runtime_id}, mission={mission_id})')
+        return True
     squad_def = b''
     squad_def += pb_int64(1, team_runtime_faction_id)  # f1 missionSquadId (=team)
     squad_def += pb_int64(2, squad_template_id)        # f2 squadTemplateId

@@ -508,6 +508,44 @@ def _build_pricing_map():
 
 _PRICING_MAP = _build_pricing_map()
 
+
+def _build_store_discount_map():
+    """Static discount rows, when supplied by the selected WarDatabase."""
+    path = os.path.join(WARDDB_DIR, 'StoreDiscount')
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    for f in _parse_wardb_table('StoreDiscount'):
+        raw = f.get(5, b'')
+        value = (struct.unpack('<f', raw)[0]
+                 if isinstance(raw, bytes) and len(raw) == 4 else 0.0)
+        out[int(f.get(1, 0) or 0)] = {
+            'object_type': (f.get(2, b'') or b'').decode('utf-8', 'replace'),
+            'object_id': int(f.get(3, 0) or 0),
+            'currency': int(f.get(4, 0) or 0),
+            'discount_value': float(value),
+            'campaign_id': int(f.get(6, 0) or 0),
+        }
+    return out
+
+
+_STORE_DISCOUNT_MAP = _build_store_discount_map()
+
+
+def _build_store_campaign_map():
+    out = {}
+    for f in _parse_wardb_table('StoreCampaign'):
+        def text(field):
+            raw = f.get(field, b'') or b''
+            return raw.decode('utf-8', 'replace') if isinstance(raw, bytes) else str(raw)
+        out[int(f.get(1, 0) or 0)] = {
+            'active_from': text(6), 'active_to': text(7),
+        }
+    return out
+
+
+_STORE_CAMPAIGN_MAP = _build_store_campaign_map()
+
 # 维修定价索引：(type, objectId) -> Pricing 行。客户端 PriceModel.
 # createItemMaintenancePurchaseOptions 按 HnGGUIGamePrices.TYPE_*_REPAIR +
 # 模板 id 查价，维修价 = 基础价 x 损耗比例（PriceObject.calculateFractionPrice：
@@ -1510,12 +1548,11 @@ def commandnode_template(faction, name):
 
 
 def _load_preset(preset_id):
-    """读 WarDatabase/missionpreset 行（缓存）。查不到回退 preset 10 硬编码值。
+    """读 WarDatabase/missionpreset 行（缓存）；未知 id 返回空行。
 
-    ★ 兜底行按【原 preset_id】缓存——旧实现回退时把 preset_id 改写成 10
-    再入缓存，会用缺 f6/f8/f12-f15 的兜底行覆盖 preset 10 的真实行
-    （任意一次未知 preset 查询即污染：后续 f12 missionCategoryId /
-    maxPlayerCount 等全读不到，2026-09-10 test_mm_mapfilter B13 发现）。
+    Callers that only inspect metadata can treat an empty row as unavailable;
+    combat launch uses :func:`preset_scene` and fails explicitly.  Never turn
+    a corrupt/unknown preset into an unrelated Mill battle.
     """
     if preset_id in _PRESET_CACHE:
         return _PRESET_CACHE[preset_id]
@@ -1528,10 +1565,8 @@ def _load_preset(preset_id):
     except Exception as e:
         log(f'[!] missionpreset parse failed: {e}')
     if row is None:
-        # preset 10: Training - Encounter - Mill（WarDatabase 实测行的
-        # 最小子集；仅缺场景等兜底用途，字段不全）
-        row = {1: 10, 3: 13, 4: 5, 5: b'Training - Encounter - Mill', 7: 0, 11: 24}
-        log(f'[!] preset {preset_id} not in WarDatabase, fallback to preset 10')
+        row = {}
+        log(f'[!] preset {preset_id} not in WarDatabase')
     _PRESET_CACHE[preset_id] = row
     return row
 
@@ -1562,7 +1597,7 @@ def _load_gamemap_scene(gamemap_id):
     """gamemap → 场景名（combat server /M 启动参数，不含 .scn 后缀）。
 
     WarDatabase 存 'T01M08_Mill.scn'，启动参数为 'T01M08_Mill'
-    （start_server.bat 实测）。查不到回退 Mill。
+    （start_server.bat 实测）。查不到时抛错，阻止启动错误地图。
     """
     row = _load_gamemap_row(gamemap_id)
     scene = ''
@@ -1573,16 +1608,16 @@ def _load_gamemap_scene(gamemap_id):
     if scene.endswith('.scn'):
         scene = scene[:-4]
     if not scene:
-        log(f'[!] gamemap {gamemap_id} scenefile missing, '
-            f'fallback to T01M08_Mill')
-        return 'T01M08_Mill'
+        raise LookupError(f'gamemap {gamemap_id} scenefile missing')
     return scene
 
 
 def preset_scene(preset_id):
     """missionpreset → gamemap → scenefile（combat server /M 单一来源）。"""
     preset = _load_preset(preset_id)
-    gamemap_id = int(preset.get(3, 0) or 0) or 13
+    gamemap_id = int(preset.get(3, 0) or 0)
+    if not gamemap_id:
+        raise LookupError(f'preset {preset_id} has no gamemap')
     return _load_gamemap_scene(gamemap_id)
 
 
@@ -1590,13 +1625,12 @@ def battlefield_entity_for_gamemap(gamemap_id):
     """battlefield 表 f7==gamemap 的行 id（MissionInfo f5 mapEntityId）。
 
     battlefield 表只覆盖战役地图（f7 ∈ {70439 Town, 201 Mountain, 203 Factory,
-    204 Airfield, 205 Forward Airfield}）；Mill(13) 等遭遇战/训练图无行，
-    回退 MISSION_MAP_ENTITY_ID 常量值（112741325='Benoit Village'），
-    保证客户端简报查表可用。
+    204 Airfield, 205 Forward Airfield}）；Mill(13) 等遭遇战/训练图无行时
+    返回 0，避免客户端把普通匹配显示成无关的 Benoit Village。
     """
     if gamemap_id in _BATTLEFIELD_ENTITY_CACHE:
         return _BATTLEFIELD_ENTITY_CACHE[gamemap_id]
-    entity_id = 112741325
+    entity_id = 0
     try:
         for r in _parse_wardb_table('battlefield'):
             if int(r.get(7, 0) or 0) == int(gamemap_id):
@@ -1942,4 +1976,3 @@ def at_pricing():
             log(f'[!] Pricing parse failed: {e}')
         _RTS_CACHE['at_pricing'] = matched or allrows
     return _RTS_CACHE['at_pricing']
-

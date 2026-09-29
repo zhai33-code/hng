@@ -138,6 +138,8 @@ def _war_config(morale=None):
         'strategytimescale': mm_config.WAR_TIMESCALE,
         'daycycletimescale': mm_config.WAR_DAYCYCLE_TIMESCALE,
         'maxPlayerPerFaction': mm_config.WAR_MAX_PLAYERS_PER_FACTION,
+        'queueReinforcements': mm_config.WAR_QUEUE_REINFORCEMENTS,
+        'firstResourceFree': mm_config.WAR_FIRST_RESOURCE_FREE,
         'morale': morale,
     }
 

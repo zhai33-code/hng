@@ -145,7 +145,16 @@ def _msg_supreme_command_rows():
     return defs, instances
 
 
-def _msg_faction_resource_rows(queue_windows=None):
+def _queue_window(queue_windows, faction, category=None):
+    value = (queue_windows or {}).get(faction, (0, 0))
+    if not isinstance(value, dict):       # compatibility with old callers/tests
+        return value
+    if category is None:
+        return value.get('overall', (0, 0))
+    return value.get('categories', {}).get(category, (0, 0))
+
+
+def _msg_faction_resource_rows(queue_windows=None, next_production_ms=None):
     """KVS 'FactionResourceProduction' + 'FactionResourceConsumption' 行
     （三阵营 × 全部 armyresourcecategory 分类）：阵营资源总览窗口数据源，
     缺 FactionResourceProduction 行时客户端每分类 dd.error 并留空。
@@ -155,9 +164,9 @@ def _msg_faction_resource_rows(queue_windows=None):
     相同：步兵 900/85 万、重坦 2/225、战斗机 3/1800……），间隔全表恒 600s。
     此前误用 armyresourcecategory f6（speed）×10 当产量、间隔取 1h，已废弃。
     时间戳为 Zulu 'YYYYMMDDHHmmss'（TimeUtilities.convertZuluTimeToMilliseconds），
-    nextRunTimeStamp = 当前时间 + 模板间隔（客户端倒计时展示值）。
-    queue_windows={faction: (head, tail)}：消耗行 f8/f9 队列窗口
-    （M3-2 队列化，war_campaign.supply_windows 提供；空=0）。"""
+    nextRunTimeStamp 沿战争 production_ms 游标推进，不因每次重推而重置。
+    queue_windows 同时含阵营总窗口与各资源类别窗口；消耗行 f8/f9 使用
+    自己类别的窗口（M3-2，空=0）。"""
     prods, cons = [], []
     templates = {(t['faction'], t['category_id']): t
                  for t in armyresource_production()}
@@ -165,12 +174,14 @@ def _msg_faction_resource_rows(queue_windows=None):
     prev_ts = time.strftime('%Y%m%d%H%M%S', time.gmtime(now))
     for tmpl, fid in FACTION_ROW_IDS.items():
         hq = FACTION_SUPREME_COMMANDS[tmpl]
-        win = (queue_windows or {}).get(tmpl, (0, 0))
         for cat, _name in army_resource_categories():
             t = templates.get((tmpl, cat))
-            interval = t['run_every_seconds'] if t else 600
-            next_ts = time.strftime(
-                '%Y%m%d%H%M%S', time.gmtime(now + interval))
+            interval = int(t['run_every_seconds']) if t else 0
+            target = ((float(next_production_ms) / 1000.0 + interval)
+                      if next_production_ms else now + interval)
+            while interval > 0 and target <= now:
+                target += interval
+            next_ts = time.strftime('%Y%m%d%H%M%S', time.gmtime(target))
             p = pb_int64(1, fid * 1000 + cat)                # id（faction×分类 唯一）
             p += pb_int64(2, fid)                              # factionId
             p += pb_int64(3, _WAR_ID)                          # warId
@@ -189,8 +200,9 @@ def _msg_faction_resource_rows(queue_windows=None):
             c += pb_int64(5, cat)                              # armyResourceCategoryId
             c += pb_string(6, prev_ts)                         # previousConsumptionTimeStamp
             c += pb_int32(7, 0)                                # previousConsumptionValue
-            c += pb_int32(8, win[0])                           # supplyQueueHead（阵营窗口）
-            c += pb_int32(9, win[1])                           # supplyQueueTail
+            win = _queue_window(queue_windows, tmpl, cat)
+            c += pb_int32(8, win[0])                           # category queue head
+            c += pb_int32(9, win[1])                           # category queue tail
             cons.append(c)
     return prods, cons
 
@@ -199,10 +211,10 @@ def _msg_faction_queue_rows(queue_windows):
     """KVS 'FactionResourceQueue' 行（每阵营 1 行，§3.12 schema）：
     f1 id / f2 factionId / f3 warId / f4 supplyQueueHead(I32) /
     f5 supplyQueueTail(I32)。窗口语义：head=MIN(queue_number)、
-    tail=MAX+1、空队 (0,0)。queue_windows={faction: (head, tail)}。"""
+    tail=MAX+1、空队 (0,0)。queue_windows 取各阵营的 overall 窗口。"""
     rows = []
     for tmpl, fid in FACTION_ROW_IDS.items():
-        head, tail = (queue_windows or {}).get(tmpl, (0, 0))
+        head, tail = _queue_window(queue_windows, tmpl)
         r = pb_int64(1, fid)                               # id（=factionId）
         r += pb_int64(2, fid)                              # factionId
         r += pb_int64(3, _WAR_ID)                          # warId

@@ -24,14 +24,29 @@ from .supply import (
 # ---- M3-1 阵营资源生产（docs/hng-rts-protocol.md §9.1 / §3.12.1）----
 
 
-_PROD_INTERVAL_MS = 600_000        # ArmyResourceProductionTemplate 全表恒 600s
-
-
 _PROD_LAST_RUN = 0.0               # WAR_PRODUCTION_MIN_TICK 节流游标
 
 
+def _production_interval_ms(rows):
+    """Return the interval declared by WarDatabase, or None if unusable.
+
+    ``wars.production_ms`` is a single cursor, so this implementation requires
+    every active production row to use the same interval.  Refuse mixed data
+    rather than silently applying one category's cadence to every category.
+    """
+    intervals = {int(r.get('run_every_seconds') or 0) for r in rows
+                 if int(r.get('produce_per_run') or 0) > 0}
+    intervals.discard(0)
+    if not intervals:
+        return None
+    if len(intervals) != 1:
+        raise ValueError(
+            f'WarDatabase contains mixed production intervals: {sorted(intervals)}')
+    return intervals.pop() * 1000
+
+
 async def production_tick(store):
-    """阵营资源生产推进：wars.production_ms 游标按 600s/run 结算 runs，
+    """阵营资源生产推进：按 WarDatabase 模板周期结算 runs，
     把模板产量累加进 war_faction_resources，并对 resourceview 订阅会话
     重推 FactionResourceProduction/Consumption 行 + 最高司令部 armyresource
     行（客户端不做本地生产模拟，不推则资源总览数值停滞）。
@@ -50,16 +65,21 @@ async def production_tick(store):
         war = await ensure_war(store)
         if war is None:
             return
+        templates = wardb.armyresource_production()
+        interval_ms = _production_interval_ms(templates)
+        if interval_ms is None:
+            log('[war] production skipped: no usable WarDatabase production rows')
+            return
         now_ms = int(now_s * 1000)
         cursor = int(war.get('production_ms') or 0)
         if cursor <= 0:
             await store.update_war_production(war['id'], now_ms)
             return
-        runs = int((now_ms - cursor) // _PROD_INTERVAL_MS)
+        runs = int((now_ms - cursor) // interval_ms)
         if runs <= 0:
             return
         deltas = {}
-        for t in wardb.armyresource_production():
+        for t in templates:
             per = int(t.get('produce_per_run') or 0)
             if per <= 0:
                 continue            # 死行 cat 13 等
@@ -69,8 +89,9 @@ async def production_tick(store):
             d[cat] = d.get(cat, 0) + per * runs
         for fac, d in deltas.items():
             await store.adjust_war_faction_resources(war['id'], fac, d)
-        await store.update_war_production(
-            war['id'], cursor + runs * _PROD_INTERVAL_MS)
+        new_cursor = cursor + runs * interval_ms
+        await store.update_war_production(war['id'], new_cursor)
+        war['production_ms'] = new_cursor
         log(f'[war] production: war={war["id"]} runs={runs} '
             f'factions={sorted(deltas)}')
         # ---- 行重推（resourceview 订阅会话，与订阅时同函数同 warId 源）----
@@ -78,7 +99,8 @@ async def production_tick(store):
         from state import FLASH_SESSIONS
         from messages import _push_kvcs
         windows = await supply_windows(store, war)
-        prods, cons = mm_factions._msg_faction_resource_rows(windows)
+        prods, cons = mm_factions._msg_faction_resource_rows(
+            windows, int(war.get('production_ms') or 0))
         queue_rows = mm_factions._msg_faction_queue_rows(windows)
         hq_rows = await hq_stock_rows(store, war)
         for sess in list(FLASH_SESSIONS.values()):

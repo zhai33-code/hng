@@ -45,7 +45,7 @@ async def handle_set_equipmentselection(sess, writer, cmd_id, req_type, proto):
     # set_equipmentselection_response { int32 msg = 1; }
     try:
         f = pb_parse(proto)
-        eq_char_id = f.get(1, 1)
+        eq_char_id = f.get(1, 0)
         equip_id = f.get(2, 0)
         equip_slot = f.get(3, 0)
         log(f'      EquipItem: charId={eq_char_id}, weaponId={equip_id}, slot={equip_slot}')
@@ -53,7 +53,7 @@ async def handle_set_equipmentselection(sess, writer, cmd_id, req_type, proto):
         log(f'      set_equipmentselection parse error: {e}')
         equip_id = 0
         equip_slot = 0
-        eq_char_id = 1
+        eq_char_id = 0
 
     # 装备（含挤槽）：客户端替换槽位武器时只发本请求（新武器），不发
     # remove_equipmentselection（旧武器）——set_weapon_equipment 会把同容器

@@ -64,8 +64,7 @@ RC_TRANSPORTING_TO_JOIN_BATTLE = 23
 RC_TRANSPORTING_TO_JOIN_ONGOING_BATTLE = 24
 
 
-# 无坐标数据时单段回退时长（秒）
-SEGMENT_FALLBACK_SECONDS = 300
+SEGMENT_FALLBACK_SECONDS = mm_config.WAR_SEGMENT_FALLBACK_SECONDS
 
 
 def at_speed(at):
@@ -94,7 +93,7 @@ def segment_seconds(from_bf, to_bf, speed, faction=0, owners=None,
     from_bf, to_bf = int(from_bf or 0), int(to_bf or 0)
     a, b = p.get(from_bf), p.get(to_bf)
     if not a or not b:
-        return SEGMENT_FALLBACK_SECONDS
+        return max(1, SEGMENT_FALLBACK_SECONDS)
     import math
     dist = math.hypot(a[0] - b[0], a[1] - b[1])
     factor = 1.0

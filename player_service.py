@@ -6,7 +6,7 @@ messages(消息构建/KVCS 推送)。被 handlers 各域模块与入口复用。
 """
 import time
 
-from protocol import msg_player
+from protocol import build_response, msg_player, pb_int32
 
 from state import (
     STORE,
@@ -152,6 +152,41 @@ async def _charge_player_multi(sess, pricing_ids, currency):
     log(f'      [MONEY] -{total} {_CUR_NAME.get(int(currency), currency)} for pricings '
         f'{[int(p) for p in pricing_ids if p]} -> {key}={new_balance}')
     return total, True
+
+
+async def _refund_player_charge(sess, currency, amount):
+    """Refund a completed shop charge after persistence failed.
+
+    Shop handlers charge before creating the owned-item row.  A failed INSERT
+    must not be converted into a session-local fake item, and it must not leave
+    the player out of pocket either.  Returns False when no refund was needed
+    or when the refund itself could not be persisted.
+    """
+    amount = int(amount or 0)
+    key = _CUR_KEY.get(int(currency)) if currency is not None else None
+    if amount <= 0 or key is None:
+        return False
+    pid = await sess.ensure_player()
+    if pid is None:
+        return False
+    try:
+        await STORE.add_currency(pid, **{key: amount})
+        log(f'      [MONEY] refund +{amount} {key} after item persistence failure')
+        return True
+    except Exception as e:
+        log(f'[DB] CRITICAL: refund +{amount} {key} failed: {e}')
+        return False
+
+
+async def _fail_persisted_purchase(sess, writer, cmd_id, response_type,
+                                   field_no, currency, amount, detail=''):
+    """Refund a failed shop write and send the protocol's generic failure code."""
+    await _refund_player_charge(sess, currency, amount)
+    resp = build_response(cmd_id, response_type, pb_int32(field_no, 0))
+    writer.write(resp)
+    await writer.drain()
+    log(f'S->C cmd={cmd_id:<4} {response_type} '
+        f'(response=0 persistence_failed{":" + detail if detail else ""})')
 
 
 
@@ -445,12 +480,12 @@ async def _unlock_need_for_char(sess, char_id, req_uids):
 
 # ---- war_catalogue 构建（用于 query_war_catalogue_response）----
 async def _msg_player_for(sess, gamertag=None):
-    """从数据库读取货币/教程完成态并构建 player proto；DB 不可用时回退默认值。
+    """从数据库读取货币/教程完成态并构建 player proto。
 
     f10/f11 官服口径：f10 = 当前战争 id；f11 = 本场战争的阵营选择
     （player_war_factions，无行 = 未选择 → 发 0，客户端弹
     FactionSelectionWindow / 首页 CTA，join_war_request 落库后重推本行）。"""
-    cur = {'credits': 100000, 'warfunds': 100000, 'gold': 100000}
+    cur = None
     tutorials_completed = 0
     faction = None
     war = None
@@ -458,11 +493,14 @@ async def _msg_player_for(sess, gamertag=None):
     first_action_date = ''
     unlock_ids = ()
     pid = await sess.ensure_player()
+    if pid is None:
+        raise RuntimeError('cannot build player row without a persisted player id')
+    try:
+        cur = await STORE.get_currency(pid)
+    except Exception as e:
+        log(f'[DB] get_currency failed: {e}')
+        raise RuntimeError('cannot build player row without persisted currency') from e
     if pid is not None:
-        try:
-            cur = await STORE.get_currency(pid)
-        except Exception as e:
-            log(f'[DB] get_currency failed: {e}')
         try:
             tutorials_completed = await STORE.get_tutorials_completed(pid)
         except Exception as e:
@@ -505,7 +543,7 @@ async def _msg_player_for(sess, gamertag=None):
             unlock_ids = ()
     return msg_player(gamertag or sess.username or 'DemoPlayer',
                       tutorials_completed=tutorials_completed,
-                      pid=pid or 1, faction=faction, total_score=total_score,
+                      pid=pid, faction=faction, total_score=total_score,
                       first_action_date=first_action_date,
                       war=war['id'] if war is not None else 0,
                       unlock_ids=unlock_ids, **cur)
@@ -851,4 +889,3 @@ async def _load_db_loadout(player_id):
                 loadout['xp_booster_id'] = tmpl
                 loadout['xp_booster_mul'] = mul
     return loadout
-

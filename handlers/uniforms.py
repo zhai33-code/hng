@@ -34,6 +34,7 @@ from messages import (
 from player_service import (
     _char_unlock_bits_for,
     _charge_player,
+    _fail_persisted_purchase,
     _msg_player_for,
     )
 
@@ -46,13 +47,13 @@ async def handle_createuniformvariantrequest(sess, writer, cmd_id, req_type, pro
     #   int64 uniformVariantTemplateId=5; int64 variantPricingId=6;
     #   int64 discountId=7; int32 paymentCurrency=8; }
     # CreateUniformVariantResponse { int32 response = 1; }
-    uv_char_id = 1
+    uv_char_id = 0
     uv_template_id = 0
     uv_pricing_id = 0
     uv_currency = 0
     try:
         f = pb_parse(proto)
-        uv_char_id = f.get(1, 1)
+        uv_char_id = f.get(1, 0)
         uv_template_id = f.get(5, 0)
         uv_pricing_id = f.get(6, 0)
         uv_currency = f.get(8, 0)
@@ -72,7 +73,7 @@ async def handle_createuniformvariantrequest(sess, writer, cmd_id, req_type, pro
         log(f'S->C cmd={cmd_id:<4} CreateUniformVariantResponse (response=56 not_enough) cost={cost}')
         return
 
-    # 持久化军服迷彩变体实例（失败时用内存计数器兜底）
+    # 持久化军服迷彩变体实例；失败时退款并返回失败。
     pid = await sess.ensure_player()
     if pid is not None:
         try:
@@ -84,8 +85,10 @@ async def handle_createuniformvariantrequest(sess, writer, cmd_id, req_type, pro
     else:
         uvid = None
     if uvid is None:
-        uvid = getattr(sess, '_fallback_uniform_variant_id', 699) + 1
-        sess._fallback_uniform_variant_id = uvid
+        await _fail_persisted_purchase(
+            sess, writer, cmd_id, 'CreateUniformVariantResponse', 1,
+            uv_currency, cost)
+        return
 
     # 1. 返回 CreateUniformVariantResponse (response=1 ok)
     resp_proto = pb_int32(1, 1)
@@ -114,11 +117,11 @@ async def handle_setuniformvariantrequest(sess, writer, cmd_id, req_type, proto)
     # SetUniformVariantRequest { int64 characterId=1; int64 variantId=2; }
     # SetUniformVariantResponse { int32 response = 2; }  ← 响应字段号是 2！
     # variantId 是 UniformVariant 实例 id（0 = 卸下，恢复默认军服）
-    suv_char_id = 1
+    suv_char_id = 0
     suv_variant_id = 0
     try:
         f = pb_parse(proto)
-        suv_char_id = f.get(1, 1)
+        suv_char_id = f.get(1, 0)
         suv_variant_id = f.get(2, 0)
         log(f'      SetUniformVariant: charId={suv_char_id}, variantId={suv_variant_id}')
     except Exception as e:
@@ -214,14 +217,14 @@ async def handle_purchaseuniformpartrequest(sess, writer, cmd_id, req_type, prot
     #   int64 discountId=5; int32 paymentCurrency=6; }
     # PurchaseUniformPartResponse { int32 response = 1; }
     # EUniformPartType: eHelmet=1
-    hp_char_id = 1
+    hp_char_id = 0
     hp_part_type = 0
     hp_template_id = 0
     hp_pricing_id = 0
     hp_currency = 0
     try:
         f = pb_parse(proto)
-        hp_char_id = f.get(1, 1)
+        hp_char_id = f.get(1, 0)
         hp_part_type = f.get(2, 0)
         hp_template_id = f.get(3, 0)
         hp_pricing_id = f.get(4, 0)
@@ -242,7 +245,7 @@ async def handle_purchaseuniformpartrequest(sess, writer, cmd_id, req_type, prot
         log(f'S->C cmd={cmd_id:<4} PurchaseUniformPartResponse (response=56 not_enough) cost={cost}')
         return
 
-    # 持久化头盔实例（失败时用内存计数器兜底）
+    # 持久化头盔实例；失败时退款并返回失败。
     pid = await sess.ensure_player()
     part_id = None
     if pid is not None:
@@ -252,8 +255,10 @@ async def handle_purchaseuniformpartrequest(sess, writer, cmd_id, req_type, prot
         except Exception as e:
             log(f'[DB] create_uniform_part failed: {e}')
     if part_id is None:
-        part_id = getattr(sess, '_fallback_uniform_part_id', 899) + 1
-        sess._fallback_uniform_part_id = part_id
+        await _fail_persisted_purchase(
+            sess, writer, cmd_id, 'PurchaseUniformPartResponse', 1,
+            hp_currency, cost)
+        return
 
     # 1. 返回 PurchaseUniformPartResponse (response=1 ok)
     resp_proto = pb_int32(1, 1)
@@ -282,12 +287,12 @@ async def handle_setuniformpartrequest(sess, writer, cmd_id, req_type, proto):
     # SetUniformPartRequest { int64 characterId=1; int64 uniformPartId=2; int32 uniformPartType=3; }
     # SetUniformPartResponse { int32 response = 2; }  ← 响应字段号是 2！
     # uniformPartId 是 UniformPart 实例 id（0 = 卸下，恢复默认头盔）
-    sp_char_id = 1
+    sp_char_id = 0
     sp_part_id = 0
     sp_part_type = 0
     try:
         f = pb_parse(proto)
-        sp_char_id = f.get(1, 1)
+        sp_char_id = f.get(1, 0)
         sp_part_id = f.get(2, 0)
         sp_part_type = f.get(3, 0)
         log(f'      SetUniformPart: charId={sp_char_id}, partId={sp_part_id}, '

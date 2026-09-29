@@ -465,7 +465,11 @@ def _qn_window(rows):
 
 
 async def supply_windows(store, war=None):
-    """{faction: (head, tail)} 队列窗口（resourceview 订阅/重推共用）。
+    """Faction-wide and per-resource queue windows.
+
+    Return ``{faction: {'overall': (head, tail), 'categories': {cat:
+    (head, tail)}}}``.  FactionResourceQueue consumes ``overall`` while each
+    FactionResourceConsumption row consumes its category window.
     DB 不可用/无战争时回 {}（全部按 (0,0)）。"""
     try:
         if store is None or getattr(store, 'pool', None) is None:
@@ -477,7 +481,17 @@ async def supply_windows(store, war=None):
         by_fac = {}
         for r in await store.list_war_supply_queue(war['id']):
             by_fac.setdefault(int(r.get('faction') or 0), []).append(r)
-        return {fac: _qn_window(rs) for fac, rs in by_fac.items()}
+        out = {}
+        for fac, rows in by_fac.items():
+            cats = {}
+            for row in rows:
+                cats.setdefault(int(row.get('category_id') or 0), []).append(row)
+            out[fac] = {
+                'overall': _qn_window(rows),
+                'categories': {cat: _qn_window(rs)
+                               for cat, rs in cats.items()},
+            }
+        return out
     except Exception as e:
         log(f'[war] supply_windows failed: {e}')
         return {}
@@ -522,18 +536,30 @@ async def supply_queue_tick(store):
                     await store.dequeue_war_supply([row['id']])
                     dequeued_ids.append(int(row['id']))
                     continue        # AT 没了：出队不退款，继续清理下一行
-                await store.adjust_war_faction_resources(
-                    war['id'], fid, {cat: -need})
-                await store.update_command_node(
-                    at['id'], resources=_at_add_resources(at, cat, need))
+                if bool(row.get('deliver_as_column')):
+                    col, events, ecode = await spawn_supply_column(
+                        store, war, at, {cat: need},
+                        near_capital_bf=int(
+                            row.get('near_capital_battlefield_id') or 0))
+                    if col is None and ecode:
+                        break
+                    await store.adjust_war_faction_resources(
+                        war['id'], fid, {cat: -need})
+                    await broadcast_war_events(events, store)
+                else:
+                    await store.adjust_war_faction_resources(
+                        war['id'], fid, {cat: -need})
+                    await store.update_command_node(
+                        at['id'], resources=_at_add_resources(at, cat, need))
                 await store.dequeue_war_supply([row['id']])
                 dequeued_ids.append(int(row['id']))
                 at = await store.get_command_node(at['id'])
-                delivered.append(at)
+                if not bool(row.get('deliver_as_column')):
+                    delivered.append(at)
                 log(f'[war] supply queue: at={at["id"]} faction={fid} '
                     f'cat={cat} x{need} delivered from stock')
                 break               # 队头已推进，本阵营下 tick 再看下一行
-        if not delivered:
+        if not delivered and not dequeued_ids:
             return
         # ---- 推送：touched AT 重取后推 armyresource/Instance 行 ----
         events = []
@@ -546,7 +572,8 @@ async def supply_queue_tick(store):
         await broadcast_war_events(events, store)
         windows = await supply_windows(store, war)
         queue_rows = mm_factions._msg_faction_queue_rows(windows)
-        cons = mm_factions._msg_faction_resource_rows(windows)[1]
+        cons = mm_factions._msg_faction_resource_rows(
+            windows, int(war.get('production_ms') or 0))[1]
         hq_rows = await hq_stock_rows(store, war)
         from messages import _push_kvcs_delete
         for sess in list(FLASH_SESSIONS.values()):
@@ -585,10 +612,14 @@ def msg_supply_queue_item_row(qrow, at, war_id=None):
     id/playerId/commandNodeWarInstanceId/armyResourceCategoryId/warId/
     factionId/timestamp/pricingId/paymentCurrency/queueNumber/
     nearCapitalBattlefieldId/playerSessionId/deviceId/metricsUid）。
-    f8 pricingId / f9 paymentCurrency 入队时未持久化、客户端展示不读 →
-    填 0；f11-f14 官服遥测字段填空值。queueNumber>10000000 客户端显示
-    "unassigned"（我们 plentiful 合成值不入 war_supply_queue，不受影响）。"""
-    ts = int(qrow.get('created_at') or 0) or int(time.time() * 1000)
+    f8 pricingId / f9 paymentCurrency / f11 nearCapitalBattlefieldId 与
+    f15 discountId 均来自购买时持久化快照；f12-f14 官服遥测字段留空。
+    queueNumber>10000000 客户端显示 "unassigned"。"""
+    created = qrow.get('created_at')
+    if hasattr(created, 'timestamp'):
+        ts = int(created.timestamp() * 1000)
+    else:
+        ts = int(created or 0) or int(time.time() * 1000)
     m = b''
     m += pb_int64(1, int(qrow['id']))                       # id
     m += pb_int64(2, int(at.get('owner_player_id') or 0))   # playerId
@@ -597,13 +628,18 @@ def msg_supply_queue_item_row(qrow, at, war_id=None):
     m += pb_int64(5, int(qrow.get('war_id') or war_id or 0))
     m += pb_int64(6, int(qrow['faction']))                  # factionId
     m += pb_int64(7, ts)                                    # timestamp
-    m += pb_int64(8, 0)                                     # pricingId
-    m += pb_int32(9, 0)                                     # paymentCurrency (enum)
+    m += pb_int64(8, int(qrow.get('pricing_id') or 0))       # pricingId
+    m += pb_int32(9, int(qrow.get('payment_currency') or 2)) # paymentCurrency
     m += pb_int32(10, int(qrow['queue_number']))            # queueNumber
-    m += pb_int64(11, 0)                                    # nearCapitalBattlefieldId
+    m += pb_int64(11, int(qrow.get(
+        'near_capital_battlefield_id') or 0))
     m += pb_int64(12, 0)                                    # playerSessionId
     m += pb_string(13, '')                                  # deviceId
     m += pb_string(14, '')                                  # metricsUid
+    if int(qrow.get('discount_id') or 0):
+        m += pb_int64(15, int(qrow['discount_id']))
+    m += pb_int64(16, int(qrow.get(
+        'command_node_definition_id') or qrow['command_node_id']))
     m += pb_int32(17, int(qrow.get('count') or 0))          # resourcesNeeded
     return m
 
@@ -616,7 +652,11 @@ def msg_supply_queue_ticket_row(qrow, at, place):
     REQUIRED f1 id / f2 playerId / f3 warId / f4 factionId / f7 timestamp /
     f8 queueNumber / f9 queuePlace（f5/f6 无 descriptor 跳过，实锤 schema）。
     ticket id 复用队列行 id（两表键空间独立，出队 DELETE 同 id 推两张表）。"""
-    ts = int(qrow.get('created_at') or 0) or int(time.time() * 1000)
+    created = qrow.get('created_at')
+    if hasattr(created, 'timestamp'):
+        ts = int(created.timestamp() * 1000)
+    else:
+        ts = int(created or 0) or int(time.time() * 1000)
     m = b''
     m += pb_int64(1, int(qrow['id']))
     m += pb_int64(2, int(at.get('owner_player_id') or 0))
@@ -663,17 +703,26 @@ async def push_supply_queue_rows(store, war=None):
     """AT 级补给队列行重推到 resourceview 订阅会话（item+ticket 全量 set）。
     入队后调用（226 触发的 RESOURCE_VIEW 订阅在响应之后才发生，新订阅者
     由 views.handle_subscribe 快照覆盖；此处覆盖已订阅会话）。"""
+    import mm_factions
     from state import FLASH_SESSIONS
     from messages import _push_kvcs
+    if war is None:
+        war = await ensure_war(store)
     items, tickets = await supply_queue_table_rows(store, war)
-    if not items:
-        return
+    windows = await supply_windows(store, war)
+    queue_rows = mm_factions._msg_faction_queue_rows(windows)
+    consumption_rows = mm_factions._msg_faction_resource_rows(
+        windows, int((war or {}).get('production_ms') or 0))[1]
     for sess in list(FLASH_SESSIONS.values()):
         cmd = getattr(sess, 'resource_view_cmd', None)
         w = getattr(sess, 'writer', None)
         if not cmd or not w:
             continue
         try:
+            for row in queue_rows:
+                await _push_kvcs(w, cmd, b'FactionResourceQueue', row)
+            for row in consumption_rows:
+                await _push_kvcs(w, cmd, b'FactionResourceConsumption', row)
             for row in items:
                 await _push_kvcs(w, cmd, b'CommandNodeSupplyQueueItem', row)
             for row in tickets:
@@ -681,6 +730,26 @@ async def push_supply_queue_rows(store, war=None):
                                  b'CommandNodeSupplyQueueItemTicket', row)
         except Exception:
             pass                # 单会话故障不影响其他订阅者
+
+
+async def push_supply_queue_deletes(row_ids):
+    """Remove queue item/ticket rows from every resource-view subscriber."""
+    from state import FLASH_SESSIONS
+    from messages import _push_kvcs_delete
+    ids = [int(x) for x in row_ids or ()]
+    for sess in list(FLASH_SESSIONS.values()):
+        cmd = getattr(sess, 'resource_view_cmd', None)
+        writer = getattr(sess, 'writer', None)
+        if not cmd or not writer:
+            continue
+        try:
+            for rid in ids:
+                await _push_kvcs_delete(
+                    writer, cmd, b'CommandNodeSupplyQueueItem', rid)
+                await _push_kvcs_delete(
+                    writer, cmd, b'CommandNodeSupplyQueueItemTicket', rid)
+        except Exception:
+            pass
 
 
 def _at_add_resources(at, cat, need):

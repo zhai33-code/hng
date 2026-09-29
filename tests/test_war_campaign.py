@@ -155,6 +155,8 @@ async def main():
     check('f13 daycycletimescale 快照', abs(f32(top[13]) - 1.5) < 1e-5)
     check('f15 maxPlayerPerFaction 快照', int(top[15]) == 50)
     check('f17 mapid', int(top[17]) == 1)
+    check('f22/f23 补给配置快照', int(top[22]) == 1
+          and int(top[23]) == 1)
     mt = war_campaign.morale_defaults()
     check('f24-29 morale 参数', int(top[24]) == mt['min']
           and int(top[25]) == mt['max']
@@ -172,6 +174,14 @@ async def main():
           int(top2[8]) == exp_pts_def)
     check('缺省回退 f12=MM_WAR_TIMESCALE',
           abs(f32(top2[12]) - mm_config.WAR_TIMESCALE) < 1e-5)
+    check('显式关闭补给队/首次免费写入 f22/f23',
+          (lambda p: int(p[22]) == 0 and int(p[23]) == 0)(pb_parse(
+              war_campaign.build_war_proto({
+                  'id': 2, 'name': '', 'begintime': None, 'endtime': None,
+                  'winning_faction_id': 0, 'points_needed_for_victory': 1,
+                  'sequel_war_id': 0, 'mapid': 1, 'state': 1,
+                  'config': {'queueReinforcements': False,
+                             'firstResourceFree': False}}))))
 
     # ---- B. ensure_war ----
     store = FakeStore()

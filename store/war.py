@@ -532,15 +532,18 @@ class WarStoreMixin:
     # ---- war_supply_queue（M3-2 阵营资源增援队列）----
 
     async def enqueue_war_supply(self, war_id, faction, command_node_id,
-                                 items):
+                                 items, metadata=None):
         """AT 增援缺口入队（FIFO）：items={category_id: count}，
         queue_number = 阵营内单调递增，返回入队行数。
         并发安全（2026-09-16 审计 §2）：事务级咨询锁按 (war_id, faction)
         串行化取号——原实现每行 INSERT 内嵌 MAX() 子查询，两个并发事务
         互相看不到未提交行会取到相同 MAX → queue_number 重复、FIFO 出队
         乱序；锁在事务结束自动释放，无需手工解锁。"""
+        metadata = metadata or {}
+        per_category = metadata.get('per_category') or {}
         rows = [(int(war_id), int(faction), int(command_node_id),
-                 int(cat), int(cnt)) for cat, cnt in (items or {}).items()
+                 int(cat), int(cnt), dict(per_category.get(int(cat)) or {}))
+                for cat, cnt in (items or {}).items()
                 if int(cnt) > 0]
         if not rows:
             return 0
@@ -558,18 +561,183 @@ class WarStoreMixin:
                 await conn.executemany(
                     'INSERT INTO war_supply_queue '
                     '(war_id, faction, command_node_id, category_id, '
-                    'count, queue_number) VALUES '
-                    '($1, $2, $3, $4, $5, $6)',
-                    [(wid, fac, cnid, cat, cnt, base + i + 1)
-                     for i, (wid, fac, cnid, cat, cnt)
+                    'count, queue_number, pricing_id, discount_id, '
+                    'payment_currency, near_capital_battlefield_id, '
+                    'command_node_definition_id, paid_amount, '
+                    'deliver_as_column) VALUES '
+                    '($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '
+                    '$12, $13)',
+                    [(wid, fac, cnid, cat, cnt, base + i + 1,
+                      int(md.get('pricing_id', metadata.get('pricing_id', 0)) or 0),
+                      int(md.get('discount_id', metadata.get('discount_id', 0)) or 0),
+                      int(md.get('payment_currency', metadata.get('payment_currency', 2)) or 2),
+                      int(md.get('near_capital_battlefield_id', metadata.get('near_capital_battlefield_id', 0)) or 0),
+                      int(md.get('command_node_definition_id', metadata.get('command_node_definition_id', cnid)) or cnid),
+                      int(md.get('paid_amount', 0) or 0),
+                      bool(md.get('deliver_as_column', metadata.get('deliver_as_column', False))))
+                     for i, (wid, fac, cnid, cat, cnt, md)
                      in enumerate(rows)])
         return len(rows)
+
+    async def commit_war_resupply_purchase(
+            self, player_id, currency_key, cost, war_id, faction,
+            command_node_id, give, queued, node_updates, metadata=None):
+        """Atomically charge, reserve faction stock, update the AT and queue.
+
+        The handler performs static pricing and route validation first.  This
+        method is the concurrency boundary: a competing purchase cannot spend
+        the same stock and any SQL failure rolls currency, stock, AT and queue
+        changes back together.  Returns ``(status, balance)`` where status is
+        ``ok``, ``insufficient_currency``, ``insufficient_stock`` or
+        ``missing_command_node``.
+        """
+        key = str(currency_key or '').lower()
+        if key not in ('credits', 'warfunds', 'gold'):
+            return 'insufficient_currency', 0
+        give = {int(cat): int(count) for cat, count in (give or {}).items()
+                if int(count) > 0}
+        queued = {int(cat): int(count)
+                  for cat, count in (queued or {}).items() if int(count) > 0}
+        metadata = metadata or {}
+        per_category = metadata.get('per_category') or {}
+        import json as _json
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    'SELECT pg_advisory_xact_lock($1::int, $2::int)',
+                    int(war_id), int(faction))
+                node = await conn.fetchrow(
+                    'SELECT id, owner_player_id, faction FROM command_nodes '
+                    'WHERE id=$1 AND war_id=$2 '
+                    'FOR UPDATE', int(command_node_id), int(war_id))
+                if (node is None
+                        or int(node['owner_player_id'] or 0) != int(player_id)
+                        or int(node['faction'] or 0) != int(faction)):
+                    return 'missing_command_node', 0
+                balance = await conn.fetchval(
+                    f'SELECT {key} FROM players WHERE id=$1 FOR UPDATE',
+                    int(player_id))
+                if balance is None or int(balance) < int(cost):
+                    return 'insufficient_currency', int(balance or 0)
+                for cat, count in sorted(give.items()):
+                    available = await conn.fetchval(
+                        'SELECT count FROM war_faction_resources '
+                        'WHERE war_id=$1 AND faction=$2 AND category_id=$3 '
+                        'FOR UPDATE', int(war_id), int(faction), cat)
+                    if available is None or int(available) < count:
+                        return 'insufficient_stock', int(balance)
+                if int(cost) > 0:
+                    balance = await conn.fetchval(
+                        f'UPDATE players SET {key}={key}-$2 WHERE id=$1 '
+                        f'RETURNING {key}', int(player_id), int(cost))
+                for cat, count in sorted(give.items()):
+                    await conn.execute(
+                        'UPDATE war_faction_resources SET count=count-$4 '
+                        'WHERE war_id=$1 AND faction=$2 AND category_id=$3',
+                        int(war_id), int(faction), cat, count)
+                allowed = {
+                    'resources', 'has_gotten_soldier_free',
+                    'has_gotten_vehicle_free', 'template_id', 'airbase_bf'}
+                sets, args = [], []
+                for name, value in (node_updates or {}).items():
+                    if name not in allowed:
+                        continue
+                    if name == 'resources' and not isinstance(value, str):
+                        value = _json.dumps(value or {})
+                    args.append(value)
+                    sets.append(f'{name}=${len(args)}')
+                if sets:
+                    args.append(int(command_node_id))
+                    await conn.execute(
+                        f'UPDATE command_nodes SET {", ".join(sets)} '
+                        f'WHERE id=${len(args)}', *args)
+                if queued:
+                    row = await conn.fetchrow(
+                        'SELECT COALESCE(MAX(queue_number), 0) AS m '
+                        'FROM war_supply_queue WHERE war_id=$1 AND faction=$2',
+                        int(war_id), int(faction))
+                    base = int(row['m'])
+                    values = []
+                    for i, (cat, count) in enumerate(sorted(queued.items())):
+                        md = dict(per_category.get(cat) or {})
+                        values.append((
+                            int(war_id), int(faction), int(command_node_id),
+                            cat, count, base + i + 1,
+                            int(md.get('pricing_id', metadata.get(
+                                'pricing_id', 0)) or 0),
+                            int(md.get('discount_id', metadata.get(
+                                'discount_id', 0)) or 0),
+                            int(md.get('payment_currency', metadata.get(
+                                'payment_currency', 2)) or 2),
+                            int(md.get('near_capital_battlefield_id',
+                                metadata.get('near_capital_battlefield_id', 0))
+                                or 0),
+                            int(md.get('command_node_definition_id',
+                                metadata.get('command_node_definition_id',
+                                             command_node_id))
+                                or command_node_id),
+                            int(md.get('paid_amount', 0) or 0),
+                            bool(md.get('deliver_as_column', metadata.get(
+                                'deliver_as_column', False)))))
+                    await conn.executemany(
+                        'INSERT INTO war_supply_queue '
+                        '(war_id, faction, command_node_id, category_id, '
+                        'count, queue_number, pricing_id, discount_id, '
+                        'payment_currency, near_capital_battlefield_id, '
+                        'command_node_definition_id, paid_amount, '
+                        'deliver_as_column) VALUES '
+                        '($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
+                        values)
+        return 'ok', int(balance)
+
+    async def cancel_war_supply(self, war_id, command_node_id, player_id):
+        """Atomically remove an owned AT's queue rows and refund their balance."""
+        refunds = {'credits': 0, 'warfunds': 0, 'gold': 0}
+        currency_keys = {1: 'credits', 2: 'warfunds', 3: 'gold'}
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                node = await conn.fetchrow(
+                    'SELECT owner_player_id FROM command_nodes '
+                    'WHERE id=$1 AND war_id=$2 FOR UPDATE',
+                    int(command_node_id), int(war_id))
+                if (node is None or
+                        int(node['owner_player_id'] or 0) != int(player_id)):
+                    return [], refunds
+                player_exists = await conn.fetchval(
+                    'SELECT 1 FROM players WHERE id=$1 FOR UPDATE',
+                    int(player_id))
+                if not player_exists:
+                    return [], refunds
+                rows = await conn.fetch(
+                    'SELECT id, payment_currency, paid_amount '
+                    'FROM war_supply_queue WHERE war_id=$1 '
+                    'AND command_node_id=$2 FOR UPDATE',
+                    int(war_id), int(command_node_id))
+                if not rows:
+                    return [], refunds
+                ids = [int(row['id']) for row in rows]
+                for row in rows:
+                    key = currency_keys.get(int(row['payment_currency'] or 0))
+                    if key:
+                        refunds[key] += int(row['paid_amount'] or 0)
+                await conn.execute(
+                    'DELETE FROM war_supply_queue WHERE id=ANY($1::bigint[])',
+                    ids)
+                await conn.execute(
+                    'UPDATE players SET credits=credits+$2, '
+                    'warfunds=warfunds+$3, gold=gold+$4 WHERE id=$1',
+                    int(player_id), refunds['credits'], refunds['warfunds'],
+                    refunds['gold'])
+        return ids, refunds
 
     async def list_war_supply_queue(self, war_id, faction=None,
                                     command_node_id=None):
         """队列行（FIFO 序：faction, queue_number）。可按阵营/AT 过滤。"""
         sql = ('SELECT id, war_id, faction, command_node_id, category_id, '
-               'count, queue_number, created_at '
+               'count, queue_number, pricing_id, discount_id, '
+               'payment_currency, near_capital_battlefield_id, '
+               'command_node_definition_id, paid_amount, deliver_as_column, '
+               'created_at '
                'FROM war_supply_queue WHERE war_id = $1')
         args = [int(war_id)]
         if faction is not None:
@@ -596,3 +764,49 @@ class WarStoreMixin:
             return int(res.split()[-1])
         except (ValueError, IndexError):
             return len(ids)
+
+    async def reorder_war_supply(self, war_id, faction, command_node_id,
+                                 direction):
+        """Move one AT's queue group: 0=up, 1=down, 2=top."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    'SELECT pg_advisory_xact_lock($1::int, $2::int)',
+                    int(war_id), int(faction))
+                rows = await conn.fetch(
+                    'SELECT id, command_node_id FROM war_supply_queue '
+                    'WHERE war_id=$1 AND faction=$2 '
+                    'ORDER BY queue_number, id FOR UPDATE',
+                    int(war_id), int(faction))
+                groups = []
+                by_node = {}
+                for row in rows:
+                    nid = int(row['command_node_id'])
+                    if nid not in by_node:
+                        by_node[nid] = []
+                        groups.append((nid, by_node[nid]))
+                    by_node[nid].append(int(row['id']))
+                idx = next((i for i, g in enumerate(groups)
+                            if g[0] == int(command_node_id)), -1)
+                if idx < 0:
+                    return 111
+                if direction == 0:
+                    if idx == 0:
+                        return 112
+                    groups[idx - 1], groups[idx] = groups[idx], groups[idx - 1]
+                elif direction == 1:
+                    if idx == len(groups) - 1:
+                        return 112
+                    groups[idx], groups[idx + 1] = groups[idx + 1], groups[idx]
+                elif direction == 2:
+                    groups.insert(0, groups.pop(idx))
+                else:
+                    return 36
+                qn = 1
+                for _nid, ids in groups:
+                    for rid in ids:
+                        await conn.execute(
+                            'UPDATE war_supply_queue SET queue_number=$2 '
+                            'WHERE id=$1', rid, qn)
+                        qn += 1
+        return 1

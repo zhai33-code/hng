@@ -56,8 +56,10 @@ def build_war_proto(war):
     m += pb_int32(19, mm_config.WAR_FOW_GRID_SIZE)                # fowGridSize
     m += pb_int32(20, mm_config.WAR_FOW_GRID_ORIGIN_X)            # fowGridOriginX
     m += pb_int32(21, mm_config.WAR_FOW_GRID_ORIGIN_Y)            # fowGridOriginY
-    m += pb_int32(22, 0)                                          # queueReinforcements（M2）
-    m += pb_int32(23, 0)                                          # firstResourceFree
+    m += pb_int32(22, int(bool(cfg.get(
+        'queueReinforcements', mm_config.WAR_QUEUE_REINFORCEMENTS))))
+    m += pb_int32(23, int(bool(cfg.get(
+        'firstResourceFree', mm_config.WAR_FIRST_RESOURCE_FREE))))
     m += pb_uint32(24, int(morale['min']))                        # moraleMinValue
     m += pb_uint32(25, int(morale['max']))                        # moraleMaxValue
     m += pb_uint32(26, int(morale['lost_per_battle']))            # moraleLostPerBattle

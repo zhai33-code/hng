@@ -169,12 +169,12 @@ async def handle_set_combatbadge_request(sess, writer, cmd_id, req_type, proto):
     # 设置角色战斗徽章槽位
     # set_combatbadge_request { int64 characterid=1; int64 combatbadgeid=2; int32 slotnumber=3; }
     # set_combatbadge_response { int32 msg = 1; }
-    badge_char_id = 1
+    badge_char_id = 0
     badge_id = 0
     badge_slot = 0
     try:
         f = pb_parse(proto)
-        badge_char_id = f.get(1, 1)
+        badge_char_id = f.get(1, 0)
         badge_id = f.get(2, 0)
         badge_slot = f.get(3, 0)
         log(f'      set_combatbadge: charId={badge_char_id}, badgeId={badge_id}, '

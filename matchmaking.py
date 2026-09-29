@@ -77,8 +77,7 @@ AI_PLAYER_COUNT = 2                     # mission_info f9（他服单人AI局实
 # f4 突击队构成：本局 force_pool 抽取的 AT 名单（双侧镜像，名单见
 # force_pool.init_mission 日志）。模板 id 是【阵营相关】库值
 # （commandnodetemplate f2 兵种名 × f3 阵营：infantry US=103/GE=203/SU=303），
-# 按参战阵营现查 WarDatabase。无池回退官方锚点组合（三兵种 ×2）。
-ASSAULT_TEAM_NODE_NAMES = ('infantry', 'motorized_infantry', 'motorized_guard')
+# 按参战阵营现查 WarDatabase。资源池缺失时返回空，不虚构突击队。
 
 
 def _assault_team_nodes(faction, mission_id=None):
@@ -88,7 +87,7 @@ def _assault_team_nodes(faction, mission_id=None):
     names_by_faction）；staged 局回退镜像名单。"""
     names = (force_pool.assault_team_names(mission_id, faction)
              or force_pool.assault_team_names(mission_id)
-             or list(ASSAULT_TEAM_NODE_NAMES) * 2)
+             or [])
     faction = int(faction) if int(faction) in (1, 2, 3) else 3
     return [commandnode_template(faction, n) for n in names]
 
@@ -183,7 +182,9 @@ async def _war_mission_preset(battle_id, war_rec):
       encounter 池 / 任一方含侦察·装甲=skirmish 池（war1.md §野外遭遇战）。
       record 准备期临时 preset 不在对应池 → 重选并回写 record（简报/
       automission 据点数判定同源）。读库/模板异常回退 record preset。"""
-    preset = int((war_rec or {}).get('preset') or 0) or AI_MISSIONPRESET
+    preset = int((war_rec or {}).get('preset') or 0)
+    if not preset:
+        raise LookupError(f'war battle {battle_id} has no mission preset')
     if state.STORE is None:
         return preset
     try:
@@ -223,7 +224,7 @@ async def _init_war_mission_resources(mission_id, battle_id, attacker,
     编制 = AT 实际存量（command_nodes.resources）优先、缺省模板满编
     （_at_composition——打残 AT 的损耗传导进本局池，与简报 roster 同
     口径，成局前后数字不跳变）。任一侧无有效 AT（DB 异常/实例已解散）
-    → 整局回退镜像随机抽取，保证会战可玩（宁要可打的局，不要空池死局）。"""
+    时返回 False，让调用方中止成局；战争局不回退镜像训练兵力。"""
     comps = {int(attacker): [], int(defender): []}
     names = {int(attacker): [], int(defender): []}
     ats = {int(attacker): [], int(defender): []}   # AT 实例（战报 f11.f3 归属）
@@ -290,11 +291,10 @@ async def _init_war_mission_resources(mission_id, battle_id, attacker,
     except Exception as ex:
         _log(f'[war] battle {battle_id} AT roster load failed: {ex}')
     if not comps[int(attacker)] or not comps[int(defender)]:
-        _log(f'[war] battle {battle_id} AT roster incomplete '
+        _log(f'[war] battle {battle_id} AT roster incomplete; match rejected '
              f'(atk={len(comps[int(attacker)])}, '
-             f'dfd={len(comps[int(defender)])}) -> fallback mirror draw')
-        _init_mission_resources(mission_id, 10, attacker, defender)
-        return
+             f'dfd={len(comps[int(defender)])})')
+        return False
     force_pool.init_mission_war(mission_id, attacker, defender, comps, names,
                                 ats)
     # ★守方红线（官方规则 2026-09-15 用户口径：war 地图上据点连线为红色
@@ -319,6 +319,7 @@ async def _init_war_mission_resources(mission_id, battle_id, attacker,
                 force_pool.assign_lines(mission_id, len(_a_aps), _a_aps)
         except Exception as ex:
             _log(f'[war] battle {battle_id} assign_lines failed: {ex}')
+    return True
 
 
 def _lane_ownership(dest_bf, owners, ap_tmpl_by_id):
@@ -669,7 +670,7 @@ def _msg_player_matchmaking(pmm_id, char_id, faction_id, mission_id, zulu_time,
     m += pb_string(7, '')               # metricsDeviceId
     m += pb_int64(8, mission_id or 0)   # missionId（0 = 随机匹配）
     m += pb_bool(10, True)              # isMatchmaking
-    m += pb_int64(11, 1)                # warId
+    m += pb_int64(11, _WAR_ID)          # warId（与 faction/PMS 行同源）
     m += pb_int64(12, faction_id)       # factionId
     m += pb_int32(13, 0)                # missionTypeMask
     m += pb_bool(14, False)             # forceStart
@@ -1034,7 +1035,7 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
     # atk_fac/dfn_fac = viewer/AI 口径，交替首点=viewer 与旧码一致）
     m += _msg_briefing_f6(L, atk_fac, dfn_fac)
     m += _msg_briefing_f7(gamemap_id, L, atk_fac, dfn_fac)
-    pos = battlefield_pos(MISSION_MAP_ENTITY_ID)
+    pos = battlefield_pos(MISSION_MAP_ENTITY_ID) or (0.0, 0.0)
     m += pb_float(8, pos[0])   # posX（mapEntityId 对应 battlefield 行坐标）
     m += pb_float(9, pos[1])   # posY
     return m
@@ -1749,7 +1750,9 @@ async def _start_match(match):
                 _arm_ai_fill(dpid, e.gamemode_id)
 
     preset_row = _load_preset(preset)
-    gamemap_id = int(preset_row.get(3, 0) or 0) or 13
+    gamemap_id = int(preset_row.get(3, 0) or 0)
+    if not gamemap_id:
+        raise LookupError(f'mission preset {preset} has no gamemap')
     if battle_id:
         # war 局：简报落点 = 会战城市（record.map_entity_id，成局时写）
         map_entity_id = int(war_rec['map_entity_id'] or 0) \
@@ -1946,8 +1949,10 @@ async def _start_match(match):
     # 出生消耗（ReportMissionStatusRequest f2）扣减（与详情同生命周期）
     # war 会战局：池 = 双方实际参战 AT 编制之和（init_mission_war）
     if battle_id:
-        await _init_war_mission_resources(mission_id, battle_id, attacker,
-                                          defender)
+        if not await _init_war_mission_resources(
+                mission_id, battle_id, attacker, defender):
+            raise RuntimeError(
+                f'war battle {battle_id} has incomplete assault-team roster')
     else:
         # 官服口径"进局必有装备载具之一"：池按成局玩家装备载具类别并集
         # 查缺补齐（坦克兵/飞行员缺类别即无法部署，攻方 120s 判负根因）

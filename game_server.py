@@ -63,7 +63,15 @@ from messages import (                     # noqa: E402（放在使用处附近�
     _WEAPON_FIELDS,
     _group_dim_stats,
     character_stats_payload,
-    )
+)
+
+
+async def _handler_error(writer, cmd_id, reason):
+    """协议级拒绝：缺少可靠身份/战局数据时不猜测其他会话。"""
+    writer.write(build_response(cmd_id, 'HandlerErrorResponse'))
+    await writer.drain()
+    log(f'GAME S->C cmd={cmd_id:<4} HandlerErrorResponse ({reason})')
+    return True
 
 
 async def handle_request(sess, writer, cmd_id, req_type, proto):
@@ -92,26 +100,12 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         mm_sess = mm_state.PMS_TO_SESSION.get(pms_id)
         pms_exact = mm_sess is not None   # 身份绑定只信任精确命中（见 if mm_sess 内）
         if mm_sess is None:
-            # ★ pms 未精确命中（stale pms：rejoin/结算清理后 ZServer 仍持有）
-            #   时兜底必须圈定本局：请求来自战斗服连接（握手已记
-            #   combat_mission），全局"最新会话"在多局并行时会拿错玩家 →
-            #   身份/阵营/角色错配（"进游戏人变成 bot"根因之一：ZServer
-            #   建玩家失败 → AI 补位顶替）。
-            cm = int(getattr(sess, 'combat_mission', 0) or 0)
-            for _s in mm_state.PMS_TO_SESSION.values():
-                if cm and int(_s.get('mission_id', 0) or 0) != cm:
-                    continue
-                mm_sess = _s          # dict 保序 → 本局最新进局会话
-            if mm_sess is None and not cm:
-                for _s in mm_state.PMS_TO_SESSION.values():
-                    mm_sess = _s      # 无本局信息（理论不可达）→ 全局最新
-                if mm_sess is not None:
-                    log(f'      [WARN] GetPlayerSettings: pms={pms_id} miss, '
-                        f'fell back to latest session (player='
-                        f'{mm_sess.get("player_id")})')
+            return await _handler_error(
+                writer, cmd_id, f'unknown playerMissionSessionId={pms_id}')
         faction = None
         quickplay = None
         first_action_game = None
+        membership_benefit_id = 0
         if mm_sess:
             char_id = int(mm_sess['char_id'])
             player_id = int(mm_sess['player_id'])
@@ -165,6 +159,11 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                     # ★ f12 装备 DB 化：聚合武器/弹药/配件/载具/军服表
                     #   （失败 = 空装备条目，不回退回放）
                     loadout = await _load_db_loadout(int(mm_sess['player_id']))
+                    membership = await STORE.get_active_membership(
+                        int(mm_sess['player_id']))
+                    # MembershipBenefitTemplate #2 是原版老兵会员收益模板；
+                    # 仅在数据库确有未过期会员时下发。
+                    membership_benefit_id = 2 if membership else 0
                     if loadout is not None:
                         nw = sum(len(v) for v in loadout['weapons'].values())
                         nv = sum(len(v) for v in loadout['vehicles'].values())
@@ -172,27 +171,14 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                             f'across {len(loadout["weapons"])} chars')
                 except Exception as e:
                     log(f'      [DB] list_characters failed: {e}')
-        else:
-            # 无任何进局会话（理论不可达：hng.exe 仅在匹配成功后拉起）：
-            # player/char 无从查库置零，id 全部现场生成
-            char_id = 0
-            player_id = 0
-            gamertag = 'Player'
-            squad_id = mm_state._next_match_id(mm_state._MM_SQUAD_ID)
-            squad_slot = 0
-            metrics_uid = str(uuid.uuid4())
-            metrics_session_id = mm_state._next_match_id(
-                mm_state._MM_METRICS_SESSION_ID)
-            mission_session_id = mm_state._next_match_id(
-                mm_state._MM_BATTLE_SESSION_ID)
-            log(f'      [WARN] GetPlayerSettings: no PMS session '
-                f'(pms_id={pms_id}), ids generated, player fields zeroed')
         # missionId 必须与客户端启动参数 /M 一致（否则客户端校验失败挂起→20s 超时断开）
         # pms 命中时从映射取；未命中（兜底会话）用该会话的 mission；
         # 都没有才回退全局计数（旧行为）
         mission_id = mm_state.PMS_TO_MISSION.get(pms_id, 0) or \
-            (int(mm_sess.get('mission_id', 0) or 0) if mm_sess else 0) or \
-            mm_state._MM_MISSION_ID[0]
+            int(mm_sess.get('mission_id', 0) or 0)
+        if not mission_id:
+            return await _handler_error(
+                writer, cmd_id, f'PMS {pms_id} has no mission binding')
         # ★ 记在连接上：玩家游戏进程的 ActiveMissionRequestEventList 轮询
         #   实测不带 mission_id（f1=0，与战斗服同款），combat.py 用它定位
         #   本局资源池/布局（否则回退 Mill 模板 → 资源数字错局）。
@@ -238,6 +224,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             loadout=loadout,
             quickplay=quickplay,
             first_action_game=first_action_game,
+            membership_benefit_id=membership_benefit_id,
         )
         resp = build_response(cmd_id, 'PlayerSettings', resp_proto)
         writer.write(resp)
@@ -361,8 +348,10 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         except Exception:
             pass
         if not req_pid:
-            for _s in mm_state.PMS_TO_SESSION.values():
-                req_pid = _s['player_id']   # dict 保序 → 最新进局会话
+            req_pid = int(getattr(sess, 'player_id', 0) or 0)
+        if not req_pid:
+            return await _handler_error(writer, cmd_id,
+                                        'RequestEarnings missing playerId')
         credits = gold = 0
         if req_pid and STORE is not None:
             try:
@@ -415,8 +404,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         # ★ uid 用账号库 player_id（与 PlayerSettings f1 / JWT sub 同源）：
         #   1) 按请求昵称精确匹配进局会话（多人服各玩家查各自的 uid）；
         #   2) 昵称即登录名 → 查 players 表（未进局的账号也能查到）；
-        #   3) 都未命中 → 回退最新一条会话（EAC 可能用非昵称串查询）；
-        #   4) 完全无会话 → found=0（真实 not-found 响应，不用回放 id）。
+        #   3) 都未命中 → found=0；绝不把别的最新会话冒充查询结果。
         uid_pid = None
         if nick:
             for _s in mm_state.PMS_TO_SESSION.values():
@@ -428,9 +416,6 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                     uid_pid = await STORE.get_player(nick)
                 except Exception as e:
                     log(f'[DB] get_player({nick!r}) failed: {e}')
-        if uid_pid is None:
-            for _s in mm_state.PMS_TO_SESSION.values():
-                uid_pid = _s['player_id']
         found = 1 if uid_pid is not None else 0
         uid_str = str(uid_pid)[:10] if uid_pid is not None else ''  # ≤10 字符 SSO 安全区
         resp_proto = pb_string(1, uid_str)   # f1 = playeruid
@@ -516,14 +501,9 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             except AttributeError:
                 pass
         else:
-            preset_id = MISSION_PRESET_ID
-            defender_faction = BF_DEFENDER_FACTION_ID
-            attacker_faction = 3
-            enable_bots = True
-            enable_sa_bots = False
-            weather_tod = 1
-            weather_condition = 0
-            timeofday = None
+            return await _handler_error(
+                writer, cmd_id,
+                f'no battlefield details for mission={missionid}')
         # ---- war 会战局战役标识（官方机制，build_battle_report_spbc 实锤）：
         # f17 isCampaignMission 是战斗服战役加成总开关（+50% XP/勋带、+25%
         # 银币、warfundsEarned 基础值）；f16 战争天数；f24 野外遭遇局补给线

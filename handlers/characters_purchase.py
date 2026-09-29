@@ -154,9 +154,9 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
     start_xp = _EXPERIENCE_LEVELS[rank] if 0 <= rank < len(_EXPERIENCE_LEVELS) else 0
     log(f'      character startCombatXp={start_xp}')
 
-    # 写入数据库（失败时用内存 ID 兜底，仅本次会话可见）；
+    # 写入数据库；失败时退款并返回失败，禁止使用会话假角色 id。
     # 默认军服实例随建号分配 —— (兵种,阵营) 基础迷彩（官方服角色生来带基础迷彩）
-    char_id = 1
+    char_id = None
     new_uniform_variant_id = 0
     db_created = False
     uv_template_id = default_uniform_variant(template, faction)
@@ -211,6 +211,14 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
                         f'(create failed)')
                 except Exception as re_:
                     log(f'[DB] refund after create failure failed: {re_}')
+    if not db_created:
+        resp = build_response(
+            cmd_id, 'CreateCharacterResponse', pb_int32(1, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} CreateCharacterResponse '
+            f'(result=0 persistence_failed)')
+        return
     log(f'      character id={char_id}')
 
     # 1. 返回 CreateCharacterResponse (result=1 ok)
@@ -223,7 +231,7 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
     # 1.5 发放初始装备（starting_gear.py 独立配置：slot1 武器+默认弹药+侦察瞄具、
     #     坦克兵/飞行员赠送载具+默认载具弹药）。须在 character 推送前完成 ——
     #     unlock bits 计算包含已持有武器/载具的解锁需求（商店显示已拥有）。
-    #     仅 DB 建号成功时发放（失败兜底 char_id=1 是假 id，发装备会错挂到别的角色）
+    #     仅 DB 建号成功时发放。
     weapon_info = None
     vehicle_info = None
     gear = STARTING_GEAR.get((faction, template), {})

@@ -107,7 +107,7 @@ else:
 # dispatch 入口（handlers/__init__.py）按会话设置；asyncio task 各自持有
 # context 拷贝，跨连接/后台 _spawn 任务不会串号。
 import contextvars
-CURRENT_PID = contextvars.ContextVar('current_pid', default=1)
+CURRENT_PID = contextvars.ContextVar('current_pid', default=0)
 
 # 服务器对外地址（下发给客户端的连接地址）：
 # - Settings.js 的 flash_dynhttp / unique_file_servers / account_url 等

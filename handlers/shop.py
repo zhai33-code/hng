@@ -792,7 +792,7 @@ async def handle_addribbonlevelrequest(sess, writer, cmd_id, req_type, proto):
     try:
         f = pb_parse(proto)
         upgrade_template_id = f.get(1, 0)
-        char_id = f.get(2, 1)
+        char_id = f.get(2, 0)
         pricing_id = f.get(3, 0)
         currency = f.get(5, 0)
         log(f'      AddRibbonLevel: ribbonLevelUpgradeTemplateId={upgrade_template_id}, '
