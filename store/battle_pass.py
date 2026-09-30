@@ -135,3 +135,19 @@ class BattlePassMixin:
                         player_id, int(season_id), json.dumps(claimed))
         return first, claimed
 
+    async def rollback_battle_pass_reward_claim(self, player_id, season_id,
+                                                template_id):
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    'SELECT claimed_tiers FROM battle_pass_progress '
+                    'WHERE player_id = $1 AND season_id = $2 FOR UPDATE',
+                    int(player_id), int(season_id))
+                if row is None:
+                    return
+                claimed = json.loads(row['claimed_tiers'] or '[]')
+                claimed = [x for x in claimed if int(x) != int(template_id)]
+                await conn.execute(
+                    'UPDATE battle_pass_progress SET claimed_tiers = $3::jsonb '
+                    'WHERE player_id = $1 AND season_id = $2',
+                    int(player_id), int(season_id), json.dumps(claimed))

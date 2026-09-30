@@ -12,15 +12,65 @@ class SquadsMixin:
     async def create_squad(self, char_id, faction, name, matchmaking_flag=False):
         """创建小队 + 队长成员会话（CreateSquadRequest）。返回 squad_id。"""
         async with self.pool.acquire() as conn:
-            sid = await conn.fetchval(
-                'INSERT INTO squads (name, faction, leader_character_id, '
-                'matchmaking_flag) VALUES ($1, $2, $3, $4) RETURNING id',
-                str(name or ''), int(faction or 0), int(char_id),
-                bool(matchmaking_flag))
-            await conn.execute(
-                'INSERT INTO squad_members (squad_id, character_id, status) '
-                'VALUES ($1, $2, 2)', int(sid), int(char_id))  # 2=InLobby
+            async with conn.transaction():
+                player_id = await conn.fetchval(
+                    'SELECT player_id FROM characters WHERE id = $1',
+                    int(char_id))
+                if player_id is None:
+                    raise ValueError('leader character not found')
+                await conn.execute('SELECT pg_advisory_xact_lock($1)',
+                                   int(player_id))
+                occupied = await conn.fetchval(
+                    'SELECT 1 FROM squad_members m JOIN characters c '
+                    'ON c.id = m.character_id WHERE c.player_id = $1 LIMIT 1',
+                    int(player_id))
+                if occupied:
+                    raise ValueError('player already in squad')
+                sid = await conn.fetchval(
+                    'INSERT INTO squads (name, faction, leader_character_id, '
+                    'matchmaking_flag) VALUES ($1, $2, $3, $4) RETURNING id',
+                    str(name or ''), int(faction or 0), int(char_id),
+                    bool(matchmaking_flag))
+                await conn.execute(
+                    'INSERT INTO squad_members (squad_id, character_id, status) '
+                    'VALUES ($1, $2, 2)', int(sid), int(char_id))  # 2=InLobby
         return int(sid)
+
+    async def create_squad_with_invite(self, leader_char_id, faction, name,
+                                       invited_char_id, status=1):
+        """Atomically create an implicit squad, its leader, and first invite."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                leader_pid = await conn.fetchval(
+                    'SELECT player_id FROM characters WHERE id = $1',
+                    int(leader_char_id))
+                invited_pid = await conn.fetchval(
+                    'SELECT player_id FROM characters WHERE id = $1',
+                    int(invited_char_id))
+                if leader_pid is None or invited_pid is None:
+                    raise ValueError('squad character not found')
+                for player_id in sorted({int(leader_pid), int(invited_pid)}):
+                    await conn.execute('SELECT pg_advisory_xact_lock($1)',
+                                       player_id)
+                occupied = await conn.fetchval(
+                    'SELECT 1 FROM squad_members m JOIN characters c '
+                    'ON c.id = m.character_id '
+                    'WHERE c.player_id = ANY($1::bigint[]) LIMIT 1',
+                    [int(leader_pid), int(invited_pid)])
+                if occupied:
+                    raise ValueError('player already in squad')
+                sid = await conn.fetchval(
+                    'INSERT INTO squads (name, faction, leader_character_id, '
+                    'matchmaking_flag) VALUES ($1, $2, $3, FALSE) RETURNING id',
+                    str(name or ''), int(faction or 0), int(leader_char_id))
+                await conn.execute(
+                    'INSERT INTO squad_members (squad_id, character_id, status) '
+                    'VALUES ($1, $2, 2)', int(sid), int(leader_char_id))
+                mid = await conn.fetchval(
+                    'INSERT INTO squad_members (squad_id, character_id, status) '
+                    'VALUES ($1, $2, $3) RETURNING id',
+                    int(sid), int(invited_char_id), int(status))
+        return int(sid), int(mid)
 
     async def update_squad_leader(self, squad_id, leader_char_id, faction):
         """队长换兵种/换角色（官服语义：小队类型跟随队长）。
@@ -57,7 +107,9 @@ class SquadsMixin:
                 's.matchmaking_flag FROM squads s '
                 'JOIN squad_members m ON m.squad_id = s.id '
                 'JOIN characters c ON c.id = m.character_id '
-                'WHERE c.player_id = $1', int(player_id))
+                'WHERE c.player_id = $1 '
+                'ORDER BY CASE WHEN m.status = 1 THEN 1 ELSE 0 END, s.id '
+                'LIMIT 1', int(player_id))
         return dict(row) if row else None
 
     async def list_squad_members(self, squad_id):
@@ -121,6 +173,72 @@ class SquadsMixin:
                 int(squad_id), int(char_id), int(status))
         return int(mid)
 
+    async def add_squad_member_checked(self, squad_id, char_id, status=1,
+                                       max_members=4):
+        """Serialize invitations and enforce one squad per player/capacity."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.fetchrow('SELECT id FROM squads WHERE id = $1 '
+                                    'FOR UPDATE', int(squad_id))
+                player_id = await conn.fetchval(
+                    'SELECT player_id FROM characters WHERE id = $1',
+                    int(char_id))
+                if player_id is None:
+                    return 0, 'missing'
+                await conn.execute('SELECT pg_advisory_xact_lock($1)',
+                                   int(player_id))
+                occupied = await conn.fetchval(
+                    'SELECT 1 FROM squad_members m JOIN characters c '
+                    'ON c.id = m.character_id WHERE c.player_id = $1 LIMIT 1',
+                    int(player_id))
+                if occupied:
+                    return 0, 'already'
+                count = await conn.fetchval(
+                    'SELECT count(*) FROM squad_members WHERE squad_id = $1',
+                    int(squad_id))
+                if int(count or 0) >= int(max_members):
+                    return 0, 'full'
+                mid = await conn.fetchval(
+                    'INSERT INTO squad_members (squad_id, character_id, status) '
+                    'VALUES ($1, $2, $3) RETURNING id',
+                    int(squad_id), int(char_id), int(status))
+        return int(mid), 'ok'
+
+    async def reconfigure_squad_members(self, squad_id, leader_member_id,
+                                        leader_char_id, faction, status,
+                                        replacements, removals):
+        """Atomically switch squad type and apply all member migrations."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                locked = await conn.fetchrow(
+                    'SELECT id FROM squads WHERE id = $1 FOR UPDATE',
+                    int(squad_id))
+                if locked is None:
+                    return False
+                await conn.execute(
+                    'UPDATE squads SET leader_character_id = $2, faction = $3 '
+                    'WHERE id = $1', int(squad_id), int(leader_char_id),
+                    int(faction))
+                if status:
+                    await conn.execute(
+                        'UPDATE squad_members SET character_id = $2, status = $3 '
+                        'WHERE id = $1', int(leader_member_id),
+                        int(leader_char_id), int(status))
+                else:
+                    await conn.execute(
+                        'UPDATE squad_members SET character_id = $2 '
+                        'WHERE id = $1', int(leader_member_id),
+                        int(leader_char_id))
+                for member_id, char_id in replacements:
+                    await conn.execute(
+                        'UPDATE squad_members SET character_id = $2 '
+                        'WHERE id = $1', int(member_id), int(char_id))
+                if removals:
+                    await conn.execute(
+                        'DELETE FROM squad_members WHERE id = ANY($1::bigint[])',
+                        [int(x) for x in removals])
+        return True
+
     async def get_squad_member(self, member_row_id):
         """按成员行 id 查（RemoveSquadMember/SquadRespondToInvite）。"""
         async with self.pool.acquire() as conn:
@@ -155,10 +273,10 @@ class SquadsMixin:
                 n = await conn.execute(
                     f'UPDATE squad_members SET {", ".join(sets)} '
                     'WHERE id = $1', *args)
-        except Exception:
+        except Exception as exc:
             # character_id 换成同队已有角色 → PK 冲突，退化为仅改状态
-            if status is None:
-                return False
+            if getattr(exc, 'sqlstate', None) != '23505' or status is None:
+                raise
             async with self.pool.acquire() as conn:
                 n = await conn.execute(
                     'UPDATE squad_members SET status = $2 WHERE id = $1',
@@ -192,4 +310,3 @@ class SquadsMixin:
                 'UPDATE squads SET matchmaking_flag = $2 WHERE id = $1',
                 int(squad_id), bool(flag))
         return _rowcount(n) > 0
-

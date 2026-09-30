@@ -40,6 +40,7 @@ from messages import (
 
 from player_service import (
     _char_bits_for,
+    _character_owned,
     _char_ribbon_level,
     _charge_player,
     _charge_player_multi,
@@ -139,6 +140,17 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
     except Exception as e:
         log(f'      CreateWeaponVariant parse error: {e}')
 
+    if not await _character_owned(sess, char_id):
+        writer.write(build_response(
+            cmd_id, 'CreateWeaponVariantResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
+    if weapon_id and int(await _weapon_owner_id(sess, weapon_id)) != int(char_id):
+        writer.write(build_response(
+            cmd_id, 'CreateWeaponVariantResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
+
     # 解锁校验：角色 bits 需已包含需求 uid。
     # - 买新武器判定用 eWeapon(2)（商店 hasCharacterUnlockedItem）
     # - 买武器皮肤变体判定用 eWeaponVariant(14)
@@ -166,10 +178,20 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
                 f'req14={sorted(need14)} not unlocked)')
             return
 
+    is_skin_purchase = weapon_id > 0 and weapon_template_id == 0 and variant_template_id > 0
+    if ((weapon_template_id and int(weapon_pricing_id or 0) <= 0)
+            or (is_skin_purchase and int(variant_pricing_id or 0) <= 0)):
+        writer.write(build_response(
+            cmd_id, 'CreateWeaponVariantResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
+
     # 扣款（武器本体 + 皮肤变体合并为一次原子扣款：余额不足时整体不扣，
     # 杜绝"武器已扣款、变体不足"的钱货两空）；余额不足返回错误响应，不创建武器
     cost_w, ok_w = await _charge_player_multi(
-        sess, [weapon_pricing_id, variant_pricing_id], currency)
+        sess, [weapon_pricing_id, variant_pricing_id], currency,
+        expected=[(weapon_template_id, 'weapontemplate'),
+                  (variant_template_id, 'WeaponVariantTemplate')])
     if not ok_w:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'CreateWeaponVariantResponse', resp_proto)
@@ -183,7 +205,6 @@ async def handle_createweaponvariantrequest(sess, writer, cmd_id, req_type, prot
     # （ModifyWeaponMediator.weaponSkinPurchaseRequest 只买皮肤时填这两个字段）。
     # 只创建 WeaponVariant 实例，绝不创建新武器 —— 否则会推送 templateId=0 的假武器，
     # 客户端 WeaponDepotViewMediator 渲染时模板查不到 → Error #1009 崩溃卡住。
-    is_skin_purchase = weapon_id > 0 and weapon_template_id == 0 and variant_template_id > 0
     if is_skin_purchase:
         # 先持久化再返回成功；失败时退款，禁止生成仅本会话可见的假 id。
         spid = await sess.ensure_player()
@@ -444,6 +465,13 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
             log(f'      starting-gear sight {mod_template_id} on weapon tpl '
                 f'{wtemplate}: ribbon check waived')
         mapping_id = _MOD_MAPPING_IDS.get((mod_template_id, wtemplate), 0)
+        if not mapping_id:
+            writer.write(build_response(
+                cmd_id, 'CreateWeaponModifierResponse', pb_int32(2, 0)))
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} CreateWeaponModifierResponse '
+                f'(rejected: no modifier mapping)')
+            return
         req = _MOD_REQ_LEVEL.get(mapping_id) if mapping_id else None
         if req is not None and not starting_sight:
             ribbon_id, need_level = req
@@ -469,7 +497,9 @@ async def handle_createweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
                     return
 
     # 扣款；余额不足返回错误响应，不创建配件
-    cost, ok = await _charge_player(sess, pricing_id, currency)
+    cost, ok = await _charge_player(
+        sess, pricing_id, currency, expected_object_id=mod_template_id,
+        expected_types='WeaponModifierTemplate')
     if not ok:
         resp_proto = pb_int32(2, 56)  # not_enough_credits（response 字段号=2）
         resp = build_response(cmd_id, 'CreateWeaponModifierResponse', resp_proto)
@@ -618,6 +648,13 @@ async def handle_createweaponammorequest(sess, writer, cmd_id, req_type, proto):
     if pid_v is not None:
         wtemplate = await _weapon_template_id(sess, ammo_weapon_id)
         mapping_id = _AMMO_MAPPING_IDS.get((ammo_template_id, wtemplate), 0)
+        if (not wtemplate or not mapping_id
+                or int(await _weapon_owner_id(sess, ammo_weapon_id))
+                != int(ammo_char_id)):
+            writer.write(build_response(
+                cmd_id, 'CreateWeaponAmmoResponse', pb_int32(1, 0)))
+            await writer.drain()
+            return
         is_default = False
         if mapping_id:
             for (mid, _at, dflt) in _AMMO_MAPPINGS_BY_WEAPON.get(wtemplate, ()):
@@ -638,7 +675,9 @@ async def handle_createweaponammorequest(sess, writer, cmd_id, req_type, proto):
                 return
 
     # 扣款；余额不足返回错误响应，不创建弹药
-    cost, ok = await _charge_player(sess, pricing_id, currency)
+    cost, ok = await _charge_player(
+        sess, pricing_id, currency, expected_object_id=ammo_template_id,
+        expected_types='ammotemplate')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'CreateWeaponAmmoResponse', resp_proto)

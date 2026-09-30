@@ -111,22 +111,30 @@ async def handle_startlogin(sess, writer, cmd_id, req_type, proto):
 
 async def handle_login2_begin(sess, writer, cmd_id, req_type, proto):
     try:
-        username = pb_parse(proto).get(1, b'').decode('utf-8', 'replace')
+        username = pb_parse(proto).get(1, b'').decode('utf-8', 'replace').strip()
     except Exception:
-        username = 'DemoPlayer'
+        username = ''
     # 从数据库加载该账号密码；账号不存在或 DB 异常一律标记 user_exists=False
     # （响应阶段直接拒登）——不再回退任何固定密码，防止绕过认证。
     user_exists = False
     pw = b''  # 未命中时占位，响应阶段不会走到密码校验
-    try:
-        stored = await STORE.get_password(username)
-        if stored is None:
-            log(f'      [auth] user {username!r} NOT in database, will reject')
-        else:
-            pw = stored.encode('utf-8')
-            user_exists = True
-    except Exception as e:
-        log(f'[DB] auth lookup failed ({e}), rejecting login')
+    if not username:
+        log('      [auth] empty or malformed username, will reject')
+    else:
+        try:
+            stored = await STORE.get_password(username)
+            if stored is None:
+                log(f'      [auth] user {username!r} NOT in database, will reject')
+            else:
+                pw = stored.encode('utf-8')
+                user_exists = True
+        except Exception as e:
+            log(f'[DB] auth lookup failed ({e}), rejecting login')
+    # Starting/restarting authentication invalidates all identity cached on the
+    # connection.  In particular, never let a player_id resolved for an older
+    # login attempt survive into this one.
+    sess.authenticated = False
+    sess.player_id = None
     sess.username = username
     sess.pw = pw
     sess.user_exists = user_exists
@@ -158,7 +166,7 @@ async def handle_login2_response(sess, writer, cmd_id, req_type, proto):
     # 账号不在数据库中：直接拒登（不回 challenge 逻辑，客户端收 wrong_password）
     if not sess.user_exists:
         code = RC['wrong_password']
-        resp_proto = msg_login2_result(sess.username or 'DemoPlayer', code)
+        resp_proto = msg_login2_result(sess.username or '', code)
         resp = build_response(cmd_id, 'login2_result', resp_proto)
         log(f'S->C cmd={cmd_id:<4} login2_result -- wrong_password=98 (user not found)')
         await _record_login_event(sess, code, pid=None)
@@ -220,9 +228,16 @@ async def handle_login2_response(sess, writer, cmd_id, req_type, proto):
     # f10/f11 官服口径：当前战争 id + 本场阵营选择（无选择发 0 →
     # 客户端弹 FactionSelectionWindow，join_war_request 落库后修正）
     # 封禁拦截也取 pid：login_events 落库要记是哪个账号被拦
-    pid = await sess.ensure_player() \
-        if code in (RC['login_success'], RC['user_ban_permanent'],
-                    RC['user_ban_temporary']) else None
+    pid = None
+    # Bind the database identity only after authentication succeeded and all
+    # ban checks passed.  A username supplied to login2_begin is untrusted.
+    if code == RC['login_success']:
+        sess.authenticated = True
+        pid = await sess.ensure_player()
+        if pid is None:
+            sess.authenticated = False
+            code = RC['wrong_password']
+            note = 'wrong_password=98 (player missing)'
     await _record_login_event(sess, code, pid=pid)
     faction = None
     war = None
@@ -235,7 +250,7 @@ async def handle_login2_response(sess, writer, cmd_id, req_type, proto):
                 faction = int(sel) if sel is not None else 0
         except Exception as e:
             log(f'[DB] player war faction failed: {e}')
-    resp_proto = msg_login2_result(sess.username or 'DemoPlayer', code,
+    resp_proto = msg_login2_result(sess.username or '', code,
                                    pid=pid or 0, faction=faction,
                                    war=war['id'] if war is not None else 0,
                                    ban_reason=ban_reason or None,
@@ -271,12 +286,15 @@ async def handle_login2_postlogin(sess, writer, cmd_id, req_type, proto):
     # sessionID 拼进 IRC PASS `<sid>::<HMAC>`，服务端凭 sid 注册表验签
     # （irc_server.SESSIONS，R19 身份贯通）
     import irc_server
-    if not sess.player_id or getattr(sess, 'session_key', None) is None:
+    username = str(sess.username or '').strip()
+    if (not getattr(sess, 'authenticated', False)
+            or not sess.player_id or not username
+            or getattr(sess, 'session_key', None) is None):
         raise RuntimeError('post-login requested without an authenticated player')
     sid = secrets.randbits(63)
     sess.irc_sid = sid
     irc_server.register_session(sid, int(sess.player_id),
-                                sess.username or 'player',
+                                username,
                                 sess.session_key)
     resp_proto = b''
     resp_proto += pb_int64(1, sid)            # sessionid

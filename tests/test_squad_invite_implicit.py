@@ -290,11 +290,13 @@ async def main():
           int(squad2['faction']) == 3,
           f'result={result2} faction={squad2 and squad2["faction"]}')
 
-    # 用例 3：已有真队 → 不新建，仅加 pending 成员
+    # 用例 3：重复邀请当前队成员 → 157，不能把正式/pending 行重复写入
     before = set(store.squads)
     result3, _ = await _invite(store, sess_a, 31, 11)
-    check('已有队：result=1 且不重复建队',
-          result3 == RC_OK and set(store.squads) == before)
+    check('重复邀请当前队成员：157 且不重复建队/成员',
+          result3 == RC_PLAYER_ALREADY_IN_SQUAD
+          and set(store.squads) == before
+          and len(await store.list_squad_members(squad['id'])) == 2)
 
     # 用例 4：残留 solo 隐式小队 → 注册表清空 + 新真队建立
     from matchmaking import _SOLO_SQUADS

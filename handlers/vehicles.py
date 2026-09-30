@@ -22,7 +22,9 @@ from wardb import (
     _CUR_NAME,
     _VEHICLE_UPGRADE_MAXCOND,
     _VEHICLE_VARIANT_PARENT,
+    ammo_wear_params,
     vehicle_full_condition,
+    vehicle_upgrade_wear_params,
     )
 
 from messages import (
@@ -36,6 +38,7 @@ from messages import (
 from player_service import (
     _charge_player,
     _push_player_refresh,
+    _refund_player_charge,
     )
 
 
@@ -103,11 +106,18 @@ async def handle_setvehiclevariantrequest(sess, writer, cmd_id, req_type, proto)
         return
 
     # 持久化到 vehicles.variant_id 列（0 = 卸下）
+    persisted = False
     if pid is not None:
         try:
             await STORE.set_vehicle_variant(pid, int(sv_vehicle_id), int(sv_variant_id))
+            persisted = True
         except Exception as e:
             log(f'[DB] set_vehicle_variant failed: {e}')
+    if not persisted:
+        writer.write(build_response(
+            cmd_id, 'SetVehicleVariantResponse', pb_int32(2, 0)))
+        await writer.drain()
+        return
 
     # 官方装备语义：仓库/角色皮肤行绑定到该载具（vehicleId + characterId
     # 跟随载具），客户端 isVehicleVariantOwned 要求 characterId==选中角色
@@ -185,11 +195,12 @@ async def handle_setvehicleequipmentrequest(sess, writer, cmd_id, req_type, prot
         except Exception as e:
             log(f'[DB] set_vehicle_equipment failed: {e}')
 
-    resp_proto = pb_int32(1, 1)  # msg = 1 (ok)
+    resp_proto = pb_int32(1, 1 if affected else 0)
     resp = build_response(cmd_id, 'SetVehicleEquipmentResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} SetVehicleEquipmentResponse (msg=1 ok)')
+    log(f'S->C cmd={cmd_id:<4} SetVehicleEquipmentResponse '
+        f'(msg={1 if affected else 0})')
 
     # 重推受影响的载具（目标 + 被挤掉槽位的），客户端 VehicleTable 刷新装备状态
     if sess.soldier_view_cmd is not None:
@@ -243,7 +254,7 @@ async def handle_setvehicleupgraderequest(sess, writer, cmd_id, req_type, proto)
         except Exception as e:
             log(f'[DB] set_vehicle_upgrade_equipment failed: {e}')
 
-    resp_proto = pb_int32(1, 1)  # response = 1 (ok)
+    resp_proto = pb_int32(1, 1 if affected else 0)
     resp = build_response(cmd_id, 'SetVehicleUpgradeResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
@@ -285,8 +296,37 @@ async def handle_repairvehicleupgraderequest(sess, writer, cmd_id, req_type, pro
     except Exception as e:
         log(f'      RepairVehicleUpgrade parse error: {e}')
 
+    # 先校验归属并以模板满耐久计算实际缺损比例。客户端显示价也是
+    # (maxCondition - condition) / maxCondition，服务端不能按整条 Pricing 满额扣款。
+    pid = await sess.ensure_player()
+    repaired = None
+    if pid is not None:
+        try:
+            repaired = next((u for u in await STORE.list_vehicle_upgrades(pid)
+                             if int(u['id']) == int(ru_upgrade_id)), None)
+        except Exception as e:
+            log(f'[DB] load vehicle upgrade for repair failed: {e}')
+    if repaired is None:
+        resp = build_response(
+            cmd_id, 'RepairVehicleUpgradeResponse', pb_int32(1, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} RepairVehicleUpgradeResponse '
+            f'(response=0 upgrade_not_found)')
+        return
+
+    upgrade_template_id = int(repaired['upgrade_template_id'])
+    params = vehicle_upgrade_wear_params(upgrade_template_id)
+    maxcond = (params[0] if params and params[0] > 0
+               else _VEHICLE_UPGRADE_MAXCOND.get(upgrade_template_id, 100.0))
+    current = max(0.0, min(float(repaired.get('condition') or 0), maxcond))
+    fraction = (maxcond - current) / maxcond if maxcond > 0 else 0.0
+
     # 扣款（维修费）；余额不足返回错误响应
-    cost, ok = await _charge_player(sess, ru_pricing_id, ru_currency)
+    cost, ok = await _charge_player(
+        sess, ru_pricing_id, ru_currency, fraction=fraction,
+        expected_object_id=upgrade_template_id,
+        expected_types='VehicleUpgradeMaxConditionRepair')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'RepairVehicleUpgradeResponse', resp_proto)
@@ -295,20 +335,17 @@ async def handle_repairvehicleupgraderequest(sess, writer, cmd_id, req_type, pro
         log(f'S->C cmd={cmd_id:<4} RepairVehicleUpgradeResponse (response=56 not_enough) cost={cost}')
         return
 
-    # 查升级模板 → 修复到满耐久
-    maxcond = 100.0
-    repaired = None
-    pid = await sess.ensure_player()
-    if pid is not None:
-        try:
-            for u in await STORE.list_vehicle_upgrades(pid):
-                if u['id'] == ru_upgrade_id:
-                    maxcond = _VEHICLE_UPGRADE_MAXCOND.get(int(u['upgrade_template_id']), 100.0)
-                    await STORE.update_vehicle_upgrade_condition(pid, ru_upgrade_id, maxcond)
-                    repaired = u
-                    break
-        except Exception as e:
-            log(f'[DB] repair vehicle upgrade failed: {e}')
+    # 修复到模板满耐久（不信任请求中的 repairToCondition）
+    try:
+        await STORE.update_vehicle_upgrade_condition(pid, ru_upgrade_id, maxcond)
+        repaired['condition'] = maxcond
+    except Exception as e:
+        log(f'[DB] repair vehicle upgrade failed: {e}')
+        await _refund_player_charge(sess, ru_currency, cost)
+        writer.write(build_response(
+            cmd_id, 'RepairVehicleUpgradeResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
 
     resp_proto = pb_int32(1, 1)  # response = 1 (ok)
     resp = build_response(cmd_id, 'RepairVehicleUpgradeResponse', resp_proto)
@@ -363,7 +400,8 @@ async def handle_setvehicleammorequest(sess, writer, cmd_id, req_type, proto):
     resp = build_response(cmd_id, 'SetVehicleAmmoResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} SetVehicleAmmoResponse (response=1 ok, '
+    log(f'S->C cmd={cmd_id:<4} SetVehicleAmmoResponse '
+        f'(response={1 if affected else 0}, '
         f'storage={sa_storage_id if sa_do_equip else 0}, slot={sa_slot_index if sa_do_equip else 0})')
 
     # 重推受影响的载具弹药（目标 + 被挤掉槽位的），客户端刷新 isEquipped 状态
@@ -402,8 +440,35 @@ async def handle_repairvehicleammorequest(sess, writer, cmd_id, req_type, proto)
     except Exception as e:
         log(f'      RepairVehicleAmmo parse error: {e}')
 
+    pid = await sess.ensure_player()
+    repaired = None
+    if pid is not None:
+        try:
+            repaired = next((a for a in await STORE.list_vehicle_ammo(pid)
+                             if int(a['id']) == int(ra_ammo_id)), None)
+        except Exception as e:
+            log(f'[DB] load vehicle ammo for repair failed: {e}')
+    if repaired is None:
+        resp = build_response(
+            cmd_id, 'RepairVehicleAmmoResponse', pb_int32(1, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} RepairVehicleAmmoResponse '
+            f'(response=0 ammo_not_found)')
+        return
+
+    ammo_template_id = int(repaired['ammo_template_id'])
+    params = ammo_wear_params(ammo_template_id)
+    maxcond = (params[0] if params and params[0] > 0
+               else _AMMO_MAXCOND.get(ammo_template_id, 100.0))
+    current = max(0.0, min(float(repaired.get('condition') or 0), maxcond))
+    fraction = (maxcond - current) / maxcond if maxcond > 0 else 0.0
+
     # 扣款（维修费）；余额不足返回错误响应
-    cost, ok = await _charge_player(sess, ra_pricing_id, ra_currency)
+    cost, ok = await _charge_player(
+        sess, ra_pricing_id, ra_currency, fraction=fraction,
+        expected_object_id=ammo_template_id,
+        expected_types='AmmoMaxConditionRepair')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'RepairVehicleAmmoResponse', resp_proto)
@@ -412,20 +477,17 @@ async def handle_repairvehicleammorequest(sess, writer, cmd_id, req_type, proto)
         log(f'S->C cmd={cmd_id:<4} RepairVehicleAmmoResponse (response=56 not_enough) cost={cost}')
         return
 
-    # 查弹药模板 → 修复到满耐久
-    maxcond = 100.0
-    repaired = None
-    pid = await sess.ensure_player()
-    if pid is not None:
-        try:
-            for a in await STORE.list_vehicle_ammo(pid):
-                if a['id'] == ra_ammo_id:
-                    maxcond = _AMMO_MAXCOND.get(int(a['ammo_template_id']), 100.0)
-                    await STORE.update_vehicle_ammo_condition(pid, ra_ammo_id, maxcond)
-                    repaired = a
-                    break
-        except Exception as e:
-            log(f'[DB] repair vehicle ammo failed: {e}')
+    # 修复到模板满耐久（不信任请求中的 repairToCondition）
+    try:
+        await STORE.update_vehicle_ammo_condition(pid, ra_ammo_id, maxcond)
+        repaired['condition'] = maxcond
+    except Exception as e:
+        log(f'[DB] repair vehicle ammo failed: {e}')
+        await _refund_player_charge(sess, ra_currency, cost)
+        writer.write(build_response(
+            cmd_id, 'RepairVehicleAmmoResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
 
     resp_proto = pb_int32(1, 1)  # response = 1 (ok)
     resp = build_response(cmd_id, 'RepairVehicleAmmoResponse', resp_proto)
@@ -462,18 +524,22 @@ async def handle_setvehicleammoautorepairrequest(sess, writer, cmd_id, req_type,
         log(f'      SetVehicleAmmoAutoRepair parse error: {e}')
 
     pid = await sess.ensure_player()
+    updated = False
     if pid is not None and ar_ammo_id:
         try:
             await STORE.set_equipment_auto_repair(pid, 9, int(ar_ammo_id),
                                                   int(ar_auto))
+            updated = any(int(a['id']) == int(ar_ammo_id)
+                          for a in await STORE.list_vehicle_ammo(pid))
         except Exception as e:
             log(f'[DB] set_equipment_auto_repair failed: {e}')
 
-    resp_proto = pb_int32(1, 1)  # response = 1 (ok)
+    resp_proto = pb_int32(1, 1 if updated else 0)
     resp = build_response(cmd_id, 'SetVehicleAmmoAutoRepairResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} SetVehicleAmmoAutoRepairResponse (response=1 ok)')
+    log(f'S->C cmd={cmd_id:<4} SetVehicleAmmoAutoRepairResponse '
+        f'(response={1 if updated else 0})')
 
     # 推送更新后的 VehicleAmmo（autoRepair f9 更新；三态原样回传）
     if pid is not None and sess.soldier_view_cmd is not None:
@@ -516,8 +582,34 @@ async def handle_repairvehiclerequest(sess, writer, cmd_id, req_type, proto):
         rv_pricing_id = 0
         rv_currency = 0
 
-    # 扣款（维修费）；余额不足返回错误响应
-    cost, ok = await _charge_player(sess, rv_pricing_id, rv_currency)
+    pid = await sess.ensure_player()
+    repaired = None
+    if pid is not None and rv_vehicle_id:
+        try:
+            repaired = await STORE.get_vehicle(pid, int(rv_vehicle_id))
+        except Exception as e:
+            log(f'[DB] load vehicle for repair failed: {e}')
+    if repaired is None:
+        resp = build_response(
+            cmd_id, 'RepairVehicleResponse', pb_int32(2, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} RepairVehicleResponse '
+            f'(response=0 vehicle_not_found)')
+        return
+
+    # 载具实例持有的是 variant template，由 wardb 映射到基础载具的满耐久。
+    maxcond = vehicle_full_condition(repaired['vehicle_variant_template_id'])
+    current = max(0.0, min(float(repaired.get('condition') or 0), maxcond))
+    fraction = (maxcond - current) / maxcond if maxcond > 0 else 0.0
+
+    # 与客户端显示价使用同一损耗比例扣款。
+    cost, ok = await _charge_player(
+        sess, rv_pricing_id, rv_currency, fraction=fraction,
+        expected_object_id=_VEHICLE_VARIANT_PARENT.get(
+            int(repaired['vehicle_variant_template_id']),
+            int(repaired['vehicle_variant_template_id'])),
+        expected_types='VehicleMaxConditionRepair')
     if not ok:
         resp_proto = pb_int32(2, 56)  # not_enough_credits（字段号 2）
         resp = build_response(cmd_id, 'RepairVehicleResponse', resp_proto)
@@ -527,25 +619,24 @@ async def handle_repairvehiclerequest(sess, writer, cmd_id, req_type, proto):
             f'cost={cost}')
         return
 
-    pid = await sess.ensure_player()
-    repaired = None
-    if pid is not None and rv_vehicle_id:
-        try:
-            v = await STORE.get_vehicle(pid, int(rv_vehicle_id))
-            await STORE.update_vehicle_condition(pid, int(rv_vehicle_id),
-                                                 float(rv_condition or 100))
-            if v is not None:
-                v['condition'] = float(rv_condition or 100)
-                repaired = v
-        except Exception as e:
-            log(f'[DB] update_vehicle_condition failed: {e}')
+    # 修复到模板满耐久，不信任客户端传入的目标值。
+    try:
+        await STORE.update_vehicle_condition(pid, int(rv_vehicle_id), maxcond)
+        repaired['condition'] = maxcond
+    except Exception as e:
+        log(f'[DB] update_vehicle_condition failed: {e}')
+        await _refund_player_charge(sess, rv_currency, cost)
+        writer.write(build_response(
+            cmd_id, 'RepairVehicleResponse', pb_int32(2, 0)))
+        await writer.drain()
+        return
 
-    resp_proto = pb_int32(2, 1)  # response = 1 (ok；字段号 2)
+    resp_proto = pb_int32(2, 1)
     resp = build_response(cmd_id, 'RepairVehicleResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RepairVehicleResponse (response=1 ok, '
-        f'condition={rv_condition})')
+        f'condition={maxcond})')
 
     # 推送更新后的 Vehicle（condition 恢复）
     if sess.soldier_view_cmd is not None and repaired is not None:
@@ -555,10 +646,10 @@ async def handle_repairvehiclerequest(sess, writer, cmd_id, req_type, proto):
                                   repaired.get('equipped_in_slot', 0),
                                   repaired.get('variant_id', 0),
                                   repaired.get('auto_repair', 0),
-                                  float(rv_condition or 100))
+                                  maxcond)
             await _push_kvcs(writer, sess.soldier_view_cmd, b'Vehicle', vproto)
             log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
-                f'(Vehicle id={rv_vehicle_id} repaired, condition={rv_condition})')
+                f'(Vehicle id={rv_vehicle_id} repaired, condition={maxcond})')
         except Exception as e:
             log(f'[KVCS] vehicle repair push failed: {e}')
     await _push_player_refresh(sess, writer)
@@ -591,11 +682,12 @@ async def handle_setvehicleautorepairrequest(sess, writer, cmd_id, req_type, pro
         except Exception as e:
             log(f'[DB] set_equipment_auto_repair failed: {e}')
 
-    resp_proto = pb_int32(2, 1)  # response = 1 (ok；字段号 2)
+    resp_proto = pb_int32(2, 1 if updated is not None else 0)
     resp = build_response(cmd_id, 'SetVehicleAutoRepairResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} SetVehicleAutoRepairResponse (response=1 ok)')
+    log(f'S->C cmd={cmd_id:<4} SetVehicleAutoRepairResponse '
+        f'(response={1 if updated is not None else 0})')
 
     # 推送更新后的 Vehicle（autoRepair f8 更新；三态原样回传，勾选框不跳变）
     if sess.soldier_view_cmd is not None and updated is not None:
@@ -631,18 +723,22 @@ async def handle_setvehicleupgradeautorepairrequest(sess, writer, cmd_id,
         au_auto = 0
 
     pid = await sess.ensure_player()
+    updated = False
     if pid is not None and au_upgrade_id:
         try:
             await STORE.set_equipment_auto_repair(pid, 8, int(au_upgrade_id),
                                                   int(au_auto))
+            updated = any(int(u['id']) == int(au_upgrade_id)
+                          for u in await STORE.list_vehicle_upgrades(pid))
         except Exception as e:
             log(f'[DB] set_equipment_auto_repair failed: {e}')
 
-    resp_proto = pb_int32(1, 1)  # response = 1 (ok)
+    resp_proto = pb_int32(1, 1 if updated else 0)
     resp = build_response(cmd_id, 'SetVehicleUpgradeAutoRepairResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} SetVehicleUpgradeAutoRepairResponse (response=1 ok)')
+    log(f'S->C cmd={cmd_id:<4} SetVehicleUpgradeAutoRepairResponse '
+        f'(response={1 if updated else 0})')
 
     # 推送更新后的 VehicleUpgrade（autoRepair f8 更新；三态原样回传）
     if pid is not None and sess.soldier_view_cmd is not None:

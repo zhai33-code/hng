@@ -34,6 +34,7 @@ from messages import (
 from player_service import (
     _char_unlock_bits_for,
     _charge_player,
+    _character_owned,
     _fail_persisted_purchase,
     _msg_player_for,
     )
@@ -63,8 +64,17 @@ async def handle_createuniformvariantrequest(sess, writer, cmd_id, req_type, pro
     except Exception as e:
         log(f'      CreateUniformVariant parse error: {e}')
 
+    if not await _character_owned(sess, uv_char_id):
+        writer.write(build_response(
+            cmd_id, 'CreateUniformVariantResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
+
     # 扣款（迷彩购买费用）；余额不足返回错误响应
-    cost, ok = await _charge_player(sess, uv_pricing_id, uv_currency)
+    cost, ok = await _charge_player(
+        sess, uv_pricing_id, uv_currency,
+        expected_object_id=uv_template_id,
+        expected_types='UniformVariantTemplate')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'CreateUniformVariantResponse', resp_proto)
@@ -152,11 +162,18 @@ async def handle_setuniformvariantrequest(sess, writer, cmd_id, req_type, proto)
         return
 
     # 持久化到角色 uniform_variant_id 列
+    persisted = False
     if pid is not None:
         try:
             await STORE.set_uniform_variant(pid, suv_char_id, suv_variant_id)
+            persisted = True
         except Exception as e:
             log(f'[DB] set_uniform_variant failed: {e}')
+    if not persisted:
+        writer.write(build_response(
+            cmd_id, 'SetUniformVariantResponse', pb_int32(2, 0)))
+        await writer.drain()
+        return
 
     # 在队内换迷彩 → 重推整队行（SquadMemberSession f8 变化，
     # 其他成员的小队头像立即刷新，否则要重登才可见）
@@ -235,8 +252,17 @@ async def handle_purchaseuniformpartrequest(sess, writer, cmd_id, req_type, prot
     except Exception as e:
         log(f'      PurchaseUniformPart parse error: {e}')
 
+    if not await _character_owned(sess, hp_char_id):
+        writer.write(build_response(
+            cmd_id, 'PurchaseUniformPartResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
+
     # 扣款（头盔价格）；余额不足返回错误响应
-    cost, ok = await _charge_player(sess, hp_pricing_id, hp_currency)
+    cost, ok = await _charge_player(
+        sess, hp_pricing_id, hp_currency,
+        expected_object_id=hp_template_id,
+        expected_types='UniformPartTemplate')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'PurchaseUniformPartResponse', resp_proto)
@@ -326,11 +352,18 @@ async def handle_setuniformpartrequest(sess, writer, cmd_id, req_type, proto):
         return
 
     # 持久化到角色 headgear_id 列（0 = 卸下）
+    persisted = False
     if pid is not None:
         try:
             await STORE.set_character_headgear(pid, sp_char_id, sp_part_id)
+            persisted = True
         except Exception as e:
             log(f'[DB] set_character_headgear failed: {e}')
+    if not persisted:
+        writer.write(build_response(
+            cmd_id, 'SetUniformPartResponse', pb_int32(2, 0)))
+        await writer.drain()
+        return
 
     # 在队内换头盔 → 重推整队行（SquadMemberSession f19 变化，
     # 其他成员的小队头像立即刷新）

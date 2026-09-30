@@ -42,6 +42,22 @@ _WHITELIST = {
     # --- 无响应 proto 定义（ZServer 未注册，回 HandlerErrorResponse）---
     'AdminToolQueryFastRequest', 'DebugGetWarCatalogueRequest',
     'DebugGetPlayerRequest', 'DebugAddCharacterRibbonXPRequest',
+    # 外部支付、Debug/Admin 变更接口没有真实后端：必须明确报错，不能假成功。
+    'SteamInitializeTransactionRequest', 'SteamFinalizeTransactionRequest',
+    'EpicGetAccessTokenRequest', 'EpicFinalizeTransactionRequest',
+    'DiscordInitializeTransactionRequest', 'DiscordFinalizeTransactionRequest',
+    'HypeFinalizeTransactionRequest', 'HypeReverseTransactionRequest',
+    'MailRUInitializeTransactionRequest', 'MailRUFinalizeTransactionRequest',
+    'DebugStartBattlesRequest', 'DebugSetPlayerTierRequest',
+    'DebugSetPlayerGoldRequest', 'DebugSetMapEntityOwnerRequest',
+    'DebugSetAtMoraleRequest', 'DebugResupplyATRequest',
+    'DebugRemoveBattlesRequest', 'DebugPlaceATRequest',
+    'DebugGetWarRequest', 'DebugGetCharactersRequest', 'DebugGetAtsRequest',
+    'DebugEquipATRequest', 'AdminToolUpdateRequest',
+    'AdminToolTestMatchmakerRequest', 'AdminToolStatQueryRequest',
+    'AdminToolQueryRequest', 'AdminToolPlayerStatRequest',
+    'AdminToolModifyRibbonLevelRequest', 'AdminToolGetDbInfoRequest',
+    'AdminToolPerformActionRequest', 'AdminToolExecuteSqlRequest',
 }
 
 

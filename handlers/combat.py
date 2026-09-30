@@ -368,8 +368,7 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
                 _tags = {int(r['id']): r['username'] for r in _rows}
             except Exception as e:
                 log(f'      [combat] f5 AT owner lookup failed: {e}')
-        _map_ent = int((det or {}).get('map_entity_id') or 0) \
-            or mm_state.MISSION_MAP_ENTITY_ID
+        _map_ent = int((det or {}).get('map_entity_id') or 0)
         for _fac, _ats in war_ats.items():
             _fac = int(_fac)
             for a in _ats:
@@ -377,36 +376,22 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
                 at = b''
                 at += pb_int64(1, int(a.get('id') or 0))      # assaultTeamId
                 at += pb_int64(2, oid)                        # ownerPlayerId
-                at += pb_string(3, _tags.get(oid) or 'Player')  # ownerGamertag
+                at += pb_string(3, _tags.get(oid) or '')       # ownerGamertag
                 at += pb_int64(4, _fac)                       # factionId
-                at += pb_int64(5, int(a.get('template_id') or 0)
-                               or commandnode_template(_fac, 'infantry'))
+                template_id = int(a.get('template_id') or 0)
+                if not template_id:
+                    log(f'      [combat] skip AT {a.get("id")}: no template')
+                    continue
+                at += pb_int64(5, template_id)
                 at += pb_int64(6, _map_ent)                   # mapEntityId
-                at += pb_int64(7, 1)                          # 1=battlefield
+                at += pb_int64(7, 1 if _map_ent else 0)
                 at += pb_bool(8, False)                       # inTransit
                 at += pb_bool(14, True)                       # inActiveMission
                 at += pb_int64(15, int(a.get('ap_tmpl') or 0)
                                or home_by_fac.get(_fac, home_ap_default))
                 resp_proto += pb_message(5, at)
                 at_count += 1
-    else:
-        # 非 war 局（staged/AI）：维持旧口径——每在局玩家一行伪 AT
-        for s in mm_state.PMS_TO_SESSION.values():
-            fac = int(s.get('faction', 3) or 3)
-            home_ap = home_by_fac.get(fac, home_ap_default)
-            at = b''
-            at += pb_int64(1, int(s.get('battle_session_id', 0) or 0))  # assaultTeamId
-            at += pb_int64(2, int(s.get('player_id', 0) or 0))          # ownerPlayerId
-            at += pb_string(3, s.get('gamertag') or 'Player')           # ownerGamertag
-            at += pb_int64(4, fac)                                      # factionId(runtime)
-            at += pb_int64(5, commandnode_template(fac, 'infantry'))  # commandNodeTemplateId
-            at += pb_int64(6, mm_state.MISSION_MAP_ENTITY_ID)        # mapEntityId
-            at += pb_int64(7, 1)                                        # mapEntityTypeId(1=battlefield)
-            at += pb_bool(8, False)                                     # inTransit
-            at += pb_bool(14, True)                                     # inActiveMission
-            at += pb_int64(15, home_ap)                                 # accesspointTemplateId
-            resp_proto += pb_message(5, at)
-            at_count += 1
+    # 普通匹配没有战略层 AssaultTeam；不再为每个玩家伪造一支步兵 AT。
 
     resp = build_response(cmd_id, 'ActiveMissionRequestEventListResponse', resp_proto)
     writer.write(resp)

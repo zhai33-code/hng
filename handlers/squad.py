@@ -86,8 +86,10 @@ RC_PLAYER_NOT_FOUND = 64
 RC_CHARACTER_NOT_OWNED = 17
 RC_PLAYER_ALREADY_IN_SQUAD = 157
 RC_SQUAD_SLOT_NOT_FOUND = 158
+RC_PLAYER_NOT_OWNER = 159
 RC_SQUAD_NOT_FOUND = 161
 RC_SQUAD_NOT_OWNED = 164
+RC_SQUAD_IN_LOCKED_STATE = 261
 
 # 官方小队人数上限（客户端 SquadModel.MAX_CHARACTERS_PER_SQUAD=4 硬编码，
 # 反编译 swf-frontend/scripts/.../squad/model/SquadModel.as:108）。
@@ -105,6 +107,48 @@ def _str(v):
     if isinstance(v, bytes):
         return v.decode('utf-8', 'replace')
     return str(v)
+
+
+def _leader_member(squad, members):
+    """Resolve the authoritative leader row; never grant ownership by fallback."""
+    if squad is None:
+        return None
+    leader_char = int(squad.get('leader_character_id', 0) or 0)
+    return next((m for m in members or ()
+                 if int(m.get('character_id', 0) or 0) == leader_char), None)
+
+
+def _player_is_leader(squad, members, player_id):
+    leader = _leader_member(squad, members)
+    return leader is not None and int(leader['player_id']) == int(player_id or 0)
+
+
+def _squad_is_locked(squad, members):
+    """Member/customization mutations are forbidden while queued or in combat."""
+    return bool((squad or {}).get('matchmaking_flag')) or any(
+        int(m.get('status', 0) or 0) == ST_IN_COMBAT for m in members or ())
+
+
+def _auto_squad_leader(info):
+    members = list((info or {}).get('members') or [])
+    leader_char = int((info or {}).get('leader_char_id', 0) or 0)
+    if leader_char:
+        leader = next((m for m in members
+                       if int(m.get('char_id', 0) or 0) == leader_char), None)
+        if leader is not None:
+            return leader
+    return members[0] if members else None
+
+
+async def _push_member_delete_to_session(session, member_row_id):
+    """Push a member DELETE to a captured session, including a just-kicked user."""
+    if session is None or session.playerview_cmd is None:
+        return
+    try:
+        await _push_kvcs_delete(session.writer, session.playerview_cmd,
+                                b'SquadMemberSession', member_row_id)
+    except Exception as e:
+        log(f'      [squad] target delete push failed: {e}')
 
 
 # ------------------------------------------------------------- KVCS 推送
@@ -138,8 +182,9 @@ def _msg_squad_session(squad, members, mission_id=0, entered=0,
     m += pb_int64(17, int(mission_id or 0))          # missionId
     m += pb_int64(18, squad['id'])                   # squadId
     m += pb_int32(19, int(entered or 0))             # actionGamesEntered
-    m += pb_bool(20, False)                          # isLockedForMembers
-    m += pb_bool(21, False)                          # isLockedForCustomization
+    locked = _squad_is_locked(squad, members)
+    m += pb_bool(20, locked)                         # isLockedForMembers
+    m += pb_bool(21, locked)                         # isLockedForCustomization
     m += pb_bool(22, False)                          # forceReady
     return m
 
@@ -387,13 +432,16 @@ async def handle_create_squad(sess, writer, cmd_id, req_type, proto):
             char = await STORE.get_character(int(pid), char_id)
             if char is None:
                 code = RC_CHARACTER_NOT_OWNED        # character_not_owned_by_player
+            elif not str(sess.username or '').strip():
+                code = RC_PLAYER_NOT_FOUND
             else:
-                existing = await STORE.get_squad_for_character(char_id)
+                # 一个账号只能处于一个真小队中；不能通过换另一个角色重复建队。
+                existing = await STORE.get_squad_for_player(int(pid))
                 if existing is not None:
                     code = RC_PLAYER_ALREADY_IN_SQUAD
                     squad_id = existing['id']
                 else:
-                    name = f"Squad of {sess.username or 'Player'}"
+                    name = f"Squad of {str(sess.username).strip()}"
                     squad_id = await STORE.create_squad(
                         char_id, char['faction'], name)
                     log(f'      [DB] create_squad id={squad_id} '
@@ -429,11 +477,19 @@ async def handle_modify_squad(sess, writer, cmd_id, req_type, proto):
 
     pid = await sess.ensure_player()
     code = RC_OK
-    if pid is not None and STORE is not None and squad_session_id:
+    if pid is None or STORE is None or not squad_session_id:
+        code = RC_SQUAD_NOT_FOUND
+    else:
         try:
             squad = await STORE.get_squad(squad_session_id)
             if squad is None:
                 code = RC_SQUAD_NOT_FOUND
+            else:
+                members = await STORE.list_squad_members(squad_session_id)
+                if not _player_is_leader(squad, members, pid):
+                    code = RC_SQUAD_NOT_OWNED
+                elif _squad_is_locked(squad, members):
+                    code = RC_SQUAD_IN_LOCKED_STATE
         except Exception as e:
             log(f'      [DB] modify_squad lookup failed: {e}')
             code = RC_SQUAD_NOT_FOUND
@@ -473,6 +529,17 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
                           None)
                 if me is None:
                     continue
+                leader = _auto_squad_leader(_info)
+                if leader is None or int(leader.get('player_id', 0) or 0) != \
+                        int(pid):
+                    resp = build_response(cmd_id, 'RemoveSquadResponse',
+                                          pb_int32(1, RC_SQUAD_NOT_OWNED))
+                    writer.write(resp)
+                    await writer.drain()
+                    log(f'S->C cmd={cmd_id:<4} RemoveSquadResponse '
+                        f'(auto squad={_sq_id}, response='
+                        f'{RC_SQUAD_NOT_OWNED} non-leader)')
+                    return
                 my_row = int(me['row_id'])
                 all_rows = [int(m['row_id']) for m in _info['members']]
                 # 删本人连接上的凑队行：★SquadSession 行必须先删——客户端
@@ -592,22 +659,19 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
             else:
                 squad_id = squad['id']
                 members = await STORE.list_squad_members(squad_id)
-                member_ids = [m['id'] for m in members]
-                # 解散后查库为空 → 先收集在线会话再 dissolve
-                live_sessions = _online_member_sessions(members)
-                # ★解散前整队撤出匹配队列：排队中的真小队解散不清队会留
-                #   幽灵 entry（group_key 指向已删的 squad_id，成局后向不
-                #   存在的小队推局）。必须在 dissolve 前调——_cancel_squad_
-                #   queue 按 DB 成员表逐个撤队，解散后表已空（已成局成员
-                #   mission_id≠0 被跳过，不受影响）。
-                #   push_rows=False（2026-09-09）：dissolve + DELETE 行紧随
-                #   其后，撤队时推整队 SET 行集会给队长客户端喂成员行 SET
-                #   → 自动重发 SetSquadMatchMakingFlagRequest（死循环燃料，
-                #   在途请求跨过解散全变 161）——跳过推送。
-                await _cancel_squad_queue(squad_id, push_rows=False)
-                await STORE.dissolve_squad(squad_id)
-                log(f'      [DB] dissolve_squad id={squad_id} '
-                    f'({len(member_ids)} members)')
+                if not _player_is_leader(squad, members, pid):
+                    code = RC_SQUAD_NOT_OWNED
+                else:
+                    member_ids = [m['id'] for m in members]
+                    # 解散后查库为空 → 先收集在线会话再 dissolve
+                    live_sessions = _online_member_sessions(members)
+                    # ★解散前整队撤出匹配队列：排队中的真小队解散不清队会留
+                    #   幽灵 entry（group_key 指向已删的 squad_id，成局后向不
+                    #   存在的小队推局）。必须在 dissolve 前调。
+                    await _cancel_squad_queue(squad_id, push_rows=False)
+                    await STORE.dissolve_squad(squad_id)
+                    log(f'      [DB] dissolve_squad id={squad_id} '
+                        f'({len(member_ids)} members)')
         except Exception as e:
             log(f'      [DB] dissolve_squad failed: {e}')
             code = RC_SQUAD_NOT_FOUND
@@ -664,9 +728,21 @@ async def handle_remove_squad_member(sess, writer, cmd_id, req_type, proto):
                           None)
                 if me is None:
                     continue
-                if not any(int(m.get('player_id', 0) or 0) == int(pid)
-                           for m in _info.get('members') or []):
+                requester = next(
+                    (m for m in _info.get('members') or []
+                     if int(m.get('player_id', 0) or 0) == int(pid)), None)
+                leader = _auto_squad_leader(_info)
+                if requester is None:
                     break              # 请求者不在该凑队 → 交回原分支判错
+                if (int(me.get('player_id', 0) or 0) != int(pid)
+                        and (leader is None or
+                             int(leader.get('player_id', 0) or 0) != int(pid))):
+                    resp = build_response(
+                        cmd_id, 'RemoveSquadMemberResponse',
+                        pb_int32(1, RC_PLAYER_NOT_OWNER))
+                    writer.write(resp)
+                    await writer.drain()
+                    return
                 # 删除该成员行：请求者本人 + 其他在线成员连接都推
                 if sess.playerview_cmd is not None:
                     await _push_kvcs_delete(writer, sess.playerview_cmd,
@@ -696,18 +772,40 @@ async def handle_remove_squad_member(sess, writer, cmd_id, req_type, proto):
                     f'★auto squad id={_sq_id})')
                 return
 
+    target_session = None
     if pid is None or STORE is None or not member_row:
         code = RC_SQUAD_SLOT_NOT_FOUND
     else:
         try:
             mem = await STORE.get_squad_member(member_row)
-            removed_squad_id = int(mem['squad_id']) if mem else 0
-            removed = await STORE.remove_squad_member(member_row)
-            if not removed:
+            if mem is None:
                 code = RC_SQUAD_SLOT_NOT_FOUND
-                removed_squad_id = 0
             else:
-                log(f'      [DB] remove_squad_member row={member_row}')
+                removed_squad_id = int(mem['squad_id'])
+                squad = await STORE.get_squad(removed_squad_id)
+                members = await STORE.list_squad_members(removed_squad_id)
+                target = next((m for m in members
+                               if int(m['id']) == int(member_row)), None)
+                if squad is None or target is None:
+                    code = RC_SQUAD_SLOT_NOT_FOUND
+                elif _squad_is_locked(squad, members):
+                    code = RC_SQUAD_IN_LOCKED_STATE
+                elif (int(target['player_id']) != int(pid)
+                      and not _player_is_leader(squad, members, pid)):
+                    code = RC_PLAYER_NOT_OWNER
+                elif int(target['character_id']) == int(
+                        squad.get('leader_character_id', 0) or 0):
+                    # 队长必须走 RemoveSquadRequest 解散，不能留下无主/空队。
+                    code = RC_SQUAD_NOT_OWNED
+                else:
+                    target_session = FLASH_SESSIONS.get(
+                        target.get('gamertag') or '')
+                    removed = await STORE.remove_squad_member(member_row)
+                    if not removed:
+                        code = RC_SQUAD_SLOT_NOT_FOUND
+                        removed_squad_id = 0
+                    else:
+                        log(f'      [DB] remove_squad_member row={member_row}')
         except Exception as e:
             log(f'      [DB] remove_squad_member failed: {e}')
             code = RC_SQUAD_SLOT_NOT_FOUND
@@ -716,6 +814,8 @@ async def handle_remove_squad_member(sess, writer, cmd_id, req_type, proto):
         await delete_squad_member_row(sess, writer, member_row)
         # 队长/其他成员实时看到成员移除；被移除者若在线也收到
         await delete_squad_member_row_everywhere(member_row, removed_squad_id)
+        if target_session is not None and target_session is not sess:
+            await _push_member_delete_to_session(target_session, member_row)
 
     resp = build_response(cmd_id, 'RemoveSquadMemberResponse',
                           pb_int32(1, code))
@@ -800,21 +900,11 @@ async def _leader_switch_spec(squad, members, slot_id, new_leader_char,
     new_spec = (int(new_leader_char['faction']),
                 squad_template_for_character(new_leader_char['template']))
     kicked = []
-    try:
-        await STORE.update_squad_leader(
-            squad_id, int(new_leader_char['id']), new_spec[0])
-        await STORE.update_squad_member(
-            slot_id, character_id=int(new_leader_char['id']),
-            status=int(status) if status else None)
-    except Exception as e:
-        log(f'      [DB] leader switch failed: {e}')
-        return []
-    log(f'      [DB] leader switch: squad={squad_id} -> char='
-        f'{new_leader_char["id"]} faction={new_spec[0]} '
-        f'squad_tmpl={new_spec[1]}')
+    replacements = []
+    kicked_sessions = {}
     for m in members:
         if int(m['id']) == int(slot_id):
-            continue                     # 队长行已处理
+            continue
         try:
             resolved, _d = await _resolve_join_char(
                 int(m['player_id']), new_spec[0], new_spec[1],
@@ -824,28 +914,52 @@ async def _leader_switch_spec(squad, members, slot_id, new_leader_char,
             resolved, _d = None, False
         if resolved is not None:
             if int(resolved['id']) != int(m['character_id']):
-                try:
-                    await STORE.update_squad_member(
-                        int(m['id']), character_id=int(resolved['id']))
-                    log(f'      [DB] member auto-switch row={m["id"]} '
-                        f'char={m["character_id"]} -> {resolved["id"]} '
-                        f'(follow leader spec)')
-                except Exception as e:
-                    log(f'      [DB] member auto-switch failed: {e}')
+                replacements.append((int(m['id']), int(resolved['id'])))
         else:
-            # 无匹配角色 → 请离（删行；KVCS delete 广播在下方）
-            try:
-                await STORE.remove_squad_member(int(m['id']))
-                kicked.append(int(m['id']))
-                log(f'      [DB] member kicked row={m["id"]} '
-                    f'pid={m["player_id"]} (no char for new spec '
-                    f'faction={new_spec[0]} squad_tmpl={new_spec[1]})')
-            except Exception as e:
-                log(f'      [DB] member kick failed: {e}')
-    # 请离者行删除推其本人在线连接（其他成员走整队行广播）
+            kicked.append(int(m['id']))
+            kicked_sessions[int(m['id'])] = FLASH_SESSIONS.get(
+                m.get('gamertag') or '')
+
+    try:
+        if hasattr(STORE, 'reconfigure_squad_members'):
+            ok = await STORE.reconfigure_squad_members(
+                squad_id, slot_id, int(new_leader_char['id']), new_spec[0],
+                int(status) if status else 0, replacements, kicked)
+            if not ok:
+                raise RuntimeError('squad disappeared during leader switch')
+        else:  # lightweight regression fakes
+            await STORE.update_squad_leader(
+                squad_id, int(new_leader_char['id']), new_spec[0])
+            await STORE.update_squad_member(
+                slot_id, character_id=int(new_leader_char['id']),
+                status=int(status) if status else None)
+            for member_id, resolved_id in replacements:
+                await STORE.update_squad_member(
+                    member_id, character_id=resolved_id)
+            for member_id in kicked:
+                await STORE.remove_squad_member(member_id)
+    except Exception as e:
+        log(f'      [DB] leader switch failed: {e}')
+        raise
+
+    log(f'      [DB] leader switch: squad={squad_id} -> char='
+        f'{new_leader_char["id"]} faction={new_spec[0]} '
+        f'squad_tmpl={new_spec[1]}')
+    for member_id, resolved_id in replacements:
+        log(f'      [DB] member auto-switch row={member_id} '
+            f'-> char={resolved_id} (follow leader spec)')
+    for m in members:
+        if int(m['id']) in kicked:
+            log(f'      [DB] member kicked row={m["id"]} '
+                f'pid={m["player_id"]} (no char for new spec '
+                f'faction={new_spec[0]} squad_tmpl={new_spec[1]})')
+
+    # 请离者已不在 DB roster，必须使用删除前捕获的会话定向推送。
     for row_id in kicked:
         try:
             await delete_squad_member_row_everywhere(row_id, squad_id)
+            await _push_member_delete_to_session(
+                kicked_sessions.get(row_id), row_id)
         except Exception as e:
             log(f'      [squad] kick KVCS push failed: {e}')
     return kicked
@@ -886,13 +1000,12 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
                     except Exception as e:
                         log(f'      [DB] set_player_selected_char '
                             f'failed: {e}')
-            # 被邀者已在别的真小队 → 157 player_already_in_squad
-            friend_squad = await STORE.get_squad_for_player(
-                int(friend_player_id))
-            if friend_squad is not None and \
-                    (squad is None or
-                     int(friend_squad['id']) != int(squad['id'])):
-                code = RC_PLAYER_ALREADY_IN_SQUAD
+            if squad is not None:
+                members = await STORE.list_squad_members(int(squad['id']))
+                if not _player_is_leader(squad, members, pid):
+                    code = RC_PLAYER_NOT_OWNER
+                elif _squad_is_locked(squad, members):
+                    code = RC_SQUAD_IN_LOCKED_STATE
 
             # ★ 满员校验（官方 MAX_CHARACTERS_PER_SQUAD=4）：
             #   既有真队已满（pending + 正式成员）→ 158 拒绝
@@ -907,6 +1020,15 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
                             f'{MAX_SQUAD_MEMBERS})')
                 except Exception as e:
                     log(f'      [DB] squad capacity lookup failed: {e}')
+
+            # 被邀者已在任意真小队（包括当前队/pending）→ 157。
+            # 容量错误保持客户端原有优先级；非满员时重复邀请绝不把正式
+            # 成员 UPSERT 回 pending，也不允许同一玩家用另一角色占第二槽。
+            if code == RC_OK:
+                friend_squad = await STORE.get_squad_for_player(
+                    int(friend_player_id))
+                if friend_squad is not None:
+                    code = RC_PLAYER_ALREADY_IN_SQUAD
 
             # ★ 官服入队规则：入队约束 = A（邀请者）选中角色的阵营+兵种；
             #   B 当前选中士兵同阵营同兵种 → 直接入队；否则取 B 该阵营
@@ -941,6 +1063,10 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
 
             if code == RC_OK:
                 if squad is None:
+                    username = str(sess.username or '').strip()
+                    if not username:
+                        code = RC_PLAYER_NOT_FOUND
+                        raise ValueError('authenticated squad owner has no username')
                     # ★ 客户端从不发 CreateSquadRequest（SquadService.inviteFriend
                     #   直接发本请求，桌面/网页两版 swf 均无建队调用）：官服由
                     #   服务端在首次邀请时隐式建队。用锚点角色（选中角色，兜底
@@ -951,29 +1077,52 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
                     if solo is not None and sess.playerview_cmd is not None:
                         await _push_kvcs_delete(
                             writer, sess.playerview_cmd,
-                            b'SquadMemberSession', solo['member_row'])
+                            b'SquadSession', solo['squad_row'])
                         await _push_kvcs_delete(
                             writer, sess.playerview_cmd,
-                            b'SquadSession', solo['squad_row'])
+                            b'SquadMemberSession', solo['member_row'])
                         log(f'S->C cmd={sess.playerview_cmd:<4} '
                             f'KeyValueChangeSet (solo squad delete '
                             f'id={solo["squad_row"]} ★before implicit create)')
-                    name = f"Squad of {sess.username or 'Player'}"
-                    created_squad_id = await STORE.create_squad(
-                        anchor_char['id'], anchor_char['faction'], name)
+                    name = f"Squad of {username}"
+                    if hasattr(STORE, 'create_squad_with_invite'):
+                        created_squad_id, member_row = \
+                            await STORE.create_squad_with_invite(
+                                anchor_char['id'], anchor_char['faction'],
+                                name, friend_char['id'], ST_INVITE_PENDING)
+                    else:  # lightweight regression fakes
+                        created_squad_id = await STORE.create_squad(
+                            anchor_char['id'], anchor_char['faction'], name)
                     squad = await STORE.get_squad(created_squad_id)
                     log(f'      [DB] implicit create_squad id='
                         f'{created_squad_id} leader_char={anchor_char["id"]} '
                         f'faction={anchor_char["faction"]} (on invite)')
-                member_row = await STORE.add_squad_member(
-                    squad['id'], friend_char['id'], status=ST_INVITE_PENDING)
+                if not member_row:
+                    if hasattr(STORE, 'add_squad_member_checked'):
+                        member_row, add_result = \
+                            await STORE.add_squad_member_checked(
+                                squad['id'], friend_char['id'],
+                                status=ST_INVITE_PENDING,
+                                max_members=MAX_SQUAD_MEMBERS)
+                        if add_result == 'already':
+                            code = RC_PLAYER_ALREADY_IN_SQUAD
+                        elif add_result == 'full':
+                            code = RC_SQUAD_SLOT_NOT_FOUND
+                    else:  # lightweight regression fakes
+                        member_row = await STORE.add_squad_member(
+                            squad['id'], friend_char['id'],
+                            status=ST_INVITE_PENDING)
+                if code != RC_OK:
+                    member_row = 0
+                    raise ValueError(f'invite rejected during atomic add: {code}')
                 log(f'      [DB] squad_invite squad={squad["id"]} '
                     f'friend_char={friend_char["id"]} '
                     f'{"(selected)" if direct else "(first matching)"} '
                     f'row={member_row}')
         except Exception as e:
             log(f'      [DB] squad_invite failed: {e}')
-            code = RC_PLAYER_NOT_FOUND
+            if code == RC_OK:
+                code = RC_PLAYER_NOT_FOUND
 
     if code == RC_OK and member_row:
         if created_squad_id:
@@ -1034,20 +1183,23 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
             mem = await STORE.get_squad_member(member_row)
             if mem is None:
                 code = RC_SQUAD_SLOT_NOT_FOUND
-            elif has_accepted:
-                # 记录被邀者当前选中士兵（f3 characterId，落库）
-                if char_id:
-                    PLAYER_SELECTED_CHAR[int(pid)] = int(char_id)
-                    try:
-                        await STORE.set_player_selected_char(
-                            int(pid), int(char_id))
-                    except Exception as e:
-                        log(f'      [DB] set_player_selected_char '
-                            f'failed: {e}')
+            else:
+                squad = await STORE.get_squad(int(mem['squad_id']))
+                members = await STORE.list_squad_members(int(mem['squad_id']))
+                target = next((m for m in members
+                               if int(m['id']) == int(member_row)), None)
+                if (squad is None or target is None
+                        or int(target['player_id']) != int(pid)
+                        or int(mem.get('status', 0) or 0) !=
+                        ST_INVITE_PENDING):
+                    code = RC_SQUAD_SLOT_NOT_FOUND
+                elif _squad_is_locked(squad, members):
+                    code = RC_SQUAD_IN_LOCKED_STATE
+
+            if code == RC_OK and has_accepted:
                 # ★ 官服入队规则同 invite：接受时按小队（队长角色）约束
                 #   复核入队角色 —— f3 选中角色匹配则直接用，否则用邀请时
                 #   存入成员行的解析角色/首个匹配角色；无匹配 → 17 拒绝
-                squad = await STORE.get_squad(int(mem['squad_id']))
                 spec = await _squad_join_spec(squad) if squad else None
                 resolved, _direct = (None, False)
                 if spec is not None:
@@ -1061,14 +1213,24 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
                         f'char for faction={spec[0] if spec else "?"} '
                         f'squad_tmpl={spec[1] if spec else "?"}')
                 else:
-                    await STORE.update_squad_member(
+                    updated = await STORE.update_squad_member(
                         member_row,
                         character_id=resolved['id'],
                         status=ST_IN_LOBBY)
-                    log(f'      [DB] squad_invite accepted row={member_row} '
-                        f'char={resolved["id"]} '
-                        f'(requested={char_id or mem["character_id"]})')
-            else:
+                    if not updated:
+                        code = RC_SQUAD_SLOT_NOT_FOUND
+                    else:
+                        PLAYER_SELECTED_CHAR[int(pid)] = int(resolved['id'])
+                        try:
+                            await STORE.set_player_selected_char(
+                                int(pid), int(resolved['id']))
+                        except Exception as e:
+                            log(f'      [DB] set_player_selected_char '
+                                f'failed: {e}')
+                        log(f'      [DB] squad_invite accepted row={member_row} '
+                            f'char={resolved["id"]} '
+                            f'(requested={char_id or mem["character_id"]})')
+            elif code == RC_OK:
                 declined_squad_id = int(mem['squad_id'])
                 await STORE.remove_squad_member(member_row)
                 log(f'      [DB] squad_invite declined row={member_row}')
@@ -1151,23 +1313,37 @@ async def handle_set_squad_details(sess, writer, cmd_id, req_type, proto):
             code = name_err
         else:
             try:
-                squad = (await STORE.get_squad_for_character(char_id)
-                         if char_id else None)
-                if squad is None:
-                    squad = await STORE.get_squad_for_player(int(pid))
+                squad = await STORE.get_squad_for_player(int(pid))
+                if squad is None and char_id:
+                    squad = await STORE.get_squad_for_character(char_id)
                 if squad is None:
                     code = RC_SQUAD_NOT_FOUND
                 elif int(squad.get('leader_character_id', 0) or 0) != char_id:
                     code = RC_SQUAD_NOT_OWNED
                 else:
-                    cost, ok = await _charge_player(sess, pricing_id, currency)
-                    if not ok:
-                        code = 56  # not_enough_credits
+                    members = (await STORE.list_squad_members(int(squad['id']))
+                               if hasattr(STORE, 'list_squad_members') else [])
+                    if members and not _player_is_leader(squad, members, pid):
+                        code = RC_SQUAD_NOT_OWNED
+                    elif _squad_is_locked(squad, members):
+                        code = RC_SQUAD_IN_LOCKED_STATE
                     else:
-                        squad_id = squad['id']
-                        await STORE.rename_squad(squad_id, squad_name)
-                        log(f'      [DB] rename_squad id={squad_id} '
-                            f'name={squad_name!r} cost={cost}')
+                        cost, ok = await _charge_player(
+                            sess, pricing_id, currency,
+                            expected_types='squad_rename')
+                        if not ok:
+                            code = 56  # not_enough_credits
+                        else:
+                            squad_id = squad['id']
+                            try:
+                                await STORE.rename_squad(squad_id, squad_name)
+                            except Exception:
+                                from player_service import _refund_player_charge
+                                await _refund_player_charge(
+                                    sess, currency, cost)
+                                raise
+                            log(f'      [DB] rename_squad id={squad_id} '
+                                f'name={squad_name!r} cost={cost}')
             except Exception as e:
                 log(f'      [DB] set_squad_details failed: {e}')
                 code = RC_SQUAD_NOT_FOUND
@@ -1196,32 +1372,53 @@ async def handle_set_squad_matchmaking_flag(sess, writer, cmd_id, req_type,
     except Exception as e:
         log(f'      [squad] SetSquadMatchMakingFlag parse error: {e}')
 
+    pid = await sess.ensure_player()
     code = RC_OK
     # 内存隐式小队（solo / 匹配凑队）：squadSessionId 是内存行 id（超
     # int32），走 DB set_squad_flag 必炸（"value out of int32 range"）
     # 且回 161 会触发客户端 sendFeedbackMessage 错误弹窗（2026-09-02
     # 实测每次凑队成局客户端连发两条 161）。战争模式标记对隐式小队
     # 无持久化意义 → 静默 OK。
-    in_memory = any(int(s.get('squad_row', 0) or 0) == squad_session_id
-                    for s in _SOLO_SQUADS.values())
+    memory_owner_ok = False
+    in_memory = False
+    for owner_pid, solo in _SOLO_SQUADS.items():
+        if int(solo.get('squad_row', 0) or 0) == squad_session_id:
+            in_memory = True
+            memory_owner_ok = int(owner_pid) == int(pid or 0)
+            break
     if not in_memory:
         for _mid in list(_MM_MISSION_SQUADS.keys()):
-            if squad_session_id in _MM_MISSION_SQUADS.get(_mid, {}):
+            info = _MM_MISSION_SQUADS.get(_mid, {}).get(squad_session_id)
+            if info is not None:
                 in_memory = True
+                leader = _auto_squad_leader(info)
+                memory_owner_ok = (leader is not None and int(
+                    leader.get('player_id', 0) or 0) == int(pid or 0))
                 break
     if in_memory:
-        log(f'      [squad] SetSquadMatchMakingFlag: in-memory squad '
-            f'{squad_session_id} → no-op OK')
-    elif STORE is None or not squad_session_id:
+        if not memory_owner_ok:
+            code = RC_PLAYER_NOT_OWNER
+        else:
+            log(f'      [squad] SetSquadMatchMakingFlag: in-memory squad '
+                f'{squad_session_id} → no-op OK')
+    elif pid is None or STORE is None or not squad_session_id:
         code = RC_SQUAD_NOT_FOUND
     else:
         try:
-            updated = await STORE.set_squad_flag(squad_session_id, flag)
-            if not updated:
+            squad = await STORE.get_squad(squad_session_id)
+            members = await STORE.list_squad_members(squad_session_id) \
+                if squad is not None else []
+            if squad is None:
                 code = RC_SQUAD_NOT_FOUND
+            elif not _player_is_leader(squad, members, pid):
+                code = RC_SQUAD_NOT_OWNED
             else:
-                log(f'      [DB] set_squad_flag id={squad_session_id} '
-                    f'flag={flag}')
+                updated = await STORE.set_squad_flag(squad_session_id, flag)
+                if not updated:
+                    code = RC_SQUAD_NOT_FOUND
+                else:
+                    log(f'      [DB] set_squad_flag id={squad_session_id} '
+                        f'flag={flag}')
         except Exception as e:
             log(f'      [DB] set_squad_flag failed: {e}')
             code = RC_SQUAD_NOT_FOUND
@@ -1293,91 +1490,64 @@ async def handle_set_squad_member_status(sess, writer, cmd_id, req_type,
     except Exception as e:
         log(f'      [squad] SetSquadMemberStatus parse error: {e}')
 
+    pid = await sess.ensure_player()
     code = RC_OK
-    if STORE is None or not slot_id:
+    mem = squad = me = None
+    members = []
+    if pid is None or STORE is None or not slot_id:
+        code = RC_SQUAD_SLOT_NOT_FOUND
+    elif status not in (0, ST_IN_LOBBY, ST_READY):
+        # pending / in-combat are server-owned transitions.
         code = RC_SQUAD_SLOT_NOT_FOUND
     else:
         try:
             mem = await STORE.get_squad_member(slot_id)
             if mem is None:
                 code = RC_SQUAD_SLOT_NOT_FOUND
-            elif member_char_id:
-                # ★ 官服换角色语义（两个分支）：
-                #   队长行换角色 → 小队类型跟随（leader_character_id +
-                #     faction 更新），全体成员按新约束重新解析：有匹配
-                #     角色的自动换角，无匹配的请离（删行 + KVCS 推全员）
-                #   成员行换角色 → 必须同阵营+同兵种（否则 SquadModel 崩溃）
-                spec = None
-                me_pid = 0
-                is_leader_row = False
-                members = []
-                squad = None
-                try:
-                    members = await STORE.list_squad_members(
-                        int(mem['squad_id']))
-                    squad = await STORE.get_squad(int(mem['squad_id']))
-                    leader = next(
-                        (m for m in members if squad is not None and
-                         int(m['character_id']) ==
-                         int(squad['leader_character_id'])),
-                        members[0] if members else None)
-                    if leader is not None:
-                        spec = (int(leader['faction']),
-                                squad_template_for_character(
-                                    leader['template']))
-                    me = next((m for m in members
-                               if int(m['id']) == int(slot_id)), None)
-                    if me is not None:
-                        me_pid = int(me['player_id'])
-                        is_leader_row = (leader is not None and
-                                         int(me['id']) ==
-                                         int(leader['id']))
-                except Exception as e:
-                    log(f'      [DB] squad member lookup failed: {e}')
+            else:
+                squad = await STORE.get_squad(int(mem['squad_id']))
+                members = await STORE.list_squad_members(int(mem['squad_id']))
+                me = next((m for m in members
+                           if int(m['id']) == int(slot_id)), None)
+                if (squad is None or me is None
+                        or int(me['player_id']) != int(pid)):
+                    code = RC_PLAYER_NOT_OWNER
+                elif _squad_is_locked(squad, members):
+                    code = RC_SQUAD_IN_LOCKED_STATE
 
-                own_char = None
-                if me_pid:
-                    try:
-                        own_char = await STORE.get_character(
-                            me_pid, member_char_id)
-                    except Exception as e:
-                        log(f'      [DB] get_character failed: {e}')
+            if code == RC_OK and member_char_id:
+                leader = _leader_member(squad, members)
+                spec = ((int(leader['faction']),
+                         squad_template_for_character(leader['template']))
+                        if leader is not None else None)
+                own_char = await STORE.get_character(int(pid), member_char_id)
                 if own_char is None:
                     code = RC_CHARACTER_NOT_OWNED
-                elif is_leader_row:
-                    # 队长换角色：小队类型跟随 + 成员重新校验请离
+                elif leader is not None and int(me['id']) == int(leader['id']):
                     await _leader_switch_spec(
                         squad, members, slot_id, own_char, status)
                 else:
-                    switch_ok = False
+                    resolved, _direct = (None, False)
                     if spec is not None:
-                        resolved, _d = await _resolve_join_char(
-                            me_pid, spec[0], spec[1],
+                        resolved, _direct = await _resolve_join_char(
+                            int(pid), spec[0], spec[1],
                             selected_id=member_char_id)
-                        switch_ok = (resolved is not None and
-                                     int(resolved['id']) ==
-                                     int(member_char_id))
-                    if not switch_ok:
+                    if resolved is None or int(resolved['id']) != member_char_id:
                         code = RC_CHARACTER_NOT_OWNED
-                        log(f'      [squad] switch rejected: char '
-                            f'{member_char_id} not squad-compatible '
-                            f'(faction={spec[0] if spec else "?"} '
-                            f'squad_tmpl={spec[1] if spec else "?"})')
                     else:
-                        await STORE.update_squad_member(
+                        updated = await STORE.update_squad_member(
                             slot_id, character_id=member_char_id,
                             status=status if status else None)
-                        log(f'      [DB] set_squad_member_status '
-                            f'row={slot_id} char={member_char_id} '
-                            f'status={status}')
-            else:
-                await STORE.update_squad_member(
-                    slot_id,
-                    character_id=None,
-                    status=status if status else None)
-                log(f'      [DB] set_squad_member_status row={slot_id} '
-                    f'char={mem["character_id"]} '
-                    f'status={status or mem["status"]}')
+                        if not updated:
+                            code = RC_SQUAD_SLOT_NOT_FOUND
+            elif code == RC_OK:
+                if not status:
+                    code = RC_SQUAD_SLOT_NOT_FOUND
+                else:
+                    updated = await STORE.update_squad_member(
+                        slot_id, status=status)
+                    if not updated:
+                        code = RC_SQUAD_SLOT_NOT_FOUND
         except Exception as e:
             log(f'      [DB] set_squad_member_status failed: {e}')
             code = RC_SQUAD_SLOT_NOT_FOUND
@@ -1416,14 +1586,21 @@ async def handle_update_squad_resource(sess, writer, cmd_id, req_type, proto):
     except Exception as e:
         log(f'      [squad] UpdateSquadResource parse error: {e}')
 
+    pid = await sess.ensure_player()
     code = RC_OK
-    if STORE is None or not squad_session_id:
+    if pid is None or STORE is None or not squad_session_id:
         code = RC_SQUAD_NOT_FOUND
     else:
         try:
             squad = await STORE.get_squad(squad_session_id)
             if squad is None:
                 code = RC_SQUAD_NOT_FOUND
+            else:
+                members = await STORE.list_squad_members(squad_session_id)
+                if not _player_is_leader(squad, members, pid):
+                    code = RC_SQUAD_NOT_OWNED
+                elif _squad_is_locked(squad, members):
+                    code = RC_SQUAD_IN_LOCKED_STATE
         except Exception as e:
             log(f'      [DB] update_squad_resource lookup failed: {e}')
             code = RC_SQUAD_NOT_FOUND

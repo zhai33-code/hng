@@ -122,6 +122,9 @@ class Session:
     def __init__(self, writer):
         self.writer = writer
         self.username = None
+        # Only set after login2_response has verified the challenge response.
+        # username is populated earlier by login2_begin and is not proof of auth.
+        self.authenticated = False
         self.login_ctx = None
         self.soldier_view_cmd = None  # SOLDIER_VIEW 的 cmd_id，用于推送 character 数据
         self.shop_view_cmd = None     # SHOP_VIEW 的 cmd_id，用于后续推送商店更新
@@ -137,9 +140,11 @@ class Session:
 
     async def ensure_player(self):
         """返回数据库 player_id；账号不存在 / DB 不可用返回 None（不自动建号）。"""
+        if not self.authenticated or not self.username:
+            return None
         if self.player_id is None:
             try:
-                self.player_id = await STORE.get_player(self.username or 'demo')
+                self.player_id = await STORE.get_player(self.username)
             except Exception as e:
                 log(f'[DB] get_player failed: {e}')
         return self.player_id

@@ -221,3 +221,10 @@ class BattleReportsMixin:
                     'AND career_order_id = $2', player_id, int(career_order_id))
                 return False, int(prog or 0)
             return True, int(row['progress'])
+
+    async def rollback_career_order_claim(self, player_id, career_order_id):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE career_orders SET status = 1, updated_at = now() '
+                'WHERE player_id = $1 AND career_order_id = $2 AND status = 2',
+                int(player_id), int(career_order_id))

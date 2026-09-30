@@ -28,27 +28,7 @@ def _cur_pid():
 
 # ---- war_catalogue 构建（用于 query_war_catalogue_response）----
 def _msg_war_catalogue_faction(fid, ftid, tag):
-    m = b''
-    m += pb_int64(1, fid)        # factionId
-    m += pb_int64(2, ftid)       # factionTemplateId (1=US 2=GE 3=SU)
-    m += pb_string(3, tag)       # factionTag
-    m += pb_int32(4, 0)          # factionVictoryPoints
-    m += pb_int32(5, 1)          # factionPlayerCount
-    m += pb_int32(6, 0)          # factionMinPlayerCount
-    m += pb_int32(7, 100)        # factionMaxPlayerCount
-    m += pb_int32(8, 1)          # factionPlayerOnlineCount
-    m += pb_int32(9, 0)          # factionBonus
-    m += pb_int32(10, 0)         # factionDeployedCommandPointsInfantry
-    m += pb_int32(11, 0)         # factionDeployedCommandPointsArmor
-    m += pb_int32(12, 0)         # factionDeployedCommandPointsAir
-    m += pb_int32(13, 0)         # factionControlledBattlefields
-    m += pb_uint32(14, 0)        # battlesWon
-    m += pb_uint32(15, 0)        # battlesLost
-    m += pb_uint32(16, 0)        # infantryLost
-    m += pb_uint32(17, 0)        # vehiclesLost
-    m += pb_uint32(18, 0)        # tanksLost
-    m += pb_uint32(19, 0)        # planesLost
-    return m
+    raise RuntimeError('war catalogue factions must come from war_campaign/DB')
 
 
 def _msg_war_catalogue():

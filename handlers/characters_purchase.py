@@ -46,6 +46,7 @@ from player_service import (
     _charge_player,
     _official_name_error,
     _push_player_refresh,
+    _refund_player_charge,
     )
 
 from starting_gear import STARTING_GEAR
@@ -122,10 +123,10 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
             f'pricingId={char_pricing_id}, currency={char_currency}')
     except Exception as e:
         log(f'      CreateCharacter parse error: {e}')
-        char_name = 'Soldier'
+        char_name = ''
         char_pack_id = 0
         char_pricing_id = 0
-        char_currency = 1
+        char_currency = 0
 
     # 官方规则校验：空名/非法名拒绝建号（no_name=53 / invalid_name=36）
     name_err = _official_name_error(char_name)
@@ -143,10 +144,15 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
 
     # 从 ShopCharacterPacks 解析阵营/模板/军衔（如 pack 35 = Soviet Infantryman: faction=3, template=1）
     pack_info = CHARACTER_PACKS.get(char_pack_id)
-    if pack_info:
-        faction, template, rank = pack_info
-    else:
-        faction, template, rank = 1, 1, 0
+    if not pack_info:
+        resp = build_response(
+            cmd_id, 'CreateCharacterResponse', pb_int32(1, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} CreateCharacterResponse '
+            f'(result=0 unknown_character_pack id={char_pack_id})')
+        return
+    faction, template, rank = pack_info
     log(f'      character faction={faction}, template={template}, rank={rank}')
 
     # 军衔单源：pack 的起始军衔 → 换算为初始 combat_xp（该军衔等级阈值）。
@@ -178,7 +184,10 @@ async def handle_createcharacterrequest(sess, writer, cmd_id, req_type, proto):
     paid_cost = 0
     paid_key = None
     if not first_free:
-        cost, ok = await _charge_player(sess, char_pricing_id, char_currency)
+        cost, ok = await _charge_player(
+            sess, char_pricing_id, char_currency,
+            expected_object_id=char_pack_id,
+            expected_types='ShopCharacterPacks')
         if not ok:
             rc = {1: 56, 3: 57, 2: 153}.get(int(char_currency or 1), 56)
             resp = build_response(cmd_id, 'CreateCharacterResponse', pb_int32(1, rc))
@@ -368,7 +377,8 @@ async def handle_renamecharacterrequest(sess, writer, cmd_id, req_type, proto):
         return
 
     # 扣款（改名费；无 pricing 时免费）
-    cost, ok = await _charge_player(sess, rc_pricing_id, rc_currency)
+    cost, ok = await _charge_player(
+        sess, rc_pricing_id, rc_currency, expected_types='character_rename')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'RenameCharacterResponse', resp_proto)
@@ -385,6 +395,8 @@ async def handle_renamecharacterrequest(sess, writer, cmd_id, req_type, proto):
             updated = await STORE.rename_character(pid, int(rc_char_id), rc_new_name)
         except Exception as e:
             log(f'[DB] rename_character failed: {e}')
+    if not updated:
+        await _refund_player_charge(sess, rc_currency, cost)
 
     resp_proto = pb_int32(1, 1 if updated else 0)
     resp = build_response(cmd_id, 'RenameCharacterResponse', resp_proto)
@@ -435,7 +447,9 @@ async def handle_changecharactertemplaterequest(sess, writer, cmd_id, req_type, 
         return
 
     # 扣款（转职费）
-    cost, ok = await _charge_player(sess, ct_pricing_id, ct_currency)
+    cost, ok = await _charge_player(
+        sess, ct_pricing_id, ct_currency, expected_object_id=new_template,
+        expected_types='CharacterTemplateSwitchItem')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'ChangeCharacterTemplateResponse', resp_proto)
@@ -453,6 +467,8 @@ async def handle_changecharactertemplaterequest(sess, writer, cmd_id, req_type, 
                 pid, int(ct_char_id), new_template)
         except Exception as e:
             log(f'[DB] change_character_template failed: {e}')
+    if old_template is None:
+        await _refund_player_charge(sess, ct_currency, cost)
 
     resp_proto = pb_int32(1, 1 if old_template is not None else 0)
     resp = build_response(cmd_id, 'ChangeCharacterTemplateResponse', resp_proto)
@@ -497,8 +513,12 @@ async def handle_swapheadrequest(sess, writer, cmd_id, req_type, proto):
 
     # 购买头（有定价且非默认头）先扣款
     head_swap_type = 1 if sh_pricing_id else 0  # 0=eFree 1=eNeedPayment
-    if sh_pricing_id and sh_head_template:
-        cost, ok = await _charge_player(sess, sh_pricing_id, sh_currency)
+    cost = 0
+    if sh_head_template:
+        cost, ok = await _charge_player(
+            sess, sh_pricing_id, sh_currency,
+            expected_object_id=sh_head_template,
+            expected_types=('UniformPartTemplate', 'SwapToDefaultHead'))
         if not ok:
             resp_proto = pb_int32(1, 56)  # not_enough_credits
             resp = build_response(cmd_id, 'SwapHeadResponse', resp_proto)
@@ -540,6 +560,11 @@ async def handle_swapheadrequest(sess, writer, cmd_id, req_type, proto):
                 await STORE.swap_character_head(pid, int(sh_char_id), int(sh_head_template))
         except Exception as e:
             log(f'[DB] swap head failed: {e}')
+            await _refund_player_charge(sess, sh_currency, cost)
+            writer.write(build_response(
+                cmd_id, 'SwapHeadResponse', pb_int32(1, 0)))
+            await writer.drain()
+            return
 
     resp_proto = pb_int32(1, 1)  # response = 1 (ok)
     resp = build_response(cmd_id, 'SwapHeadResponse', resp_proto)

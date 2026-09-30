@@ -1,8 +1,17 @@
 import asyncio
+import inspect
 
+from handlers import auth
+from handlers import characters_purchase
+from handlers import squad
 import player_service
+import matchmaking
+import messages
+import mm_handler
+import warserver_messages
+from handlers import acks
 from handlers import uniforms
-from protocol import pb_int32, pb_int64
+from protocol import pb_int32, pb_int64, pb_parse_loose, msg_player
 from war_campaign.production import _production_interval_ms
 import wardb
 
@@ -32,6 +41,9 @@ class _FailingUniformStore:
 
     async def create_uniform_variant(self, *_args):
         raise RuntimeError('forced insert failure')
+
+    async def get_character(self, player_id, character_id):
+        return {'id': character_id, 'player_id': player_id}
 
     async def add_currency(self, player_id, **amount):
         self.refunds.append((player_id, amount))
@@ -76,3 +88,66 @@ def test_unknown_preset_cannot_silently_launch_mill():
         pass
     else:
         raise AssertionError('unknown preset silently selected a scene')
+
+
+def test_missing_player_and_war_data_stays_empty():
+    player = pb_parse_loose(msg_player('Unknown'))
+    assert player[1] == 0
+    assert player[10] == 0
+    assert player[11] == 0
+    assert player[14] == 0
+    assert player[17] == 0
+    assert player[24] == 0
+    assert player[26] == b''
+    catalogue = pb_parse_loose(messages.msg_query_war_catalogue_response())
+    assert 1 not in catalogue
+    assert catalogue[2] == 0
+
+
+def test_runtime_battlefield_ids_are_scoped_to_mission():
+    a = warserver_messages._runtime_entity_id(101, 'battlefield')
+    b = warserver_messages._runtime_entity_id(102, 'battlefield')
+    assert a != b
+    assert a not in (1, 880001, 880100, 880101)
+
+
+def test_ordinary_missions_do_not_claim_a_strategy_city():
+    ai = pb_parse_loose(
+        matchmaking._msg_mission_info(10, 42, 'zulu', 2))
+    assert ai[5] == 0
+    assert ai[6] == 0
+
+    staged = pb_parse_loose(mm_handler._msg_mission_info_multi(
+        11, {
+            'players': [{'player_id': 42}],
+            'preset': 10,
+            'battle_id': 0,
+            'defender_faction': 2,
+        }, 'zulu'))
+    assert staged[5] == 0
+    assert staged[6] == 0
+
+
+def test_unimplemented_mutations_do_not_return_fake_success():
+    for request in (
+            'SteamFinalizeTransactionRequest', 'DebugSetPlayerGoldRequest',
+            'DebugResupplyATRequest', 'AdminToolExecuteSqlRequest'):
+        assert request not in acks.HANDLERS
+
+
+def test_production_auth_has_no_demo_identity_fallback():
+    source = inspect.getsource(auth)
+    assert 'DemoPlayer' not in source
+
+
+def test_missing_identity_and_unknown_pack_have_no_placeholder_fallbacks():
+    assert "sess.username or 'Player'" not in inspect.getsource(squad)
+    source = inspect.getsource(characters_purchase)
+    assert "char_name = 'Soldier'" not in source
+    assert 'faction, template, rank = 1, 1, 0' not in source
+
+
+def test_missing_force_pool_does_not_make_fake_assault_teams(monkeypatch):
+    monkeypatch.setattr(matchmaking.force_pool, 'assault_team_names',
+                        lambda *_args: [])
+    assert matchmaking._assault_team_nodes(1, 999) == []

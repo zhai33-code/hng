@@ -203,7 +203,7 @@ def test_starting_sight_purchase_waiver():
     async def _wowner(sess, wid):
         return _owner_box['owner'] if wid else 0
 
-    async def _charge(sess, pricing_id, currency):
+    async def _charge(sess, pricing_id, currency, **_kwargs):
         return 0, True
 
     async def _noop_republish(sess, writer, cid):

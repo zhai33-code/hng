@@ -279,8 +279,14 @@ async def handle_create_insignia(sess, writer, cmd_id, req_type, proto):
 
     # 逐项扣款（部件购买费）；任一不足 → not_enough_credits
     from player_service import _charge_player
-    for pid_price in pricing_ids:
-        cost, ok = await _charge_player(sess, pid_price, currency)
+    for index, pid_price in enumerate(pricing_ids):
+        part = parts[index] if index < len(parts) else None
+        if part is None:
+            ok, cost = False, 0
+        else:
+            cost, ok = await _charge_player(
+                sess, pid_price, currency,
+                expected_object_id=part.get('partId'))
         if not ok:
             resp = build_response(cmd_id, 'CreateInsigniaResponse',
                                   pb_int32(1, 56))

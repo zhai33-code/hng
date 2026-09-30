@@ -143,9 +143,13 @@ def _parse_characters(cli, foreign_pid):
             continue
         if foreign_pid and _iv(f, 3) != foreign_pid:
             continue                        # 他人角色行（理论不出现，防御）
+        name = _sv(f, 2).strip()
+        if not name:
+            raise ForeignCollectError(
+                f'外服角色 {_iv(f, 1)} 缺少名字，拒绝生成占位身份')
         out.append({
             'fid': _iv(f, 1),
-            'name': _sv(f, 2, 'Soldier') or 'Soldier',
+            'name': name,
             'template': _iv(f, 4),
             'faction': _iv(f, 5),
             'rank': _iv(f, 13),

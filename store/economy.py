@@ -10,12 +10,12 @@ class EconomyMixin:
     注意: get_username 在此二次定义以保持原 PlayerStore 的覆盖语义。"""
 
     async def get_currency(self, player_id):
-        """返回 {credits, warfunds, gold}；账号不存在返回默认值。"""
+        """返回持久化余额；账号不存在时明确失败，禁止发放伪默认余额。"""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 'SELECT credits, warfunds, gold FROM players WHERE id = $1', player_id)
         if row is None:
-            return {'credits': 100000, 'warfunds': 100000, 'gold': 100000}
+            raise LookupError(f'player {int(player_id)} does not exist')
         return {'credits': row['credits'], 'warfunds': row['warfunds'],
                 'gold': row['gold']}
 
@@ -108,6 +108,17 @@ class EconomyMixin:
                     'daily_reward_redeemed_count = $2 WHERE id = $1',
                     int(player_id), n)
         return True, n, n, int(row['c'])
+
+    async def rollback_daily_reward_claim(self, player_id, redeemed_count):
+        """Make a failed same-day reward delivery claimable again."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE players SET daily_reward_redeemed_count = '
+                'GREATEST(daily_reward_redeemed_count - 1, 0), '
+                'last_daily_reward_at = NULL WHERE id = $1 '
+                'AND daily_reward_redeemed_count = $2 '
+                'AND last_daily_reward_at::date = now()::date',
+                int(player_id), int(redeemed_count))
 
     async def touch_daily_login(self, player_id):
         """登录即记连续天数（subscribeplayerview 推 player 行前、以及

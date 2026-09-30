@@ -61,9 +61,11 @@ from messages import (
 
 from player_service import (
     _char_unlock_bits_for,
+    _character_owned,
     _charge_player,
     _msg_player_for,
     _push_player_refresh,
+    _refund_player_charge,
     push_ribbon_unlock_notifications,
     )
 
@@ -316,7 +318,8 @@ def _bundle_item_blocks(items_xml):
     return blocks if blocks else [root]
 
 
-async def _deliver_store_bundle(sess, writer, pid, bundle_id, req_char_id):
+async def _deliver_store_bundle(sess, writer, pid, bundle_id, req_char_id,
+                                with_status=False):
     """解析 StoreBundle.items XML 并逐项发货（入库 + KVCS 推送）。
 
     支持的元素：charactertemplate（含嵌套武器/载具，创建新角色）、
@@ -328,13 +331,13 @@ async def _deliver_store_bundle(sess, writer, pid, bundle_id, req_char_id):
     if info is None:
         log(f'      [bundle] StoreBundle {bundle_id} not found in WarDatabase, '
             f'nothing delivered')
-        return 0, 0
+        return (0, 0, 0, 1) if with_status else (0, 0)
     target_type, factions, identifier, items_xml = info
     try:
         blocks = _bundle_item_blocks(items_xml)
     except Exception as e:
         log(f'      [bundle] StoreBundle {bundle_id} items XML parse failed: {e}')
-        return 0, 0
+        return (0, 0, 0, 1) if with_status else (0, 0)
     root = blocks[0]
     if len(blocks) > 1:
         # 多阵营礼包：按请求角色阵营选取对应 <items factionTemplateId=N>，
@@ -357,6 +360,8 @@ async def _deliver_store_bundle(sess, writer, pid, bundle_id, req_char_id):
 
     n_boosters = 0
     n_memberships = 0
+    delivered = 0
+    failed = 0
     for el in list(root):
         tag = el.tag.lower()
         try:
@@ -415,12 +420,18 @@ async def _deliver_store_bundle(sess, writer, pid, bundle_id, req_char_id):
                         f'char={req_char_id}) [bundle]')
             else:
                 log(f'      [bundle] unknown element <{el.tag}>, skipped')
+                failed += 1
+                continue
+            delivered += 1
         except Exception as e:
             # 单项失败不影响其余物品发货（钱已扣，尽量多发货并留日志排查）
             log(f'[DB] bundle item <{el.tag} id={el.get("id")}> delivery '
                 f'failed: {e}')
+            failed += 1
     log(f'      [bundle] {identifier!r} delivered: +{n_boosters} boosters, '
         f'+{n_memberships} memberships')
+    if with_status:
+        return n_boosters, n_memberships, delivered, failed
     return n_boosters, n_memberships
 
 
@@ -448,8 +459,23 @@ async def handle_buystorebundlerequest(sess, writer, cmd_id, req_type, proto):
     except Exception as e:
         log(f'      BuyStoreBundle parse error: {e}')
 
+    # Reject unknown/malformed bundle ids before taking any money.
+    if int(bundle_id or 0) not in _STORE_BUNDLES:
+        writer.write(build_response(
+            cmd_id, 'BuyStoreBundleResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
+    if (_STORE_BUNDLES[int(bundle_id)][0].lower() == 'soldier'
+            and not await _character_owned(sess, char_id)):
+        writer.write(build_response(
+            cmd_id, 'BuyStoreBundleResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
+
     # 扣款；余额不足返回错误响应
-    cost, ok = await _charge_player(sess, pricing_id, currency)
+    cost, ok = await _charge_player(
+        sess, pricing_id, currency, expected_object_id=bundle_id,
+        expected_types='StoreBundle')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'BuyStoreBundleResponse', resp_proto)
@@ -460,16 +486,25 @@ async def handle_buystorebundlerequest(sess, writer, cmd_id, req_type, proto):
 
     # ★ 发货：解析 WarDatabase StoreBundle.items XML，逐项入库并推送
     #   （此前只扣款返回 ok，礼包物品从未入库——钱扣了东西不到账的根因）
-    n_boosters, n_memberships = 0, 0
+    n_boosters, n_memberships, delivered, failed = 0, 0, 0, 0
     pid = await sess.ensure_player()
     if pid is not None and bundle_id:
         try:
-            n_boosters, n_memberships = await _deliver_store_bundle(
-                sess, writer, pid, bundle_id, char_id)
+            n_boosters, n_memberships, delivered, failed = await _deliver_store_bundle(
+                sess, writer, pid, bundle_id, char_id, with_status=True)
         except Exception as e:
             log(f'[DB] deliver store bundle {bundle_id} failed: {e}')
     elif pid is None:
         log('      [bundle] no player id, delivery skipped')
+
+    if delivered == 0 or failed:
+        await _refund_player_charge(sess, currency, cost)
+        writer.write(build_response(
+            cmd_id, 'BuyStoreBundleResponse', pb_int32(1, 0)))
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} BuyStoreBundleResponse '
+            f'(result=0 delivery_failed delivered={delivered} failed={failed})')
+        return
 
     # 返回 result=1 (ok)，客户端 dispatch PurchaseCompletedSignal 显示购买成功弹窗
     resp_proto = pb_int32(1, 1)  # result = 1 (ok)
@@ -802,7 +837,10 @@ async def handle_addribbonlevelrequest(sess, writer, cmd_id, req_type, proto):
         log(f'      AddRibbonLevel parse error: {e}')
 
     # 扣款（购买勋带等级费用）；余额不足返回错误响应
-    cost, ok = await _charge_player(sess, pricing_id, currency)
+    cost, ok = await _charge_player(
+        sess, pricing_id, currency,
+        expected_object_id=upgrade_template_id,
+        expected_types='RibbonLevelUpgradeTemplate')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'AddRibbonLevelResponse', resp_proto)

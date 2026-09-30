@@ -167,6 +167,13 @@ class EquipmentWeaponsMixin:
         按新旧两把重复计算。"""
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                if int(container_slot) > 0:
+                    owns_character = await conn.fetchval(
+                        'SELECT EXISTS(SELECT 1 FROM characters WHERE id = $1 '
+                        'AND player_id = $2 AND NOT is_deleted)',
+                        int(container_id), int(player_id))
+                    if not owns_character:
+                        return []
                 row = await conn.fetchrow(
                     'SELECT id, name, template_id, character_id, container_id, '
                     'container_slot, variant_template_id, variant_id, condition, '
@@ -292,4 +299,3 @@ class EquipmentWeaponsMixin:
             await conn.execute(
                 'UPDATE weapon_ammo SET condition = $1 '
                 'WHERE id = $2 AND player_id = $3', condition, ammo_id, player_id)
-

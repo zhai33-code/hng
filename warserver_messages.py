@@ -38,7 +38,6 @@ from wardb import (
     _rank_from_combat_xp,
     _ribbon_level_from_xp,
     assault_ap_decision,
-    battlefield_entity_for_gamemap,
     battlefield_pos,
     charactertemplate_actionid,
     default_uniform_variant,
@@ -159,14 +158,8 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
             f'from characterlist (generals cannot enter combat)')
     char_entries = [_msg_character_entry(ch, loadout) for ch in combat_chars]
     if not char_entries:
-        e = b''
-        e += pb_int64(1, int(char_id or 0))
-        e += pb_string(2, 'Soldier')
-        e += pb_int32(7, 0)                      # 7 rank
-        e += pb_int32(8, 0)                      # 8 level
-        e += pb_int32(9, 0)                      # 9 xp
-        e += pb_int32(11, 0)                     # 11 ribbonCount
-        char_entries.append(pb_message(12, e))
+        raise LookupError(
+            f'player {player_id} has no combat character for faction {faction}')
     # f18 squadPoints ← 本次进局角色的 characters.squad_points
     squad_points = int(joined.get('squad_points', 0) or 0) if joined else 0
 
@@ -324,14 +317,14 @@ def _msg_character_entry(ch, loadout=None):
     # 飞行员被当步兵 → 徒步部署、飞机不显示（2026-08-25 回放对照修复：
     # Yaroslav(飞行员) f7=11 / Kaspar(步兵) f7=2 / Arkady(坦克) f7=10）
     # f8 军衔（回放对照：Artyom f8=13 == PMS characterRank）
-    out += pb_int32(7, charactertemplate_actionid(ch.get('template', 1)))
+    out += pb_int32(7, charactertemplate_actionid(ch.get('template', 0)))
     out += pb_int32(8, rank)
     # f9 军服迷彩模板（characters.uniform_variant_id 实例 id → uniform_variants 模板；
     # 无实例时回退 (兵种,阵营) 默认变体 —— 回放里官方服每个角色 f9 恒非零，
     # 缺失则客户端无法构建士兵外观模型，角色不显示）
     uvt = loadout['uv_tmpl'].get(int(ch.get('uniform_variant_id', 0) or 0), 0)
     if not uvt:
-        uvt = default_uniform_variant(ch.get('template', 1), ch.get('faction', 0))
+        uvt = default_uniform_variant(ch.get('template', 0), ch.get('faction', 0))
     if uvt:
         out += pb_int64(9, int(uvt))
     # f10 军装部件模板：只发已装备的（characters.headgear_id → uniform_parts
@@ -697,7 +690,8 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
                                         is_campaign=False,
                                         days_since_war_started=0,
                                         supply_line_id=0,
-                                        underdog_mults=None):
+                                        underdog_mults=None,
+                                        map_entity_id=0):
     """构建 ResponseBattleFieldSettings（31 字段，spbc 描述符 @0x1807B1120）。
 
     天气/时段：weather_time_of_day / weather_condition 取客户端枚举
@@ -827,12 +821,10 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     # f29/f30 stagedPos：战斗内 SpawnMenu 的 IngameEuropeMapOverlay 缩放定位
     # （player.dll SpawnMenu/IngameEuropeMapOverlayBlend + WarMap/deployTarget）。
     # 取本局 gamemap 对应 battlefield 行坐标（与简报 GMD f8/f9、大厅地图同源
-    # 同值）；遭遇战图无行时 battlefield_entity_for_gamemap 回退 Benoit Village
-    # 锚点。恒为 0.0 会让 overlay 缩放到欧洲地图左上角（与大厅位置不一致）。
-    gamemap_id = int(preset.get(3, 0) or 0)
-    if not gamemap_id:
+    # 同值）；无战略地图实体时保持 0.0，不冒充某座复用该场景的城市。
+    if not int(preset.get(3, 0) or 0):
         raise LookupError(f'mission preset {preset_id} has no gamemap')
-    pos = battlefield_pos(battlefield_entity_for_gamemap(gamemap_id)) or (0.0, 0.0)
+    pos = battlefield_pos(int(map_entity_id or 0)) or (0.0, 0.0)
     m += pb_float(29, pos[0])                      # 29 stagedPosX
     m += pb_float(30, pos[1])                      # 30 stagedPosY
     m += pb_bool(31, enable_sa_bots)                # 31 enableSaBots（SA bot：官方多人局路径，killfeed=阵营默认名）

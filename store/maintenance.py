@@ -196,6 +196,14 @@ class MaintenanceMixin:
         8: 'vehicle_upgrades', 9: 'vehicle_ammo', 10: 'vehicle_variants',
         42: 'tracer_effects',
     }
+    _ITEM_TYPE_TEMPLATE_COLUMNS = {
+        1: 'template_id', 2: 'vehicle_variant_template_id',
+        3: 'uniform_part_template_id', 4: 'uniform_variant_template_id',
+        5: 'template_id', 6: 'ammo_template_id',
+        7: 'weapon_variant_template_id', 8: 'upgrade_template_id',
+        9: 'ammo_template_id', 10: 'vehicle_variant_template_id',
+        42: 'tracer_template_id',
+    }
     # 挂靠件（配件/皮肤/弹药/载具升级与弹药）指派角色时需同步清 0 的外键列。
     # 官方容器归属不变式：客户端 ModifyWeaponMediator 只认
     # characterId==角色 && (weaponId==本枪 || weaponId==0)，指派后仍挂在
@@ -221,6 +229,13 @@ class MaintenanceMixin:
         if tbl is None:
             return False
         async with self.pool.acquire() as conn:
+            if int(character_id or 0) > 0:
+                owns_character = await conn.fetchval(
+                    'SELECT EXISTS(SELECT 1 FROM characters WHERE id = $1 '
+                    'AND player_id = $2 AND NOT is_deleted)',
+                    int(character_id), int(player_id))
+                if not owns_character:
+                    return False
             if tbl == 'weapons':
                 n = await conn.execute(
                     f'UPDATE {tbl} SET character_id = $3 WHERE id = $1 '
@@ -316,6 +331,18 @@ class MaintenanceMixin:
                 f'SELECT character_id FROM {tbl} WHERE id = $1 AND player_id = $2',
                 int(object_id), int(player_id))
             return row['character_id'] if row else None
+
+    async def get_item_template(self, player_id, item_type, object_id):
+        """Return the owned item's pricing object id, or None."""
+        kind = int(item_type or 0)
+        tbl = self._ITEM_TYPE_ID_TABLES.get(kind)
+        column = self._ITEM_TYPE_TEMPLATE_COLUMNS.get(kind)
+        if tbl is None or column is None:
+            return None
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                f'SELECT {column} FROM {tbl} WHERE id = $1 AND player_id = $2',
+                int(object_id), int(player_id))
 
     async def send_item_to_depot(self, player_id, item_type, object_id):
         """物品送回仓库（SendItemToDepotRequest，itemType 为 ItemType 枚举 int）：
@@ -631,4 +658,3 @@ class MaintenanceMixin:
                     'DELETE FROM squad_members WHERE character_id NOT IN '
                     '(SELECT id FROM characters)')
         return deleted
-

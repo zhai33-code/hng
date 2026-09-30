@@ -401,7 +401,7 @@ async def _grant_daily_reward(pid, day):
     会员按 ShopMembershipItems 时长入 player_memberships。"""
     rtype = _DAILY_REWARDS.get(day, '')
     spec = _DAILY_REWARD_GRANTS.get(rtype)
-    out = {'items': [], 'push': set()}
+    out = {'items': [], 'push': set(), 'ok': True}
     if STORE is None or spec is None:
         return out
     kind, val = spec
@@ -431,6 +431,7 @@ async def _grant_daily_reward(pid, day):
             out['push'].add('membership')
     except Exception as e:
         log(f'      [DB] grant daily reward (day={day}, {rtype}) failed: {e}')
+        out['ok'] = False
     return out
 
 
@@ -442,7 +443,7 @@ async def _grant_consecutive_bonus(pid, consecutive):
     即两奖齐发）；折算镜像客户端：连续天数 >=8 → 回到第 2 天开新一轮。
     返回结构同 _grant_daily_reward。"""
     cday = 2 if int(consecutive) >= 8 else int(consecutive)
-    out = {'items': [], 'push': set()}
+    out = {'items': [], 'push': set(), 'ok': True}
     if STORE is None:
         return out
     for kind, val in _CONSECUTIVE_REWARDS.get(cday, []):
@@ -460,6 +461,7 @@ async def _grant_consecutive_bonus(pid, consecutive):
         except Exception as e:
             log(f'      [DB] grant consecutive bonus (day={cday}, '
                 f'{kind} {val}) failed: {e}')
+            out['ok'] = False
     return out
 
 
@@ -491,6 +493,7 @@ async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto
     pid = await sess.ensure_player()
     code = RC_OK
     day = 0
+    redeemed = 0
     consecutive = 0
     if pid is not None and STORE is not None:
         try:
@@ -513,6 +516,15 @@ async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto
     if day:
         granted = await _grant_daily_reward(int(pid), _adjust_day(day))
         bonus = await _grant_consecutive_bonus(int(pid), consecutive)
+        delivery_ok = granted['ok'] and bonus['ok']
+        if not delivery_ok:
+            try:
+                await STORE.rollback_daily_reward_claim(int(pid), redeemed)
+            except Exception as e:
+                log(f'      [DB] rollback daily reward claim failed: {e}')
+            code = 0
+            granted['items'].clear()
+            bonus['items'].clear()
         if granted['items']:
             packs.append(_msg_voucher_pack_info(granted['items']))
         if bonus['items']:
@@ -532,8 +544,9 @@ async def handle_redeem_daily_login_reward(sess, writer, cmd_id, req_type, proto
         # 货币变化时的刷新也一并覆盖（不再只看 'player' push 标记）
         await _push_player_refresh(sess, writer)
         # 生涯军令 12 eRedeemDailyReward（客户端无上报点）+ 推行实时刷新
-        from handlers.career import complete_order_and_push
-        await complete_order_and_push(sess, writer, pid, 12)
+        if delivery_ok:
+            from handlers.career import complete_order_and_push
+            await complete_order_and_push(sess, writer, pid, 12)
 
     resp = build_response(cmd_id, 'RedeemDailyLoginRewardResponse',
                           pb_int32(1, code) + infos)
@@ -615,7 +628,10 @@ async def handle_add_warbond(sess, writer, cmd_id, req_type, proto):
     try:
         # 扣款+发货同一事务：任一步失败整体回滚（钱未扣、货未发）
         async with STORE.transaction() as tx:
-            cost, ok = await _charge_player(sess, pricing_id, currency, conn=tx)
+            cost, ok = await _charge_player(
+                sess, pricing_id, currency, conn=tx,
+                expected_object_id=template_id,
+                expected_types='ShopWarBondItemTemplate')
             if not ok:
                 raise _PaymentFailed()
             if pid is not None and template_id:
@@ -625,7 +641,7 @@ async def handle_add_warbond(sess, writer, cmd_id, req_type, proto):
         code = _NOT_ENOUGH.get(currency, 56)
     except Exception as e:
         log(f'      [DB] add_warbond failed (rolled back): {e}')
-        cost, ok = 0, True
+        cost, ok, code = 0, False, 0
 
     if ok:
         await _push_player_refresh(sess, writer)
@@ -726,7 +742,10 @@ async def handle_add_membership(sess, writer, cmd_id, req_type, proto):
     try:
         # 扣款+发货同一事务：任一步失败整体回滚（钱未扣、货未发）
         async with STORE.transaction() as tx:
-            cost, ok = await _charge_player(sess, pricing_id, currency, conn=tx)
+            cost, ok = await _charge_player(
+                sess, pricing_id, currency, conn=tx,
+                expected_object_id=template_id,
+                expected_types='ShopMembershipItems')
             if not ok:
                 raise _PaymentFailed()
             if pid is not None and template_id:
@@ -746,7 +765,7 @@ async def handle_add_membership(sess, writer, cmd_id, req_type, proto):
         code = _NOT_ENOUGH.get(currency, 56)
     except Exception as e:
         log(f'      [DB] add_membership failed (rolled back): {e}')
-        cost, ok = 0, True
+        cost, ok, code = 0, False, 0
 
     if ok:
         await _push_player_refresh(sess, writer)
@@ -783,7 +802,10 @@ async def handle_add_booster(sess, writer, cmd_id, req_type, proto):
     try:
         # 扣款+发货同一事务：任一步失败整体回滚（钱未扣、货未发）
         async with STORE.transaction() as tx:
-            cost, ok = await _charge_player(sess, pricing_id, currency, conn=tx)
+            cost, ok = await _charge_player(
+                sess, pricing_id, currency, conn=tx,
+                expected_object_id=booster_id,
+                expected_types='RibbonBoosterTemplate')
             if not ok:
                 raise _PaymentFailed()
             if pid is not None and booster_id:
@@ -798,7 +820,7 @@ async def handle_add_booster(sess, writer, cmd_id, req_type, proto):
         code = _NOT_ENOUGH.get(currency, 56)
     except Exception as e:
         log(f'      [DB] add_booster failed (rolled back): {e}')
-        cost, ok = 0, True
+        cost, ok, code = 0, False, 0
 
     if ok:
         await _push_player_refresh(sess, writer)
@@ -863,7 +885,9 @@ async def handle_add_various_booster(sess, writer, cmd_id, req_type, proto):
     try:
         # 扣款+发货同一事务：任一步失败整体回滚（钱未扣、货未发）
         async with STORE.transaction() as tx:
-            cost, ok = await _charge_player(sess, pricing_id, currency, conn=tx)
+            cost, ok = await _charge_player(
+                sess, pricing_id, currency, conn=tx,
+                expected_object_id=template_id, expected_types='BoosterTemplate')
             if not ok:
                 raise _PaymentFailed()
             if pid is not None and template_id:
@@ -878,7 +902,7 @@ async def handle_add_various_booster(sess, writer, cmd_id, req_type, proto):
         code = _NOT_ENOUGH.get(currency, 56)
     except Exception as e:
         log(f'      [DB] add_booster failed (rolled back): {e}')
-        cost, ok = 0, True
+        cost, ok, code = 0, False, 0
 
     if ok:
         await _push_player_refresh(sess, writer)
@@ -947,7 +971,9 @@ async def handle_add_ticket(sess, writer, cmd_id, req_type, proto):
     try:
         # 扣款+发货同一事务：任一步失败整体回滚（钱未扣、货未发）
         async with STORE.transaction() as tx:
-            cost, ok = await _charge_player(sess, pricing_id, currency, conn=tx)
+            cost, ok = await _charge_player(
+                sess, pricing_id, currency, conn=tx,
+                expected_object_id=template_id)
             if not ok:
                 raise _PaymentFailed()
             if pid is not None and template_id:
@@ -959,7 +985,7 @@ async def handle_add_ticket(sess, writer, cmd_id, req_type, proto):
         code = _NOT_ENOUGH.get(currency, 56)
     except Exception as e:
         log(f'      [DB] add_ticket failed (rolled back): {e}')
-        cost, ok = 0, True
+        cost, ok, code = 0, False, 0
 
     if ok:
         await _push_player_refresh(sess, writer)

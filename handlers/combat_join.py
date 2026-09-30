@@ -159,8 +159,15 @@ async def _push_pms_admitted(sess, writer, mm_sess):
     pid = int(mm_sess.get('player_id', 0) or 0)
     char_id = int(mm_sess.get('char_id', 0) or 0)
     mission_id = int(mm_state.PMS_TO_MISSION.get(pms_id, 0) or 0)
-    gamertag = mm_sess.get('gamertag') or 'Player'
-    faction = int(mm_sess.get('faction', 3) or 3)
+    gamertag = str(mm_sess.get('gamertag') or '').strip()
+    if not gamertag:
+        log(f'      [combat] PMS {pms_id} has no gamertag; Admitted suppressed')
+        return
+    faction = int(mm_sess.get('faction', 0) or 0)
+    if faction not in (1, 2, 3):
+        log(f'      [combat] PMS {pms_id} has invalid faction={faction}; '
+            f'Admitted push suppressed')
+        return
     char_name, rank = gamertag, 0
     if STORE is not None and pid and char_id:
         try:

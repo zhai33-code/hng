@@ -381,8 +381,6 @@ COMBAT_START_COUNTDOWN_OVERRIDE = _int_env(
     'MM_COMBAT_START_COUNTDOWN_OVERRIDE', 10)
 # 非战役地图通常没有 battlefield 行。0 会让客户端不解析成无关城市；
 # 仅兼容特殊客户端时才显式设置一个真实 battlefield entity id。
-MISSION_MAP_ENTITY_FALLBACK = _int_env(
-    'MM_MISSION_MAP_ENTITY_FALLBACK', 0)
 
 # ---- M3 战争经济（docs/hng-rts-protocol.md §9 / §3.12.1）----
 # 阵营资源生产推进最小间隔秒（war_tick 内检查；产量节奏由模板 600s 决定，

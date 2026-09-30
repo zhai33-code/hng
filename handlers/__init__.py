@@ -30,6 +30,15 @@ from . import (
     weapons_purchase,
     )
 from state import CURRENT_PID
+from protocol import build_response
+from state import log
+
+
+_PREAUTH_REQUESTS = {
+    'QueryServerInfo', 'QueryBannedMachineRequest', 'StartLogin',
+    'login2_begin', 'login2_response',
+}
+_COMBAT_SERVER_REQUESTS = set(combat.HANDLERS) | {'PlayerJoined'}
 
 _EXACT = {}
 for _m in (acks, auth, battlereport, career, characters,
@@ -47,6 +56,19 @@ _PREFIX_HANDLERS = {
 
 
 async def dispatch(sess, writer, cmd_id, req_type, proto):
+    h = _EXACT.get(req_type)
+    is_view_request = req_type.lower().startswith(('subscribe', 'unsubscribe'))
+    # Unknown requests may belong to game_server/mm_handler and must fall
+    # through.  Authentication is enforced for this package's own surface.
+    if ((h is not None or is_view_request)
+            and req_type not in _PREAUTH_REQUESTS
+            and not getattr(sess, 'authenticated', False)
+            and not (getattr(sess, 'is_combat_server', False)
+                     and req_type in _COMBAT_SERVER_REQUESTS)):
+        log(f'[auth] rejected unauthenticated request {req_type}')
+        writer.write(build_response(cmd_id, 'HandlerErrorResponse', b''))
+        await writer.drain()
+        return True
     # 绑定当前会话的数据库 player_id：messages._msg_* 构建士兵视图各表行
     # 的 playerId 字段从 contextvar 读（客户端按 currentPlayer.id 过滤）。
     # ★ 只在 username 已设置时解析：首条消息几乎总是 login2_begin，此时
@@ -61,9 +83,7 @@ async def dispatch(sess, writer, cmd_id, req_type, proto):
             CURRENT_PID.set(0)
     except Exception as e:
         CURRENT_PID.set(0)
-        from state import log
         log(f'[auth] failed to bind CURRENT_PID: {e}')
-    h = _EXACT.get(req_type)
     if h is not None:
         await h(sess, writer, cmd_id, req_type, proto)
         return True

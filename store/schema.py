@@ -607,6 +607,46 @@ CREATE TABLE IF NOT EXISTS player_memberships (
 );
 -- 小队成员会话行 id（KVCS delete 需 8 字节行 id，proto SquadMemberSession.id）
 ALTER TABLE squad_members ADD COLUMN IF NOT EXISTS id BIGSERIAL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_squad_members_row_id
+    ON squad_members(id);
+-- 修复历史坏状态：一个账号最多保留一条小队关系（正式成员优先于 pending），
+-- 清空队并把悬空 leader 修正到仍在队内的首名成员。后续并发由事务内的
+-- player advisory lock 阻止，不再产生重复关系。
+WITH ranked_memberships AS (
+    SELECT m.id,
+           row_number() OVER (
+               PARTITION BY c.player_id
+               ORDER BY CASE WHEN m.status = 1 THEN 1 ELSE 0 END, m.id
+           ) AS rn
+      FROM squad_members m
+      JOIN characters c ON c.id = m.character_id
+)
+DELETE FROM squad_members m
+ USING ranked_memberships r
+ WHERE m.id = r.id AND r.rn > 1;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_squad_members_character
+    ON squad_members(character_id);
+DELETE FROM squads s
+ WHERE NOT EXISTS (
+     SELECT 1 FROM squad_members m WHERE m.squad_id = s.id
+ );
+UPDATE squads s
+   SET leader_character_id = (
+           SELECT m.character_id FROM squad_members m
+            WHERE m.squad_id = s.id
+            ORDER BY CASE WHEN m.status = 1 THEN 1 ELSE 0 END, m.id LIMIT 1
+       ),
+       faction = (
+           SELECT c.faction FROM squad_members m
+           JOIN characters c ON c.id = m.character_id
+            WHERE m.squad_id = s.id
+            ORDER BY CASE WHEN m.status = 1 THEN 1 ELSE 0 END, m.id LIMIT 1
+       )
+ WHERE NOT EXISTS (
+     SELECT 1 FROM squad_members current_leader
+      WHERE current_leader.squad_id = s.id
+        AND current_leader.character_id = s.leader_character_id
+ );
 -- 军团属性（CreateCompanyRequest 的短名/描述）
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS name_short TEXT NOT NULL DEFAULT '';
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';

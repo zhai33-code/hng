@@ -88,6 +88,8 @@ async def _squad_request(mission_session_id, squad_id, sess=None):
     await game_server.handle_request(sess, w, 6, 'SquadRequest', proto)
     main, _ = Chunk.parse(w.data, 0)
     title = main.subs[0]
+    if title.as_str() == 'HandlerErrorResponse':
+        return {'error': True}
     resp = _parse_varints(title.subs[0].data)
     squad_def = _parse_varints(resp['_messages'][2])
     return {
@@ -210,6 +212,7 @@ async def run():
           resp_solo['faction_template'] == 2 and resp_solo['team'] == 2)
 
     # --- 用例 3：精确命中 pms_id 旧路径不回归 ---
+    matchmaking.PMS_TO_SESSION[sess_b['pms_id']] = sess_b
     resp_exact = await _squad_request(sess_b['pms_id'], sess_b['squad_id'])
     check('精确命中 pms_id 路径 faction 正确',
           resp_exact['faction_template'] == 3 and resp_exact['team'] == 3)
@@ -230,11 +233,7 @@ async def run():
     finally:
         game_server.STORE = old_store
 
-    # --- 用例 5：跨局并行 SquadRequest 兜底圈定本局 ---
-    # 战斗服 M1 的连接（combat_mission=488464），f1=ZServer 自产 id（未命中）、
-    # f2=0（未命中）→ 修复前全局"最新会话"= M2 后进玩家 → faction 错；
-    # 修复后圈定 M1 → faction 用 M1 玩家的登记小队。
-    # （M1 只留一个会话：f2 未命中时局内无法区分具体玩家，验证点在跨局。）
+    # --- 用例 5：跨局并行 SquadRequest 缺少精确键时明确拒绝 ---
     from types import SimpleNamespace as NS
     mission, sess_a, sess_b = _seed_two_player_match()
     m2 = 488465
@@ -248,24 +247,16 @@ async def run():
     matchmaking.PMS_TO_MISSION[sess_c['pms_id']] = m2
     resp_scope = await _squad_request(
         730433917 * 10**6 + m2, 0, sess=NS(combat_mission=mission))
-    check('跨局 SquadRequest 兜底圈定本局（faction=M1 德军 2）',
-          resp_scope['faction_template'] == 2 and resp_scope['team'] == 2,
-          f'got team={resp_scope["team"]} factionTemplate='
-          f'{resp_scope["faction_template"]}')
-    # M1 会话全清（结算后残留请求）：宁缺毋错 → 单槽默认而非串到 M2
+    check('跨局 SquadRequest 无精确 PMS/squad 时拒绝（不猜 M1 玩家）',
+          resp_scope.get('error') is True, f'got={resp_scope}')
+    # M1 会话全清（结算后残留请求）：同样拒绝，不创建默认单槽小队
     matchmaking.PMS_TO_SESSION.pop(sess_a['pms_id'])
     resp_empty = await _squad_request(
         730433917 * 10**6 + m2, 0, sess=NS(combat_mission=mission))
-    check('M1 会话清空后不串到 M2（faction=默认 3 且 squad 非成员队）',
-          resp_empty['faction_template'] == 3
-          and resp_empty['squad_id'] not in (sess_b['squad_id'],
-                                             sess_c['squad_id']),
-          f'got faction={resp_empty["faction_template"]} '
-          f'squad={resp_empty["squad_id"]}')
+    check('M1 会话清空后明确拒绝（不串 M2、不造默认阵营/小队）',
+          resp_empty.get('error') is True, f'got={resp_empty}')
 
-    # --- 用例 6：GetPlayerSettings 跨局兜底圈定本局 ---
-    # stale pms（rejoin/结算清理后 ZServer 仍持有）+ 战斗服 M1 连接 →
-    # 修复前全局最新会话 = M2 玩家 → 身份/角色错配（"进游戏人变成 bot"路径）
+    # --- 用例 6：GetPlayerSettings stale PMS 明确拒绝 ---
     matchmaking.PMS_TO_SESSION.clear()
     matchmaking.PMS_TO_SESSION[sess_a['pms_id']] = sess_a
     matchmaking.PMS_TO_SESSION[sess_c['pms_id']] = sess_c
@@ -281,21 +272,15 @@ async def run():
             NS(combat_mission=mission), w, 8, 'GetPlayerSettings',
             pb_varint(1, stale_pms))
         main, _ = Chunk.parse(w.data, 0)
-        ps = _parse_varints(main.subs[0].subs[0].data)
-        check('GetPlayerSettings stale pms 圈定本局（M1 玩家 2/角色 31）',
-              ps.get(1) == 2 and ps.get(15) == 31,
-              f'got player={ps.get(1)} char={ps.get(15)} '
-              f'faction={ps.get(7)}')
-        check('GetPlayerSettings 圈定本局阵营（M1 德军 2）',
-              ps.get(7) == 2, f'got faction={ps.get(7)}')
-        # 无 combat_mission（旧路径）→ 保持全局最新会话行为
+        check('GetPlayerSettings stale PMS 在已知局也拒绝（不猜唯一玩家）',
+              main.subs[0].as_str() == 'HandlerErrorResponse')
+        # 无 combat_mission 同样拒绝，不取全局最新会话
         w2 = FakeWriter()
         await game_server.handle_request(None, w2, 9, 'GetPlayerSettings',
                                          pb_varint(1, stale_pms))
         main2, _ = Chunk.parse(w2.data, 0)
-        ps2 = _parse_varints(main2.subs[0].subs[0].data)
-        check('无 combat_mission 时保持旧回退（最新会话 M2 玩家 33）',
-              ps2.get(1) == 33, f'got player={ps2.get(1)}')
+        check('无 combat_mission 时 stale PMS 同样拒绝',
+              main2.subs[0].as_str() == 'HandlerErrorResponse')
     finally:
         game_server.STORE = old_store
 
@@ -407,16 +392,14 @@ async def run():
     check('装甲小队 4 成员超模板 3 槽 → 补第 4 槽',
           tmpl == 4 and slots == [(17, 0), (18, 1), (19, 2), (19, 3)],
           f'got template={tmpl} slots={slots}')
-    # 无登记表（兜底路径）→ 回归冒烟（响应可解析、字段齐全）
+    # 无登记表时明确拒绝，不生成动态假小队。
     matchmaking.PMS_TO_SESSION.clear()
     w = FakeWriter()
     await game_server.handle_request(None, w, 6, 'SquadRequest',
                                      pb_varint(1, 1) + pb_varint(2, 0))
     main, _ = Chunk.parse(w.data, 0)
-    resp = _parse_varints(main.subs[0].subs[0].data)
-    check('无登记表兜底仍回有效 SquadResponse（动态 squadId 非零）',
-          int(resp.get(1) or 0) != 0 and '_messages' in resp
-          and 2 in resp.get('_messages', {}))
+    check('无登记表时返回 HandlerErrorResponse（不生成假 squadId）',
+          main.subs[0].as_str() == 'HandlerErrorResponse')
 
     # --- 清理 ---
     matchmaking.PMS_TO_SESSION.clear()

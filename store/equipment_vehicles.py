@@ -62,6 +62,13 @@ class EquipmentVehiclesMixin:
         [{id, vehicle_variant_template_id, character_id, equipped_in_slot, variant_id}]（含被挤掉槽位的）。"""
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                if int(equip_in_slot) > 0:
+                    owns_character = await conn.fetchval(
+                        'SELECT EXISTS(SELECT 1 FROM characters WHERE id = $1 '
+                        'AND player_id = $2 AND NOT is_deleted)',
+                        int(character_id), int(player_id))
+                    if not owns_character:
+                        return []
                 # 目标载具校验归属
                 row = await conn.fetchrow(
                     'SELECT id, vehicle_variant_template_id, character_id, equipped_in_slot, variant_id, condition '
@@ -275,9 +282,10 @@ class EquipmentVehiclesMixin:
                         'AND equipped_storage_id = $3 AND slot_index = $4 AND id != $5',
                         player_id, row['vehicle_id'], storage_id, slot_index, ammo_id)
                     for c in cleared:
-                        c['equipped_storage_id'] = 0
-                        c['slot_index'] = 0
-                        affected.append(dict(c))
+                        cd = dict(c)
+                        cd['equipped_storage_id'] = 0
+                        cd['slot_index'] = 0
+                        affected.append(cd)
                 new_storage = storage_id if do_equip else 0
                 new_slot = slot_index if do_equip else 0
                 await conn.execute(

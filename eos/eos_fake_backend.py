@@ -233,7 +233,7 @@ def oauth_token_body(sub: str, name: str) -> dict:
         'deployment_id': DEPLOYMENT_ID,
         'organization_id': 'hng-org',
         'product_user_id': _puid('connect|' + sub),
-        'display_name': name or 'Player',
+        'display_name': name or '',
     }
 
 

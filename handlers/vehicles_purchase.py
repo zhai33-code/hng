@@ -42,6 +42,7 @@ from messages import (
 
 from player_service import (
     _char_bits_for,
+    _character_owned,
     _charge_player,
     _charge_player_multi,
     _fail_persisted_purchase,
@@ -118,10 +119,32 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
     except Exception as e:
         log(f'      CreateVehicleVariant parse error: {e}')
 
+    if not await _character_owned(sess, vv_char_id):
+        writer.write(build_response(
+            cmd_id, 'CreateVehicleVariantResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
+    if vv_vehicle_id:
+        pid_v = await sess.ensure_player()
+        owned_vehicle = (await STORE.get_vehicle(pid_v, int(vv_vehicle_id))
+                         if pid_v is not None else None)
+        if (owned_vehicle is None
+                or int(owned_vehicle['character_id']) != int(vv_char_id)):
+            writer.write(build_response(
+                cmd_id, 'CreateVehicleVariantResponse', pb_int32(1, 0)))
+            await writer.drain()
+            return
+
     # 皮肤购买判定：vehicleId 指向已有载具 + vehicleVariantTemplateId=0 + extraTemplate>0
     # （VehicleModificationMediator.onPurchaseClickHandler 给已有载具买皮肤时填这三个字段）。
     # 只创建 VehicleVariant 实例，绝不创建新载具（否则会推送 templateId=0 的假载具）。
     is_skin_purchase = vv_vehicle_id > 0 and vv_template_id == 0 and vv_extra_template_id > 0
+    if ((vv_template_id and int(vv_pricing_id or 0) <= 0)
+            or (is_skin_purchase and int(vv_extra_pricing_id or 0) <= 0)):
+        writer.write(build_response(
+            cmd_id, 'CreateVehicleVariantResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
 
     # 解锁校验：买新载具判定用 eVehicle(4) + eVehiclesVariant(15)；
     # 给已有载具买皮肤判定用皮肤模板的 eVehiclesVariant(15)。需求为空视为无门槛。
@@ -154,7 +177,9 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
     # 扣款（载具本体 + 可选额外变体合并为一次原子扣款：余额不足时整体不扣，
     # 杜绝"载具已扣款、变体不足"的钱货两空）；余额不足返回错误响应，不创建载具
     cost_v, ok_v = await _charge_player_multi(
-        sess, [vv_pricing_id, vv_extra_pricing_id], currency)
+        sess, [vv_pricing_id, vv_extra_pricing_id], currency,
+        expected=[(vv_template_id, 'VehicleVariantTemplate'),
+                  (vv_extra_template_id, 'VehicleVariantTemplate')])
     if not ok_v:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'CreateVehicleVariantResponse', resp_proto)
@@ -343,7 +368,10 @@ async def handle_createvehicleupgraderequest(sess, writer, cmd_id, req_type, pro
             return
 
     # 扣款；余额不足返回错误响应，不创建升级
-    cost, ok = await _charge_player(sess, vu_pricing_id, vu_currency)
+    cost, ok = await _charge_player(
+        sess, vu_pricing_id, vu_currency,
+        expected_object_id=vu_template_id,
+        expected_types='vehicleupgradetemplate')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'CreateVehicleUpgradeResponse', resp_proto)
@@ -442,7 +470,9 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
         return
 
     # 扣款；余额不足返回错误响应，不创建弹药
-    cost, ok = await _charge_player(sess, va_pricing_id, va_currency)
+    cost, ok = await _charge_player(
+        sess, va_pricing_id, va_currency,
+        expected_object_id=va_template_id, expected_types='ammotemplate')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'CreateVehicleAmmoResponse', resp_proto)

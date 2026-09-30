@@ -19,6 +19,8 @@ import gzip
 import struct
 import time
 
+MAX_CHUNK_SIZE = 16 * 1024 * 1024
+
 # ---------------------------------------------------------------- chunk codec
 
 class Chunk:
@@ -34,9 +36,13 @@ class Chunk:
         if off + 4 > len(buf):
             return None, off
         total = struct.unpack_from('<i', buf, off)[0]
-        if total < 8 or off + total > len(buf):
+        if total < 8 or total > MAX_CHUNK_SIZE:
+            raise ValueError(f'invalid chunk size {total}')
+        if off + total > len(buf):
             return None, off
         self_size = struct.unpack_from('<i', buf, off + 4)[0]
+        if self_size < 4 or self_size > total - 4:
+            raise ValueError(f'invalid chunk self size {self_size}/{total}')
         data_end = off + 8 + (self_size - 4)
         c = Chunk(buf[off + 8:data_end])
         pos = data_end
@@ -44,10 +50,12 @@ class Chunk:
         while remaining > 0:
             sub, nxt = Chunk.parse(buf, pos)
             if sub is None:
-                break
+                raise ValueError('truncated subchunk')
             c.subs.append(sub)
             consumed = nxt - pos
             remaining -= consumed
+            if remaining < 0:
+                raise ValueError('subchunks exceed parent chunk')
             pos = nxt
         return c, off + total
 
@@ -184,6 +192,8 @@ def _pb_read_varint(b, i):
         if not c & 0x80:
             return val, i
         shift += 7
+        if shift >= 70:
+            raise ValueError('varint too long')
 
 def pb_parse(b):
     """Minimal proto2 wire decoder -> {field_num: value(bytes for wiretype 2, int otherwise)}.
@@ -196,11 +206,17 @@ def pb_parse(b):
         if wt == 0:
             val, i = _pb_read_varint(b, i)
         elif wt == 1:
+            if i + 8 > len(b):
+                raise ValueError('fixed64 truncated')
             val = b[i:i + 8]; i += 8
         elif wt == 2:
             ln, i = _pb_read_varint(b, i)
+            if ln > len(b) - i:
+                raise ValueError('length-delimited field truncated')
             val = b[i:i + ln]; i += ln
         elif wt == 5:
+            if i + 4 > len(b):
+                raise ValueError('fixed32 truncated')
             val = b[i:i + 4]; i += 4
         else:
             raise ValueError(f'unsupported wiretype {wt}')
@@ -219,11 +235,17 @@ def pb_parse_multi(b):
         if wt == 0:
             val, i = _pb_read_varint(b, i)
         elif wt == 1:
+            if i + 8 > len(b):
+                raise ValueError('fixed64 truncated')
             val = b[i:i + 8]; i += 8
         elif wt == 2:
             ln, i = _pb_read_varint(b, i)
+            if ln > len(b) - i:
+                raise ValueError('length-delimited field truncated')
             val = b[i:i + ln]; i += ln
         elif wt == 5:
+            if i + 4 > len(b):
+                raise ValueError('fixed32 truncated')
             val = b[i:i + 4]; i += 4
         else:
             raise ValueError(f'unsupported wiretype {wt}')
@@ -388,7 +410,7 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     m += pb_int64(23, 0)                # warfundsBought
     m += pb_int64(24, warfunds)         # warfundsEarned (初始战争资金)
     m += pb_int64(25, 0)                # warfundsUsed
-    m += pb_string(26, 'metrics-demo')  # metricsUid (optional)
+    m += pb_string(26, '')              # metricsUid（无持久化来源时留空）
     m += pb_int32(27, 0)                # yellowGriefPoints
     m += pb_int32(28, 0)                # redGriefPoints
     m += pb_string(29, '')              # latestRedGriefPointTimestamp
@@ -426,7 +448,7 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     return m
 
 
-def msg_login2_result(username, code, pid=1, faction=None, war=None,
+def msg_login2_result(username, code, pid=0, faction=None, war=None,
                       ban_reason=None, ban_expires=None):
     m = b''
     m += pb_string(1, username)

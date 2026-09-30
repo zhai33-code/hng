@@ -23,6 +23,9 @@ from wardb import (
     _MOD_CATEGORY_BY_TEMPLATE,
     _MOD_CATEGORY_SLOT,
     _mod_usable_by_class,
+    ammo_wear_params,
+    weapon_modifier_wear_params,
+    weapon_wear_params,
     weapon_template_clipcount,
     )
 
@@ -38,6 +41,7 @@ from messages import (
 from player_service import (
     _charge_player,
     _push_player_refresh,
+    _refund_player_charge,
     _weapon_owner_id,
     _weapon_template_id,
     )
@@ -128,11 +132,18 @@ async def handle_setweaponvariantrequest(sess, writer, cmd_id, req_type, proto):
             log(f'[DB] bind_weapon_variant failed: {e}')
 
     # 持久化到 weapons.variant_id 列（0 = 卸下）
+    persisted = False
     if pid is not None:
         try:
             await STORE.set_weapon_variant(pid, int(sw_weapon_id), int(sw_variant_id))
+            persisted = True
         except Exception as e:
             log(f'[DB] set_weapon_variant failed: {e}')
+    if not persisted:
+        writer.write(build_response(
+            cmd_id, 'SetWeaponVariantResponse', pb_int32(2, 0)))
+        await writer.drain()
+        return
     if getattr(sess, 'weapons', None) and int(sw_weapon_id) in sess.weapons:
         sess.weapons[int(sw_weapon_id)]['variant_id'] = int(sw_variant_id)
 
@@ -225,11 +236,18 @@ async def handle_setweaponclipcountrequest(sess, writer, cmd_id, req_type, proto
         return
 
     # 持久化 + 会话缓存
+    persisted = False
     if pid is not None:
         try:
             await STORE.set_weapon_clip_count(pid, int(swc_weapon_id), swc_clip_count)
+            persisted = True
         except Exception as e:
             log(f'[DB] set_weapon_clip_count failed: {e}')
+    if not persisted:
+        writer.write(build_response(
+            cmd_id, 'SetWeaponClipCountResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
     if getattr(sess, 'weapons', None) and int(swc_weapon_id) in sess.weapons:
         sess.weapons[int(swc_weapon_id)]['clip_count'] = swc_clip_count
 
@@ -277,27 +295,31 @@ async def handle_setweaponammorequest(sess, writer, cmd_id, req_type, proto):
 
     new_slot = slot_index if do_equip else 0
     pid = await sess.ensure_player()
+    updated = False
     if pid is not None:
         try:
             # 装备时先清空同武器其他弹药槽（互斥：一枪只装一发弹药），
             # 否则客户端 isEquipped（equippedAmmoSlotIndex==1）会同时显示多发
+            target = None
+            for a in await STORE.list_weapon_ammo(pid):
+                if a['id'] == ammo_id:
+                    target = a
+                    break
             if do_equip:
-                target = None
-                for a in await STORE.list_weapon_ammo(pid):
-                    if a['id'] == ammo_id:
-                        target = a
-                        break
                 if target is not None:
                     await STORE.clear_weapon_ammo_slots(pid, target['weapon_id'], ammo_id)
-            await STORE.update_weapon_ammo_slot(pid, ammo_id, new_slot)
+            if target is not None:
+                await STORE.update_weapon_ammo_slot(pid, ammo_id, new_slot)
+                updated = True
         except Exception as e:
             log(f'[DB] update_weapon_ammo_slot failed: {e}')
 
-    resp_proto = pb_int32(1, 1)  # response = 1 (ok)
+    resp_proto = pb_int32(1, 1 if updated else 0)
     resp = build_response(cmd_id, 'SetWeaponAmmoResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} SetWeaponAmmoResponse (response=1 ok, slot={new_slot})')
+    log(f'S->C cmd={cmd_id:<4} SetWeaponAmmoResponse '
+        f'(response={1 if updated else 0}, slot={new_slot})')
 
     # 推送更新后的所有 WeaponAmmo（equippedAmmoSlotIndex 变化，客户端 isEquipped 判定依据）
     if sess.soldier_view_cmd is not None:
@@ -332,6 +354,7 @@ async def handle_repairweaponammorequest(sess, writer, cmd_id, req_type, proto):
     # RepairWeaponAmmoResponse { int32 response = 1; }
     ammo_id = 0
     repair_pricing_id = 0
+    currency = 0
     try:
         f = pb_parse(proto)
         ammo_id = f.get(1, 0)
@@ -342,8 +365,38 @@ async def handle_repairweaponammorequest(sess, writer, cmd_id, req_type, proto):
     except Exception as e:
         log(f'      RepairWeaponAmmo parse error: {e}')
 
+    # 客户端显示价不是整条 Pricing 的满额价格，而是按实际缺损比例计算：
+    #   (maxCondition - condition) / maxCondition
+    # 服务端必须用同一比例扣款，否则界面显示 146，实际却可能扣 9481。
+    pid = await sess.ensure_player()
+    ammo = None
+    if pid is not None:
+        try:
+            ammo = next((a for a in await STORE.list_weapon_ammo(pid)
+                         if int(a['id']) == int(ammo_id)), None)
+        except Exception as e:
+            log(f'[DB] load weapon ammo for repair failed: {e}')
+    if ammo is None:
+        resp = build_response(
+            cmd_id, 'RepairWeaponAmmoResponse', pb_int32(1, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} RepairWeaponAmmoResponse '
+            f'(response=0 ammo_not_found)')
+        return
+
+    ammo_template_id = int(ammo['ammo_template_id'])
+    params = ammo_wear_params(ammo_template_id)
+    maxcond = (params[0] if params and params[0] > 0
+               else _AMMO_MAXCOND.get(ammo_template_id, 100.0))
+    current = max(0.0, min(float(ammo.get('condition') or 0), maxcond))
+    fraction = (maxcond - current) / maxcond if maxcond > 0 else 0.0
+
     # 扣款（维修费）；余额不足返回错误响应
-    cost, ok = await _charge_player(sess, repair_pricing_id, currency)
+    cost, ok = await _charge_player(
+        sess, repair_pricing_id, currency, fraction=fraction,
+        expected_object_id=ammo_template_id,
+        expected_types='AmmoMaxConditionRepair')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'RepairWeaponAmmoResponse', resp_proto)
@@ -352,20 +405,16 @@ async def handle_repairweaponammorequest(sess, writer, cmd_id, req_type, proto):
         log(f'S->C cmd={cmd_id:<4} RepairWeaponAmmoResponse (response=56 not_enough) cost={cost}')
         return
 
-    # 查弹药模板 → 修复到满耐久
-    maxcond = 100.0
-    ammo_template_id = 0
-    pid = await sess.ensure_player()
-    if pid is not None:
-        try:
-            for a in await STORE.list_weapon_ammo(pid):
-                if a['id'] == ammo_id:
-                    ammo_template_id = a['ammo_template_id']
-                    maxcond = _AMMO_MAXCOND.get(int(ammo_template_id), 100.0)
-                    await STORE.update_weapon_ammo_condition(pid, ammo_id, maxcond)
-                    break
-        except Exception as e:
-            log(f'[DB] repair weapon ammo failed: {e}')
+    # 修复到模板满耐久（不信任请求中的 repairToCondition）
+    try:
+        await STORE.update_weapon_ammo_condition(pid, ammo_id, maxcond)
+    except Exception as e:
+        log(f'[DB] repair weapon ammo failed: {e}')
+        await _refund_player_charge(sess, currency, cost)
+        writer.write(build_response(
+            cmd_id, 'RepairWeaponAmmoResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
 
     resp_proto = pb_int32(1, 1)  # response = 1 (ok)
     resp = build_response(cmd_id, 'RepairWeaponAmmoResponse', resp_proto)
@@ -418,7 +467,8 @@ async def handle_renameweaponrequest(sess, writer, cmd_id, req_type, proto):
         rw_currency = 0
 
     # 扣款（改名费；无 pricing 时免费）
-    cost, ok = await _charge_player(sess, rw_pricing_id, rw_currency)
+    cost, ok = await _charge_player(
+        sess, rw_pricing_id, rw_currency, expected_types='weapon_rename')
     if not ok:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
         resp = build_response(cmd_id, 'RenameWeaponResponse', resp_proto)
@@ -435,6 +485,8 @@ async def handle_renameweaponrequest(sess, writer, cmd_id, req_type, proto):
             updated = await STORE.rename_weapon(pid, int(rw_weapon_id), rw_new_name)
         except Exception as e:
             log(f'[DB] rename_weapon failed: {e}')
+    if not updated:
+        await _refund_player_charge(sess, rw_currency, cost)
 
     resp_proto = pb_int32(1, 1 if updated else 0)
     resp = build_response(cmd_id, 'RenameWeaponResponse', resp_proto)
@@ -481,8 +533,32 @@ async def handle_repairweaponrequest(sess, writer, cmd_id, req_type, proto):
         rp_pricing_id = 0
         rp_currency = 0
 
-    # 扣款（维修费）
-    cost, ok = await _charge_player(sess, rp_pricing_id, rp_currency)
+    pid = await sess.ensure_player()
+    weapon = None
+    if pid is not None:
+        try:
+            weapon = await STORE.get_weapon(pid, int(rp_weapon_id))
+        except Exception as e:
+            log(f'[DB] load weapon for repair failed: {e}')
+    if weapon is None:
+        resp = build_response(
+            cmd_id, 'RepairWeaponResponse', pb_int32(2, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} RepairWeaponResponse '
+            f'(response=0 weapon_not_found)')
+        return
+
+    params = weapon_wear_params(weapon['template_id'])
+    maxcond = params[0] if params and params[0] > 0 else 1.0
+    current = max(0.0, min(float(weapon.get('condition') or 0), maxcond))
+    fraction = (maxcond - current) / maxcond if maxcond > 0 else 0.0
+
+    # 与客户端 PriceObject.calculateFractionPrice 使用同一损耗比例扣款。
+    cost, ok = await _charge_player(
+        sess, rp_pricing_id, rp_currency, fraction=fraction,
+        expected_object_id=weapon['template_id'],
+        expected_types=('WeaponMaxConditionRepair', 'WeaponBrokenRepair'))
     if not ok:
         resp_proto = pb_int32(2, 56)  # not_enough_credits（字段号 2）
         resp = build_response(cmd_id, 'RepairWeaponResponse', resp_proto)
@@ -492,20 +568,22 @@ async def handle_repairweaponrequest(sess, writer, cmd_id, req_type, proto):
             f'cost={cost}')
         return
 
-    pid = await sess.ensure_player()
-    if pid is not None and rp_weapon_id:
-        try:
-            await STORE.update_weapon_condition(pid, int(rp_weapon_id),
-                                                float(rp_condition or 100))
-        except Exception as e:
-            log(f'[DB] update_weapon_condition failed: {e}')
+    try:
+        await STORE.update_weapon_condition(pid, int(rp_weapon_id), maxcond)
+    except Exception as e:
+        log(f'[DB] update_weapon_condition failed: {e}')
+        await _refund_player_charge(sess, rp_currency, cost)
+        writer.write(build_response(
+            cmd_id, 'RepairWeaponResponse', pb_int32(2, 0)))
+        await writer.drain()
+        return
 
     resp_proto = pb_int32(2, 1)  # response = 1 (ok；字段号 2)
     resp = build_response(cmd_id, 'RepairWeaponResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RepairWeaponResponse (response=1 ok, '
-        f'condition={rp_condition})')
+        f'condition={maxcond})')
 
     # 重推 weapon（condition 恢复）
     if pid is not None and sess.soldier_view_cmd is not None:
@@ -518,9 +596,9 @@ async def handle_repairweaponrequest(sess, writer, cmd_id, req_type, proto):
                                              w['container_slot'], w['variant_id'],
                                              w.get('clip_count', 0),
                                              w.get('auto_repair', 0),
-                                             float(rp_condition or 100)))
+                                             maxcond))
                 log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
-                    f'(weapon id={rp_weapon_id} repaired, condition={rp_condition})')
+                    f'(weapon id={rp_weapon_id} repaired, condition={maxcond})')
         except Exception as e:
             log(f'[DB] reload weapon after repair failed: {e}')
     await _push_player_refresh(sess, writer)
@@ -549,8 +627,34 @@ async def handle_repairweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
         rm_pricing_id = 0
         rm_currency = 0
 
-    # 扣款（维修费）
-    cost, ok = await _charge_player(sess, rm_pricing_id, rm_currency)
+    pid = await sess.ensure_player()
+    modifier = None
+    if pid is not None:
+        try:
+            modifier = next((m for m in await STORE.list_weapon_modifiers(pid)
+                             if int(m['id']) == int(rm_modifier_id)), None)
+        except Exception as e:
+            log(f'[DB] load weapon modifier for repair failed: {e}')
+    if modifier is None:
+        resp = build_response(
+            cmd_id, 'RepairWeaponModifierResponse', pb_int32(2, 0))
+        writer.write(resp)
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} RepairWeaponModifierResponse '
+            f'(response=0 modifier_not_found)')
+        return
+
+    params = weapon_modifier_wear_params(modifier['template_id'])
+    maxcond = params[0] if params and params[0] > 0 else 1.0
+    current = max(0.0, min(float(modifier.get('condition') or 0), maxcond))
+    fraction = (maxcond - current) / maxcond if maxcond > 0 else 0.0
+
+    # 与客户端显示价使用相同的损耗比例。
+    cost, ok = await _charge_player(
+        sess, rm_pricing_id, rm_currency, fraction=fraction,
+        expected_object_id=modifier['template_id'],
+        expected_types=('WeaponModifierMaxConditionRepair',
+                        'WeaponModifierBrokenRepair'))
     if not ok:
         resp_proto = pb_int32(2, 56)  # not_enough_credits（字段号 2）
         resp = build_response(cmd_id, 'RepairWeaponModifierResponse', resp_proto)
@@ -560,20 +664,23 @@ async def handle_repairweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
             f'(response=56 not_enough) cost={cost}')
         return
 
-    pid = await sess.ensure_player()
-    if pid is not None and rm_modifier_id:
-        try:
-            await STORE.update_weapon_modifier_condition(pid, int(rm_modifier_id),
-                                                         float(rm_condition or 1.0))
-        except Exception as e:
-            log(f'[DB] update_weapon_modifier_condition failed: {e}')
+    try:
+        await STORE.update_weapon_modifier_condition(
+            pid, int(rm_modifier_id), maxcond)
+    except Exception as e:
+        log(f'[DB] update_weapon_modifier_condition failed: {e}')
+        await _refund_player_charge(sess, rm_currency, cost)
+        writer.write(build_response(
+            cmd_id, 'RepairWeaponModifierResponse', pb_int32(2, 0)))
+        await writer.drain()
+        return
 
     resp_proto = pb_int32(2, 1)  # response = 1 (ok；字段号 2)
     resp = build_response(cmd_id, 'RepairWeaponModifierResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} RepairWeaponModifierResponse (response=1 ok, '
-        f'condition={rm_condition})')
+        f'condition={maxcond})')
 
     # 重推 WeaponModifier（condition 恢复）
     if pid is not None and sess.soldier_view_cmd is not None:
@@ -585,10 +692,10 @@ async def handle_repairweaponmodifierrequest(sess, writer, cmd_id, req_type, pro
                                                           m['character_id'],
                                                           m['weapon_id'],
                                                           m.get('auto_repair', 0),
-                                                          float(rm_condition or 1.0)))
+                                                          maxcond))
                     log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
                         f'(WeaponModifier id={rm_modifier_id} repaired, '
-                        f'condition={rm_condition})')
+                        f'condition={maxcond})')
                     break
         except Exception as e:
             log(f'[DB] reload modifier after repair failed: {e}')
@@ -618,6 +725,7 @@ async def handle_setweaponmodifierrequest(sess, writer, cmd_id, req_type, proto)
     pid = await sess.ensure_player()
     replaced_ids = []  # 被同槽位互斥卸下的配件（重推 weaponId=0）
     equip_denied = False  # 兵种校验拒绝（不挂接，response=0）
+    persisted = False
     if pid is not None and sm_modifier_id:
         try:
             # 兵种/归属校验（2026-09-13 配件入库解绑改造：配件不再随武器
@@ -695,15 +803,17 @@ async def handle_setweaponmodifierrequest(sess, writer, cmd_id, req_type, proto)
                     pid, int(sm_modifier_id),
                     int(sm_weapon_id) if sm_do_equip else 0,
                     int(sm_char_id) if sm_do_equip else None)
+                persisted = True
         except Exception as e:
             log(f'[DB] set_weapon_modifier_weapon failed: {e}')
 
-    resp_proto = pb_int32(2, 0 if equip_denied else 1)  # response（字段号 2）
+    resp_proto = pb_int32(2, 1 if persisted and not equip_denied else 0)
     resp = build_response(cmd_id, 'SetWeaponModifierResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} SetWeaponModifierResponse '
-        f'(response={0 if equip_denied else 1}, doEquip={sm_do_equip})')
+        f'(response={1 if persisted and not equip_denied else 0}, '
+        f'doEquip={sm_do_equip})')
 
     # 重推 WeaponModifier（weaponId 变化 → 客户端配件槽刷新；
     # 被互斥卸下的也重推 weaponId=0，客户端才能及时取消 isEquipped）
@@ -746,18 +856,21 @@ async def handle_setweaponautorepairrequest(sess, writer, cmd_id, req_type, prot
         ar_auto = 0
 
     pid = await sess.ensure_player()
+    updated = None
     if pid is not None and ar_weapon_id:
         try:
             await STORE.set_equipment_auto_repair(pid, 1, int(ar_weapon_id),
                                                   int(ar_auto))
+            updated = await STORE.get_weapon(pid, int(ar_weapon_id))
         except Exception as e:
             log(f'[DB] set_equipment_auto_repair failed: {e}')
 
-    resp_proto = pb_int32(2, 1)  # response = 1 (ok；字段号 2)
+    resp_proto = pb_int32(2, 1 if updated is not None else 0)
     resp = build_response(cmd_id, 'SetWeaponAutoRepairResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} SetWeaponAutoRepairResponse (response=1 ok)')
+    log(f'S->C cmd={cmd_id:<4} SetWeaponAutoRepairResponse '
+        f'(response={1 if updated is not None else 0})')
 
     # 重推 weapon（autoRepair f13 更新；三态原样回传，保持客户端勾选框不跳变）
     if pid is not None and sess.soldier_view_cmd is not None:
@@ -793,18 +906,22 @@ async def handle_setweaponmodiferautorepairrequest(sess, writer, cmd_id, req_typ
         ma_auto = 0
 
     pid = await sess.ensure_player()
+    updated = False
     if pid is not None and ma_modifier_id:
         try:
             await STORE.set_equipment_auto_repair(pid, 5, int(ma_modifier_id),
                                                   int(ma_auto))
+            updated = any(int(m['id']) == int(ma_modifier_id)
+                          for m in await STORE.list_weapon_modifiers(pid))
         except Exception as e:
             log(f'[DB] set_equipment_auto_repair failed: {e}')
 
-    resp_proto = pb_int32(1, 1)  # response = 1 (ok)
+    resp_proto = pb_int32(1, 1 if updated else 0)
     resp = build_response(cmd_id, 'SetWeaponModiferAutoRepairResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} SetWeaponModiferAutoRepairResponse (response=1 ok)')
+    log(f'S->C cmd={cmd_id:<4} SetWeaponModiferAutoRepairResponse '
+        f'(response={1 if updated else 0})')
 
     # 重推 WeaponModifier（autoRepair f7 更新；三态原样回传）
     if pid is not None and sess.soldier_view_cmd is not None:
@@ -839,18 +956,22 @@ async def handle_setweaponammaautorepairrequest(sess, writer, cmd_id, req_type, 
         aa_auto = 0
 
     pid = await sess.ensure_player()
+    updated = False
     if pid is not None and aa_ammo_id:
         try:
             await STORE.set_equipment_auto_repair(pid, 6, int(aa_ammo_id),
                                                   int(aa_auto))
+            updated = any(int(a['id']) == int(aa_ammo_id)
+                          for a in await STORE.list_weapon_ammo(pid))
         except Exception as e:
             log(f'[DB] set_equipment_auto_repair failed: {e}')
 
-    resp_proto = pb_int32(1, 1)  # response = 1 (ok)
+    resp_proto = pb_int32(1, 1 if updated else 0)
     resp = build_response(cmd_id, 'SetWeaponAmmoAutoRepairResponse', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} SetWeaponAmmoAutoRepairResponse (response=1 ok)')
+    log(f'S->C cmd={cmd_id:<4} SetWeaponAmmoAutoRepairResponse '
+        f'(response={1 if updated else 0})')
 
     # 重推 WeaponAmmo（autoRepair f8 更新；三态原样回传）
     if pid is not None and sess.soldier_view_cmd is not None:
@@ -879,6 +1000,7 @@ async def handle_settracereffectrequest(sess, writer, cmd_id, req_type, proto):
     try:
         f = pb_parse(proto)
         te_is_free = bool(f.get(1, 0))
+        te_tracer_template_id = f.get(2, 0)
         te_weapon_id = f.get(4, 0)
         te_pricing_id = f.get(5, 0)
         te_currency = f.get(7, 0)
@@ -889,14 +1011,19 @@ async def handle_settracereffectrequest(sess, writer, cmd_id, req_type, proto):
     except Exception as e:
         log(f'      SetTracerEffect parse error: {e}')
         te_is_free = True
+        te_tracer_template_id = 0
         te_weapon_id = 0
         te_pricing_id = 0
         te_currency = 0
         te_tracer_id = 0
 
     # 扣款（非免费更换时）
+    cost = 0
     if not te_is_free and te_pricing_id:
-        cost, ok = await _charge_player(sess, te_pricing_id, te_currency)
+        cost, ok = await _charge_player(
+            sess, te_pricing_id, te_currency,
+            expected_object_id=te_tracer_template_id,
+            expected_types='TracerEffectTemplate')
         if not ok:
             resp_proto = pb_int32(1, 56)  # not_enough_credits
             resp = build_response(cmd_id, 'SetTracerEffectResponse', resp_proto)
@@ -907,6 +1034,7 @@ async def handle_settracereffectrequest(sess, writer, cmd_id, req_type, proto):
             return
 
     pid = await sess.ensure_player()
+    persisted = False
     if pid is not None and te_weapon_id:
         try:
             # character_id 跟随武器（行模型：characterId=0 为仓库在库，
@@ -918,7 +1046,9 @@ async def handle_settracereffectrequest(sess, writer, cmd_id, req_type, proto):
             if affected is None:
                 log(f'[DB] set_weapon_tracer_effect: tracer row '
                     f'{te_tracer_id} not owned, ignored')
-            elif sess.soldier_view_cmd is not None:
+            else:
+                persisted = True
+            if affected is not None and sess.soldier_view_cmd is not None:
                 for t in affected:
                     await _push_kvcs(
                         writer, sess.soldier_view_cmd, b'TracerEffect',
@@ -930,6 +1060,13 @@ async def handle_settracereffectrequest(sess, writer, cmd_id, req_type, proto):
                     f'weapon={te_weapon_id}, tracerId={te_tracer_id})')
         except Exception as e:
             log(f'[DB] set_weapon_tracer_effect failed: {e}')
+
+    if not persisted:
+        await _refund_player_charge(sess, te_currency, cost)
+        writer.write(build_response(
+            cmd_id, 'SetTracerEffectResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
 
     resp_proto = pb_int32(1, 1)  # response = 1 (ok)
     resp = build_response(cmd_id, 'SetTracerEffectResponse', resp_proto)

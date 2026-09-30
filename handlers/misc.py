@@ -68,14 +68,7 @@ async def handle_set_equipmentselection(sess, writer, cmd_id, req_type, proto):
                 pid, equip_id, eq_char_id, equip_slot)
         except Exception as e:
             log(f'[DB] set_weapon_equipment failed: {e}')
-    if not affected:
-        # 无 DB / 查不到行：退回会话缓存内存更新（仅本次会话可见）
-        w = sess.weapons.get(equip_id) if hasattr(sess, 'weapons') else None
-        if w is not None:
-            w['container_id'] = eq_char_id
-            w['container_slot'] = equip_slot
-            affected = [w]
-    else:
+    if affected:
         # 同步会话缓存（新装备 + 被挤掉的旧武器）
         if hasattr(sess, 'weapons') and sess.weapons is not None:
             for wa in affected:
@@ -118,12 +111,13 @@ async def handle_set_equipmentselection(sess, writer, cmd_id, req_type, proto):
                 log(f'[DB] detach_weapon_modifiers failed: {e}')
                 stripped_mods = []
 
-    # 返回 msg=1 (ok)
-    resp_proto = pb_int32(1, 1)
+    # Only acknowledge a persisted ownership-checked update.
+    resp_proto = pb_int32(1, 1 if affected else 0)
     resp = build_response(cmd_id, 'set_equipmentselection_response', resp_proto)
     writer.write(resp)
     await writer.drain()
-    log(f'S->C cmd={cmd_id:<4} set_equipmentselection_response (msg=1 ok)')
+    log(f'S->C cmd={cmd_id:<4} set_equipmentselection_response '
+        f'(msg={1 if affected else 0})')
 
     # 推送所有受影响 weapon 行（先被挤掉的旧武器归库，再新武器进槽），
     # 客户端刷新槽位显示 + 军械库列表 + 装备点数
@@ -263,17 +257,24 @@ async def handle_clientlogmessage(sess, writer, cmd_id, req_type, proto):
     # 客户端日志消息，打印内容用于调试
     try:
         f = pb_parse(proto)
-        log(f'      ClientLogMessage ALL fields: {f}')
         log_type = f.get(1, b'')
         log_msg = f.get(6, b'')
+        if isinstance(log_type, (bytes, bytearray)) and len(log_type) > 256:
+            raise ValueError('client log type exceeds 256 bytes')
+        if isinstance(log_msg, (bytes, bytearray)) and len(log_msg) > 65536:
+            raise ValueError('client log message exceeds 64 KiB')
         if isinstance(log_msg, bytes):
             log_msg = log_msg.decode('utf-8', 'replace')
         if isinstance(log_type, bytes):
             log_type = log_type.decode('utf-8', 'replace')
-        log(f'      ClientLogMessage type={log_type}: {log_msg}')
+        log(f'      ClientLogMessage type={str(log_type)[:128]}: '
+            f'{str(log_msg)[:2048]}')
         # 完整客户端日志落盘（客户端只发最后 50 行，但保留最近几次以便崩溃分析）
         try:
-            with open(os.path.join(_SRV_DIR, 'client_logs.txt'), 'a', encoding='utf-8') as clf:
+            log_path = os.path.join(_SRV_DIR, 'client_logs.txt')
+            if os.path.exists(log_path) and os.path.getsize(log_path) > 10 * 1024 * 1024:
+                os.replace(log_path, log_path + '.1')
+            with open(log_path, 'a', encoding='utf-8') as clf:
                 clf.write(f'===== {time.strftime("%Y-%m-%d %H:%M:%S")} type={log_type} =====\n')
                 clf.write(log_msg if isinstance(log_msg, str) else str(log_msg))
                 clf.write('\n')

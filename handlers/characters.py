@@ -52,6 +52,7 @@ from player_service import (
     _char_unlock_bits_for,
     _charge_player,
     _push_player_refresh,
+    _refund_player_charge,
     _weapon_template_id,
     )
 
@@ -745,10 +746,13 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
     # 每次都被重复扣全价转运费）：物品已在仓库（character_id=0）时直接成功返回，
     # 不扣款不重写；物品不存在（None）时同样跳过扣款（避免钱货两空）
     cur_char = None
+    item_template = None
     if pid is not None and sd_object_id:
         try:
             cur_char = await STORE.get_item_character(pid, int(sd_item_type),
                                                       int(sd_object_id))
+            item_template = await STORE.get_item_template(
+                pid, int(sd_item_type), int(sd_object_id))
         except Exception as e:
             log(f'[DB] get_item_character failed: {e}')
     if cur_char == 0:
@@ -766,9 +770,25 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
     # 扣款（非免费存放时收存放费 = 定价 50%，与客户端 ItemInfoOverlayMediator
     # setTransferPrice 的 finalGoldFractionPrice(0.5)/finalCreditFractionPrice(0.5)
     # 一致；此前扣全价，确认框显示半价、实际扣款翻倍）
-    if not sd_is_free and sd_pricing_id and cur_char is not None:
-        cost, ok = await _charge_player(sess, sd_pricing_id, sd_currency,
-                                        fraction=0.5)
+    cost = 0
+    if cur_char is not None and int(sd_pricing_id or 0) <= 0:
+        writer.write(build_response(
+            cmd_id, 'SendItemToDepotResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
+    if cur_char is not None:
+        price_types = {
+            1: 'weapontemplate', 2: 'VehicleVariantTemplate',
+            3: 'UniformPartTemplate', 4: 'UniformVariantTemplate',
+            5: 'WeaponModifierTemplate', 6: 'ammotemplate',
+            7: 'WeaponVariantTemplate', 8: 'vehicleupgradetemplate',
+            9: 'ammotemplate', 10: 'VehicleVariantTemplate',
+            42: 'TracerEffectTemplate',
+        }
+        cost, ok = await _charge_player(
+            sess, sd_pricing_id, sd_currency, fraction=0.5,
+            expected_object_id=item_template,
+            expected_types=price_types.get(int(sd_item_type)))
         if not ok:
             # 余额不足 response 码按支付货币映射（客户端 handleSendItemToDepotRequest
             # 区分 56/57/153 弹对应货币的不足提示，此前一律 56 金币不足时提示错误）
@@ -825,6 +845,9 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
                 await STORE.mark_depot_item_new(pid, sd_tab, int(sd_object_id))
         except Exception as e:
             log(f'[DB] send_item_to_depot failed: {e}')
+
+    if not updated:
+        await _refund_player_charge(sess, sd_currency, cost)
 
     resp_proto = pb_int32(1, 1 if updated else 0)
     resp = build_response(cmd_id, 'SendItemToDepotResponse', resp_proto)

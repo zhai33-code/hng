@@ -90,25 +90,43 @@ def _official_name_error(name, max_length=CHARACTER_NAME_MAX_LENGTH):
     return 0
 
 
-async def _charge_player(sess, pricing_id, currency, conn=None, fraction=1.0):
-    """按 pricing_id + 支付货币扣款，返回 (cost, ok)。定价缺失或货币类型无效时不扣款（返回 0, True）。
+def _pricing_matches(price, expected_object_id=None, expected_types=None):
+    """Return whether a WarDatabase pricing row belongs to the requested item."""
+    if price is None:
+        return False
+    if expected_object_id is not None:
+        expected = int(expected_object_id or 0)
+        if expected <= 0 or int(price.get('object_id') or 0) != expected:
+            return False
+    if expected_types is not None:
+        allowed = ({expected_types} if isinstance(expected_types, str)
+                   else set(expected_types))
+        if price.get('type') not in allowed:
+            return False
+    return True
+
+
+async def _charge_player(sess, pricing_id, currency, conn=None, fraction=1.0,
+                         expected_object_id=None, expected_types=None):
+    """按服务端定价扣款，未知定价、货币或目标不匹配均失败。
 
     原子扣款（事务内 FOR UPDATE + 增量扣减），杜绝并发丢更新/超额消费；
     传入 conn（STORE.transaction() 上下文）时并入外部事务，与发货同生共死。
     fraction 为价格比例（如仓库转运费 0.5），取整口径与客户端
     PriceObject.calculateFractionPrice 的 Math.max(1, int(base*fraction)) 一致。
     """
-    if pricing_id is None or pricing_id <= 0:
-        return 0, True
+    if pricing_id is None or int(pricing_id) <= 0:
+        return 0, False
     price = _PRICING_MAP.get(int(pricing_id))
-    if price is None:
-        return 0, True
+    if not _pricing_matches(price, expected_object_id, expected_types):
+        log(f'      [MONEY] rejected pricing {pricing_id}: target/type mismatch')
+        return 0, False
     key = _CUR_KEY.get(int(currency))
     if key is None:
-        return 0, True
+        return 0, False
     cost = int(price[key] or 0)
     if cost <= 0:
-        return 0, True
+        return 0, False
     if fraction != 1.0:
         cost = max(1, int(cost * fraction))
     pid = await sess.ensure_player()
@@ -126,23 +144,34 @@ class _PaymentFailed(Exception):
     """余额不足：在 STORE.transaction() 内抛出以触发整体回滚（含本事务已扣部分）。"""
 
 
-async def _charge_player_multi(sess, pricing_ids, currency):
+async def _charge_player_multi(sess, pricing_ids, currency, expected=None):
     """多笔定价合并为一次原子扣款（同一货币），返回 (total_cost, ok)。
 
     余额不足时整体不扣，杜绝"第一笔已扣、第二笔不足"的钱货两空；
-    定价缺失/货币无效的条目按 0 计（与 _charge_player 口径一致）。"""
+    0 表示请求没有该可选项；所有非零定价必须存在且匹配对应目标。"""
     key = _CUR_KEY.get(int(currency)) if currency is not None else None
     if key is None:
-        return 0, True
+        return 0, False
     total = 0
-    for prid in pricing_ids:
+    found = False
+    expected = expected or [None] * len(pricing_ids)
+    for index, prid in enumerate(pricing_ids):
         if prid is None or int(prid) <= 0:
             continue
+        found = True
         price = _PRICING_MAP.get(int(prid))
-        if price is not None:
-            total += int(price[key] or 0)
-    if total <= 0:
-        return 0, True
+        spec = expected[index] if index < len(expected) else None
+        object_id = spec[0] if spec else None
+        types = spec[1] if spec and len(spec) > 1 else None
+        if not _pricing_matches(price, object_id, types):
+            log(f'      [MONEY] rejected pricing {prid}: target/type mismatch')
+            return 0, False
+        item_cost = int(price[key] or 0)
+        if item_cost <= 0:
+            return 0, False
+        total += item_cost
+    if not found or total <= 0:
+        return 0, False
     pid = await sess.ensure_player()
     if pid is None:
         return total, False
@@ -375,41 +404,49 @@ async def _char_unlock_bits_for(sess, template, faction, char_id=0):
 
 
 async def _weapon_template_id(sess, weapon_id):
-    """按 weapon_id 查武器模板 id（先会话缓存，后数据库）。"""
-    w = getattr(sess, 'weapons', {}).get(weapon_id)
+    """按 weapon_id 查武器模板 id（数据库为准，会话缓存仅作兜底）。
+
+    武器在仓库/角色间转移后，长连接里的 ``sess.weapons`` 可能仍是转移前的
+    快照。配件购买和挂接若先读缓存，会把合法请求按旧归属拒绝，表现为
+    “改配件没反应”。
+    """
+    pid = await sess.ensure_player()
+    if pid is not None:
+        try:
+            wrow = await STORE.get_weapon(pid, int(weapon_id))
+            if wrow is not None:
+                # 顺手刷新缓存，避免本次请求后续步骤再次读到旧容器/归属。
+                if getattr(sess, 'weapons', None) is not None:
+                    sess.weapons[int(weapon_id)] = dict(wrow)
+                return int(wrow['template_id'])
+        except Exception as e:
+            log(f'[DB] weapon template lookup failed: {e}')
+    w = getattr(sess, 'weapons', {}).get(int(weapon_id))
     if w:
         return int(w['template_id'])
-    pid = await sess.ensure_player()
-    if pid is None:
-        return 0
-    try:
-        for wrow in await STORE.list_weapons(pid):
-            if wrow['id'] == weapon_id:
-                return int(wrow['template_id'])
-    except Exception as e:
-        log(f'[DB] weapon template lookup failed: {e}')
     return 0
 
 
 
 async def _weapon_owner_id(sess, weapon_id):
-    """按 weapon_id 查武器归属角色 id（先会话缓存，后数据库）。0 = 未找到。
+    """按 weapon_id 查武器归属角色 id（数据库为准，缓存仅兜底）。0 = 未找到。
 
     2026-09-13 步兵买侦察镜事故：CreateWeaponModifier 校验配件须买给
     charId 自己名下的武器实例，防止客户端 UI 卡死后拿别的角色武器 id
     越权挂接（如侦察 charId 配步兵的 98k 实例）。"""
-    w = getattr(sess, 'weapons', {}).get(weapon_id)
+    pid = await sess.ensure_player()
+    if pid is not None:
+        try:
+            wrow = await STORE.get_weapon(pid, int(weapon_id))
+            if wrow is not None:
+                if getattr(sess, 'weapons', None) is not None:
+                    sess.weapons[int(weapon_id)] = dict(wrow)
+                return int(wrow.get('character_id') or 0)
+        except Exception as e:
+            log(f'[DB] weapon owner lookup failed: {e}')
+    w = getattr(sess, 'weapons', {}).get(int(weapon_id))
     if w:
         return int(w.get('character_id') or 0)
-    pid = await sess.ensure_player()
-    if pid is None:
-        return 0
-    try:
-        for wrow in await STORE.list_weapons(pid):
-            if wrow['id'] == weapon_id:
-                return int(wrow.get('character_id') or 0)
-    except Exception as e:
-        log(f'[DB] weapon owner lookup failed: {e}')
     return 0
 
 
@@ -442,6 +479,18 @@ async def _char_bits_for(sess, char_id):
     except Exception as e:
         log(f'[DB] char bits lookup failed: {e}')
     return set()
+
+
+async def _character_owned(sess, char_id):
+    """Whether a live character belongs to the authenticated player."""
+    pid = await sess.ensure_player()
+    if pid is None or int(char_id or 0) <= 0:
+        return False
+    try:
+        return await STORE.get_character(pid, int(char_id)) is not None
+    except Exception as e:
+        log(f'[DB] character ownership lookup failed: {e}')
+        return False
 
 
 
@@ -495,6 +544,9 @@ async def _msg_player_for(sess, gamertag=None):
     pid = await sess.ensure_player()
     if pid is None:
         raise RuntimeError('cannot build player row without a persisted player id')
+    resolved_gamertag = str(gamertag or sess.username or '').strip()
+    if not resolved_gamertag:
+        raise RuntimeError('cannot build player row without an authenticated gamertag')
     try:
         cur = await STORE.get_currency(pid)
     except Exception as e:
@@ -541,7 +593,7 @@ async def _msg_player_for(sess, gamertag=None):
         except Exception as e:
             log(f'[DB] get_player_unlock_ids failed: {e}')
             unlock_ids = ()
-    return msg_player(gamertag or sess.username or 'DemoPlayer',
+    return msg_player(resolved_gamertag,
                       tutorials_completed=tutorials_completed,
                       pid=pid, faction=faction, total_score=total_score,
                       first_action_date=first_action_date,

@@ -212,7 +212,7 @@ async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
         root = ET.fromstring(xml_str)
     except Exception as e:
         log(f'      [career] reward xml parse error ({tag}): {e}')
-        return granted
+        raise ValueError(f'invalid reward xml for {tag}') from e
     if STORE is None:
         return granted
 
@@ -331,9 +331,10 @@ async def _grant_reward_xml(sess, writer, pid, xml_str, tag):
                 log(f'      [career] reward item skipped ({tag}): '
                     f'<{item.tag} id={tid}>')
         except Exception as e:
-            # 单项失败不影响其余奖励发货
             log(f'      [career] reward item <{item.tag} id={tid}> '
                 f'grant failed ({tag}): {e}')
+            raise RuntimeError(
+                f'reward item {item.tag}#{tid} failed for {tag}') from e
     if delta:
         # 原子增量入账（读-改-写绝对值会覆盖并发变动，如结算加钱）
         await STORE.add_currency(pid, **delta)
@@ -739,9 +740,15 @@ async def handle_claim_career_order_reward(sess, writer, cmd_id, req_type, proto
         if ok:
             tpl = _career_templates().get(template_id)
             if tpl:
-                granted = await _grant_reward_xml(sess, writer, int(pid),
-                                                  tpl[2],
-                                                  f'career order {template_id}')
+                try:
+                    granted = await _grant_reward_xml(
+                        sess, writer, int(pid), tpl[2],
+                        f'career order {template_id}')
+                except Exception as e:
+                    await STORE.rollback_career_order_claim(
+                        int(pid), template_id)
+                    log(f'      [career] reward delivery rolled back: {e}')
+                    granted = []
                 if granted:
                     log(f'      [MONEY] career order {template_id} reward: '
                         f'{granted}')
@@ -928,9 +935,15 @@ async def _claim_reached_rewards(sess, writer, pid, season_id):
             first, _ = await STORE.claim_battle_pass_reward(
                 pid, season_id, t['id'])
             if first:
+                try:
+                    await _grant_reward_xml(sess, writer, pid, t['reward'],
+                                            f'battle pass tier {t["id"]}')
+                except Exception as e:
+                    await STORE.rollback_battle_pass_reward_claim(
+                        pid, season_id, t['id'])
+                    log(f'      [career] battle-pass claim rolled back: {e}')
+                    continue
                 granted_ids.append(t['id'])
-                await _grant_reward_xml(sess, writer, pid, t['reward'],
-                                        f'battle pass tier {t["id"]}')
                 granted_templates.append(_msg_bp_template(t))
     return granted_templates, granted_ids
 

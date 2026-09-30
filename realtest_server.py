@@ -78,6 +78,8 @@ async def _send_pulse(sess, writer):
 
 
 PULSE_INTERVAL = 5  # 秒；私服 PMS→Pulse 间隔约 5s，客户端 SERVER_SLOW_LIMIT_SECONDS=20
+MAX_RECEIVE_BUFFER = 16 * 1024 * 1024
+READ_IDLE_TIMEOUT = 120
 
 
 async def _pulse_loop(sess, writer, fd):
@@ -117,17 +119,21 @@ async def handle_tcp(reader, writer):
     buf = b''
     try:
         while True:
-            data = await reader.read(65536)
+            data = await asyncio.wait_for(
+                reader.read(65536), timeout=READ_IDLE_TIMEOUT)
             if not data:
                 break
             buf += data
+            if len(buf) > MAX_RECEIVE_BUFFER:
+                raise ValueError('receive buffer limit exceeded')
             while True:
                 chunk, nxt = Chunk.parse(buf, 0)
                 if chunk is None:
                     break
                 buf = buf[nxt:]
                 await dispatch(sess, chunk, writer)
-    except (ConnectionResetError, asyncio.IncompleteReadError):
+    except (ConnectionResetError, asyncio.IncompleteReadError,
+            asyncio.TimeoutError):
         pass
     except Exception as e:
         log(f'[handle_tcp] UNEXPECTED {addr}: {type(e).__name__}: {e}')
@@ -205,6 +211,13 @@ async def dispatch(sess, chunk, writer):
             return
         if req_type in ('JoinMatchMakingRequest', 'CancelJoinMatchMakingRequest',
                         'GetMissionDetailsRequest'):
+            if not getattr(sess, 'authenticated', False):
+                writer.write(build_response(
+                    cmd_id, 'HandlerErrorResponse', b''))
+                await writer.drain()
+                log(f'[auth] rejected unauthenticated matchmaking request '
+                    f'{req_type}')
+                return
             # 战斗匹配：匹配请求 / 取消匹配 / 战局详情（简报部署界面），独立模块实现
             await mm_handler.handle_request(sess, writer, cmd_id, req_type, proto)
             return

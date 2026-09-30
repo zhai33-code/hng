@@ -41,8 +41,6 @@ from state import STORE, log
 
 from player_service import _load_db_loadout
 from warserver_messages import (
-    BF_DEFENDER_FACTION_ID,
-    MISSION_PRESET_ID,
     _load_preset,
     _msg_player_settings,
     _msg_response_battlefield_settings,
@@ -110,7 +108,10 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             char_id = int(mm_sess['char_id'])
             player_id = int(mm_sess['player_id'])
             gamertag = mm_sess['gamertag']
-            faction = int(mm_sess.get('faction', 3) or 3)
+            faction = int(mm_sess.get('faction', 0) or 0)
+            if faction not in (1, 2, 3):
+                return await _handler_error(
+                    writer, cmd_id, f'PMS {pms_id} has invalid faction={faction}')
             # ★ 2026-09-06：把玩家身份绑定到本游戏连接（hng.exe 单连接单玩家）。
             #   局内举报（AddPlayerReportRequest）等社交类消息由 hng.exe 经本连接
             #   直发（player.dll warcomm 注册表实证），此前不绑定 →
@@ -120,6 +121,7 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
                 try:
                     sess.player_id = player_id
                     sess.username = str(gamertag)
+                    sess.authenticated = True
                 except AttributeError:
                     pass
                 # ★ 玩家游戏连接打标（战斗服 ZServer 连接也会带精确 pms 查
@@ -208,24 +210,27 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         #    字节打底替换，requesterType 0/1 一律走 warserver_messages.
         #    _msg_player_settings 全动态构建（f12 = 库内角色+装备，
         #    库里没有就发空装备条目）。
-        resp_proto = _msg_player_settings(
-            player_id=player_id,
-            pms_id=pms_id,
-            char_id=char_id,
-            eos_token=eos_token,
-            display_name=username,
-            metrics_uid=metrics_uid,
-            metrics_session_id=metrics_session_id,
-            mission_session_id=mission_session_id,
-            squad_id=squad_id,
-            squad_slot=squad_slot,
-            faction=faction if faction is not None else 3,
-            db_chars=db_chars,
-            loadout=loadout,
-            quickplay=quickplay,
-            first_action_game=first_action_game,
-            membership_benefit_id=membership_benefit_id,
-        )
+        try:
+            resp_proto = _msg_player_settings(
+                player_id=player_id,
+                pms_id=pms_id,
+                char_id=char_id,
+                eos_token=eos_token,
+                display_name=username,
+                metrics_uid=metrics_uid,
+                metrics_session_id=metrics_session_id,
+                mission_session_id=mission_session_id,
+                squad_id=squad_id,
+                squad_slot=squad_slot,
+                faction=faction,
+                db_chars=db_chars,
+                loadout=loadout,
+                quickplay=quickplay,
+                first_action_game=first_action_game,
+                membership_benefit_id=membership_benefit_id,
+            )
+        except LookupError as e:
+            return await _handler_error(writer, cmd_id, str(e))
         resp = build_response(cmd_id, 'PlayerSettings', resp_proto)
         writer.write(resp)
         await writer.drain()
@@ -352,14 +357,17 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         if not req_pid:
             return await _handler_error(writer, cmd_id,
                                         'RequestEarnings missing playerId')
-        credits = gold = 0
-        if req_pid and STORE is not None:
-            try:
-                cur = await STORE.get_currency(int(req_pid))
-                credits = int(cur['credits'])
-                gold = int(cur['gold'])
-            except Exception as e:
-                log(f'[DB] get_currency failed: {e}')
+        if STORE is None:
+            return await _handler_error(writer, cmd_id,
+                                        'RequestEarnings database unavailable')
+        try:
+            cur = await STORE.get_currency(int(req_pid))
+            credits = int(cur['credits'])
+            gold = int(cur['gold'])
+        except Exception as e:
+            log(f'[DB] get_currency failed: {e}')
+            return await _handler_error(
+                writer, cmd_id, f'unknown earnings player={req_pid}')
         resp_proto = pb_int64(1, int(req_pid or 0))
         resp_proto += pb_int64(2, credits)            # silver_earned
         resp_proto += pb_int64(3, gold)               # gold_earned
@@ -546,7 +554,8 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
             is_campaign=is_campaign,
             days_since_war_started=days_since_war,
             supply_line_id=supply_line_id,
-            underdog_mults=underdog_mults)
+            underdog_mults=underdog_mults,
+            map_entity_id=int((det or {}).get('map_entity_id') or 0))
         if is_campaign:
             log(f'[war] campaign battle settings mission={missionid} '
                 f'days={days_since_war} supplyline={supply_line_id} '

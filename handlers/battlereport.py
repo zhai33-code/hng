@@ -154,9 +154,8 @@ async def _report_map_entity(rep):
 
     回退链：war 局 battle 行口径（城战=城市 battlefield id/1、野外遭遇=
     补给线 id/3，battle_map_entity 与 battle 行 f3/f4 同源）→
-    record.map_entity_id/1 → 结算时快照 rep['map_entity_id']/1（正常匹配
-    局唯一来源，combat.py 结算时从 live det 快照入库）→ Benoit Village
-    常量（最旧 staged 口径）。客户端结算界面"赢得了 %c 之战"城市名与
+    record.map_entity_id/1 → 结算时快照 rep['map_entity_id']/1；均缺失则
+    保持 0/0。客户端结算界面"赢得了 %c 之战"城市名与
     地图 zoom 动画位置均由此解析。"""
     from war_campaign.common import battle_map_entity
     ent_id = ent_type = 0
@@ -188,7 +187,7 @@ def _msg_client_battle_report(rep, players, entity_id=0, entity_type=0):
     """ClientBattleReport（战报行 + 玩家行列表）。
 
     entity_id/entity_type：f2/f3 地图实体（调用方 _report_map_entity 解析）；
-    缺省 0 回退 Benoit Village 常量（测试/兼容路径）。"""
+    缺省 0 表示没有战略地图实体。"""
     m = b''
     m += pb_int64(1, int(rep['id']))                    # missionBattleReportId
     m += pb_int64(2, int(entity_type or 0))             # mapEntityTypeId

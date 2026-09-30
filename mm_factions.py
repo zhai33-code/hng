@@ -36,11 +36,6 @@ from mm_state import _WAR_ID, _log
 # GMD/PMS/社交列表引用同源即可（getFromId 有效性不受数值大小影响）。
 FACTION_ROW_IDS = {tmpl: tmpl for tmpl in (1, 2, 3)}
 
-# Assault 简报守方阵营 logo 锚点：Mill A 点（全库无据点挂靠 AP）——客户端
-# setupMissionAssaultTeamOnMap 次选路径把 logo 画在地图中心（O 点区域，
-# BattlefieldUtilities.as L99-105）；f4 仅驱动大厅 logo 定位，战斗侧
-# combat.py f5 home_ap 仍锚真实守方线出兵点（引擎判负/部署必需）
-ASSAULT_DEFENDER_LOGO_AP = 8
 FACTION_SUPREME_COMMANDS = {tmpl: random.getrandbits(63) for tmpl in (1, 2, 3)}
 # 与上面配对的 CommandNodeDefinition 行 id（客户端 CommandnodeTable 由
 # CommandNodeDefinition + CommandNodeWarInstance 两行 join 而成）
