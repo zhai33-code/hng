@@ -49,6 +49,8 @@ class SquadsMixin:
                     int(invited_char_id))
                 if leader_pid is None or invited_pid is None:
                     raise ValueError('squad character not found')
+                if int(leader_pid) == int(invited_pid):
+                    raise ValueError('cannot invite own player account')
                 for player_id in sorted({int(leader_pid), int(invited_pid)}):
                     await conn.execute('SELECT pg_advisory_xact_lock($1)',
                                        player_id)
@@ -255,6 +257,33 @@ class SquadsMixin:
                 'FROM squad_members WHERE squad_id = $1 AND character_id = $2',
                 int(squad_id), int(char_id))
         return dict(row) if row else None
+
+    async def accept_squad_invite(self, member_row_id, player_id,
+                                  character_id):
+        """Accept exactly one still-pending invitation owned by the player."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'UPDATE squad_members m '
+                'SET character_id = $3, status = 2 '
+                'FROM characters old_char, characters new_char '
+                'WHERE m.id = $1 AND m.status = 1 '
+                'AND old_char.id = m.character_id '
+                'AND old_char.player_id = $2 '
+                'AND new_char.id = $3 AND new_char.player_id = $2 '
+                'RETURNING m.squad_id',
+                int(member_row_id), int(player_id), int(character_id))
+        return int(row['squad_id']) if row else 0
+
+    async def decline_squad_invite(self, member_row_id, player_id):
+        """Delete exactly one still-pending invitation owned by the player."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'DELETE FROM squad_members m USING characters c '
+                'WHERE m.id = $1 AND m.status = 1 '
+                'AND c.id = m.character_id AND c.player_id = $2 '
+                'RETURNING m.squad_id',
+                int(member_row_id), int(player_id))
+        return int(row['squad_id']) if row else 0
 
     async def update_squad_member(self, member_row_id, character_id=None,
                                   status=None):

@@ -8,10 +8,10 @@
 
 撮合规则：
   1. FIFO：取池中最早的 entry 为锚点
-  2. 收集与其选图有交集（任一方空 = 通配）的同模式 entry
+  2. 按 FIFO 收集与当前整组仍有共同选图的同模式 entry（空 = 通配）
   3. 凑够 min_players 即成组（收编到 max_players，剩余留池；锚点所在
      整队全员进组、可超 max_players——绝不截断拆队）
-  4. 选图：组内被勾选次数最多的公共 preset（并列取 id 小者）；
+  4. 选图：只从整组共同 preset 中选择（并列取 id 小者）；
      全空 → 从该模式 fallback_presets 随机选（无配置 → FALLBACK_PRESET）
 """
 from dataclasses import dataclass, field
@@ -156,9 +156,14 @@ class MatchPool:
             if e.battle_id:
                 buckets.setdefault(int(e.battle_id), []).append(e)
         min_factions = 1 if mm_config.WAR_SOLO_FORM else 2
-        for battle_id, group in buckets.items():
+        max_p = max(1, int(mm_config.gamemode_cfg(10).get(
+            'max_players', 18)))
+        for battle_id, entries in buckets.items():
             if self.war_ready is not None and not self.war_ready(battle_id):
                 continue                  # 准备期未到（集结倒计时中）
+            group = self._collect_war_group(entries, max_p, min_factions)
+            if group is None:
+                continue
             factions = {int(e.faction) for e in group}
             if len(factions) < min_factions:
                 continue
@@ -167,6 +172,63 @@ class MatchPool:
             return Match(players=group, preset_id=0, ai_fill=False,
                          battle_id=battle_id)
         return None
+
+    @staticmethod
+    def _atomic_units(entries):
+        """按 FIFO 顺序把散人/整队整理成不可拆分的入池单元。"""
+        units = []
+        seen_groups = set()
+        for e in entries:
+            if not e.group_key:
+                units.append([e])
+                continue
+            if e.group_key in seen_groups:
+                continue
+            seen_groups.add(e.group_key)
+            units.append([x for x in entries
+                          if x.group_key == e.group_key])
+        return units
+
+    def _collect_war_group(self, entries, max_p, min_factions):
+        """从会战桶取不超过上限的一局，并保持真实小队原子性。
+
+        双方真人模式先为最早等待方寻找最早的对方阵营单元，再按 FIFO
+        填满剩余席位。这样不会因队首同阵营人数过多而把对方挤到下一局。
+        """
+        units = self._atomic_units(entries)
+        if not units:
+            return None
+
+        first = units[0]
+        if len(first) > max_p:
+            return None                  # 非法超大小队不能突破战局硬上限
+        selected = [first]
+        selected_ids = {id(first)}
+        factions = {int(e.faction) for e in first}
+
+        if len(factions) < min_factions:
+            opponent = next(
+                (u for u in units[1:]
+                 if ({int(e.faction) for e in u} - factions)
+                 and len(first) + len(u) <= max_p),
+                None)
+            if opponent is None:
+                return None
+            selected.append(opponent)
+            selected_ids.add(id(opponent))
+            factions.update(int(e.faction) for e in opponent)
+
+        used = sum(len(u) for u in selected)
+        for unit in units[1:]:
+            if id(unit) in selected_ids:
+                continue
+            if used + len(unit) > max_p:
+                continue
+            selected.append(unit)
+            used += len(unit)
+
+        chosen = {id(e) for unit in selected for e in unit}
+        return [e for e in entries if id(e) in chosen]
 
     def war_bucket(self, battle_id):
         """war 会战桶内等待条目（FIFO 序）：详情简报"战局玩家列表"数据源
@@ -195,6 +257,8 @@ class MatchPool:
             for e in entries[1:]:
                 if e.group_key == anchor.group_key and e not in group:
                     group.append(e)
+        if self._common_presets(group) == set():
+            return None
         for e in entries[1:]:
             if len(group) >= max_p:
                 break
@@ -205,33 +269,39 @@ class MatchPool:
                          if x.group_key == e.group_key and x not in group]
                 if not mates or len(group) + len(mates) > max_p:
                     continue           # 装不下整队 → 跳过（不拆队）
-                if not all(self._compatible(anchor, x) for x in mates):
+                if self._common_presets(group + mates) == set():
                     continue
                 group.extend(mates)
-            elif self._compatible(anchor, e):
+            elif self._common_presets(group + [e]) != set():
                 group.append(e)
         if len(group) < min_p:
             return None
         return group
 
     @staticmethod
-    def _compatible(a, b):
-        """选图兼容：任一方空 = 通配；否则要求有交集。"""
-        if not a.presets or not b.presets:
-            return True
-        return bool(set(a.presets) & set(b.presets))
+    def _common_presets(group):
+        """整组共同可接受地图；None 表示全员通配，空集合表示无交集。"""
+        constrained = [set(e.presets) for e in group if e.presets]
+        if not constrained:
+            return None
+        common = constrained[0]
+        for presets in constrained[1:]:
+            common &= presets
+        return common
 
     @staticmethod
     def _pick_preset(group, gamemode_id=None):
-        """选图：组内多数票（并列取 id 小者）；全空 → 模式兜底池随机。
+        """选图：只从整组共同交集中选；并列取 id 小者。
 
         无人勾图（quickplay / 只选模式）时从该模式 fallback_presets 随机
         选一张，模式无配置则回退全局 FALLBACK_PRESET。
         """
+        common = MatchPool._common_presets(group)
         votes = {}
         for e in group:
             for p in e.presets:
-                votes[p] = votes.get(p, 0) + 1
+                if common is None or p in common:
+                    votes[p] = votes.get(p, 0) + 1
         if votes:
             return min(votes.items(), key=lambda kv: (-kv[1], kv[0]))[0]
         if gamemode_id is not None:

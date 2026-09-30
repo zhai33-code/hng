@@ -10,7 +10,8 @@ _join_existing_mission 会话登记/推送序列（假 writer，无需服务器/
  6. only_mission（f2 指定战局：战争图点战斗 / 好友列表"跟随进入"）
     → 只匹配该局，且绕过 gamemode/preset/JOIN_WINDOW 过滤（阵营/满员仍挡）
  7. _join_existing_mission：登记 PMS_TO_MISSION/PMS_TO_SESSION、追加
-    details['players']、推出 PMS Admitted/Armed + PMM delete + BattleInfo
+    details['players']、推出 PMS Admitted + PMM delete + BattleInfo；Entered
+    等真实 hng.exe 连接后再推
 """
 import asyncio
 import os
@@ -178,10 +179,10 @@ def main():
         check('中途加入：排队上下文已清理',
               pid not in mm_state._MM_QUEUES and
               pid not in mm_state._MATCH_PMM_IDS)
-        # KVCS 序列：PMS(Admitted+Armed) + PMM delete + BattleInfo
+        # 初始 KVCS 序列只含 Admitted；Entered 等真实 hng.exe 连接后再推
         data = w.data
-        check('推送序列：PlayerMissionSession ×2（Admitted+Armed）',
-              data.count(b'PlayerMissionSession') == 2)
+        check('推送序列：PlayerMissionSession ×1（仅 Admitted）',
+              data.count(b'PlayerMissionSession') == 1)
         check('推送序列：PMM delete 已推',
               b'delete' in data and b'PlayerMatchMaking' in data)
         check('推送序列：BattleInfo 已推', b'BattleInfo' in data)
@@ -1068,4 +1069,3 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-

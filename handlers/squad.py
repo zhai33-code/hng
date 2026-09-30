@@ -70,7 +70,12 @@ from player_service import (
     )
 
 from messages import _push_kvcs
-from matchmaking import _cancel_squad_queue, _push_kvcs_delete, _try_form_all
+from matchmaking import (
+    _cancel_squad_queue,
+    _msg_auto_squad_session,
+    _push_kvcs_delete,
+    _try_form_all,
+)
 from mm_state import (
     _AI_FILL_TASKS,
     _MM_MISSION_SQUADS,
@@ -125,8 +130,20 @@ def _player_is_leader(squad, members, player_id):
 
 def _squad_is_locked(squad, members):
     """Member/customization mutations are forbidden while queued or in combat."""
-    return bool((squad or {}).get('matchmaking_flag')) or any(
-        int(m.get('status', 0) or 0) == ST_IN_COMBAT for m in members or ())
+    if bool((squad or {}).get('matchmaking_flag')):
+        return True
+    for member in members or ():
+        if int(member.get('status', 0) or 0) == ST_IN_COMBAT:
+            return True
+        # matchmaking_flag can be changed by a client request while the
+        # authoritative queue entry is still alive; the queue registry wins.
+        if int(member.get('player_id', 0) or 0) in _MM_QUEUES:
+            return True
+    return False
+
+
+def _player_in_matchmaking(player_id):
+    return int(player_id or 0) in _MM_QUEUES
 
 
 def _auto_squad_leader(info):
@@ -138,6 +155,32 @@ def _auto_squad_leader(info):
         if leader is not None:
             return leader
     return members[0] if members else None
+
+
+async def _repair_auto_squad_leader(mission_id, squad_id, info):
+    """Elect and publish a replacement when an auto-squad leader leaves."""
+    members = list((info or {}).get('members') or [])
+    if not members:
+        return
+    leader_char = int((info or {}).get('leader_char_id', 0) or 0)
+    if any(int(m.get('char_id', 0) or 0) == leader_char for m in members):
+        return
+    info['leader_char_id'] = int(members[0].get('char_id', 0) or 0)
+    # Remaining clients must also see the new owner.  A member-only DELETE
+    # leaves their cached SquadSession.ownerPlayerId pointing at the leaver.
+    row = _msg_auto_squad_session(squad_id, info, mission_id)
+    for member in members:
+        flash = FLASH_SESSIONS.get(member.get('gamertag') or '')
+        if flash is None or flash.playerview_cmd is None:
+            continue
+        try:
+            await _push_kvcs(flash.writer, flash.playerview_cmd,
+                             b'SquadSession', row)
+        except Exception as e:
+            # A dead peer must not prevent the roster mutation or the caller's
+            # response; that peer will receive the repaired row on reconnect.
+            log(f'      [squad] auto leader sync to '
+                f'{member.get("gamertag")!r} failed: {e}')
 
 
 async def _push_member_delete_to_session(session, member_row_id):
@@ -427,6 +470,8 @@ async def handle_create_squad(sess, writer, cmd_id, req_type, proto):
     squad_id = 0
     if pid is None or STORE is None or not char_id:
         code = RC_PLAYER_NOT_FOUND
+    elif _player_in_matchmaking(pid):
+        code = RC_SQUAD_IN_LOCKED_STATE
     else:
         try:
             char = await STORE.get_character(int(pid), char_id)
@@ -451,6 +496,17 @@ async def handle_create_squad(sess, writer, cmd_id, req_type, proto):
             code = RC_PLAYER_NOT_FOUND
 
     if code == RC_OK and squad_id:
+        # A completed match can leave the reusable solo row registered.  Once
+        # a real squad exists it must be removed before publishing the DB row,
+        # otherwise the client can retain two current SquadSession records.
+        stale_solo = _SOLO_SQUADS.pop(int(pid), None)
+        if stale_solo is not None and sess.playerview_cmd is not None:
+            await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                    b'SquadSession',
+                                    stale_solo['squad_row'])
+            await _push_kvcs_delete(writer, sess.playerview_cmd,
+                                    b'SquadMemberSession',
+                                    stale_solo['member_row'])
         await push_squad_rows(sess, writer, squad_id)
         # 生涯军令 27 eCreateSquad（客户端无上报点）+ 推行实时刷新
         from handlers.career import complete_order_and_push
@@ -576,6 +632,9 @@ async def handle_remove_squad(sess, writer, cmd_id, req_type, proto):
                     _MM_MISSION_SQUADS[_mid].pop(_sq_id, None)
                     if not _MM_MISSION_SQUADS[_mid]:
                         _MM_MISSION_SQUADS.pop(_mid, None)
+                else:
+                    await _repair_auto_squad_leader(
+                        _mid, _sq_id, _info)
                 resp = build_response(cmd_id, 'RemoveSquadResponse',
                                       pb_int32(1, RC_OK))
                 writer.write(resp)
@@ -763,6 +822,9 @@ async def handle_remove_squad_member(sess, writer, cmd_id, req_type, proto):
                     _MM_MISSION_SQUADS[_mid].pop(_sq_id, None)
                     if not _MM_MISSION_SQUADS[_mid]:
                         _MM_MISSION_SQUADS.pop(_mid, None)
+                else:
+                    await _repair_auto_squad_leader(
+                        _mid, _sq_id, _info)
                 resp = build_response(cmd_id, 'RemoveSquadMemberResponse',
                                       pb_int32(1, RC_OK))
                 writer.write(resp)
@@ -986,6 +1048,11 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
     squad = None
     if pid is None or STORE is None or not friend_player_id:
         code = RC_PLAYER_NOT_FOUND
+    elif int(friend_player_id) == int(pid):
+        code = RC_PLAYER_ALREADY_IN_SQUAD
+    elif (_player_in_matchmaking(pid)
+          or _player_in_matchmaking(friend_player_id)):
+        code = RC_SQUAD_IN_LOCKED_STATE
     else:
         try:
             squad = await STORE.get_squad_for_player(int(pid))
@@ -1071,19 +1138,6 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
                     #   直接发本请求，桌面/网页两版 swf 均无建队调用）：官服由
                     #   服务端在首次邀请时隐式建队。用锚点角色（选中角色，兜底
                     #   最新角色）建队 —— 与上面解析 B 用的是同一约束。
-                    # 清残留 solo 隐式小队（上一局 squadId=0 行仍在客户端
-                    # SquadSession 表），否则新真队行入表后两行并存冲突
-                    solo = _SOLO_SQUADS.pop(int(pid), None)
-                    if solo is not None and sess.playerview_cmd is not None:
-                        await _push_kvcs_delete(
-                            writer, sess.playerview_cmd,
-                            b'SquadSession', solo['squad_row'])
-                        await _push_kvcs_delete(
-                            writer, sess.playerview_cmd,
-                            b'SquadMemberSession', solo['member_row'])
-                        log(f'S->C cmd={sess.playerview_cmd:<4} '
-                            f'KeyValueChangeSet (solo squad delete '
-                            f'id={solo["squad_row"]} ★before implicit create)')
                     name = f"Squad of {username}"
                     if hasattr(STORE, 'create_squad_with_invite'):
                         created_squad_id, member_row = \
@@ -1126,6 +1180,20 @@ async def handle_squad_invite_player(sess, writer, cmd_id, req_type, proto):
 
     if code == RC_OK and member_row:
         if created_squad_id:
+            # Only discard the reusable solo row after the atomic DB create
+            # succeeded.  A transient DB failure must not destroy the user's
+            # current solo state.
+            solo = _SOLO_SQUADS.pop(int(pid), None)
+            if solo is not None and sess.playerview_cmd is not None:
+                await _push_kvcs_delete(
+                    writer, sess.playerview_cmd,
+                    b'SquadSession', solo['squad_row'])
+                await _push_kvcs_delete(
+                    writer, sess.playerview_cmd,
+                    b'SquadMemberSession', solo['member_row'])
+                log(f'S->C cmd={sess.playerview_cmd:<4} '
+                    f'KeyValueChangeSet (solo squad delete '
+                    f'id={solo["squad_row"]} ★after implicit create)')
             # 隐式建队：队长此前无队 → 整队行（SquadSession + 队长 InLobby 行
             # + 被邀请者 pending 行）一起推，客户端小队 UI 才会激活
             await push_squad_rows(sess, writer, created_squad_id)
@@ -1193,7 +1261,7 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
                         or int(mem.get('status', 0) or 0) !=
                         ST_INVITE_PENDING):
                     code = RC_SQUAD_SLOT_NOT_FOUND
-                elif _squad_is_locked(squad, members):
+                elif has_accepted and _squad_is_locked(squad, members):
                     code = RC_SQUAD_IN_LOCKED_STATE
 
             if code == RC_OK and has_accepted:
@@ -1213,10 +1281,14 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
                         f'char for faction={spec[0] if spec else "?"} '
                         f'squad_tmpl={spec[1] if spec else "?"}')
                 else:
-                    updated = await STORE.update_squad_member(
-                        member_row,
-                        character_id=resolved['id'],
-                        status=ST_IN_LOBBY)
+                    if hasattr(STORE, 'accept_squad_invite'):
+                        updated = bool(await STORE.accept_squad_invite(
+                            member_row, int(pid), int(resolved['id'])))
+                    else:
+                        updated = await STORE.update_squad_member(
+                            member_row,
+                            character_id=resolved['id'],
+                            status=ST_IN_LOBBY)
                     if not updated:
                         code = RC_SQUAD_SLOT_NOT_FOUND
                     else:
@@ -1231,9 +1303,17 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
                             f'char={resolved["id"]} '
                             f'(requested={char_id or mem["character_id"]})')
             elif code == RC_OK:
-                declined_squad_id = int(mem['squad_id'])
-                await STORE.remove_squad_member(member_row)
-                log(f'      [DB] squad_invite declined row={member_row}')
+                if hasattr(STORE, 'decline_squad_invite'):
+                    declined_squad_id = await STORE.decline_squad_invite(
+                        member_row, int(pid))
+                    if not declined_squad_id:
+                        code = RC_SQUAD_SLOT_NOT_FOUND
+                else:
+                    declined_squad_id = int(mem['squad_id'])
+                    if not await STORE.remove_squad_member(member_row):
+                        code = RC_SQUAD_SLOT_NOT_FOUND
+                if code == RC_OK:
+                    log(f'      [DB] squad_invite declined row={member_row}')
         except Exception as e:
             log(f'      [DB] squad_respond failed: {e}')
             code = RC_SQUAD_SLOT_NOT_FOUND

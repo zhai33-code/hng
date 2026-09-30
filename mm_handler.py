@@ -48,6 +48,72 @@ from mm_factions import (
 )
 
 
+def _quickplay_character_candidates(characters, selected, gamemode_id):
+    """返回快速匹配可替换的角色，当前选择始终排第一。
+
+    客户端两个快速匹配子按钮的真实语义（GamemodeButton.as）：
+    11 = quickplay_any_soldier（当前阵营任意士兵）；
+    12 = quickplay_current_soldier（只用当前士兵）。
+    新版窗口另有 14 = 全阵营任意士兵。将军没有 FPS 实体，排除。
+    """
+    mode = int(gamemode_id or 0)
+    if mode == 12:
+        return [selected]
+    selected_id = int(selected.get('id', 0) or 0)
+    selected_faction = int(selected.get('faction', 0) or 0)
+    result = []
+    for char in characters:
+        if is_general_character(int(char.get('template', 0) or 0)):
+            continue
+        if mode == 11 and int(char.get('faction', 0) or 0) != selected_faction:
+            continue
+        if mode not in (11, 14) and int(char.get('id', 0) or 0) != selected_id:
+            continue
+        result.append(char)
+    result.sort(key=lambda char: int(char.get('id', 0) or 0) != selected_id)
+    return result or [selected]
+
+
+async def _pick_quickplay_character(pid, characters, selected, gamemode_id):
+    """为 11/12/14 选实际参战角色，并生成 PMM f24 候选信息。
+
+    优先能立即加入现有 staging 局的候选；否则选能并入当前最忙兼容池的
+    候选。并列保持当前士兵优先，避免无收益地切换角色。
+    """
+    candidates = _quickplay_character_candidates(
+        characters, selected, gamemode_id)
+    prepared = []
+    counts = POOL.waiting_counts()
+    for char in candidates:
+        template = int(char.get('template', 0) or 0)
+        char_cat = character_resource_category(template)
+        vehicle_cats = tuple(await _char_vehicle_cats(
+            int(pid), int(char['id'])))
+        modes = tuple(
+            mode for mode in mm_config.QUICKPLAY_POOL_MODES
+            if not mm_config.mode_char_cats(mode)
+            or not char_cat
+            or char_cat in mm_config.mode_char_cats(mode))
+        presets = tuple(sorted({
+            int(preset)
+            for mode in modes
+            for preset in mm_config.gamemode_cfg(mode).get(
+                'fallback_presets', ())
+        }))
+        # 单候选无需预扫，主流程稍后会做同一次 late-join 查询；多候选
+        # 才逐个比较，避免把 12“当前士兵”路径平白多查一遍。
+        live = (_find_joinable_mission(
+            None, (), int(char['faction']), vehicle_cats=vehicle_cats,
+            char_cat=char_cat) if len(candidates) > 1 else None)
+        score = max((counts.get(mode, 0) for mode in modes), default=0)
+        prepared.append((char, live is not None, score, {
+            'faction': int(char['faction']), 'template': template,
+            'presets': presets, 'vehicle_cats': vehicle_cats,
+        }))
+    best = max(prepared, key=lambda item: (item[1], item[2]))
+    return best[0], tuple(item[3] for item in prepared)
+
+
 async def _specified_mission_join_error(req_mission_id, faction, char_cat=0):
     """指定战局加入（JoinMM f2：好友列表"跟随进入战斗"/战争图点战斗）的
     前置校验：返回错误码（无法加入）或 None（可加入）。
@@ -158,6 +224,7 @@ async def _handle_join(sess, writer, cmd_id, proto):
 
     pid = await sess.ensure_player()
     char_info = None
+    player_characters = []
     if pid is not None:
         # ★ charId=0：客户端有小队会话时 EnterMatchmakingCommand 传
         #   int64.zero（官方由服务端按小队成员行取角色）。不解析则
@@ -182,7 +249,8 @@ async def _handle_join(sess, writer, cmd_id, proto):
                 _log(f'      JoinMatchMaking: charId=0 resolved from squad '
                      f'session -> char {char_id}')
         try:
-            for ch in await state.STORE.list_characters(pid):
+            player_characters = list(await state.STORE.list_characters(pid))
+            for ch in player_characters:
                 if int(ch['id']) == int(char_id):
                     char_info = ch
                     break
@@ -200,12 +268,46 @@ async def _handle_join(sess, writer, cmd_id, proto):
     #   实体；其 actionid 与伞兵同为 7，不挡会混进战斗当伞兵）。
     #   排队/late-join/rejoin/快速游戏全经此处，单人路径一处拦截即覆盖。
     #   与"角色不存在"同款拒绝（response=0）。
-    if is_general_character(int(char_info.get('template', 0) or 0)):
+    multi_char_quickplay = (gamemode_id in (11, 14)
+                            and not req_mission_id and not war_flag)
+    if (is_general_character(int(char_info.get('template', 0) or 0))
+            and not multi_char_quickplay):
         resp = build_response(cmd_id, 'JoinMatchMakingResponse', pb_int32(1, 0))
         writer.write(resp)
         await writer.drain()
         _log(f'S->C cmd={cmd_id:<4} JoinMatchMakingResponse '
              f'(rejected: char {char_id} is general — generals cannot enter combat)')
+        return
+
+    # 两个快速匹配按钮不能退化成同一条“当前士兵”路径：11 允许服务端
+    # 从当前阵营的全部士兵里选择，12 严格锁定当前士兵；新版 14 再把
+    # 候选扩展到全部阵营。真实小队的角色由 SquadMemberSession 固定，
+    # 不在这里擅自替整队换兵种，只对 solo 快速匹配执行自动选择。
+    requested_gamemode_id = gamemode_id
+    quickplay_info = ()
+    cached_squad = await _squad_eligible_members(pid)
+    active_mission = _find_player_active_mission(pid)
+    if (gamemode_id in mm_config.QUICKPLAY_GAMEMODES
+            and not req_mission_id and not war_flag
+            and not active_mission
+            and cached_squad[0] is None):
+        picked, quickplay_info = await _pick_quickplay_character(
+            pid, player_characters, char_info, gamemode_id)
+        if int(picked['id']) != int(char_info['id']):
+            _log(f'[MM] quickplay({gamemode_id}) selected char '
+                 f'{int(picked["id"])} over current {int(char_info["id"])} '
+                 f'(faction={int(picked["faction"])})')
+        char_info = picked
+        char_id = int(picked['id'])
+
+    # “任意士兵”在当前选中将军时仍可改选同阵营/全阵营普通士兵；只有
+    # 候选中确实没有可参战角色才拒绝。客户端也只禁用“当前士兵”子项。
+    if is_general_character(int(char_info.get('template', 0) or 0)):
+        resp = build_response(cmd_id, 'JoinMatchMakingResponse', pb_int32(1, 0))
+        writer.write(resp)
+        await writer.drain()
+        _log(f'S->C cmd={cmd_id:<4} JoinMatchMakingResponse '
+             f'(rejected: quickplay has no combat character for player {pid})')
         return
 
     # 记录当前选中士兵（squad 入队规则需要：邀请时解析被邀者角色），
@@ -310,7 +412,7 @@ async def _handle_join(sess, writer, cmd_id, proto):
     #   成员 → 全队作为原子单位一起排队（group_key=squad_id 不拆队），
     #   成局后整队同 mission 部署。官方语义：队长激活小队全队进匹配，
     #   这里任何成员点匹配都带全队（角色取各自小队成员行）。
-    squad, sq_members = await _squad_eligible_members(pid)
+    squad, sq_members = cached_squad
     if squad is not None:
         # ★ 小队成员战斗中掉线重连：自己 InBattle 被 eligible 过滤 →
         #   sq_members 为空，原路径 _enqueue_squad 直接 return（静默
@@ -380,6 +482,8 @@ async def _handle_join(sess, writer, cmd_id, proto):
     ctx = {'writer': writer, 'view_cmd': view_cmd, 'gamertag': gamertag,
            'char_name': char_name, 'rank': rank, 'faction': faction,
            'char_id': int(char_id), 'quickplay': quickplay,
+           'quickplay_mode': requested_gamemode_id,
+           'quickplay_info': quickplay_info,
            'req_mission_id': req_mission_id,
            'char_template': template,
            'metrics_uid': metrics_uid,
@@ -395,7 +499,8 @@ async def _handle_join(sess, writer, cmd_id, proto):
                              pmm_id, char_id, faction, req_mission_id,
                              _zulu_now(),
                              POOL.waiting_count(gamemode_id) + 1,
-                             POOL.waiting_count() + 1))
+                             POOL.waiting_count() + 1,
+                             quickplay_info))
         _log(f'S->C cmd={view_cmd:<4} KeyValueChangeSet (PlayerMatchMaking '
              f'id={pmm_id}, gamemode={gamemode_id})')
 

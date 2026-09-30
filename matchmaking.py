@@ -413,7 +413,7 @@ async def add_reinforcement_to_live_mission(battle_id, at):
 
 
 def _msg_battle_info(battle_id, pos_x, pos_y):
-    """HnG_States.BattleInfo proto（PMS Armed 后必须推送，否则客户端不连 game server）。
+    """HnG_States.BattleInfo proto（PMS Admitted 后即推，供客户端启动使用）。
 
     私服抓包 frame 0xa636 字段：
       field 1 battleId (int64) = 5752758341220508668
@@ -658,8 +658,27 @@ def _mm_live_stats():
     return in_game, populating, running
 
 
+def _msg_quickplay_info(faction_id, character_template_id, presets=(),
+                        vehicle_cats=(), war=False):
+    """HnG_States.QuickplayMatchmakingInfo.
+
+    官服用 PlayerMatchMaking.f24 告知客户端快速匹配正在考虑哪些
+    阵营/士兵模板/地图。这里保留每个候选士兵一行；具体角色实例仍由
+    服务端在入池前选定，避免虚拟 quickplay 模式形成独立孤岛池。
+    """
+    m = pb_int64(1, int(faction_id))
+    m += pb_int64(2, int(character_template_id))
+    for preset in presets:
+        m += pb_int64(3, int(preset))
+    for cat in vehicle_cats:
+        m += pb_int64(4, int(cat))
+    m += pb_bool(5, bool(war))
+    return m
+
+
 def _msg_player_matchmaking(pmm_id, char_id, faction_id, mission_id, zulu_time,
-                            queue_local=1, queue_total=1):
+                            queue_local=1, queue_total=1,
+                            quickplay_info=()):
     """HnG_States.PlayerMatchMaking proto（匹配中状态行）。
     仅 'set' 推送；repeated 空字段完全省略（hurlant Buffer overflow 坑）。
     f18/f19 队列人数 / f20-f23 战局统计 = 实时统计（原硬编码 1/0）。"""
@@ -686,6 +705,10 @@ def _msg_player_matchmaking(pmm_id, char_id, faction_id, mission_id, zulu_time,
     m += pb_int32(21, in_game)          # playersInGameTotal（单服 = 同上）
     m += pb_int32(22, populating)       # missionsMatchingPopulating（组局中）
     m += pb_int32(23, running)          # missionsMatchingRunning（进行中）
+    for info in quickplay_info:
+        m += pb_message(24, _msg_quickplay_info(
+            info['faction'], info['template'], info.get('presets', ()),
+            info.get('vehicle_cats', ()), info.get('war', False)))
     m += pb_int64(25, 0)                # missionCategoryId
     return m
 
@@ -1160,7 +1183,8 @@ async def _push_queue_counts():
                     q['pmm_id'], ctx['char_id'], ctx['faction'],
                     ctx.get('req_mission_id', 0), _zulu_now(),
                     POOL.waiting_count(q.get('gamemode', 0)),
-                    POOL.waiting_count()))
+                    POOL.waiting_count(),
+                    ctx.get('quickplay_info', ())))
         except Exception:
             pass                         # 连接已断：留给 cancel/abandon 清理
 
@@ -1267,6 +1291,14 @@ async def _squad_eligible_members(pid):
     except Exception as e:
         _log(f'      [DB] squad lookup failed: {e}')
         return None, None
+    own_membership = next((m for m in members
+                           if int(m['player_id']) == int(pid)), None)
+    # A pending invitation is not membership. Treating it as a real squad made
+    # JoinMatchMaking enter the squad recovery path and could promote status 1
+    # to InLobby without an explicit SquadRespondToInviteRequest.
+    if own_membership is None or int(own_membership['status']) == 1:
+        return None, None
+
     eligible = []
     for m in members:
         if int(m['status']) not in (2, 3):
@@ -1301,10 +1333,16 @@ async def _revive_own_membership(squad_db_id, pid):
         _log(f'      [DB] _revive_own_membership lookup failed: {e}')
         return False
     for m in members:
-        if int(m['player_id']) == int(pid) and int(m['status']) not in (2, 3):
+        if int(m['player_id']) == int(pid) and int(m['status']) == 4:
             try:
-                await state.STORE.update_squad_member(int(m['member_id']), status=2)
-                return True
+                # list_squad_members normalizes the database row id to ``id``.
+                # Some older test doubles exposed ``member_id`` as well, which
+                # hid this mismatch and left real players stuck InBattle.
+                member_id = m.get('id', m.get('member_id'))
+                if member_id is None:
+                    return False
+                return bool(await state.STORE.update_squad_member(
+                    int(member_id), status=2))
             except Exception as e:
                 _log(f'      [DB] _revive_own_membership update failed: {e}')
                 return False
@@ -1810,6 +1848,8 @@ async def _start_match(match):
             raise RuntimeError(f'match player {pid} has no authenticated gamertag')
         sess_rec = {'pms_id': pms_id, 'player_id': pid,
                     'char_id': int(e.char_id), 'gamertag': gamertag,
+                    'char_name': ctx.get('char_name') or gamertag,
+                    'rank': int(ctx.get('rank', 0) or 0),
                     'faction': int(e.faction),
                     'metrics_uid': metrics_uid,
                     'metrics_session_id': metrics_session_id,
@@ -1817,6 +1857,7 @@ async def _start_match(match):
                     'squad_id': squad_id,
                     'squad_db_id': squad_db_id,
                     'squad_slot': 0,
+                    'pms_entered': False,
                     'mission_id': mission_id,
                     'quickplay': bool(ctx.get('quickplay', False))}
         PMS_TO_MISSION[pms_id] = mission_id
@@ -2012,8 +2053,11 @@ async def _push_player_into_mission(e, ctx, sess_rec, pms_id, mission_id,
     """单玩家进局 KVCS 序列（成局分发与等待期中途加入共用）。
 
     PMS Admitted(f14=2，触发客户端拉起 hng.exe) → solo squad InBattle
-    → PMM delete（退出匹配中界面）→ BattleInfo set → 5s 后 PMS Armed
-    (f14=3)。单玩家失败由调用方捕获（不影响其他玩家）。
+    → PMM delete（退出匹配中界面）→ BattleInfo set。
+
+    不再按固定 5 秒推进 Entered：hngsync 可能仍在下载/校验文件。真正收到
+    玩家 hng.exe 的 GetPlayerSettings（或后续 PlayerJoined）后，才由
+    mark_player_mission_entered() 推 f14=3。单玩家失败由调用方捕获。
     """
     w, vc = ctx.get('writer'), ctx.get('view_cmd')
     if w is None or vc is None:
@@ -2092,7 +2136,7 @@ async def _push_player_into_mission(e, ctx, sess_rec, pms_id, mission_id,
         await _push_kvcs_delete(w, vc, b'PlayerMatchMaking', pmm_id)
         _log(f'S->C cmd={vc:<4} KeyValueChangeSet '
              f'delete (PlayerMatchMaking id={pmm_id})')
-    # BattleInfo 'set'（PMS Armed 后必须推，否则客户端不连 game server）
+    # BattleInfo 'set'（启动 hng.exe 所需战局数据；保持 Admitted 等真实连接）
     await _push_kvcs(w, vc, b'BattleInfo',
                      _msg_battle_info(mission_id, pos[0], pos[1]))
     _log(f'S->C cmd={vc:<4} KeyValueChangeSet (BattleInfo id={mission_id})')
@@ -2105,21 +2149,64 @@ async def _push_player_into_mission(e, ctx, sess_rec, pms_id, mission_id,
         await notify_friends_of(pid)
     except Exception as ex:
         _log(f'      [social] notify_friends_of({pid}) failed: {ex}')
-    # ★ private_login.pcapng 复核：Admitted 数秒后再推 f14=3 (Armed)，
-    #   KVCS 全走 Flash 连接（game 连接保持静默）。
-    await asyncio.sleep(5)
-    await _push_kvcs(w, vc, b'PlayerMissionSession',
-                     _msg_player_mission_session(
-                         pms_id, pid, gamertag, char_id, faction,
-                         char_name, rank, mission_id, _zulu_now(),
-                         game_connect,
-                         metrics_uid=sess_rec['metrics_uid'],
-                         metrics_session_id=sess_rec['metrics_session_id'],
-                         metrics_device_id=METRICS_DEVICE_ID,
-                         platform='HnG', connection_state=3,
-                         battle_session_id=sess_rec['battle_session_id']))
-    _log(f'S->C cmd={vc:<4} KeyValueChangeSet (PlayerMissionSession '
-         f'id={pms_id}, mission={mission_id}, state=3 Armed ★battle arm)')
+
+
+async def mark_player_mission_entered(pms_id):
+    """真实玩家游戏进程连上 warserver 后，把 PMS 从 Admitted 推到 Entered。
+
+    GetPlayerSettings 有普通/EAC 两条请求路径，PlayerJoined 也可能随后重复上报，
+    因此以会话内 ``pms_entered`` 去重。战斗服自身启动时也会请求
+    GetPlayerSettings，但调用方必须排除 ``is_combat_server`` 连接。
+    """
+    try:
+        pms_id = int(pms_id)
+    except (TypeError, ValueError):
+        return False
+    rec = PMS_TO_SESSION.get(pms_id)
+    if (rec is None or rec.get('pms_entered')
+            or rec.get('pms_entering')):
+        return False
+    mission_id = int(PMS_TO_MISSION.get(pms_id, 0) or 0)
+    if not mission_id:
+        return False
+    gamertag = str(rec.get('gamertag') or '').strip()
+    flash = FLASH_SESSIONS.get(gamertag)
+    if flash is None or flash.playerview_cmd is None:
+        _log(f'PMS Entered deferred: no live Flash session for {gamertag!r} '
+             f'(pms={pms_id}, mission={mission_id})')
+        return False
+
+    pid = int(rec.get('player_id', 0) or 0)
+    char_id = int(rec.get('char_id', 0) or 0)
+    faction = int(rec.get('faction', 0) or 0)
+    char_name = str(rec.get('char_name') or gamertag)
+    rank = int(rec.get('rank', 0) or 0)
+    inst = COMBAT_INSTANCES.get(mission_id)
+    game_connect = (_game_connect_for(inst) if inst is not None
+                    else f'{PUBLIC_HOST}:5678')
+    rec['pms_entering'] = True
+    try:
+        await _push_kvcs(
+            flash.writer, flash.playerview_cmd, b'PlayerMissionSession',
+            _msg_player_mission_session(
+                pms_id, pid, gamertag, char_id, faction, char_name, rank,
+                mission_id, _zulu_now(), game_connect,
+                metrics_uid=rec.get('metrics_uid', ''),
+                metrics_session_id=int(rec.get('metrics_session_id', 0) or 0),
+                metrics_device_id=METRICS_DEVICE_ID,
+                platform='HnG', connection_state=3,
+                battle_session_id=int(rec.get('battle_session_id', 0) or 0)))
+    except Exception as ex:
+        _log(f'PMS Entered push failed (pms={pms_id}, mission={mission_id}): '
+             f'{ex}')
+        return False
+    finally:
+        rec.pop('pms_entering', None)
+    rec['pms_entered'] = True
+    _log(f'S->C cmd={flash.playerview_cmd:<4} KeyValueChangeSet '
+         f'(PlayerMissionSession id={pms_id}, mission={mission_id}, '
+         f'state=3 Entered ★real game client connected)')
+    return True
 
 
 def _find_joinable_mission(gamemode_id, presets, faction, only_mission=None,
@@ -2354,12 +2441,15 @@ async def _join_existing_mission(pid, mission_id, e, ctx):
     sess_rec = {'pms_id': pms_id, 'player_id': pid,
                 'char_id': int(e.char_id),
                 'gamertag': gamertag,
+                'char_name': ctx.get('char_name') or gamertag,
+                'rank': int(ctx.get('rank', 0) or 0),
                 'faction': faction,
                 'metrics_uid': metrics_uid,
                 'metrics_session_id': metrics_session_id,
                 'battle_session_id': _next_match_id(_MM_BATTLE_SESSION_ID),
                 'squad_id': 0, 'squad_slot': 0,
                 'squad_db_id': int(ctx.get('squad_db_id', 0) or 0),
+                'pms_entered': False,
                 'mission_id': mission_id,
                 'quickplay': bool(ctx.get('quickplay', False))}
     # ★ 局内小队归组：
@@ -2526,6 +2616,7 @@ def arm_rejoin_deadline(pid, reason='game-conn-closed'):
     for pms_id, rec in PMS_TO_SESSION.items():
         if int((rec or {}).get('player_id', 0) or 0) != pid:
             continue
+        rec['pms_entered'] = False
         if rec.get('rejoin_deadline'):
             continue              # 已有 deadline（含已过期）：不覆盖
         mid = int(PMS_TO_MISSION.get(pms_id, 0) or 0)

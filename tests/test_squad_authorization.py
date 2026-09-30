@@ -8,13 +8,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol import Chunk, pb_varint
 import handlers.squad as squad_mod
+import matchmaking
+import state
+from mm_state import _MM_QUEUES
 from handlers.squad import (
     RC_OK, RC_PLAYER_NOT_OWNER, RC_SQUAD_IN_LOCKED_STATE,
     RC_SQUAD_NOT_OWNED, RC_SQUAD_SLOT_NOT_FOUND,
     handle_modify_squad,
-    handle_remove_squad, handle_remove_squad_member,
+    handle_create_squad, handle_remove_squad, handle_remove_squad_member,
     handle_set_squad_matchmaking_flag, handle_set_squad_member_status,
-    handle_squad_respond_to_invite,
+    handle_squad_invite_player, handle_squad_respond_to_invite,
     handle_update_squad_resource,
 )
 from state import FLASH_SESSIONS
@@ -58,7 +61,7 @@ class Store:
 
     @staticmethod
     def _member(mid, pid, tag, char_id, status):
-        return {'id': mid, 'member_id': mid, 'squad_id': 10,
+        return {'id': mid, 'squad_id': 10,
                 'player_id': pid, 'gamertag': tag,
                 'character_id': char_id, 'status': status,
                 'faction': 1, 'template': 1, 'combat_xp': 0,
@@ -91,6 +94,23 @@ class Store:
         if status is not None:
             m['status'] = int(status)
         return True
+
+    async def accept_squad_invite(self, mid, pid, character_id):
+        m = self.members.get(int(mid))
+        if (m is None or int(m['player_id']) != int(pid)
+                or int(m['status']) != 1):
+            return 0
+        m['character_id'] = int(character_id)
+        m['status'] = 2
+        return int(m['squad_id'])
+
+    async def decline_squad_invite(self, mid, pid):
+        m = self.members.get(int(mid))
+        if (m is None or int(m['player_id']) != int(pid)
+                or int(m['status']) != 1):
+            return 0
+        self.members.pop(int(mid))
+        return int(m['squad_id'])
 
     async def set_squad_flag(self, sid, flag):
         self.squad['matchmaking_flag'] = bool(flag)
@@ -130,8 +150,10 @@ async def invoke(handler, sess, proto, cmd=90):
 
 async def main():
     old_store = squad_mod.STORE
+    old_state_store = state.STORE
     store = Store()
     squad_mod.STORE = store
+    state.STORE = store
     leader = Session(1, 'leader')
     member = Session(2, 'member')
     pending = Session(3, 'pending')
@@ -176,12 +198,55 @@ async def main():
                                pb_varint(1, 10))
         check('非队长不能购买小队资源', code == RC_SQUAD_NOT_OWNED)
 
+        code, _ = await invoke(handle_squad_invite_player, leader,
+                               pb_varint(1, 101) + pb_varint(2, 1))
+        check('不能邀请自己创建双成员行',
+              code == squad_mod.RC_PLAYER_ALREADY_IN_SQUAD)
+
+        _MM_QUEUES[99] = {'pmm_id': 78, 'mission_id': 0, 'ctx': {}}
+        code, _ = await invoke(handle_create_squad, outsider,
+                               pb_varint(1, 999))
+        check('匹配队列中不能新建真小队',
+              code == RC_SQUAD_IN_LOCKED_STATE)
+        _MM_QUEUES.pop(99, None)
+
+        squad, eligible = await matchmaking._squad_eligible_members(3)
+        revived = await matchmaking._revive_own_membership(10, 3)
+        check('pending 邀请不被匹配路径视为正式入队',
+              squad is None and eligible is None and not revived
+              and store.members[3]['status'] == 1)
+
+        store.members[3]['status'] = 4
+        revived = await matchmaking._revive_own_membership(10, 3)
+        check('InBattle 残留使用真实存储字段 id 恢复 InLobby',
+              revived and store.members[3]['status'] == 2)
+        store.members[3]['status'] = 1
+
+        store.squad['matchmaking_flag'] = True
+        code, _ = await invoke(handle_squad_respond_to_invite, pending,
+                               pb_varint(1, 3) + pb_varint(2, 1))
+        check('小队锁定时不能接受邀请',
+              code == RC_SQUAD_IN_LOCKED_STATE
+              and store.members[3]['status'] == 1)
+        code, _ = await invoke(handle_squad_respond_to_invite, pending,
+                               pb_varint(1, 3) + pb_varint(2, 0))
+        check('小队锁定时仍可拒绝邀请',
+              code == RC_OK and 3 not in store.members)
+        store.squad['matchmaking_flag'] = False
+
         store.squad['matchmaking_flag'] = True
         code, _ = await invoke(handle_remove_squad_member, leader,
                                pb_varint(1, 2))
         check('排队锁定期间不能踢人',
               code == RC_SQUAD_IN_LOCKED_STATE and 2 in store.members)
         store.squad['matchmaking_flag'] = False
+
+        _MM_QUEUES[2] = {'pmm_id': 77, 'mission_id': 0, 'ctx': {}}
+        code, _ = await invoke(handle_remove_squad_member, leader,
+                               pb_varint(1, 2))
+        check('客户端清掉 flag 后权威队列仍保持锁定',
+              code == RC_SQUAD_IN_LOCKED_STATE and 2 in store.members)
+        _MM_QUEUES.pop(2, None)
 
         code, _ = await invoke(handle_remove_squad_member, leader,
                                pb_varint(1, 1))
@@ -195,6 +260,8 @@ async def main():
         check('被踢者收到成员 DELETE', b'SquadMemberSession' in member.writer.data)
     finally:
         squad_mod.STORE = old_store
+        state.STORE = old_state_store
+        _MM_QUEUES.clear()
         for name in ('leader', 'member', 'pending'):
             FLASH_SESSIONS.pop(name, None)
 

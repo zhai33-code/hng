@@ -41,6 +41,10 @@ async def handle_player_joined(sess, writer, cmd_id, req_type, proto):
     if mm_sess:
         matchmaking.clear_rejoin_deadline(
             int(mm_sess.get('player_id', 0) or 0))
+        # 某些客户端路径先上报 PlayerJoined，或 GetPlayerSettings 时 Flash
+        # 短暂离线未能推状态；这里以真实加入事件作为 Entered 兜底。
+        await matchmaking.mark_player_mission_entered(
+            int(mm_sess.get('pms_id', 0) or 0))
     log(f'      [combat] PlayerJoined msid={msid} -> '
         f'{mm_sess["gamertag"] if mm_sess else "unknown session"}')
     await _ack_error(writer, cmd_id, 'PlayerJoined acknowledged')
@@ -86,6 +90,7 @@ async def handle_player_exit_batch(sess, writer, cmd_id, req_type, proto):
         #   rejoin_sweep_loop 释放会话（官服 300s 席位超时语义；点取消
         #   离开的 abandon 清理先到则本 deadline 随 PMS 记录一起消失）
         if mm_sess:
+            mm_sess['pms_entered'] = False
             matchmaking.arm_rejoin_deadline(
                 int(mm_sess.get('player_id', 0) or 0), reason='player-exit-batch')
         # ★ 离开战局链路（StatusMediator.onCancelButtonConfirmedClicked）：

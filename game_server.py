@@ -237,12 +237,19 @@ async def handle_request(sess, writer, cmd_id, req_type, proto):
         log(f'GAME S->C cmd={cmd_id:<4} PlayerSettings (pms={pms_id}, player={player_id}, '
             f'char={char_id}, {len(resp_proto)}B, requesterType={requester_type})')
 
+        # 只有玩家自己的 hng.exe 成功连到 warserver、拿到 PlayerSettings 后
+        # 才把 Flash 侧 PMS 推进到 Entered。此前匹配代码固定 5 秒推进，
+        # hngsync 尚在下载/校验时就会把仍未启动的玩家误标为已进战斗。
+        # 战斗服进程启动时也会带首名玩家 pms 请求本消息，必须排除。
+        if pms_exact and not getattr(sess, 'is_combat_server', False):
+            await matchmaking.mark_player_mission_entered(pms_id)
+
         # ★ private_login.pcapng 复核（2026-08-19 全帧解析）：
         # 真实 warserver 的 game 连接只回 PlayerSettings 后【完全静默】——
         # PMS(f14=2/3)、ViewHandlerPulse、BattleInfo、faction 全部走 Flash 客户端长连接。
         # 之前在 game 连接推 KVCS 帧属于协议违约（真实流程从不这么做），
         # 游戏收到后状态机卡死 → 不连 actionhost UDP → ~20s 断开。
-        # PMS f14=3(Armed) 由 matchmaking._matchmade 在 Flash 连接上延迟推送。
+        # PMS f14=3(Entered) 由上方真实玩家连接确认后走 Flash 长连接推送。
         return True
 
     if req_type == 'RequestReadCharacterStats':

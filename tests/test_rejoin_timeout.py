@@ -329,6 +329,10 @@ def main():
                 sess_h, w_h, 41, 'PlayerJoined', proto_h))
             check('H1 PlayerJoined（重进战局）→ 清 deadline',
                   'rejoin_deadline' not in mm_state.PMS_TO_SESSION[610004])
+            check('H2 PlayerJoined（真实游戏连接）→ 推 PMS Entered',
+                  mm_state.PMS_TO_SESSION[610004].get('pms_entered') is True
+                  and b'PlayerMissionSession' in w_g3.data
+                  and b'\x70\x03' in w_g3.data)
 
             # ---- I. rejoin_sweep_once：超时释放 ----
             # I1：保护期内（deadline 未来）→ 不动

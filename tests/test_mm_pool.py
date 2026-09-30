@@ -6,7 +6,7 @@
 3. min/max 截断（人数不足不成局；超 max 截断留池）
 4. FIFO 锚点（后来者不能挤掉先排队者）
 5. 重复入队覆盖（人数不虚增）
-6. 选图多数票（并列取 preset id 小者；全空 → FALLBACK_PRESET）
+6. 选图只取整组共同交集（并列取 preset id 小者；全空 → FALLBACK_PRESET）
 7. remove 出池
 8. force_form 超时 AI 补位（1 人也成局）
 9. 模式隔离（不同 gamemode 不互撮）
@@ -99,14 +99,25 @@ def main():
     check('重复入队：人数不虚增', p.waiting_count() == 1)
     check('重复入队：保留最新选图', p.get(1).presets == (29,))
 
-    # ---- 6. 选图多数票 / 并列取小 / 全空兜底 ----
+    # ---- 6. 整组共同交集 / 并列取小 / 全空兜底 ----
     p = mm_pool.MatchPool()
     p.enqueue(entry(1, mode=99, presets=[26, 10]))
-    p.enqueue(entry(2, mode=99, presets=[10, 29]))
-    p.enqueue(entry(3, mode=99, presets=[26]))
-    # 票数：26→2, 10→2, 29→1 → 并列取 id 小者 10
+    p.enqueue(entry(2, mode=99, presets=[10, 26, 29]))
+    p.enqueue(entry(3, mode=99, presets=[26, 10]))
     m = p.try_form()
-    check('选图：并列取 preset id 小者', m is not None and m.preset_id == 10,
+    check('选图：共同交集内并列取 preset id 小者',
+          m is not None and m.preset_id == 10,
+          f'preset={m.preset_id if m else None}')
+    # A 分别与 B/C 有交集，但三人没有共同地图：必须按 FIFO 收 A+B，C 留池。
+    p = mm_pool.MatchPool()
+    p.enqueue(entry(1, mode=99, presets=[10, 26]))
+    p.enqueue(entry(2, mode=99, presets=[10]))
+    p.enqueue(entry(3, mode=99, presets=[26]))
+    m = p.try_form()
+    check('选图：禁止仅与锚点两两兼容但整组无交集',
+          m is not None and {e.player_id for e in m.players} == {1, 2}
+          and m.preset_id == 10 and p.get(3) is not None,
+          f'players={[e.player_id for e in m.players] if m else None}, '
           f'preset={m.preset_id if m else None}')
     p = mm_pool.MatchPool()
     p.enqueue(entry(1, mode=99))
@@ -292,6 +303,40 @@ def main():
           p.waiting_count() == 0,
           f'battle_id={m.battle_id if m else None}, '
           f'players={len(m.players) if m else None}')
+    # 会战桶积压人数不得突破模式硬上限；对方阵营即使排在第 20 位也须
+    # 被纳入首局，较晚的同阵营玩家留池。
+    p = mm_pool.MatchPool()
+    for pid in range(1, 20):
+        ew = entry(pid, mode=10, faction=1)
+        ew.battle_id = 26
+        p.enqueue(ew)
+    ew = entry(20, mode=10, faction=2)
+    ew.battle_id = 26
+    p.enqueue(ew)
+    m = p.try_form_war()
+    war_max = mm_config.gamemode_cfg(10)['max_players']
+    check('war 上限：积压桶只取 max_players 且包含攻守双方',
+          m is not None and len(m.players) == war_max
+          and {e.faction for e in m.players} == {1, 2}
+          and p.waiting_count() == 20 - war_max,
+          f'players={len(m.players) if m else None}, '
+          f'waiting={p.waiting_count()}')
+    p = mm_pool.MatchPool()
+    for pid in range(1, 16):
+        ew = entry(pid, mode=10, faction=1)
+        ew.battle_id = 27
+        p.enqueue(ew)
+    for pid in range(16, 20):
+        ew = entry(pid, mode=10, faction=2, group_key=900)
+        ew.battle_id = 27
+        p.enqueue(ew)
+    m = p.try_form_war()
+    check('war 上限：临界容量仍保持整队原子性',
+          m is not None and len(m.players) == war_max
+          and {16, 17, 18, 19} <= {e.player_id for e in m.players}
+          and p.waiting_count() == 1,
+          f'players={[e.player_id for e in m.players] if m else None}, '
+          f'waiting={p.waiting_count()}')
     # ---- 12b. WAR_SOLO_FORM=1（单人测试）：单方排队即成局 ----
     old_solo = mm_config.WAR_SOLO_FORM
     mm_config.WAR_SOLO_FORM = True

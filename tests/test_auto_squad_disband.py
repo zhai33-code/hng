@@ -179,7 +179,7 @@ def _seed_auto_squad():
     mm_state._MM_MISSION_SQUADS[223287] = {
         sq_id: {
             'name': 'Infantry Squad 1', 'faction': 1, 'template': 1,
-            'squad_db_id': 0,
+            'squad_db_id': 0, 'leader_char_id': 25,
             'members': [
                 {'player_id': 2, 'char_id': 25, 'gamertag': 'DoubleBird',
                  'rank': 5, 'slot': 0, 'row_id': 101},
@@ -233,6 +233,13 @@ async def main():
         check('服务端凑队成员表移除本人',
               [int(m['player_id']) for m in members] == [11],
               f'got {[m.get("player_id") for m in members]}')
+        info = mm_state._MM_MISSION_SQUADS[223287][sq_id]
+        check('自动队长退出后重选在队成员',
+              int(info.get('leader_char_id', 0)) == 31,
+              f'leader_char_id={info.get("leader_char_id")}')
+        check('剩余成员收到 SquadSession owner 刷新',
+              ('SquadSession', sq_id) in _collect_pushes(sess_b.writer),
+              f'pushes={_collect_pushes(sess_b.writer)}')
 
         # --- 用例 2：solo 注册表残留条目未被消费 ★核心回归点 ---
         check('solo 注册表条目保留（战斗结束恢复 solo 视图）',

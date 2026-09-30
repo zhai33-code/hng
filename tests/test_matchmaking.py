@@ -230,7 +230,7 @@ async def main():
 
     # ---- 2. 等 ~5s 匹配成功 ----
     # （模拟/快速 combat 握手下 Admitted 可能落在 join 首窗口 msgs 内，
-    #  与 collect 窗口合并判定；Armed=f14:3 在 5s 后到达属正常）
+    #  与 collect 窗口合并判定；Entered 只在真实 hng.exe 连接后到达）
     msgs2 = await collect(r, 5.5)
     all_msgs = msgs + msgs2
     pms = find_kvcs(all_msgs, 'PlayerMissionSession')
