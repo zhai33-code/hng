@@ -1562,6 +1562,494 @@ def _insert_cloned_scene_tree(
     return b"FST\0" + zlib.compress(decompressed)
 
 
+def remove_cloned_scene_tree(
+    stream: FstStream,
+    graph: ReferenceGraph,
+    binding: NodeTransformBinding,
+    *,
+    allow_shipped: bool = False,
+    relocate_shared: bool = False,
+) -> bytes:
+    """Remove one complete SceneNode subtree and rebuild the object stream.
+
+    By default this is limited to compiler-created clones.  Their owned
+    SceneNodes/property/transform records occur only in the clone subtree,
+    while every shared resource dependency was first expanded by the original
+    template.  ``allow_shipped`` is for callers that deliberately opt into the
+    same strict first-occurrence audit for an official root.  When
+    ``relocate_shared`` is true, the outermost shared expansions that would be
+    lost are moved onto surviving back-reference sites before the target is
+    removed.
+    """
+    if (
+        not allow_shipped
+        and not str(binding.node["name"]).startswith("Unity_")
+    ):
+        raise FstFormatError("only compiler-created Unity_* roots are removable")
+    positions = _reference_positions(graph)
+    target_record = graph.flat_records[binding.record_index - 1][1]
+    target_pos = positions.get(binding.node_digest_b)
+    if target_pos is None:
+        raise FstFormatError("removal target has no first reference occurrence")
+    target_end = target_pos + target_record.value
+    old_values = list(graph.relation_values)
+    if target_end > len(old_values):
+        raise FstFormatError("removal target subtree overruns relation stream")
+    removed_span = target_end - target_pos
+    values_without_target = old_values[:target_pos] + old_values[target_end:]
+    preliminary_kept = {value for value in values_without_target if value}
+
+    # A record first expanded inside the deleted subtree cannot survive only as
+    # a later one-word back-reference.  Compiler clones never have this shape.
+    blockers = []
+    for index in preliminary_kept:
+        _sid, record = graph.flat_records[index - 1]
+        first = positions.get(record.digest_b)
+        if first is not None and target_pos <= first < target_end:
+            blockers.append((first, index, record.value))
+    if blockers and not relocate_shared:
+        raise FstFormatError(
+            "deletion would remove the first occurrence of a shared record"
+        )
+    if binding.record_index in preliminary_kept:
+        raise FstFormatError("deletion target itself is referenced outside its subtree")
+
+    # Nested blockers travel with their outermost expanded ancestor.  Replace a
+    # surviving one-word reference to each such ancestor with the original full
+    # DFS expansion.  This changes only serialization order, not graph identity.
+    outer_blockers = []
+    for first, index, span in sorted(blockers):
+        if any(
+            outer_first <= first < outer_first + outer_span
+            for outer_first, _outer_index, outer_span in outer_blockers
+        ):
+            continue
+        outer_blockers.append((first, index, span))
+    replacements: dict[int, tuple[int, ...]] = {}
+    relocation_deltas: list[tuple[int, int]] = []
+    for first, index, span in outer_blockers:
+        expansion = tuple(old_values[first:first + span])
+        if not expansion or expansion[0] != index:
+            raise FstFormatError("shared record expansion is malformed")
+        # A token that is a back-reference at the source must remain a
+        # back-reference at the destination.  Prefer a surviving occurrence
+        # after every dependency whose first expansion lives outside the moved
+        # block; otherwise moving the block earlier would make that one-word
+        # token become an under-expanded first occurrence.
+        external_firsts = []
+        for child_index in set(expansion):
+            if child_index == 0:
+                continue
+            _child_schema, child_record = graph.flat_records[child_index - 1]
+            child_first = positions.get(child_record.digest_b)
+            if (
+                child_first is not None
+                and not (first <= child_first < first + span)
+            ):
+                external_firsts.append(child_first)
+        minimum_site = max(external_firsts, default=-1)
+        surviving_sites = [
+            at for at, value in enumerate(old_values)
+            if value == index
+            and not (target_pos <= at < target_end)
+            and at > minimum_site
+        ]
+        if not surviving_sites:
+            raise FstFormatError(
+                "shared record has no order-safe surviving relocation site"
+            )
+        site = surviving_sites[0]
+        replacements[site] = expansion
+        relocation_deltas.append((site, span - 1))
+
+    values_old_indices = []
+    at = 0
+    while at < len(old_values):
+        if at == target_pos:
+            at = target_end
+            continue
+        replacement = replacements.get(at)
+        if replacement is not None:
+            values_old_indices.extend(replacement)
+        else:
+            values_old_indices.append(old_values[at])
+        at += 1
+    kept_indices = {value for value in values_old_indices if value}
+
+    payloads = {item.digest: item.payload for item in stream.inline_objects}
+    parent_updates: dict[int, tuple[bytes, bytes]] = {}
+    direct = graph.children_by_digest_b.get(binding.node_digest_b, ())
+    for parent_index in direct[: int(binding.node["first"])]:
+        if parent_index == 0:
+            continue
+        parent_schema, parent_record = graph.flat_records[parent_index - 1]
+        if parent_schema != 434 or parent_record.digest_a not in payloads:
+            raise FstFormatError("SceneNode parent payload is absent")
+        parent_node = decode_scene_node(payloads[parent_record.digest_a])
+        if int(parent_node["second"]) <= 0:
+            raise FstFormatError("SceneNode parent child count is already zero")
+        parent_payload = _encode_scene_node_payload(
+            {**parent_node, "second": int(parent_node["second"]) - 1}
+        )
+        parent_updates[parent_index] = (
+            hashlib.md5(parent_payload).digest(), parent_payload
+        )
+
+    span_by_b = {
+        record.digest_b: record.value for _sid, record in graph.flat_records
+    }
+    final_spans = {}
+    for digest_b, pos in positions.items():
+        span = span_by_b[digest_b]
+        if pos < target_pos < pos + span:
+            span -= removed_span
+        for site, delta in relocation_deltas:
+            if pos < site < pos + span_by_b[digest_b]:
+                span += delta
+        final_spans[digest_b] = span
+
+    index_map = {0: 0}
+    next_index = 1
+    for old_index in range(1, len(graph.flat_records) + 1):
+        if old_index in kept_indices:
+            index_map[old_index] = next_index
+            next_index += 1
+    values = [index_map[value] for value in values_old_indices]
+
+    final_groups = []
+    old_index = 1
+    for group in stream.groups:
+        records = []
+        for record in group.records:
+            if old_index in kept_indices:
+                digest_a = record.digest_a
+                if old_index in parent_updates:
+                    digest_a = parent_updates[old_index][0]
+                records.append(ObjectRecord(
+                    digest_a,
+                    final_spans[record.digest_b],
+                    record.digest_b,
+                    0,
+                    0,
+                ))
+            old_index += 1
+        final_groups.append(ObjectGroup(group.schema_id, tuple(records)))
+    final_groups = tuple(final_groups)
+
+    # Validate DFS spans and record coverage before serializing anything.
+    flat_new = tuple(
+        (group.schema_id, record) for group in final_groups for record in group.records
+    )
+    seen_b = set()
+
+    def visit(at: int) -> int:
+        index = values[at]
+        if index == 0:
+            return at + 1
+        _sid, record = flat_new[index - 1]
+        if record.digest_b in seen_b:
+            return at + 1
+        seen_b.add(record.digest_b)
+        end = at + record.value
+        cursor = at + 1
+        while cursor < end:
+            cursor = visit(cursor)
+        if cursor != end:
+            raise FstFormatError(
+                "deleted DFS stream misaligns at "
+                f"relation {at}, record {index}, expected {end}, got {cursor}; "
+                f"target={target_pos}:{target_end}, relocations={relocation_deltas}"
+            )
+        return cursor
+
+    at = 0
+    while at < len(values):
+        at = visit(at)
+    if len(seen_b) != len(flat_new):
+        raise FstFormatError(
+            f"deleted stream covers {len(seen_b)}/{len(flat_new)} records"
+        )
+
+    original_entries, _reference_offset = parse_cache_entries(stream)
+    original_by_key: dict[tuple[int, bytes], list[CacheEntry]] = {}
+    for entry in original_entries:
+        original_by_key.setdefault((entry.schema_id, entry.digest_a), []).append(entry)
+    custom_payloads = {
+        (434, digest_a): (payload, graph.flat_records[index - 1][1].digest_b)
+        for index, (digest_a, payload) in parent_updates.items()
+    }
+    seen_keys = set()
+    new_entries = []
+    for group in final_groups:
+        for record in group.records:
+            key = (group.schema_id, record.digest_a)
+            if key in seen_keys:
+                continue
+            if key in custom_payloads:
+                payload, digest_b = custom_payloads[key]
+                new_entries.append(CacheEntry(
+                    0, len(payload), payload, group.schema_id, record.digest_a, digest_b
+                ))
+                seen_keys.add(key)
+                continue
+            originals = original_by_key.get(key)
+            if originals is None:
+                raise FstFormatError(
+                    f"cache payload is absent for schema {group.schema_id}"
+                )
+            for original in originals:
+                new_entries.append(CacheEntry(
+                    0,
+                    original.size,
+                    original.payload,
+                    group.schema_id,
+                    record.digest_a,
+                    record.digest_b,
+                ))
+            if any(original.size >= 0 for original in originals):
+                seen_keys.add(key)
+
+    reference_bytes = b"".join(encode_uleb32(value) for value in values)
+    decompressed = rebuild_decompressed(
+        stream,
+        None,
+        tuple(new_entries),
+        0,
+        groups=final_groups,
+        reference_bytes=reference_bytes,
+    )
+    return b"FST\0" + zlib.compress(decompressed)
+
+
+def remove_scene_trees(
+    stream: FstStream,
+    graph: ReferenceGraph,
+    bindings: Iterable[NodeTransformBinding],
+    *,
+    allow_shipped: bool = False,
+) -> bytes:
+    """Remove multiple SceneNode roots by reserializing the surviving graph.
+
+    Unlike the single-root relocation prototype, this does not copy serialized
+    byte ranges.  It removes the hierarchy edges and walks the surviving graph
+    in DFS order again, so the first surviving reference expands naturally and
+    every later occurrence is emitted as a one-word back-reference.
+    """
+    targets = tuple(bindings)
+    if not targets:
+        return b"FST\0" + zlib.compress(stream.decompressed)
+    if not allow_shipped and any(
+        not str(binding.node["name"]).startswith("Unity_")
+        for binding in targets
+    ):
+        raise FstFormatError("only compiler-created Unity_* roots are removable")
+    target_indices = {binding.record_index for binding in targets}
+    if len(target_indices) != len(targets):
+        raise FstFormatError("duplicate SceneNode removal target")
+
+    children = {
+        digest_b: list(values)
+        for digest_b, values in graph.children_by_digest_b.items()
+    }
+    roots = list(graph.roots)
+    parent_decrements: dict[int, int] = {}
+    payloads = {item.digest: item.payload for item in stream.inline_objects}
+
+    # Expand logical roots to every serialized SceneNode descendant.  LOD,
+    # collision, and state nodes often have their first expansion elsewhere in
+    # the stream, but their explicit parent pointer still identifies them as
+    # owned by the removed root.
+    changed = True
+    while changed:
+        changed = False
+        for child_index, (schema_id, record) in enumerate(graph.flat_records, 1):
+            if (
+                child_index in target_indices
+                or schema_id != 434
+                or record.digest_a not in payloads
+            ):
+                continue
+            node = decode_scene_node(payloads[record.digest_a])
+            direct = children.get(record.digest_b, ())
+            parents = {
+                value for value in direct[: int(node["first"])] if value
+            }
+            if parents.intersection(target_indices):
+                target_indices.add(child_index)
+                changed = True
+
+    for target_index in sorted(target_indices):
+        removed_edges = 0
+        # SceneNode stores parent links on the child and a counted child array
+        # on the parent.  Contextual records may appear under more than one
+        # serialized parent, so remove every occurrence in a SceneNode child
+        # slice rather than trusting only the first parent pointer.
+        for parent_index, (parent_schema, parent_record) in enumerate(
+            graph.flat_records, 1
+        ):
+            if parent_schema != 434 or parent_record.digest_a not in payloads:
+                continue
+            parent_children = children.get(parent_record.digest_b)
+            if parent_children is None:
+                continue
+            parent_node = decode_scene_node(payloads[parent_record.digest_a])
+            child_start = int(parent_node["first"])
+            child_end = child_start + int(parent_node["second"])
+            positions_to_remove = [
+                position for position in range(child_start, min(child_end, len(parent_children)))
+                if parent_children[position] == target_index
+            ]
+            if not positions_to_remove:
+                continue
+            for position in reversed(positions_to_remove):
+                del parent_children[position]
+            if parent_index not in target_indices:
+                parent_decrements[parent_index] = (
+                    parent_decrements.get(parent_index, 0) + len(positions_to_remove)
+                )
+            removed_edges += len(positions_to_remove)
+        while target_index in roots:
+            roots.remove(target_index)
+            removed_edges += 1
+        # A requested contextual root may already be a descendant of another
+        # requested root or may exist only through fixed reference slots.  The
+        # final reachability check below is authoritative; requiring every
+        # contextual target to own a counted hierarchy edge rejects valid
+        # multi-instance batches.
+
+    # References outside counted SceneNode child arrays have fixed member
+    # arity (parent pointers, state links, optional object members).  Preserve
+    # their serialized slot and replace only the removed object reference with
+    # the format's null index.  Counted child entries above are removed rather
+    # than nulled because their payload count is updated in lockstep.
+    for child_values in children.values():
+        for position, value in enumerate(child_values):
+            if value in target_indices:
+                child_values[position] = 0
+
+    parent_updates: dict[int, tuple[bytes, bytes]] = {}
+    for parent_index, decrement in parent_decrements.items():
+        parent_schema, parent_record = graph.flat_records[parent_index - 1]
+        if parent_schema != 434 or parent_record.digest_a not in payloads:
+            raise FstFormatError("SceneNode parent payload is absent")
+        parent_node = decode_scene_node(payloads[parent_record.digest_a])
+        child_count = int(parent_node["second"])
+        if child_count < decrement:
+            raise FstFormatError("SceneNode parent child count would underflow")
+        parent_payload = _encode_scene_node_payload(
+            {**parent_node, "second": child_count - decrement}
+        )
+        parent_updates[parent_index] = (
+            hashlib.md5(parent_payload).digest(), parent_payload
+        )
+
+    old_values: list[int] = []
+    spans: dict[int, int] = {}
+    seen_b: set[bytes] = set()
+
+    def emit(index: int) -> None:
+        start = len(old_values)
+        old_values.append(index)
+        if index == 0:
+            return
+        _schema_id, record = graph.flat_records[index - 1]
+        if record.digest_b in seen_b:
+            return
+        seen_b.add(record.digest_b)
+        for child in children.get(record.digest_b, ()):
+            emit(child)
+        spans[index] = len(old_values) - start
+
+    for root in roots:
+        emit(root)
+
+    reachable = {index for index in old_values if index}
+    leaked = target_indices.intersection(reachable)
+    if leaked:
+        raise FstFormatError(
+            "removal target is still referenced outside its hierarchy edge: "
+            + ", ".join(str(index) for index in sorted(leaked))
+        )
+
+    index_map = {0: 0}
+    next_index = 1
+    for old_index in range(1, len(graph.flat_records) + 1):
+        if old_index in reachable:
+            index_map[old_index] = next_index
+            next_index += 1
+    values = [index_map[index] for index in old_values]
+
+    final_groups = []
+    old_index = 1
+    for group in stream.groups:
+        records = []
+        for record in group.records:
+            if old_index in reachable:
+                digest_a = parent_updates.get(
+                    old_index, (record.digest_a, b"")
+                )[0]
+                records.append(ObjectRecord(
+                    digest_a,
+                    spans[old_index],
+                    record.digest_b,
+                    0,
+                    0,
+                ))
+            old_index += 1
+        final_groups.append(ObjectGroup(group.schema_id, tuple(records)))
+    final_groups = tuple(final_groups)
+
+    original_entries, _reference_offset = parse_cache_entries(stream)
+    original_by_key: dict[tuple[int, bytes], list[CacheEntry]] = {}
+    for entry in original_entries:
+        original_by_key.setdefault((entry.schema_id, entry.digest_a), []).append(entry)
+    custom_payloads = {
+        (434, digest_a): (payload, graph.flat_records[index - 1][1].digest_b)
+        for index, (digest_a, payload) in parent_updates.items()
+    }
+    seen_keys = set()
+    new_entries = []
+    for group in final_groups:
+        for record in group.records:
+            key = (group.schema_id, record.digest_a)
+            if key in seen_keys:
+                continue
+            if key in custom_payloads:
+                payload, digest_b = custom_payloads[key]
+                new_entries.append(CacheEntry(
+                    0, len(payload), payload, group.schema_id, record.digest_a, digest_b
+                ))
+                seen_keys.add(key)
+                continue
+            originals = original_by_key.get(key)
+            if originals is None:
+                raise FstFormatError(
+                    f"cache payload is absent for schema {group.schema_id}"
+                )
+            for original in originals:
+                new_entries.append(CacheEntry(
+                    0,
+                    original.size,
+                    original.payload,
+                    group.schema_id,
+                    record.digest_a,
+                    record.digest_b,
+                ))
+            if any(original.size >= 0 for original in originals):
+                seen_keys.add(key)
+
+    reference_bytes = b"".join(encode_uleb32(value) for value in values)
+    decompressed = rebuild_decompressed(
+        stream,
+        None,
+        tuple(new_entries),
+        0,
+        groups=final_groups,
+        reference_bytes=reference_bytes,
+    )
+    return b"FST\0" + zlib.compress(decompressed)
+
+
 def summary(stream: FstStream) -> dict[str, object]:
     result: dict[str, object] = {
         "path": str(stream.path),

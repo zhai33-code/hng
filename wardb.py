@@ -636,6 +636,30 @@ def _build_ribbon_meta_level():
 _RIBBON_META_LEVEL = _build_ribbon_meta_level()
 
 
+# UnlockNotification 不能直接复用 _RIBBON_META_LEVEL：同一勋带/等级下会有
+# 多阵营、多兵种的平行 progressionUnlock 行，表内还保留 available=false 或
+# unlockable=false 的历史/免费条目。客户端收到通知后不会统一校验这些字段，
+# 因而必须由服务端按目标角色筛选。
+# ribbonTemplateId -> {(uid, level, factionTemplateId, characterType), ...}
+def _build_ribbon_notification_meta():
+    m = {}
+    for f in _parse_wardb_table('progressionUnlock'):
+        if not bool(f.get(10, 0)) or not bool(f.get(11, 0)):
+            continue
+        meta_name = f.get(5, b'')
+        if isinstance(meta_name, bytes):
+            meta_name = meta_name.decode('utf-8', 'replace')
+        if not str(meta_name).strip().isdigit():
+            continue
+        m.setdefault(str(meta_name), set()).add((
+            int(f.get(1, 0)), int(f.get(6, 0)),
+            int(f.get(3, 0)), int(f.get(4, 0))))
+    return m
+
+
+_RIBBON_NOTIFICATION_META = _build_ribbon_notification_meta()
+
+
 # unlockType=2（EUnlockType.eRank 军衔）条目 → (uid, 所需军衔, unlockItemType)。
 # metaName 恒 '0'（哨兵，非勋带 id）：解锁按角色 combat_xp 推导的军衔走，
 # 如 uid 210 First Blood badge（rank 1）、uid 943 ability（rank 6）、

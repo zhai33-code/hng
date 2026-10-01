@@ -25,9 +25,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol import Chunk, pb_parse          # noqa: E402
 from messages import _msg_unlock_notification  # noqa: E402
+import player_service                         # noqa: E402
 from player_service import (                   # noqa: E402
     push_ribbon_unlock_notifications, _UNLOCK_NOTIF_SEQ)
-from wardb import _RIBBON_META_LEVEL           # noqa: E402
+from wardb import (                           # noqa: E402
+    _RIBBON_META_LEVEL, _RIBBON_NOTIFICATION_META)
 
 PASS = FAIL = 0
 
@@ -82,7 +84,9 @@ def _pick_ribbon():
 def _main():
     rid, entries = _pick_ribbon()
     lvs = sorted({lv for _, lv in entries})
-    old_lv, new_lv = lvs[1], lvs[-1]
+    # 真实表中 ribbon 1 的 level 1 同时挂着 US/GE/SU 三套军服，正好覆盖
+    # 本次回归：US 步兵升级时只能收到 US 条目。
+    old_lv, new_lv = 0, lvs[1]
     expect_uids = {uid for uid, lv in entries if old_lv < lv <= new_lv}
     print(f'-- 用例勋带 {rid}：level 集 {lvs[:8]}...，区间 ({old_lv},{new_lv}] '
           f'期望 {len(expect_uids)} 行')
@@ -105,16 +109,27 @@ def _main():
     w = _FakeWriter()
     seq0 = _UNLOCK_NOTIF_SEQ[0]
     n = asyncio.run(push_ribbon_unlock_notifications(
-        w, 4242, 101, 202, int(rid), old_lv, new_lv))
+        w, 4242, 101, 202, int(rid), old_lv, new_lv,
+        faction=1, character_template=1))
     rows = _kvcs_frames(w.frames)
+    expected_notification_uids = {
+        uid for uid, lv, faction, char_type
+        in _RIBBON_NOTIFICATION_META.get(str(rid), ())
+        if old_lv < lv <= new_lv and faction in (0, 1)
+        and char_type in (0, 1)
+    }
     got_uids = {r[2][4] for r in rows}
-    check(f'T2 行数 = 区间条目数（{len(expect_uids)}）',
-          n == len(expect_uids) == len(rows), f'n={n} rows={len(rows)}')
+    check(f'T2 行数 = 当前角色适用条目数（{len(expected_notification_uids)}）',
+          n == len(expected_notification_uids) == len(rows),
+          f'n={n} rows={len(rows)}')
     check('T2 全部为 set UnlockNotification 表行',
           all(a == 'set' and t == 'UnlockNotification' for a, t, _ in rows))
-    check('T2 progressionUnlockId 集合 = wardb 区间推导',
-          got_uids == expect_uids,
-          f'差异 {sorted(got_uids ^ expect_uids)[:6]}')
+    check('T2 progressionUnlockId 集合 = 可用、可解锁且阵营/兵种匹配',
+          got_uids == expected_notification_uids,
+          f'差异 {sorted(got_uids ^ expected_notification_uids)[:6]}')
+    check('T2 排除同勋带区间内不适用条目',
+          got_uids <= expect_uids and got_uids != expect_uids,
+          f'全量={len(expect_uids)} 适用={len(got_uids)}')
     ok_fields = all(r[2][2] == 101 and r[2][3] == 202 and r[2][5] == int(rid)
                     for r in rows)
     check('T2 行内 playerId/characterId/ribbonTemplateId 正确', ok_fields)
@@ -127,21 +142,44 @@ def _main():
     # T3 等级未涨不推（floor 持平/下降、防重复推送）
     w3 = _FakeWriter()
     n3 = asyncio.run(push_ribbon_unlock_notifications(
-        w3, 4242, 101, 202, int(rid), new_lv, new_lv))
+        w3, 4242, 101, 202, int(rid), new_lv, new_lv,
+        faction=1, character_template=1))
     check('T3 new_lv == old_lv → 0 行', n3 == 0 and not w3.frames)
     n3b = asyncio.run(push_ribbon_unlock_notifications(
-        _FakeWriter(), 4242, 101, 202, int(rid), new_lv, old_lv))
+        _FakeWriter(), 4242, 101, 202, int(rid), new_lv, old_lv,
+        faction=1, character_template=1))
     check('T3 new_lv < old_lv → 0 行', n3b == 0)
 
     # T4 无订阅视图（view_cmd=None）不推不炸
     n4 = asyncio.run(push_ribbon_unlock_notifications(
-        _FakeWriter(), None, 101, 202, int(rid), old_lv, new_lv))
+        _FakeWriter(), None, 101, 202, int(rid), old_lv, new_lv,
+        faction=1, character_template=1))
     check('T4 view_cmd=None → 0 行（无订阅静默跳过）', n4 == 0)
 
     # T5 未知勋带 id → 0 行（progressionUnlock 表无此 metaName 条目）
     n5 = asyncio.run(push_ribbon_unlock_notifications(
-        _FakeWriter(), 4242, 101, 202, 999_999_999, 0, 12))
+        _FakeWriter(), 4242, 101, 202, 999_999_999, 0, 12,
+        faction=1, character_template=1))
     check('T5 未知 ribbon id → 0 行', n5 == 0)
+
+    # T6 生产调用不传角色元数据：helper 必须从 STORE 查目标角色后再过滤。
+    class _FakeStore:
+        async def get_character(self, player_id, character_id):
+            assert (player_id, character_id) == (101, 202)
+            return {'faction': 1, 'template': 1}
+
+    old_store = player_service.STORE
+    try:
+        player_service.STORE = _FakeStore()
+        w6 = _FakeWriter()
+        n6 = asyncio.run(push_ribbon_unlock_notifications(
+            w6, 4242, 101, 202, int(rid), old_lv, new_lv))
+    finally:
+        player_service.STORE = old_store
+    rows6 = _kvcs_frames(w6.frames)
+    check('T6 未显式传阵营/兵种时从角色表查询并正确过滤',
+          n6 == len(expected_notification_uids)
+          and {r[2][4] for r in rows6} == expected_notification_uids)
 
     print()
     print(f'== UnlockNotification 推送: {PASS} PASS / {FAIL} FAIL ==')

@@ -32,6 +32,7 @@ from wardb import (
     _RANK_META_LEVEL,
     _RIBBON_BOOSTERS,
     _RIBBON_META_LEVEL,
+    _RIBBON_NOTIFICATION_META,
     _XP_BOOSTERS,
     _UNLOCK_BY_ITEM,
     _UNLOCK_UID_META,
@@ -232,15 +233,16 @@ _UNLOCK_NOTIF_SEQ = [0]
 
 
 async def push_ribbon_unlock_notifications(writer, view_cmd, pid, char_id,
-                                           ribbon_id, old_lv, new_lv):
+                                           ribbon_id, old_lv, new_lv,
+                                           faction=None, character_template=None):
     """勋带等级提升（old_lv → new_lv）→ 提升区间内新解锁的每个
     progressionUnlock uid 推一条 UnlockNotification 表行（2026-09-17 补齐：
     此前服务端从不推该表，客户端解锁弹窗/面包屑角标全哑，misc.py 的
     RespondToUnlockNotification 回执 handler 空转）。
 
-    解锁语义 = "购买/使用资格达成"（unlockMetaLevel 落入 (old_lv, new_lv]
-    的 uid），非"已拥有"——已拥有武器/载具的行客户端 checkIfWeaponIsOwned
-    自清不弹，eCharacterType 类 clearNotification 自清，服务端无需甄别。
+    解锁语义 = "购买/使用资格达成"（available && unlockable、阵营/兵种
+    适用于当前角色，且 unlockMetaLevel 落入 (old_lv, new_lv] 的 uid），
+    非"已拥有"——已拥有武器/载具的行客户端 checkIfWeaponIsOwned 自清不弹。
     玩家点掉弹窗 → RespondToUnlockNotificationRequest 回执 → 服务端推
     delete 行清表（handlers/misc.py）。
     生效点：combat.py 战斗结算（勋带 XP floor 前后等级差）、shop.py
@@ -248,9 +250,25 @@ async def push_ribbon_unlock_notifications(writer, view_cmd, pid, char_id,
     返回推送行数。"""
     if view_cmd is None or new_lv <= old_lv:
         return 0
+    if faction is None or character_template is None:
+        try:
+            ch = await STORE.get_character(int(pid), int(char_id))
+        except Exception as e:
+            log(f'[DB] unlock notification character lookup failed: {e}')
+            return 0
+        if not ch:
+            return 0
+        faction = int(ch.get('faction', 0) or 0)
+        character_template = int(ch.get('template', 0) or 0)
+    else:
+        faction = int(faction)
+        character_template = int(character_template)
     n = 0
-    for (uid, meta_lv) in _RIBBON_META_LEVEL.get(str(int(ribbon_id)), ()):
-        if old_lv < meta_lv <= new_lv:
+    for (uid, meta_lv, required_faction, required_template) in \
+            _RIBBON_NOTIFICATION_META.get(str(int(ribbon_id)), ()):
+        applies = required_faction in (0, faction) \
+            and required_template in (0, character_template)
+        if applies and old_lv < meta_lv <= new_lv:
             _UNLOCK_NOTIF_SEQ[0] += 1
             await _push_kvcs(writer, view_cmd, b'UnlockNotification',
                              _msg_unlock_notification(
