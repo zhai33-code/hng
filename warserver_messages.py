@@ -38,6 +38,7 @@ from wardb import (
     _rank_from_combat_xp,
     _ribbon_level_from_xp,
     assault_ap_decision,
+    battlefield_entity_for_gamemap,
     battlefield_pos,
     charactertemplate_actionid,
     default_uniform_variant,
@@ -163,7 +164,14 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     # f18 squadPoints ← 本次进局角色的 characters.squad_points
     squad_points = int(joined.get('squad_points', 0) or 0) if joined else 0
 
-    tutorial_ids = list(tutorial_ids or ())
+    # 临时兼容策略（对齐 bf65521）：f28 的协议语义是“已触发教程”，并非
+    # “已完成教程”。当前调用链尚未提供可靠的持久化进度时，缺省下发旧版
+    # 28 项列表，阻止老客户端在部署界面连续弹教程并触发 player.dll 崩溃。
+    # 以后接入真实进度时应显式传 tutorial_ids；显式空列表仍表示全部未触发。
+    if tutorial_ids is None:
+        tutorial_ids = [1, 2, 3, 4] + list(range(6, 30))
+    else:
+        tutorial_ids = list(tutorial_ids)
 
     m = b''
     m += pb_int64(1, player_id)                 # 1 player_id — 必须等于 JWT sub
@@ -824,7 +832,10 @@ def _msg_response_battlefield_settings(preset_id=MISSION_PRESET_ID,
     # 同值）；无战略地图实体时保持 0.0，不冒充某座复用该场景的城市。
     if not int(preset.get(3, 0) or 0):
         raise LookupError(f'mission preset {preset_id} has no gamemap')
-    pos = battlefield_pos(int(map_entity_id or 0)) or (0.0, 0.0)
+    gamemap_id = int(preset.get(3, 0) or 0)
+    pos = battlefield_pos(int(map_entity_id or 0)
+                          or battlefield_entity_for_gamemap(gamemap_id)) \
+        or (0.0, 0.0)
     m += pb_float(29, pos[0])                      # 29 stagedPosX
     m += pb_float(30, pos[1])                      # 30 stagedPosY
     m += pb_bool(31, enable_sa_bots)                # 31 enableSaBots（SA bot：官方多人局路径，killfeed=阵营默认名）

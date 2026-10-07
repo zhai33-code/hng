@@ -12,7 +12,8 @@ from protocol import (build_response, pb_parse, pb_parse_multi, pb_bool,
 from state import PLAYER_SELECTED_CHAR
 import state
 from wardb import (
-    _load_preset, _rank_from_combat_xp, battlefield_pos,
+    _load_preset, _rank_from_combat_xp, battlefield_entity_for_gamemap,
+    battlefield_pos,
     character_resource_category, is_general_character,
 )
 import mm_pool
@@ -781,7 +782,8 @@ def _msg_mission_details_response_multi(mission_id, details, zulu):
     # 布局/锚点/f4(war)/f5/f6/f7 与单人版共用（matchmaking 简报共用段，
     # 2026-09-15 抽取）；布局与战斗侧 _accesspoint_layout/f12 同源同值
     L = _briefing_layout(mission_id, gamemap_id, attacker, defender)
-    pos = battlefield_pos(int(details.get('map_entity_id') or 0))
+    pos = battlefield_pos(int(details.get('map_entity_id') or 0)
+                          or battlefield_entity_for_gamemap(gamemap_id))
     if pos is None:
         # battlefield 行不在 wardb（无 WarDatabase 环境 / 异常 map_entity_id）
         # → 回退原点，f8/f9 坐标仅驱动简报战场标记位置

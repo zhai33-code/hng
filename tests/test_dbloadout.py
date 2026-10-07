@@ -235,6 +235,8 @@ def main():
     check('f17 squadSlotIndex=0', f[17][0] == 0)
     check('f22 metricsUid=uid-xyz / f23=42 / f25=43',
           f[22][0] == b'uid-xyz' and f[23][0] == 42 and f[25][0] == 43)
+    check('f28 缺省教程兼容列表与 bf65521 一致（28 项，跳过 5）',
+          f[28] == [1, 2, 3, 4] + list(range(6, 30)))
     check('f30 isQuickPlay=1', f[30][0] == 1)
     check('f999 eos token 注入', f[999][0] == b'fake-eos-token-bytes')
     check('f1000 expires_in=300', f[1000][0] == 300)

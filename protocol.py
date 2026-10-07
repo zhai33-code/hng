@@ -410,7 +410,7 @@ def msg_player(gamertag, credits=None, warfunds=None, gold=None,
     m += pb_int64(23, 0)                # warfundsBought
     m += pb_int64(24, warfunds)         # warfundsEarned (初始战争资金)
     m += pb_int64(25, 0)                # warfundsUsed
-    m += pb_string(26, '')              # metricsUid（无持久化来源时留空）
+    m += pb_string(26, 'metrics-demo')  # metricsUid（保持 46d7f89 的客户端兼容值）传空会导致进不去游戏！！！
     m += pb_int32(27, 0)                # yellowGriefPoints
     m += pb_int32(28, 0)                # redGriefPoints
     m += pb_string(29, '')              # latestRedGriefPointTimestamp

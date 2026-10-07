@@ -3,11 +3,11 @@
 事故：stagedPosX/stagedPosY 恒硬编码 0.0 → 战斗内 SpawnMenu 的
 IngameEuropeMapOverlay 欧洲地图缩放动画定位到左上角，与大厅地图位置不一致。
 
-修复后语义：f29/f30 只取本局真实 mapEntityId 对应的 battlefield 坐标；
-普通匹配即使复用战役场景也保持 0，不冒充某座城市。
+修复后语义：f29/f30 取本局 mapEntityId 或 gamemap 对应的 battlefield 坐标；
+无对应城市的普通图沿用 bf65521 的 Benoit Village 兼容锚点。
 
 验证：
-1) 普通局：无 mapEntityId → 0/0
+1) 普通局：无 mapEntityId → gamemap 对应坐标或兼容锚点
 2) 战役局：显式 mapEntityId → f29/f30 = 对应 battlefield 行坐标
 3) 与简报同源：普通 AI 局两边均为未知坐标
 4) 兜底：wardb 不可用（battlefield_pos → None）时消息仍可构建（0.0 不崩）
@@ -58,8 +58,10 @@ def _gmd_pos(mission_id=300001):
 
 print('== 1) 遭遇战 preset=10 (Mill=13，无 battlefield 行)')
 sx, sy = _staged_pos(10)
-check('无 battlefield 行时坐标保持未知，不冒充 Benoit Village',
-      sx == 0 and sy == 0, f'got=({sx},{sy})')
+mill_pos = battlefield_pos(battlefield_entity_for_gamemap(13))
+check('无 battlefield 行时沿用 bf65521 的 Benoit Village 锚点',
+      mill_pos is not None and abs(sx - mill_pos[0]) < 0.01
+      and abs(sy - mill_pos[1]) < 0.01, f'got=({sx},{sy}) want={mill_pos}')
 
 print('== 2) 战役图路径：按真实 mapEntityId 取 battlefield 行坐标')
 # (preset_id, gamemap)：Airfield / Tank Factory / Forward Airfield /
@@ -81,13 +83,15 @@ check('各战役图坐标互不相同（按本局取值，非固定值）',
       len(seen) == len(CAMPAIGN_PRESETS), f'distinct={len(seen)}')
 
 sx26, sy26 = _staged_pos(26)
-check('普通匹配复用战役场景时仍不绑定城市',
-      sx26 == 0 and sy26 == 0, f'got=({sx26},{sy26})')
+want26 = battlefield_pos(battlefield_entity_for_gamemap(204))
+check('普通匹配复用战役场景时按 gamemap 绑定对应城市坐标',
+      want26 is not None and abs(sx26 - want26[0]) < 0.01
+      and abs(sy26 - want26[1]) < 0.01, f'got=({sx26},{sy26}) want={want26}')
 
 print('== 3) 与简报 GetMissionDetailsResponse f8/f9 同源（大厅/战斗一致）')
 gmd = _gmd_pos()
 sx10, sy10 = _staged_pos(10)
-check('GMD f8/f9 与 BattleFieldSettings f29/f30 同值（未知坐标均为 0）',
+check('GMD f8/f9 与 BattleFieldSettings f29/f30 同值（bf65521 非零锚点）',
       abs(gmd[0] - sx10) < 0.01 and abs(gmd[1] - sy10) < 0.01,
       f'gmd={gmd} bfs=({sx10},{sy10})')
 

@@ -1649,12 +1649,12 @@ def battlefield_entity_for_gamemap(gamemap_id):
     """battlefield 表 f7==gamemap 的行 id（MissionInfo f5 mapEntityId）。
 
     battlefield 表只覆盖战役地图（f7 ∈ {70439 Town, 201 Mountain, 203 Factory,
-    204 Airfield, 205 Forward Airfield}）；Mill(13) 等遭遇战/训练图无行时
-    返回 0，避免客户端把普通匹配显示成无关的 Benoit Village。
+    204 Airfield, 205 Forward Airfield}）；Mill(13) 等遭遇战/训练图无行，
+    回退 112741325（Benoit Village），保持 bf65521 的非零坐标链路。
     """
     if gamemap_id in _BATTLEFIELD_ENTITY_CACHE:
         return _BATTLEFIELD_ENTITY_CACHE[gamemap_id]
-    entity_id = 0
+    entity_id = 112741325
     try:
         for r in _parse_wardb_table('battlefield'):
             if int(r.get(7, 0) or 0) == int(gamemap_id):

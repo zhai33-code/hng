@@ -40,7 +40,7 @@ from wardb import (
     _capturepoint_ap_map, _capturepoint_names, _load_accesspoint_templates,
     _load_capturepoint_templates, _load_objective_capturepoints,
     _load_preset, _missiontype_for_gamemap, _rank_from_combat_xp,
-    assault_ap_decision, battlefield_pos,
+    assault_ap_decision, battlefield_entity_for_gamemap, battlefield_pos,
     character_resource_category, commandnode_template, is_general_character, preset_scene,
     squad_template_for_character, squad_template_slot_count,
     vehicle_resource_category, accesspoint_template_by_id,
@@ -1058,7 +1058,8 @@ def _msg_mission_details_response(mission_id, player_id, gamertag, zulu_time,
     # atk_fac/dfn_fac = viewer/AI 口径，交替首点=viewer 与旧码一致）
     m += _msg_briefing_f6(L, atk_fac, dfn_fac)
     m += _msg_briefing_f7(gamemap_id, L, atk_fac, dfn_fac)
-    pos = (0.0, 0.0)  # 普通 AI 局无战略地图坐标
+    pos = battlefield_pos(battlefield_entity_for_gamemap(gamemap_id)) \
+        or (0.0, 0.0)
     m += pb_float(8, pos[0])   # posX（mapEntityId 对应 battlefield 行坐标）
     m += pb_float(9, pos[1])   # posY
     return m
@@ -1792,12 +1793,12 @@ async def _start_match(match):
     if not gamemap_id:
         raise LookupError(f'mission preset {preset} has no gamemap')
     if battle_id:
-        # war 局：简报落点只能来自会战记录中的真实战略地图实体。
-        # 缺失时保持未知，不能按 gamemap 随便挑一座使用该场景的城市。
-        map_entity_id = int(war_rec['map_entity_id'] or 0)
+        # 战争局优先真实会战城市；旧记录缺失时按场景补兼容锚点。
+        map_entity_id = int(war_rec['map_entity_id'] or 0) \
+            or battlefield_entity_for_gamemap(gamemap_id)
     else:
-        # 普通匹配不属于战略地图城市，即使复用同一 gamemap 也不绑定城市。
-        map_entity_id = 0
+        # bf65521 兼容路径：普通局也使用该场景对应的 battlefield 坐标。
+        map_entity_id = battlefield_entity_for_gamemap(gamemap_id)
     combat_map = preset_scene(preset)
 
     # ★ 选机 + 占坑（多机部署，2026-09-08）：热配置（server_config
