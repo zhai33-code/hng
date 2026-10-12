@@ -40,7 +40,7 @@ import random
 
 import mm_config
 from state import log
-from wardb import _parse_wardb_table
+from wardb import _parse_wardb_table, commandnode_template
 
 # ---------------------------------------------------------------- AT 族划分
 AT_FAMILIES = {
@@ -607,18 +607,17 @@ def lane_counts_by_ap(mission_id):
 
 
 def at_lane_aps(mission_id, faction):
-    """war 局名单每 AT 的激活线模板（按 names 顺序，未分线/无方向=0）。
+    """本局名单每 AT 的激活线模板（按 names 顺序，未分线/无方向=0）。
 
     大厅简报 f4 逐 AT 挂线用（2026-09-15 反编译实锤
     BattlefieldUtilities.setupMissionAssaultTeamOnMap：图标位置 =
     f4.accessPointTemplateId → 线入口据点，全员挂同锚 = 挤一条线根因）。
     攻方 = 分线结果（ap_line 反查）；守方不分线全 0（调用方挂守方锚）。
-    非 war 局返回 None。"""
+    普通局使用镜像名单，war 局使用各阵营实际名单。"""
     rec = _MISSIONS.get(int(mission_id or 0))
-    if not rec or rec.get('mode') != 'war':
+    if not rec:
         return None
-    names = ((rec.get('names_by_faction') or {}).get(int(faction))
-             if faction is not None else rec.get('names')) or []
+    names = assault_team_names(mission_id, faction) or []
     lines = rec.get('lines')
     if not lines:
         return None
@@ -681,6 +680,38 @@ def war_assault_teams(mission_id):
         return None
     wats = rec.get('war_ats')
     return wats or None
+
+
+def staged_assault_teams(mission_id):
+    """普通局系统 AT：与资源池抽取名单同源，空属主触发 High Command。
+
+    ID 按 mission/faction/名单序号确定，同名多支仍各有 ID，轮询不变；
+    攻方使用资源分线结果，守方/单线 ap=0 由调用方挂本方锚点。
+    战争局与缺失的资源池不生成系统 AT。
+    """
+    mid = int(mission_id or 0)
+    rec = _MISSIONS.get(mid)
+    if not rec or rec.get('mode') == 'war':
+        return None
+    teams = {}
+    for faction in rec['pool']:
+        names = assault_team_names(mid, faction) or []
+        aps = at_lane_aps(mid, faction) or []
+        rows = []
+        for i, name in enumerate(names):
+            template_id = commandnode_template(faction, name)
+            if not template_id:
+                log(f'[force_pool] skip staged AT {name}: '
+                    f'no template for faction {faction}')
+                continue
+            rows.append({
+                'id': (mid << 32) | (int(faction) << 24) | (i + 1),
+                'name': name, 'template_id': template_id,
+                'owner_player_id': 0,
+                'ap_tmpl': aps[i] if i < len(aps) else 0,
+            })
+        teams[int(faction)] = rows
+    return teams
 
 
 def faction_stats(mission_id):

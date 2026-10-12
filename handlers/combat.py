@@ -330,9 +330,7 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
         resp_proto += pb_message(3, pb_int32(1, int(tmpl)) + pb_int32(2, team))
         ap_count += 1
 
-    # f5 assaultTeams：每局一个突击队（commandNode 模板按玩家阵营查
-    # WarDatabase/commandnodetemplate：infantry US=103/GE=203/SU=303；
-    # 与 matchmaking._assault_team_nodes / 战局详情 f4 同源；
+    # f5 assaultTeams：war 发真实参战 AT，普通局发资源池同源的系统 AT；
     # mapEntityId 用 mission_info f5 同款 WarDatabase battlefield 真实行 id。
     # ★ home_ap（f15 accesspointTemplateId）按阵营锚定本方出兵点（2026-09-01
     #   随机化后 layout 首点可能是守方点——攻方 session 锚到守方点 →
@@ -345,8 +343,10 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
         if o and (o not in home_by_fac or int(tmpl) < home_by_fac[o]):
             home_by_fac[o] = int(tmpl)
     home_ap_default = int(layout[0][0]) if layout else 0
-    war_ats = force_pool.war_assault_teams(mid) if mid else None
-    if war_ats:
+    mission_ats = force_pool.war_assault_teams(mid) if mid else None
+    if mission_ats is None:
+        mission_ats = force_pool.staged_assault_teams(mid)
+    if mission_ats:
         # ★ war 局：发真实参战 AT 行（中途增援到达并入池后下一轮轮询即
         #   出现——"部队到达"的局内出生屏渲染数据源）。旧口径按在局玩家
         #   会话伪造行（属主=在局玩家、模板恒步兵）：玩家 RTS 拉兵增援
@@ -356,8 +356,9 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
         #   f1 assaultTeamId = AT 实例 id（官服 = command node war
         #   instance id）；f2/f3 = AT 所属玩家（部署将军可不在局）；
         #   f5 = AT 真实模板；f15 = AT 来向线模板（无则阵营锚点）。
+        # 普通局 owner=0/name=""：客户端原生回退 High Command；不挂玩家。
         _owner_ids = {int(a.get('owner_player_id') or 0)
-                      for _ats in war_ats.values() for a in _ats}
+                      for _ats in mission_ats.values() for a in _ats}
         _owner_ids.discard(0)
         _tags = {}
         if _owner_ids and STORE is not None:
@@ -369,7 +370,7 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
             except Exception as e:
                 log(f'      [combat] f5 AT owner lookup failed: {e}')
         _map_ent = int((det or {}).get('map_entity_id') or 0)
-        for _fac, _ats in war_ats.items():
+        for _fac, _ats in mission_ats.items():
             _fac = int(_fac)
             for a in _ats:
                 oid = int(a.get('owner_player_id') or 0)
@@ -391,7 +392,6 @@ async def handle_active_mission_event_list(sess, writer, cmd_id, req_type, proto
                                or home_by_fac.get(_fac, home_ap_default))
                 resp_proto += pb_message(5, at)
                 at_count += 1
-    # 普通匹配没有战略层 AssaultTeam；不再为每个玩家伪造一支步兵 AT。
 
     resp = build_response(cmd_id, 'ActiveMissionRequestEventListResponse', resp_proto)
     writer.write(resp)

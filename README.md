@@ -231,4 +231,4 @@ powershell -ExecutionPolicy Bypass -File run_selftest.ps1     # 登录+订阅自
 ## 十、日志
 
 - Python 服务器：`hng-server\realtest_game.log`（全部协议收发记录）
-- 战斗服务器：`combat-server\combat-server-N.log`（每局一个，N 递增）+ `hng_boot.log`
+- 战斗服务器：`combat-server\logs\combat-server-N.log`（每局一个，N 递增）

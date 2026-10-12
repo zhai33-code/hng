@@ -180,7 +180,7 @@ python -c "import sys; sys.path.insert(0, r'C:\hng'); import http.client, combat
 | 战局地图错乱（进了别的图） | 握手认领错配：条目「内网地址」与实际来源 IP 不符（远端机经 NAT 出站时，填 NAT 出口 IP） |
 | 局内不涨 XP/勋带 | 远端机连不上统计服 15115：warserver 字段的 host 部分不通（statserver 随该地址） |
 | 没有下雪效果 | 远端机 player.dll 不是补丁版（§1 哈希核对） |
-| agent 拉起的专用服异常退出 | 看远端机 `combat-server\combat-server-<seq>.log`；怀疑外联 DNS 时可把远端机 hosts 的 `game.hng-group.com` 等指向游戏服 IP（对齐游戏服机器的做法） |
+| agent 拉起的专用服异常退出 | 看远端机 `combat-server\logs\combat-server-<seq>.log`；怀疑外联 DNS 时可把远端机 hosts 的 `game.hng-group.com` 等指向游戏服 IP（对齐游戏服机器的做法） |
 
 ## 8. 日常维护
 

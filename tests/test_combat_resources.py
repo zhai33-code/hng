@@ -136,11 +136,19 @@ def _has_pack_arg(args, val):
     assert i > 0 and args[i - 1] == '/R', args     # 完整注册名 + /R 前缀
 
 
+def _has_log_arg(args, seq):
+    filename = os.path.join('logs', f'combat-server-{seq}.log')
+    i = args.index(filename)
+    assert i > 0 and args[i - 1] == '/L', args
+    assert not any(a.startswith('boot.logfile=') for a in args)
+
+
 def test_build_launch_args_packthreads():
     args = combat_agent.build_launch_args(
         'D:\\cs', 5678, 488464, 9001, 123, '10.0.0.9:15110',
         '10.0.0.9', 'Town', None, 2)
     _has_pack_arg(args, 2)
+    _has_log_arg(args, 123)
     assert 'boot.disable_eac=1' in args and '/D' in args
     args0 = combat_agent.build_launch_args(
         'D:\\cs', 5678, 488464, 9001, 123, '10.0.0.9:15110',
@@ -158,6 +166,7 @@ def test_combat_spawn_args_packthreads():
         5678, 488464, 9001, 'Town', 123, '10.0.0.9:15110',
         '10.0.0.9', 2, None)
     _has_pack_arg(args, 2)
+    _has_log_arg(args, 123)
     args0 = combat_instances._combat_spawn_args(
         5678, 488464, 9001, 'Town', 123, '10.0.0.9:15110',
         '10.0.0.9', 0, None)

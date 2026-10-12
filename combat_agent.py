@@ -353,7 +353,9 @@ def build_launch_args(combat_dir, port, mission_id, pms_id, seq,
             '/W', warserver,
             # /R 选项必须用完整注册名（组.选项），与 warserver 本机路径一致
             '/R', 'boot.disable_eac=1',
-            '/R', f'boot.logfile=combat-server-{seq}.log',
+            # 日志文件使用直接映射 boot.logfile 的专用 /L 开关，避免
+            # /R boot.logfile 未生效、最终仍落到 hng_boot.log。
+            '/L', os.path.join('logs', f'combat-server-{seq}.log'),
             '/R', f'boot.statserver={statserver_host}',
             '/R', f'boot.statserverport={STATSERVER_PORT}']
     if packthreads > 0:
@@ -385,6 +387,7 @@ def handle_launch(combat_dir, body):
         args = build_launch_args(combat_dir, port, mission_id, pms_id, seq,
                                  warserver, statserver_host, combat_map,
                                  countdown, packthreads)
+        os.makedirs(os.path.join(combat_dir, 'logs'), exist_ok=True)
         proc = subprocess.Popen(
             args, cwd=combat_dir,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

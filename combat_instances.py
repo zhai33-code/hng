@@ -109,7 +109,7 @@ if COMBAT_RESOURCE_SLOTS:
 # CombatInstance dict：{mission_id, port, proc, ready(asyncio.Event), seq, ttd}
 COMBAT_INSTANCES = {}          # mission_id -> CombatInstance
 PENDING_MATCHES = []           # 并发上限排队中的成局 [match, ...]（FIFO）
-_combat_seq = random.randint(100000, 999999)   # combat 实例序号（也用于 combat-server-<seq>.log
+_combat_seq = random.randint(100000, 999999)   # combat 实例序号（也用于 logs/combat-server-<seq>.log
                                                # 文件名，随机起始避免重启后覆盖旧日志）
 COMBAT_READY = asyncio.Event()  # 兼容回退：无法按 missionid 定位实例时置位
 # 实测（realtest_game.log 全量历史）专用服 RequestBattleFieldSettings 的
@@ -397,7 +397,7 @@ async def _log_udp_bound_bg(seq, port):
              f'map load took {time.monotonic() - t0:.1f}s)')
     else:
         _log(f'WARNING: combat server #{seq} udp/{port} not bound after 180s '
-             f'(map load slow or failed) - check combat-server\\combat-server-{seq}.log')
+             f'(map load slow or failed) - check combat-server\\logs\\combat-server-{seq}.log')
 
 
 def _host_statserver(host):
@@ -499,7 +499,9 @@ def _combat_spawn_args(port, mission_id, pms_id, combat_map, seq,
             '/M', combat_map,
             '/W', warserver_addr,
             '/R', 'boot.disable_eac=1',
-            '/R', f'boot.logfile=combat-server-{seq}.log',
+            # boot.logfile 有专用命令行开关；/R 路径在真机上未覆盖
+            # hng_boot.log，改用直接映射 boot.logfile 的 /L。
+            '/L', os.path.join('logs', f'combat-server-{seq}.log'),
             # 战斗服进程 player.dll 进图时 GetTotals 初始化勋带状态（a2[7]），
             # 失败→整局无 XP 累加→无 Statistics_Update→客户端无升级弹窗
             '/R', f'boot.statserver={statserver_host}',
@@ -577,7 +579,7 @@ async def _ensure_combat_server(mission_id, pms_id, combat_map, timeout=120):
         except asyncio.TimeoutError:
             _log(f'combat server handshake TIMEOUT after {timeout}s '
                  f'(agent {host["name"]}, pid={pid}) - 推 Admitted 继续，'
-                 f'查 {host["name"]} combat-server-{seq}.log')
+                 f'查 {host["name"]} logs\\combat-server-{seq}.log')
             return False
 
     # ---- 本机 spawn（原路径；host['warserver'] 可按机覆盖 /W 回连地址）----
@@ -602,6 +604,7 @@ async def _ensure_combat_server(mission_id, pms_id, combat_map, timeout=120):
     _log(f'launching combat server: {" ".join(args[1:])}')
     for attempt in (1, 2):              # spawn 失败重试一次（换端口）
         try:
+            os.makedirs(os.path.join(COMBAT_SERVER_DIR, 'logs'), exist_ok=True)
             inst['proc'] = await asyncio.create_subprocess_exec(
                 *launch_args, cwd=COMBAT_SERVER_DIR,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -665,5 +668,5 @@ async def _ensure_combat_server(mission_id, pms_id, combat_map, timeout=120):
         alive = inst['proc'].returncode is None
         _log(f'combat server handshake TIMEOUT after {timeout}s '
              f'(alive={alive}, exit={inst["proc"].returncode}) - 推 Admitted 继续，'
-             f'查 combat-server\\combat-server-{seq}.log')
+             f'查 combat-server\\logs\\combat-server-{seq}.log')
         return False
