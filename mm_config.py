@@ -376,9 +376,10 @@ WAR_SEGMENT_FALLBACK_SECONDS = _int_env(
 # AT 会战经验，官服公式为参战基础值 + 胜利加成。
 WAR_AT_XP_PER_BATTLE = _int_env('MM_WAR_AT_XP_PER_BATTLE', 5)
 WAR_AT_XP_WIN_BONUS = _int_env('MM_WAR_AT_XP_WIN_BONUS', 25)
-# 专用服启动倒计时覆盖值；0 表示不覆盖客户端/引擎默认值。
+# 专用服开局倒计时覆盖开关（布尔）：1 开启，0 不传覆盖选项。
+# 引擎开启后将剩余倒计时限制为 300 tick（约 5 秒），不是自定义秒数。
 COMBAT_START_COUNTDOWN_OVERRIDE = _int_env(
-    'MM_COMBAT_START_COUNTDOWN_OVERRIDE', 10)
+    'MM_COMBAT_START_COUNTDOWN_OVERRIDE', 1)
 # 非战役地图通常没有 battlefield 行。0 会让客户端不解析成无关城市；
 # 仅兼容特殊客户端时才显式设置一个真实 battlefield entity id。
 

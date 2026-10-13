@@ -14,7 +14,8 @@ import state
 from wardb import (
     _load_preset, _rank_from_combat_xp, battlefield_entity_for_gamemap,
     battlefield_pos,
-    character_resource_category, is_general_character,
+    character_resource_category, is_general_character, is_weapon_broken,
+    is_vehicle_broken, vehicle_has_depleted_ammo,
 )
 import mm_pool
 import force_pool
@@ -75,7 +76,8 @@ def _quickplay_character_candidates(characters, selected, gamemode_id):
     return result or [selected]
 
 
-async def _pick_quickplay_character(pid, characters, selected, gamemode_id):
+async def _pick_quickplay_character(pid, characters, selected, gamemode_id,
+                                    broken_character_ids=()):
     """为 11/12/14 选实际参战角色，并生成 PMM f24 候选信息。
 
     优先能立即加入现有 staging 局的候选；否则选能并入当前最忙兼容池的
@@ -83,6 +85,10 @@ async def _pick_quickplay_character(pid, characters, selected, gamemode_id):
     """
     candidates = _quickplay_character_candidates(
         characters, selected, gamemode_id)
+    candidates = [char for char in candidates
+                  if int(char['id']) not in broken_character_ids]
+    if not candidates:
+        return selected, ()
     prepared = []
     counts = POOL.waiting_counts()
     for char in candidates:
@@ -169,6 +175,27 @@ async def _specified_mission_join_error(req_mission_id, faction, char_cat=0):
     if len(det.get('players') or ()) >= max_p:
         return 227                      # 局满
     return None
+
+
+async def _equipment_join_errors(player_id):
+    """Current equipped damage per character; optional upgrades only get filtered in FPS."""
+    errors = {}
+    for weapon in await state.STORE.list_weapons(int(player_id)):
+        if int(weapon.get('container_slot', 0) or 0) > 0 and is_weapon_broken(weapon):
+            errors[int(weapon['character_id'])] = 231  # equipment_broken
+    vehicles = [v for v in await state.STORE.list_vehicles(int(player_id))
+                if int(v.get('equipped_in_slot', 0) or 0) > 0]
+    ammos_by_vehicle = {}
+    if vehicles:
+        for ammo in await state.STORE.list_vehicle_ammo(int(player_id)):
+            ammos_by_vehicle.setdefault(int(ammo['vehicle_id']), []).append(ammo)
+    for vehicle in vehicles:
+        code = 233 if is_vehicle_broken(vehicle) else (
+            232 if vehicle_has_depleted_ammo(
+                ammos_by_vehicle.get(int(vehicle['id']), ())) else None)
+        if code is not None:
+            errors.setdefault(int(vehicle['character_id']), code)
+    return errors
 
 
 async def _handle_join(sess, writer, cmd_id, proto):
@@ -288,12 +315,34 @@ async def _handle_join(sess, writer, cmd_id, proto):
     quickplay_info = ()
     cached_squad = await _squad_eligible_members(pid)
     active_mission = _find_player_active_mission(pid)
+    # Read the DB rather than the lobby cache, so repairs/unequips apply immediately.
+    try:
+        equipment_errors = await _equipment_join_errors(pid)
+        broken_character_ids = set(equipment_errors)
+        broken_squad_member = None
+        broken_squad_code = None
+        for member in cached_squad[1] or ():
+            member_pid = int(member['player_id'])
+            member_char = int(member['character_id'])
+            member_errors = (equipment_errors if member_pid == int(pid)
+                             else await _equipment_join_errors(member_pid))
+            if member_char in member_errors:
+                broken_squad_member = member
+                broken_squad_code = member_errors[member_char]
+                break
+    except Exception as e:
+        writer.write(build_response(
+            cmd_id, 'JoinMatchMakingResponse', pb_int32(1, 0)))
+        await writer.drain()
+        _log(f'[DB] matchmaking equipment validation failed: {e}')
+        return
     if (gamemode_id in mm_config.QUICKPLAY_GAMEMODES
             and not req_mission_id and not war_flag
             and not active_mission
             and cached_squad[0] is None):
         picked, quickplay_info = await _pick_quickplay_character(
-            pid, player_characters, char_info, gamemode_id)
+            pid, player_characters, char_info, gamemode_id,
+            broken_character_ids=broken_character_ids)
         if int(picked['id']) != int(char_info['id']):
             _log(f'[MM] quickplay({gamemode_id}) selected char '
                  f'{int(picked["id"])} over current {int(char_info["id"])} '
@@ -309,6 +358,17 @@ async def _handle_join(sess, writer, cmd_id, proto):
         await writer.drain()
         _log(f'S->C cmd={cmd_id:<4} JoinMatchMakingResponse '
              f'(rejected: quickplay has no combat character for player {pid})')
+        return
+
+    if int(char_id) in broken_character_ids or broken_squad_member is not None:
+        # Official damage/depletion response codes use existing localized messages.
+        writer.write(build_response(
+            cmd_id, 'JoinMatchMakingResponse',
+            pb_int32(1, broken_squad_code or equipment_errors[int(char_id)])))
+        await writer.drain()
+        blocked_char = (int(broken_squad_member['character_id'])
+                        if broken_squad_member is not None else int(char_id))
+        _log(f'[MM] rejected: char {blocked_char} has damaged or depleted equipped equipment')
         return
 
     # 记录当前选中士兵（squad 入队规则需要：邀请时解析被邀者角色），

@@ -66,12 +66,10 @@ COMBAT_WARSERVER = (os.environ.get('HNG_COMBAT_WARSERVER')
 # 不设则 agent 端也须不设 = 开放，仅限本机调试。模块级读取，改 .env 须重启。
 AGENT_TOKEN = os.environ.get('HNG_AGENT_TOKEN', '')
 AGENT_HTTP_TIMEOUT = 10
-# 战局开局等待（热身）时间覆盖，单位【秒】；None = 不覆盖（player.dll 默认）。
-# 依据 work/hng-server-re/warserver-serversystemevents.md 4.3 节：
-#   开局倒计时由 battlefield 实体(class 5) block+4 驱动，服务端默认 7200s 硬编码
-#   （ZGameMode::CreateInstance @0x1802A4796）；正确覆盖方式是启动参数
-#   /R controllers.overrideStartCountdown=<秒>（ZOption group controllers），
-#   而非改 missionpreset f6（实测不生效）。
+# 战局开局倒计时覆盖开关；None = 不传覆盖选项。
+# globals.dll 将 controllers.overrideStartCountdown 注册为布尔选项。
+# player.dll @0x1802A2D09 读取 GetOptions()+0x2C4，开启后将截止 tick
+# 限制为 currentTick+300（60Hz 下约 5 秒）；启动时传 =1，不是秒数。
 COMBAT_START_COUNTDOWN_OVERRIDE = (
     mm_config.COMBAT_START_COUNTDOWN_OVERRIDE or None)
 
@@ -511,7 +509,7 @@ def _combat_spawn_args(port, mission_id, pms_id, combat_map, seq,
         # 多人局 SendPump 饱和根因，推导依据见 mm_config COMBAT_CORES 注释）
         args += ['/R', f'server.packthreads={int(packthreads)}']
     if countdown is not None:
-        # 开局等待时间覆盖（秒），见文件头 COMBAT_START_COUNTDOWN_OVERRIDE 注释
+        # 开局倒计时覆盖开关，见文件头 COMBAT_START_COUNTDOWN_OVERRIDE 注释
         args += ['/R',
                  f'controllers.overrideStartCountdown={int(countdown)}']
     return args

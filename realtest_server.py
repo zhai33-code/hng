@@ -82,6 +82,33 @@ MAX_RECEIVE_BUFFER = 16 * 1024 * 1024
 READ_IDLE_TIMEOUT = 120
 
 
+async def _read_tcp_data(reader, sess):
+    # 局内 hng.exe 主要通过 UDP 战斗，大厅也可能长期没有上行请求。
+    # 已认证连接由服务端 pulse 保活；读空闲不代表掉线，EOF/reset 仍正常
+    # 清理。120 秒限制只用于未认证连接，避免大厅超时连带关闭游戏进程。
+    timeout = None if getattr(sess, 'authenticated', False) else READ_IDLE_TIMEOUT
+    return await asyncio.wait_for(reader.read(65536), timeout=timeout)
+
+
+async def _on_game_connection_closed(sess):
+    if not getattr(sess, 'is_game_client', False) or not sess.player_id:
+        return
+    # 旧连接的 finally 可能晚于新连接完成 GetPlayerSettings。这里只在玩家
+    # 已没有存活游戏连接时起掉线保护；检查与 on_game_client_closed 的同步
+    # 起保护段之间不 await，避免重连已经成功却被旧连接重新标成掉线。
+    pid = int(sess.player_id)
+    for other in TCP_SESSIONS:
+        if (other is not sess
+                and getattr(other, 'is_game_client', False)
+                and getattr(other, 'authenticated', False)
+                and other.player_id == pid
+                and not other.writer.is_closing()):
+            log(f'[rejoin] player {pid} stale game connection closed; '
+                f'live game connection retained, drop protection skipped')
+            return
+    await matchmaking.on_game_client_closed(pid)
+
+
 async def _pulse_loop(sess, writer, fd):
     """固定 5s 推送 ViewHandlerPulse（不依赖连接空闲）。
     ★ 不能用「reader.read 超时才推」的空闲触发：玩家连点（勋带解锁每 3-4s 一请求）
@@ -119,8 +146,7 @@ async def handle_tcp(reader, writer):
     buf = b''
     try:
         while True:
-            data = await asyncio.wait_for(
-                reader.read(65536), timeout=READ_IDLE_TIMEOUT)
+            data = await _read_tcp_data(reader, sess)
             if not data:
                 break
             buf += data
@@ -132,8 +158,11 @@ async def handle_tcp(reader, writer):
                     break
                 buf = buf[nxt:]
                 await dispatch(sess, chunk, writer)
-    except (ConnectionResetError, asyncio.IncompleteReadError,
-            asyncio.TimeoutError):
+    except asyncio.TimeoutError:
+        log(f'[TCP] read idle timeout {addr} (fd={fd}, '
+            f'game_client={getattr(sess, "is_game_client", False)}, '
+            f'authenticated={getattr(sess, "authenticated", False)})')
+    except (ConnectionResetError, asyncio.IncompleteReadError):
         pass
     except Exception as e:
         log(f'[handle_tcp] UNEXPECTED {addr}: {type(e).__name__}: {e}')
@@ -177,7 +206,7 @@ async def handle_tcp(reader, writer):
         # （客户端 REJOIN 300s 倒计时；超时 rejoin_sweep_loop 释放席位）
         if getattr(sess, 'is_game_client', False) and sess.player_id:
             try:
-                await matchmaking.on_game_client_closed(int(sess.player_id))
+                await _on_game_connection_closed(sess)
             except Exception as e:
                 log(f'[rejoin] game-conn closed hook failed: '
                     f'{type(e).__name__}: {e}')
@@ -327,6 +356,8 @@ async def start_ping_responder():
 
 
 async def main():
+    log(f'[startup] pid={os.getpid()} entry={os.path.abspath(__file__)} '
+        f'tcp_idle=unauthenticated-only stale_game_disconnect_guard=enabled')
     # 匹配模块日志注入（DB 统一走 state.STORE，无需再注入 store）
     mm_state.configure_log(log)
     # 登录排队（容量 HNG_MAX_ONLINE，事件驱动 + 1s 周期 pump 放行）

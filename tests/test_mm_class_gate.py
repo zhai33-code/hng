@@ -127,6 +127,12 @@ def main():
                 return [{'id': 42, 'faction': 3, 'name': 'Gtester',
                          'combat_xp': 0, 'template': self.template}]
 
+            async def list_vehicles(self, p, character_id=None):
+                return []
+
+            async def list_weapons(self, p, character_id=None):
+                return []
+
             async def get_mission_record(self, mid):
                 return None
 

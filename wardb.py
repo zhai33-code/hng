@@ -339,6 +339,26 @@ def weapon_modifier_wear_params(template_id):
     return _WEAPON_MOD_WEAR.get(int(template_id or 0))
 
 
+# Match the lobby's Global.itemBrokenThreshold; zero-wear items never break.
+ITEM_BROKEN_THRESHOLD = 0.1
+
+
+def _condition_is_broken(item, params):
+    if not params or params[0] <= 0 or not any(params[1:]):
+        return False
+    return float(item.get('condition', params[0])) < params[0] * ITEM_BROKEN_THRESHOLD
+
+
+def is_weapon_broken(weapon):
+    return _condition_is_broken(
+        weapon, weapon_wear_params(weapon.get('template_id')))
+
+
+def is_weapon_modifier_broken(modifier):
+    return _condition_is_broken(
+        modifier, weapon_modifier_wear_params(modifier.get('template_id')))
+
+
 def ammo_wear_params(template_id):
     """ammotemplate → (maxCondition, wearPerShot, wearPerBattle)；未知返回 None。"""
     return _AMMO_WEAR.get(int(template_id or 0))
@@ -360,6 +380,27 @@ def vehicle_wear_params_for_variant(variant_template_id):
     parent = _VEHICLE_VARIANT_PARENT.get(int(variant_template_id or 0), 0)
     return _VEHICLE_WEAR.get(parent) or \
         _VEHICLE_WEAR.get(int(variant_template_id or 0))
+
+
+def is_vehicle_broken(vehicle):
+    return _condition_is_broken(
+        vehicle, vehicle_wear_params_for_variant(vehicle.get('vehicle_variant_template_id')))
+
+
+def is_vehicle_upgrade_broken(upgrade):
+    return _condition_is_broken(
+        upgrade, vehicle_upgrade_wear_params(upgrade.get('upgrade_template_id')))
+
+
+def is_vehicle_ammo_depleted(ammo):
+    return _condition_is_broken(
+        ammo, ammo_wear_params(ammo.get('ammo_template_id')))
+
+
+def vehicle_has_depleted_ammo(ammos):
+    return any(int(ammo.get('equipped_storage_id', 0) or 0) > 0
+               and int(ammo.get('slot_index', 0) or 0) > 0
+               and is_vehicle_ammo_depleted(ammo) for ammo in ammos)
 
 
 def vehicle_full_condition(variant_template_id):

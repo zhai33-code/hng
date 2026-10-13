@@ -569,7 +569,8 @@ async def handle_conn(reader, writer):
                 for member in list(ch.members):
                     await member.send(cli.nick, 'QUIT :Connection closed')
                 if not ch.members and ch.key not in {n.lower() for n, _ in OFFICIAL_CHANNELS}:
-                    del CHANNELS[ch.key]
+                    if CHANNELS.get(ch.key) is ch:
+                        CHANNELS.pop(ch.key, None)
             log(f'[IRC] DISCONNECT {cli.nick}!{cli.user}@{cli.ip}')
         cli.cleanup()
         writer.close()

@@ -22,7 +22,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from protocol import pb_field_payload  # noqa: E402
-from wardb import _rank_from_combat_xp  # noqa: E402
+from wardb import _rank_from_combat_xp, vehicle_upgrade_wear_params  # noqa: E402
 from warserver_messages import (  # noqa: E402
     _msg_character_entry,
     _msg_player_settings,
@@ -109,7 +109,8 @@ def main():
                      'character_id': 3, 'equipped_in_slot': 0, 'variant_id': 0,
                      'condition': 100.0}]},
         'v_ups': {409: [{'id': 501, 'upgrade_template_id': 11, 'vehicle_id': 409,
-                         'equipped_slot_id': 1, 'condition': 1.0},
+                         'equipped_slot_id': 1,
+                         'condition': vehicle_upgrade_wear_params(11)[0]},
                         {'id': 502, 'upgrade_template_id': 12, 'vehicle_id': 409,
                          'equipped_slot_id': 0, 'condition': 1.0}]},
         'v_ammo': {409: [{'id': 603, 'ammo_template_id': 93, 'vehicle_id': 409,
@@ -235,8 +236,15 @@ def main():
     check('f17 squadSlotIndex=0', f[17][0] == 0)
     check('f22 metricsUid=uid-xyz / f23=42 / f25=43',
           f[22][0] == b'uid-xyz' and f[23][0] == 42 and f[25][0] == 43)
-    check('f28 缺省教程兼容列表与 bf65521 一致（28 项，跳过 5）',
-          f[28] == [1, 2, 3, 4] + list(range(6, 30)))
+    check('f38 教程逗号串符合客户端描述符（28 项，跳过 5）',
+          f[38] == [','.join(map(str, [1, 2, 3, 4] + list(range(6, 30)))).encode()])
+    check('f28 下发 gamedb 中全部 31 项 FPS 训练任务 ID（独立于 f38）',
+          f[28] == list(range(1, 32)))
+    check('f37 生涯军令状态恢复原默认空串', f[37] == [b''])
+    empty_tutorials = fields(_msg_player_settings(
+        player_id=1, pms_id=77, char_id=3, faction=3,
+        db_chars=chars, loadout=loadout, tutorial_ids=[]))
+    check('显式空教程集合仍编码为 f38 空字符串', empty_tutorials[38] == [b''])
     check('f30 isQuickPlay=1', f[30][0] == 1)
     check('f999 eos token 注入', f[999][0] == b'fake-eos-token-bytes')
     check('f1000 expires_in=300', f[1000][0] == 300)

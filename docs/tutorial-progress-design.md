@@ -1,11 +1,11 @@
 # 教程进度持久化与战斗内教程兼容方案
 
 状态：待实现（当前使用兼容模式）  
-记录日期：2026-10-07
+记录日期：2026-10-07；字段映射修正：2026-10-13
 
 ## 1. 背景与当前结论
 
-当前版本若在战斗 `PlayerSettings.f28 triggeredTutorialTemplateIds` 中下发空列表，
+战斗 `PlayerSettings.f38 triggeredTutorialTemplateIds` 为空字符串时，
 客户端进入部署地图后会连续弹出战斗教程。2026-10-07 的复现中，客户端依次上报
 `TutorialRequest`，教程 ID 为 `1`、`8`、`18`，随后 `hng.exe` 在
 `player.dll+0x6f1f21` 发生 `0xc0000005` 访问冲突。
@@ -13,8 +13,14 @@
 地图坐标逻辑回退为 `(0, 0)` 后仍可复现，因此没有证据表明地图坐标是此次崩溃
 原因。教程弹窗后的请求/响应链路仍是首要嫌疑，但尚未确认客户端期待的响应类型。
 
-为保持可玩性，当前暂时对齐已验证可用的 `bf65521`：当调用方没有显式提供教程
-进度时，战斗 `PlayerSettings.f28` 下发以下 28 个“已触发”教程 ID：
+2026-10-13 核对原始描述符 `work/wardump_out/01_desc_all.txt` 后发现：
+`PlayerSettings.f28` 实际是 `achievementsUnlocked`（成就集合）；`f38` 才是
+`triggeredTutorialTemplateIds`（单个字符串，逗号分隔 ID）。`bf65521` 和此前
+兼容修复都将教程 ID 误写进 f28，同时给 f38 发空字符串，因此教程仍会弹出。
+此前测试只验证错误字段的内容，没有验证客户端协议映射；本次已修正。
+
+当前沿用旧版的 28 项默认 ID，但通过正确的 f38 逗号串下发，f28 不再填入教程 ID。
+当调用方没有显式提供教程进度时，f38 下发以下集合：
 
 ```text
 1, 2, 3, 4, 6, 7, ..., 29
@@ -46,19 +52,19 @@
 ### 2.3 战斗内教程的已触发集合
 
 - 当前数据表：`character_tutorials`
-- 下发位置：战斗 `PlayerSettings.f28 triggeredTutorialTemplateIds`
+- 下发位置：战斗 `PlayerSettings.f38 triggeredTutorialTemplateIds`（逗号串）
 - 上报请求：战斗连接上的 `TutorialRequest`
 - 建议作用域：暂按角色级处理，最终以官服抓包/客户端逆向结果为准
 
-当前代码只写 `character_tutorials`，没有读取并传给 `PlayerSettings.f28` 的完整链路。
+当前代码只写 `character_tutorials`，没有读取并传给 `PlayerSettings.f38` 的完整链路。
 此外，`TutorialRequest` 只有 PMS ID 和教程 ID，现有证据不足以把它解释为“完成”。
 
 ## 3. 当前实现中的缺口
 
 1. `game_server.py` 构建 `PlayerSettings` 时没有读取战斗教程进度，也没有传入
    `tutorial_ids`。
-2. `warserver_messages.py` 过去把缺省 `None` 转为空列表，使老客户端认为所有战斗
-   教程均未触发。
+2. 原实现将教程 ID 写入成就字段 f28，教程字段 f38 始终为空；2026-10-13 已修正
+   为 f38 逗号串。真实进度读路径仍待实现。
 3. `handlers/combat.py::handle_tutorial_request` 当前调用
    `mark_character_tutorial(..., completed=True)`，把“收到教程事件”直接当成“已完成”，
    语义证据不足。
@@ -126,7 +132,7 @@ HNG_TUTORIAL_PROGRESS_MODE=compat|tracked
 1. 存量账号/角色预置 `bf65521` 的 28 项触发集合，或设置明确的
    `tutorial_progress_migrated` 标记并在读取时使用兼容集合。
 2. 新建的专用测试账号不预置，以验证完整教程流程。
-3. 不要用 `players.tutorials_completed=1` 代替战斗 f28；两者控制的客户端模块不同。
+3. 不要用 `players.tutorials_completed=1` 代替战斗 f38；两者控制的客户端模块不同。
 4. 不要把账号级 `player_tutorials_triggered` 与角色级战斗教程表直接互相覆盖。
 5. 迁移脚本必须幂等，并能统计迁移账号数、角色数和教程记录数。
 
@@ -135,7 +141,7 @@ HNG_TUTORIAL_PROGRESS_MODE=compat|tracked
 1. `TutorialRequest` 是单向通知，还是需要专用响应？若需要，响应消息名和字段是什么？
 2. 请求表示“弹出”“确认”“完成”中的哪一种状态？
 3. 战斗教程进度是账号级还是角色级？
-4. `PlayerSettings.f28` 是否允许真正的空列表？客户端崩溃是否由错误响应、缺少其他
+4. `PlayerSettings.f38` 为空串时如何安全完成教程？客户端崩溃是否由错误响应、缺少其他
    配套状态，或教程本身的资源/流程缺失造成？
 5. 教程 ID 5 为什么被 `bf65521` 跳过，它是否是废弃模板或由其他流程控制？
 6. 新手训练局是否需要特定 mission preset、地图、资源或机器人配置才能安全完成教程？
@@ -149,7 +155,8 @@ HNG_TUTORIAL_PROGRESS_MODE=compat|tracked
 
 - 存量玩家进入普通局不弹战斗教程。
 - 进入部署地图、选择出生点、关闭 UI 均不崩溃。
-- 重连同一战局时 f28 内容保持一致。
+- 重连同一战局时 f38 内容保持一致。
+- 协议测试验证 f38 是逗号字符串，f28 没有误填教程 ID。
 - 大厅 `Tutorial` KVCS 和 `players.tutorials_completed` 行为不受影响。
 
 ### 真实进度模式
@@ -165,12 +172,12 @@ HNG_TUTORIAL_PROGRESS_MODE=compat|tracked
 
 ## 9. 当前临时实现位置
 
-- 战斗 f28 兼容默认值：`warserver_messages.py::_msg_player_settings`
+- 战斗 f38 兼容默认值：`warserver_messages.py::_msg_player_settings`
 - 战斗教程请求：`handlers/combat.py::handle_tutorial_request`
 - 战斗教程存储：`store/maintenance.py::mark_character_tutorial`
 - 大厅触发集合：`handlers/characters.py::push_tutorial_row`
 - 大厅完成态：`handlers/characters.py::handle_settutorialcompletedrequest`
 - 数据表定义：`store/schema.py`
 
-在上述“必须确认的问题”解决前，不应删除 f28 的兼容默认列表或默认启用
+在上述“必须确认的问题”解决前，不应删除 f38 的兼容默认列表或默认启用
 `tracked` 模式。

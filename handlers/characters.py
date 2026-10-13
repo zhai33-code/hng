@@ -1041,7 +1041,7 @@ async def handle_setdepotitemviewedrequest(sess, writer, cmd_id, req_type, proto
         await _repush_depot_new_item(sess, writer, pid)
 
 
-# 教程已触发默认集：与 PlayerSettings f28 triggeredTutorialTemplateIds 同源
+# 教程已触发默认集：与 PlayerSettings f38 triggeredTutorialTemplateIds 同源
 # （[1,2,3,4]+6..29，跳过 5）。客户端 TutorialTable.wasTriggered 只认
 # KVCS Tutorial 行（id/playerId/triggeredTutorialTemplateIds 逗号串），
 # 不推该行则 wasTriggered 恒 false：战报关闭时 MissionBattleReportMediator

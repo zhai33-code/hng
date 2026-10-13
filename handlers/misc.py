@@ -208,8 +208,7 @@ async def handle_remove_equipmentselection(sess, writer, cmd_id, req_type, proto
             vproto = _msg_vehicle(v['id'], v['vehicle_variant_template_id'],
                                   v['character_id'], v['equipped_in_slot'],
                                   v.get('variant_id', 0),
-                                  condition=v.get('condition') or
-                                  vehicle_full_condition(v['vehicle_variant_template_id']))
+                                  condition=v['condition'])
             await _push_kvcs(writer, sess.soldier_view_cmd, b'Vehicle', vproto)
             log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
                 f'(Vehicle id={unequip_id} unequipped, charId={v["character_id"]})')

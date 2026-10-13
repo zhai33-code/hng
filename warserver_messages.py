@@ -43,6 +43,11 @@ from wardb import (
     charactertemplate_actionid,
     default_uniform_variant,
     is_general_character,
+    is_vehicle_broken,
+    is_vehicle_upgrade_broken,
+    vehicle_has_depleted_ammo,
+    is_weapon_broken,
+    is_weapon_modifier_broken,
     preset_scene,
     spawn_clips_for,
     vehicle_ammo_spawn_clips,
@@ -81,7 +86,7 @@ from wardb import (
 #   25     missionSessionId                  0x0a0   8     varint(int64)  ← pms_id
 #   26     playerMembershipBenefitTemplateId 0x0a8   8     varint(int64)
 #   27     defaultMembershipBenefitTemplateId 0x0b0   8     varint(int64)
-#   28     achievementsUnlocked (repeated)    0x0b8   8     (empty)
+#   28     achievementsUnlocked (repeated)    0x0b8   8     varint(int64)
 #   29     platform                          0x0c8   8     (skip: string/int64 ambiguous)
 #   30     isQuickPlay                       0x0d0   4     varint(bool)
 #   31     isQuickPlaySelectedFaction        0x0d4   4     varint(bool)
@@ -91,7 +96,7 @@ from wardb import (
 #   35     activeSoldierXPBoosterId          0x0f0   8     varint(int64)
 #   36     soldierWarBonusXPPercentage       0x0f8   4     varint(int32)
 #   37     careerOrderStatus                 0x100   8     (skip: string/int64 ambiguous)
-#   38     triggeredTutorialTemplateIds(rep) 0x108   8     (empty)
+#   38     triggeredTutorialTemplateIds      0x108   8     string（逗号分隔 ID）
 #   39     isChatModerator                   0x110   4     varint(bool)
 #  999     eos_openid_token                  0x118   8     string         ★ 关键！
 # 1000     eos_openid_expires_in             0x120   4     varint(int32)
@@ -164,9 +169,11 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     # f18 squadPoints ← 本次进局角色的 characters.squad_points
     squad_points = int(joined.get('squad_points', 0) or 0) if joined else 0
 
-    # 临时兼容策略（对齐 bf65521）：f28 的协议语义是“已触发教程”，并非
+    # 临时兼容策略：f38 的协议语义是“已触发教程”，并非
     # “已完成教程”。当前调用链尚未提供可靠的持久化进度时，缺省下发旧版
-    # 28 项列表，阻止老客户端在部署界面连续弹教程并触发 player.dll 崩溃。
+    # 28 项列表，避免老客户端在部署界面重复弹教程。
+    # 描述符 01_desc_all.txt 实证：f28=achievementsUnlocked，f38 才是教程
+    # 逗号串；bf65521 也存在将教程 ID 误写入 f28、f38 留空的问题。
     # 以后接入真实进度时应显式传 tutorial_ids；显式空列表仍表示全部未触发。
     if tutorial_ids is None:
         tutorial_ids = [1, 2, 3, 4] + list(range(6, 30))
@@ -207,8 +214,13 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     m += pb_int64(25, mission_session_id)        # 25 missionSessionId（=PMS f9 同源）
     m += pb_int64(26, int(membership_benefit_id or 0))
     m += pb_int64(27, int(membership_benefit_id or 0))
-    for tid in tutorial_ids:                     # 28 triggeredTutorialTemplateIds (repeated)
-        m += pb_int32(28, tid)
+    # FPS 左上角任务追踪来自 gamedb.dat 的 AchievementTemplate，独立于
+    # CareerOrderTemplate/f37 和教程弹窗/f38。当前资源的真实任务 ID 为
+    # 1..31（含 Combat Training 1/2、Tactical Training 1/2 与子任务）。
+    # 用户要求默认均已做完：下发真实 Achievement ID，不能用 Tutorial ID。
+    # 只影响战斗客户端已解锁状态，不写库、不发任务奖励。
+    for achievement_id in range(1, 32):
+        m += pb_int64(28, achievement_id)
     m += pb_string(29, 'HnG')                    # 29 platform
     m += pb_bool(30, bool(quickplay))            # 30 isQuickPlay（← 匹配请求）
     m += pb_bool(31, False)                      # 31 isQuickPlaySelectedFaction
@@ -232,7 +244,7 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
     # 后续接入事件系统时改此处即可
     m += pb_int32(36, 0)                         # 36 soldierWarBonusXPPercentage
     m += pb_string(37, str(career_order_status or ''))
-    m += pb_string(38, '')
+    m += pb_string(38, ','.join(str(int(tid)) for tid in tutorial_ids))
     m += pb_bool(39, False)                      # 39 isChatModerator
     if eos_token:
         m += pb_string(999, eos_token)            # 999 eos_openid_token ★
@@ -241,6 +253,8 @@ def _msg_player_settings(player_id, pms_id, char_id, eos_token=b'',
         f'chars={len(char_entries)}, field22(metricsUid)={metrics_uid}, '
         f'field25(missionSession)={mission_session_id}, '
         f'field35(xpBooster)={int((loadout or {}).get("xp_booster_id", 0) or 0)}, '
+        f'field38(triggeredTutorials)={len(tutorial_ids)}, '
+        f'field28(achievementsUnlocked)=31, '
         f'field999(token)={len(eos_token)}B')
     return m
 
@@ -367,6 +381,9 @@ def _msg_weapon_setting(w, ammos, mods, slot, wv_tmpl=None, wv_owned=None,
     f5 tracer：weapon_id → 已装备曳光弹模板（tr_tmpl 映射，来源
     tracer_effects 行 is_equipped）；无装备行发 0（默认曳光弹）。
     """
+    # All soldiers use this builder, including soldiers switched to inside FPS.
+    if is_weapon_broken(w):
+        return b''
     vid = int(w.get('variant_id', 0) or 0)
     vtmpl = int((wv_tmpl or {}).get(vid, 0) or 0) if vid else 0
     if not vtmpl and not vid \
@@ -386,12 +403,14 @@ def _msg_weapon_setting(w, ammos, mods, slot, wv_tmpl=None, wv_owned=None,
             continue
         am = pb_int64(1, int(a['id']))
         am += pb_int64(2, int(a['ammo_template_id']))
-        am += pb_float(3, float(a['condition'] or 1.0))
+        am += pb_float(3, float(a['condition']))
         m += pb_message(3, am)
     for md in mods:
+        if is_weapon_modifier_broken(md):
+            continue
         mm = pb_int64(1, int(md['id']))
         mm += pb_int64(2, int(md['template_id']))
-        mm += pb_float(3, float(md.get('condition', 1.0) or 1.0))
+        mm += pb_float(3, float(md['condition']))
         m += pb_message(4, mm)
     # f5 tracer：已装备曳光弹模板（tracer_effects 行 is_equipped → tr_tmpl；
     # 无装备行发 0=默认曳光弹）；f6 decals 官方服恒发空消息（按回放字节镜像）
@@ -400,7 +419,7 @@ def _msg_weapon_setting(w, ammos, mods, slot, wv_tmpl=None, wv_owned=None,
     m += pb_int32(7, spawn_clips_for(
         int(w.get('clip_count', 0) or 0), int(w['template_id'])))
     m += pb_int32(8, int(slot))
-    m += pb_float(9, float(w.get('condition', 1.0) or 1.0))
+    m += pb_float(9, float(w['condition']))
     if vtmpl:
         m += pb_int64(10, vtmpl)
     m += pb_string(11, w.get('name') or '')
@@ -419,6 +438,10 @@ def _msg_vehicle_setting(v, ups, vammos, vv_tmpl=None):
     vehicles.variant_id 装备位），未装备/皮肤与基础模板不同 parent（脏数据，
     会换成另一辆载具）时回退基础模板。与武器 f10 皮肤、军服 f9 迷彩同模式。
     """
+    # Applies to every switchable soldier. Do not let empty ammo fall back
+    # to the FPS client's default loadout when the vehicle is spawned.
+    if is_vehicle_broken(v) or vehicle_has_depleted_ammo(vammos):
+        return b''
     base_tmpl = int(v['vehicle_variant_template_id'])
     tmpl = base_tmpl
     camo = int((vv_tmpl or {}).get(int(v.get('variant_id', 0) or 0), 0) or 0)
@@ -429,13 +452,14 @@ def _msg_vehicle_setting(v, ups, vammos, vv_tmpl=None):
     m = b''
     m += pb_int64(1, int(v['id']))
     m += pb_int64(2, tmpl)
-    m += pb_float(3, float(v.get('condition', 100.0) or 100.0))
+    m += pb_float(3, float(v['condition']))
     m += pb_int32(4, int(v['equipped_in_slot'] or 0))
     for u in ups:
         # f5 只下发已安装升级（equipped_slot_id>0）—— 购买的升级件初始
         # slot=0（车库升级列表待安装），未安装不应在战斗生效（2026-08-28
         # 修复，与 f3/f4/f6 只发已装备同原则）
-        if int(u.get('equipped_slot_id', 0) or 0) <= 0:
+        if (int(u.get('equipped_slot_id', 0) or 0) <= 0
+                or is_vehicle_upgrade_broken(u)):
             continue
         um = pb_int64(1, int(u['id']))
         # f2 是 VehicleUpgradeSlot 表 id（equipped_slot_id，车库 schema 的
@@ -447,13 +471,14 @@ def _msg_vehicle_setting(v, ups, vammos, vv_tmpl=None):
         # 错误模板 1 且挂载失败，被 #error3 insufeciant slots 丢弃（2026-08-31
         # hng_boot.log 实证：mod slot 14/3 → template 1 → 丢弃）
         um += pb_int64(2, int(u['equipped_slot_id']))
-        um += pb_float(3, float(u['condition'] or 1.0))
+        um += pb_float(3, float(u['condition']))
         m += pb_message(5, um)
     # f6 只下发已装备弹药（equipped_storage_id>0）——官方回放（pvt_player_settings.bin
     # Yaroslav 载具）f6 仅含 storage=72 slot=1 一条；未装备弹药（storage=0，车库库存）
     # 下发会被客户端判无效移除并刷 #error2 Removing Invalid Vehicle Ammo
     for a in vammos:
-        if int(a.get('equipped_storage_id') or 0) <= 0:
+        if (int(a.get('equipped_storage_id') or 0) <= 0
+                or int(a.get('slot_index') or 0) <= 0):
             continue
         am = pb_int64(1, int(a['id']))
         am += pb_int64(2, int(a['equipped_storage_id']))
