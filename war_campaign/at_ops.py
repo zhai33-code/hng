@@ -750,12 +750,13 @@ def reserve_template_id(faction):
 
 def is_parked_planes_at(at):
     """独立运输机队（空降拆分产物，split_aircraft_back）：reserve 模板
-    且停驻机场（airbase_bf>0）。区别于补给队（同 reserve 模板但
-    airbase_bf 恒 0，走补给线）。官服口径：独立运输机只能飞己方机场
+    且停驻机场（airbase_bf>0），排除 supply_state.source=purchase 的
+    购买飞机增援。独立运输机只能飞己方机场
     （客户端 CommandnodeArrow L504 `isAirfield && (!underAttack ||
     isReserve)`——reserve 例外允许交战机场）。"""
     return (is_reserve(at)
-            and int(at.get('airbase_bf') or 0) > 0)
+            and int(at.get('airbase_bf') or 0) > 0
+            and _as_resources(at.get('supply_state')).get('source') != 'purchase')
 
 
 async def merge_parked_planes(store, at, proto, air_bf, war_id):
@@ -779,6 +780,7 @@ async def merge_parked_planes(store, at, proto, air_bf, war_id):
     parked = [p for p in parked
               if int(p.get('id') or 0) != int(at.get('id') or 0)
               and is_reserve(p)
+              and _as_resources(p.get('supply_state')).get('source') != 'purchase'
               and int(p.get('airbase_bf') or 0) == int(air_bf)
               and p.get('is_deployed')
               and int(p.get('state') or 0) < 3]

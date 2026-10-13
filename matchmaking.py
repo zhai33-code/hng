@@ -362,6 +362,15 @@ def release_mission_resources(mission_id):
     force_pool.release(mission_id)
 
 
+async def add_supply_to_live_mission(battle_id, parent, resources):
+    if state.STORE is None:
+        return False
+    rec = await state.STORE.get_mission_by_battle(int(battle_id))
+    if rec is None:
+        return False
+    return force_pool.add_war_supply(rec['id'], parent['faction'], parent['id'], resources)
+
+
 async def add_reinforcement_to_live_mission(battle_id, at):
     """war 会战中途增援（官方语义：增援 AT 为进行中战斗补充可出生兵力）。
 

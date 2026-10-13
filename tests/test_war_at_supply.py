@@ -291,6 +291,10 @@ class FakeStore:
         return [copy.deepcopy(m) for m in self.movements.values()
                 if m['war_id'] == int(war_id) and m['state'] == 0]
 
+    async def get_active_movement(self, at_id):
+        return next((copy.deepcopy(m) for m in self.movements.values()
+                     if m['commandnode_id'] == int(at_id) and m['state'] == 0), None)
+
     async def finish_movement(self, mv_id, state):
         if int(mv_id) in self.movements:
             self.movements[int(mv_id)]['state'] = int(state)
@@ -2117,8 +2121,8 @@ async def section_r():
     # R3d3 补给队（同 reserve 模板但 airbase_bf=0）同样不能手动移动
     _mk_at(st, 532, template=504, deployed=True, map_entity_id=10)
     w3, f3 = await _transport(532, target=12)
-    check('R3d3 地面补给队手动移动 → 拒 152',
-          f3.get(3) == war_campaign.RC_COMMANDNODE_NOT_DEPLOYABLE
+    check('R3d3 无对应主力的地面补给队 → 拒 7',
+          f3.get(3) == war_campaign.RC_CANNOT_FIND_COMMANDNODE
           and st.ats[532]['state'] == 0, str(f3))
 
     # R3d4 补给队非 parked planes 判定（is_parked_planes_at = reserve +

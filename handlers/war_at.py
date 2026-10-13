@@ -765,6 +765,10 @@ async def handle_retreat_command_node_request(sess, writer, cmd_id, req_type,
             code = war_campaign.RC_WAR_NOT_FOUND
         else:
             at, code = await _load_at(pid, node_id, war)
+            if (not code and war_campaign.is_reserve(at)
+                    and (war_campaign.supply_state(at).get('blocked_bf')
+                         or war_campaign.supply_state(at).get('blocked_field_id'))):
+                code = war_campaign.RC_COMMANDNODE_IN_BATTLE
             if not code:
                 try:
                     was_in_battle = int(at.get('state') or 0) == 2
@@ -1243,7 +1247,7 @@ async def _apply_resupply(at, pid, war, currency,
                 war_campaign.at_current_battlefield(at))
     if use_column:
         _sbf, _pbf, ok = await war_campaign.column_route(
-            STORE, war, at, near_capital_bf=near_capital)
+            STORE, war, at, near_capital_bf=near_capital, resources=missing)
         if not ok:
             log('      [war_at] resupply rejected: column route unreachable')
             return war_campaign.RC_CANNOT_FIND_COMMANDNODE, at
@@ -1778,6 +1782,60 @@ async def _dest_semantic_code(store, war, at, dest_bf):
     return war_campaign.RC_OK
 
 
+async def _transport_supply_order(store, war, at, target_id, target_type,
+                                  override_ap=0, override_move=False):
+    """Reserve orders share destination restrictions for both target types."""
+    target_type = (target_type or '').strip().lower()
+    dest = int(target_id) if target_type == 'battlefield' else 0
+    if target_type == 'commandnode':
+        other = await store.get_command_node(target_id)
+        dest = war_campaign.at_current_battlefield(other) if other else 0
+    if war_campaign.is_parked_planes_at(at):
+        return dest, war_campaign.RC_COMMANDNODE_NOT_DEPLOYABLE, []
+    if not await war_campaign.supply.supply_parent(store, at):
+        return dest, war_campaign.RC_CANNOT_FIND_COMMANDNODE, []
+    if not dest or override_ap or not at.get('is_deployed'):
+        return dest, war_campaign.RC_CANNOT_FIND_COMMANDNODE, []
+    if int(at.get('state') or 0) == 2:
+        return dest, war_campaign.RC_COMMANDNODE_IN_BATTLE, []
+    owners = dict(await store.get_war_cities(war['id']))
+    if int(owners.get(dest) or 0) != int(at['faction']):
+        return dest, war_campaign.RC_CANNOT_FIND_COMMANDNODE, []
+    mv = await store.get_active_movement(at['id'])
+    segment_index = 0
+    if mv:
+        segs = war_campaign.movement_segments(mv)
+        if not segs or segs[0].get('air'):
+            return dest, war_campaign.RC_ALREADY_IN_TRANSPORT, []
+        idx = war_campaign.current_segment_index(segs, int(time.time() * 1000))
+        segment_index = idx
+        tail = war_campaign.fastest_supply_path(segs[idx]['to_bf'], dest, at, owners)
+        if tail is None:
+            return dest, war_campaign.RC_CANNOT_FIND_COMMANDNODE, []
+        if override_move:
+            for seg in tail:
+                seg['seconds'] = 0
+        path = list(mv['path'][:idx + 1]) + tail
+        mv = await store.update_movement_path(mv['id'], path,
+            arrive_at=mv['started_at'] + datetime.timedelta(
+                seconds=sum(s['seconds'] for s in path)))
+        data = war_campaign.supply_state(at)
+        data['manual'] = True
+        await store.update_command_node(at['id'], supply_state=data)
+        code = war_campaign.RC_OK
+    else:
+        mv, code = await war_campaign.start_supply_movement(
+            store, war, at, dest, manual=True, override_move=override_move)
+    events = []
+    if code == war_campaign.RC_OK and mv:
+        at = await store.get_command_node(at['id'])
+        events = war_campaign.supply_movement_events(
+            at, war['id'], mv, war_campaign._faction_capital_bf(), segment_index)
+        if override_move:
+            events.extend(await war_campaign.advance_movements(store, war))
+    return dest, code, events
+
+
 async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
                                        proto):
     """transport_commandnode {f1 instance, f2 targetId, f3 targetType,
@@ -1815,14 +1873,19 @@ async def handle_transport_commandnode(sess, writer, cmd_id, req_type,
         else:
             at, code = await _load_at(pid, node_id, war)
             mv_cur = None          # 在途移动（state=1 改道用）
+            if not code and war_campaign.is_reserve(at):
+                dest_bf, code, events = await _transport_supply_order(
+                    STORE, war, at, target_id, target_type,
+                    override_ap, override_move)
+                resp = build_response(cmd_id, 'transport_commandnode_response',
+                    pb_int64(1, node_id) + pb_int64(2, dest_bf) + pb_int32(3, code))
+                writer.write(resp)
+                await writer.drain()
+                if events:
+                    await war_campaign.broadcast_war_events(events, STORE)
+                return
             if not code:
-                if war_campaign.is_reserve(at):
-                    # reserve（补给队 / 空降拆分运输机队）：无飞行员，
-                    # 官服口径不能手动拖动移动——补给队自动机动或在出生
-                    # 机场原地等本体来合并；停驻机队只能自动返航或被
-                    # re-use 合并
-                    code = war_campaign.RC_COMMANDNODE_NOT_DEPLOYABLE
-                elif not at.get('is_deployed'):
+                if not at.get('is_deployed'):
                     code = war_campaign.RC_COMMANDNODE_NOT_DEPLOYABLE
                 elif int(at.get('state') or 0) == 2:
                     code = war_campaign.RC_COMMANDNODE_IN_BATTLE

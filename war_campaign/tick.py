@@ -75,7 +75,37 @@ from .supply import (
     _cleanup_supply_columns,
     merge_waiting_columns,
     supply_queue_tick,
+    supply_state,
+    advance_supply_movement,
+    check_supply_field_encounters,
     )
+
+
+async def _advance_ground_nodes(store, war_id, at, mv, segs, now_ms, caps):
+    """Visit every crossed intermediate city exactly once, in route order."""
+    data = dict(_as_resources(at.get('supply_state')))
+    cursor = data.get('movement_cursor') or {}
+    visited = int(cursor.get('segment', -1)) if cursor.get('id') == mv['id'] else -1
+    events = []
+    for index, seg in enumerate(segs[:-1]):
+        if index <= visited or seg['end_ms'] > now_ms:
+            continue
+        bf = int(seg['to_bf'])
+        if await _passthrough_hostile(store, war_id, at, bf):
+            await store.finish_movement(mv['id'], 1)
+            await store.update_command_node(at['id'], state=0, map_entity_id=bf,
+                                           map_entity_type=MAP_ENTITY_BATTLEFIELD)
+            at = await store.get_command_node(at['id'])
+            events.extend([
+                ('del', b'transport_commandnode_segment', mv['id']),
+                ('set', b'CommandNodeWarInstance', msg_commandnode_instance_row(at, war_id, caps)),
+                ('del', b'transport_commandnode_destination', mv['id'])])
+            events.extend(await _check_battle_formation(store, war_id, at, bf))
+            return True, events
+        events.extend(await _capture_city_events(store, war_id, at.get('faction'), bf))
+        data['movement_cursor'] = {'id': mv['id'], 'segment': index}
+        await store.update_command_node(at['id'], supply_state=data)
+    return False, events
 
 
 async def advance_movements(store, war=None, now=None):
@@ -97,6 +127,12 @@ async def advance_movements(store, war=None, now=None):
             if not at or int(at.get('state') or 0) >= 3:
                 await store.finish_movement(mv['id'], 2)   # AT 已解散
                 continue
+            if (is_reserve(at) and (supply_state(at).get('source') == 'purchase'
+                    or not int(at.get('airbase_bf') or 0))):
+                if not (supply_state(at).get('blocked_bf')
+                        or supply_state(at).get('blocked_field_id')):
+                    events.extend(await advance_supply_movement(store, war, at, mv, now))
+                continue
             if int(at.get('state') or 0) == 2:
                 # 野外会战冻结（§2）：会战中不推进，结算时按会战时长顺延
                 # started_at 恢复行军
@@ -106,6 +142,13 @@ async def advance_movements(store, war=None, now=None):
                 await store.finish_movement(mv['id'], 1)
                 continue
             is_air = bool(segs[0].get('air'))
+            if not is_air and not is_reserve(at):
+                stopped, crossed_events = await _advance_ground_nodes(
+                    store, war_id, at, mv, segs, now_ms, caps)
+                events.extend(crossed_events)
+                if stopped:
+                    continue
+                at = await store.get_command_node(at['id'])
             if now_ms >= segs[-1]['end_ms']:
                 # ---- 到达：终段 to_bf（或 dest_ap 出兵点）落位 ----
                 await store.finish_movement(mv['id'], 1)
@@ -281,40 +324,9 @@ async def advance_movements(store, war=None, now=None):
                                msg_commandnode_instance_row(at, war_id, caps)))
                 if is_reserve(at):
                     continue        # 补给队途经不占城（补给线两端本方领地）
-                # ---- 换段敌情检查（途经城市 = 上一段终点）----
-                # 敌驻军/我方参战会战 → 中止行军落位途经城，成局/增援
-                # （修复：途经交战城市不停下直接穿城而过）；第三阵营
-                # 会战（我方不参战）正常通过（两方制契约）
-                pass_bf = int(segs[idx]['from_bf'] or 0)
-                if await _passthrough_hostile(store, war_id, at, pass_bf):
-                    await store.finish_movement(mv['id'], 1)
-                    await store.update_command_node(
-                        at['id'], state=0, map_entity_id=pass_bf,
-                        map_entity_type=MAP_ENTITY_BATTLEFIELD)
-                    at = await store.get_command_node(at['id'])
-                    # 中止落位推序同到达分支：del segment → set
-                    # instance → del destination（destination 的 del
-                    # 须在 instance 之后派发，否则客户端 AT 列表 status
-                    # 按在途旧 location="" 冻结，不显示途经城市名）
-                    events.append(('del', b'transport_commandnode_segment',
-                                   mv['id']))
-                    events.append(('set', b'CommandNodeWarInstance',
-                                   msg_commandnode_instance_row(
-                                       at, war_id, caps)))
-                    events.append(('del',
-                                   b'transport_commandnode_destination',
-                                   mv['id']))
-                    events.extend(await _check_battle_formation(
-                        store, war_id, at, pass_bf))
-                    log(f'[war] AT {at["id"]} 途经敌情城市 {pass_bf} '
-                        f'中止行军入战')
-                    continue
-                # 换段占城：AT 已抵达新段起点城市（=上一段终点），无敌
-                # 驻军/无进行中会战则易主（途经城市陆续占领）
-                events.extend(await _capture_city_events(
-                    store, war_id, at.get('faction'), segs[idx]['from_bf']))
         # ---- 野外遭遇成局（§2）：同补给线段在途敌对 AT 相遇 ----
         events.extend(await _check_field_encounters(store, war_id, now_ms))
+        events.extend(await check_supply_field_encounters(store, war, now_ms))
         return events
     except Exception as e:
         log(f'[war] advance_movements failed: {e}')

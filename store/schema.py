@@ -773,6 +773,8 @@ ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS parent_command_node_id BIGINT
 -- 换基地到达即记录；作战飞离保持原值 → 战局结束飞机据此飞回原机场
 -- （攻占敌方机场例外则更新为该机场）。0=无基地（非 airborne / 待命）。
 ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS airbase_bf BIGINT NOT NULL DEFAULT 0;
+-- 购买增援的独立指令/交战阻塞，独立于空降拆分返航机队。
+ALTER TABLE command_nodes ADD COLUMN IF NOT EXISTS supply_state JSONB NOT NULL DEFAULT '{}';
 -- 官方士气模型（快照+时间戳，客户端 CommandnodeSchema.getMorale 口径）：
 -- morale 是 morale_updated_at 时刻的快照，当前值=快照+0.15/分钟回复。
 -- 存量行按 created_at 一次性物化回复后重基线（此前客户端按 created_at

@@ -6,6 +6,7 @@ automission_tick 主体已迁移 war_campaign/automission.py（war-gameplay-fix-
 plan §3/§4/§7/§8 阈值/tie 判定），本模块保留符号转发。"""
 
 import time
+from .common import rts_scope
 import mm_config
 import wardb
 from state import log
@@ -71,26 +72,29 @@ async def production_tick(store):
             log('[war] production skipped: no usable WarDatabase production rows')
             return
         now_ms = int(now_s * 1000)
-        cursor = int(war.get('production_ms') or 0)
-        if cursor <= 0:
-            await store.update_war_production(war['id'], now_ms)
-            return
-        runs = int((now_ms - cursor) // interval_ms)
-        if runs <= 0:
-            return
-        deltas = {}
-        for t in templates:
-            per = int(t.get('produce_per_run') or 0)
-            if per <= 0:
-                continue            # 死行 cat 13 等
-            fac = int(t.get('faction') or 0)
-            cat = int(t.get('category_id') or 0)
-            d = deltas.setdefault(fac, {})
-            d[cat] = d.get(cat, 0) + per * runs
-        for fac, d in deltas.items():
-            await store.adjust_war_faction_resources(war['id'], fac, d)
-        new_cursor = cursor + runs * interval_ms
-        await store.update_war_production(war['id'], new_cursor)
+        async with rts_scope(store, 'production', war['id']) as bound:
+            fresh = await bound.get_active_war()
+            if fresh is None or fresh['id'] != war['id']:
+                return
+            cursor = int(fresh.get('production_ms') or 0)
+            if cursor <= 0:
+                await bound.update_war_production(war['id'], now_ms)
+                return
+            runs = int((now_ms - cursor) // interval_ms)
+            if runs <= 0:
+                return
+            deltas = {}
+            for t in templates:
+                per = int(t.get('produce_per_run') or 0)
+                if per <= 0:
+                    continue
+                fac, cat = int(t.get('faction') or 0), int(t.get('category_id') or 0)
+                d = deltas.setdefault(fac, {})
+                d[cat] = d.get(cat, 0) + per * runs
+            for fac, d in deltas.items():
+                await bound.adjust_war_faction_resources(war['id'], fac, d)
+            new_cursor = cursor + runs * interval_ms
+            await bound.update_war_production(war['id'], new_cursor)
         war['production_ms'] = new_cursor
         log(f'[war] production: war={war["id"]} runs={runs} '
             f'factions={sorted(deltas)}')

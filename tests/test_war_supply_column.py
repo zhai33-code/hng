@@ -19,8 +19,7 @@
      补给 103 / 部分在途折半）；首次免费置位；f6 nearCapitalBattlefieldId
      透传（在网城生效 / 敌城回退首都）；孤岛己方城出队；连通非首都城即时
   F. 空军系补给（官服 war2.md「补给只发生在主城附近的机场……等本体
-     飞过来合并」）：伞兵补编两队出生锚定城附近己方机场原地等待（不
-     派移动）；本体到站合并满编；父已在机场立即合并；无己方机场拒单；
+     飞过来合并」）：伞兵补编两队出生锚定城附近己方机场，人员行军、运输机等待；本体到站合并满编；父已在机场立即合并；无己方机场拒单；
      落地变体并入新买运输机后重新登机转回空中原型
 
 写法沿用 test_war_movement.py / test_war_at_supply.py：monkeypatch wardb
@@ -561,7 +560,7 @@ async def section_b():
           .get(3) == 0)
 
     # B2 near_capital_bf：己方在网城生效；敌城/孤岛己方城忽略 → 自动选
-    # 最近己方在网⭐城 10（20 非⭐跳过，2026-09-15 ⭐城口径）
+    # 主城 10 附近的己方城市 20 出生。
     st2 = FakeStore()
     war2 = await _war(st2, {10: 1, 20: 1, 30: 2})
     p2 = _mk_at(st2, 21, deployed=True, map_entity_id=30)
@@ -573,13 +572,13 @@ async def section_b():
     col3, _e3, rc3 = await war_campaign.spawn_supply_column(
         st2, war2, p2, {1: 5}, near_capital_bf=30, now=_NOW)  # 30 敌领地
     mv3 = await st2.get_active_movement(col3['id'])
-    check('B2 near_capital 敌领地忽略（就近己方在网⭐城 10，跳过非⭐ 20）',
-          rc3 == 0 and mv3 and mv3['path'][0]['from_bf'] == 10)
+    check('B2 敌领地指定忽略，主城 10 附近城市 20 出生',
+          rc3 == 0 and mv3 and mv3['path'][0]['from_bf'] == 20)
     col3b, _e3b, rc3b = await war_campaign.spawn_supply_column(
         st2, war2, p2, {1: 5}, near_capital_bf=40, now=_NOW)  # 40 孤岛己方
     mv3b = await st2.get_active_movement(col3b['id'])
-    check('B2 near_capital 孤岛己方城忽略（不在网 → 就近⭐城 10）',
-          rc3b == 0 and mv3b and mv3b['path'][0]['from_bf'] == 10)
+    check('B2 孤岛指定忽略，主城 10 附近城市 20 出生',
+          rc3b == 0 and mv3b and mv3b['path'][0]['from_bf'] == 20)
 
     # B3 同城（出生点=父 AT 位置）→ 直接汇合不出队
     st3 = FakeStore()
@@ -860,8 +859,8 @@ async def section_e():
     w, f = await _resupply(501, near_capital=30)         # 30 敌领地 → 忽略
     cols8 = [c for c in _cols(st7, 501) if c['state'] < 3]
     mv8 = await st7.get_active_movement(cols8[-1]['id'])
-    check('E7 f6=30 敌领地 → 忽略就近己方在网⭐城 10（跳过非⭐ 20）',
-          f.get(2) == 1 and mv8 and mv8['path'][0]['from_bf'] == 10,
+    check('E7 敌领地指定忽略，自动从主城附近城市 20 出生',
+          f.get(2) == 1 and mv8 and mv8['path'][0]['from_bf'] == 20,
           str(f))
 
     # E8 会战/移动状态门（101/116）不因补给队分支变化
@@ -939,35 +938,40 @@ async def section_e():
 # ===================== F 空军系补给（机场原地等本体，官服 war2.md 口径）
 
 async def section_f():
-    # F1 伞兵 AT 驻敌城 30 补编 → 士兵/运输机两队出生在主城 10 附近
-    # 机场 50 **原地等待**（「等本体飞过来合并」：不派移动、无飞行员）
+    # Airport 50 has a ground supply line, allowing personnel to march.
+    _SYN_APS.append({'id': 5, 'battlefield': 50})
+    _SYN_SLS.append({'id': 103, 'ap1': 5, 'ap2': 1})
+    war_campaign.common._ADJACENCY_CACHE = None
     st = await _ewar({10: 1, 50: 1, 30: 2})
     _mk_at(st, 500, template=106, deployed=True, map_entity_id=30,
            resources={'4': 2}, sold_free=True, veh_free=True)
     w, f = await _resupply(500)
     cols = [c for c in _cols(st, 500) if c['state'] < 3]
-    loads = sorted(sorted(c['resources'].items()) for c in cols)
-    mvs = [await st.get_active_movement(c['id']) for c in cols]
-    check('F1 伞兵补编 → 两队出生机场 50 原地等待（state0/无移动）',
-          f.get(2) == 1 and len(cols) == 2
-          and loads == [[('10', 3)], [('4', 10)]]
-          and all(c['map_entity_id'] == 50 and c['state'] == 0
-                  for c in cols)
-          and not any(mvs), f'{loads} cols={[(c["id"], c["map_entity_id"], c["state"]) for c in cols]}')
-
-    # F2 本体飞到机场 50 → 到达合并两队 → 满编 {4:12, 10:3}
+    personnel = next(c for c in cols if '4' in c['resources'])
+    planes = next(c for c in cols if '10' in c['resources'])
+    march = await st.get_active_movement(personnel['id'])
+    check('F1 伞兵自动从机场行军，运输机留机场',
+          f.get(2) == 1 and personnel['state'] == 1 and march
+          and march['path'][0]['from_bf'] == 50
+          and march['path'][-1]['to_bf'] == 30
+          and planes['state'] == 0 and planes['map_entity_id'] == 50
+          and not await st.get_active_movement(planes['id']))
+    arrived = march['arrive_at'] + datetime.timedelta(seconds=1)
+    await war_campaign.advance_movements(st, await st.get_active_war(), now=arrived)
+    check('F2a 人员到主力汇合，运输机仍等待',
+          st.ats[500]['resources'] == {'4': 12}
+          and st.ats[personnel['id']]['state'] == 3
+          and st.ats[planes['id']]['state'] == 0)
     st.ats[500]['state'] = 1
     await st.create_movement(
         500, 1, [{'sl_id': 0, 'from_bf': 30, 'to_bf': 50, 'seconds': 100,
-                  'air': True}], started_at=_NOW)
+                  'air': True}], started_at=arrived)
     ev = await war_campaign.advance_movements(
-        st, await st.get_active_war(),
-        now=_NOW + datetime.timedelta(seconds=101))
-    check('F2 本体到站合并（满编/两队软删/del armyresource 行）',
+        st, await st.get_active_war(), now=arrived + datetime.timedelta(seconds=101))
+    check('F2b 主力到机场合并运输机',
           st.ats[500]['resources'] == {'4': 12, '10': 3}
           and all(st.ats[c['id']]['state'] == 3 for c in cols)
-          and ('del', b'armyresource') in _events_tags(ev),
-          f"{st.ats[500]['resources']}")
+          and ('del', b'armyresource') in _events_tags(ev))
 
     # F3 父 AT 已在出生机场 50 → 立即合并不出队
     st3 = await _ewar({10: 1, 50: 1, 30: 2})

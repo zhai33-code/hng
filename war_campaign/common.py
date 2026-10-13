@@ -6,8 +6,26 @@
 
 import datetime
 import json
+import asyncio
+from contextlib import asynccontextmanager
 import mm_config
 import wardb
+
+
+@asynccontextmanager
+async def rts_scope(store, scope, war_id=0, faction=0):
+    if hasattr(store, 'rts_transaction'):
+        async with store.rts_transaction(scope, war_id, faction) as bound:
+            yield bound
+    else:
+        # Minimal DB-free adapters have no SQL transaction API. Serialize their
+        # calls too; production always uses the database transaction above.
+        locks = getattr(store, '_rts_operation_locks', None)
+        if locks is None:
+            locks = store._rts_operation_locks = {}
+        lock = locks.setdefault((scope, war_id, faction), asyncio.Lock())
+        async with lock:
+            yield store
 
 
 # CommandNodeMoraleTemplate 官服实值（tests/test_wardb_rts.py §F 校验）

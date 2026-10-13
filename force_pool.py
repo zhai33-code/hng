@@ -378,6 +378,26 @@ def init_mission_war(mission_id, attacker, defender, comps_by_faction,
     return True
 
 
+def add_war_supply(mission_id, faction, at_id, comp):
+    """Add delivered resources to an existing AT without duplicating its row."""
+    rec = _MISSIONS.get(int(mission_id or 0))
+    if rec is None or rec.get('mode') != 'war':
+        return False
+    fac = int(faction)
+    node = next((a for a in rec.get('war_ats', {}).get(fac, [])
+                 if int(a.get('id') or 0) == int(at_id)), None)
+    if node is None:
+        return False
+    for cat, count in comp.items():
+        cat, count = int(cat), int(count)
+        rec['pool'].setdefault(fac, {})[cat] = rec['pool'][fac].get(cat, 0) + count
+        node.setdefault('comp', {})[cat] = node['comp'].get(cat, 0) + count
+    if fac == rec.get('attacker'):
+        rec['lines'] = rec['line_pool'] = None
+        rec['ap_line'] = {}
+    return True
+
+
 def add_war_reinforcement(mission_id, faction, comp, name, at=None):
     """war 局中途增援：AT 编制并入该阵营主池（出生消耗/结算缴获/战报
     AT 名单均以池为准，并入即生效——f2 轮询读实时池，战斗服下一轮

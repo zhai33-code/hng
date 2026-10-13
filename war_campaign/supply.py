@@ -5,6 +5,9 @@
 符号逐字搬运，行为不变。"""
 
 import time
+import datetime
+import heapq
+import math
 from protocol import (
     pb_int32,
     pb_int64,
@@ -14,6 +17,9 @@ import wardb
 from state import log
 from .common import (
     _as_resources,
+    rts_scope,
+    _PLANE_CATS,
+    BATTLE_TYPE_ASSAULT,
     MAP_ENTITY_BATTLEFIELD,
     supplyline_adjacency,
     find_supplyline_path,
@@ -25,6 +31,8 @@ from .lifecycle import (
 from .battle_msgs import (
     msg_transport_segment_row,
     msg_transport_destination_row,
+    msg_air_transport_row,
+    msg_missionresource_row,
     )
 from .at_ops import (
     RC_OK,
@@ -36,6 +44,8 @@ from .at_ops import (
     nearest_owned_airfield,
     remount_on_ground_at_airfield,
     reserve_template_id,
+    msg_air_commandnode_base_row,
+    bf_distance,
     )
 from .warmap_view import (
     msg_commandnode_definition_row,
@@ -47,8 +57,133 @@ from .warmap_view import (
 from .at_movement import (
     at_current_battlefield,
     movement_segments,
-    start_movement,
+    at_speed,
+    segment_seconds,
     )
+
+
+def supply_state(at):
+    """JSONB may arrive as text when asyncpg has no JSON codec."""
+    return dict(_as_resources(at.get('supply_state')))
+
+
+def is_plane_supply(at):
+    return (is_reserve(at) and bool(_as_resources(at.get('resources')))
+            and all(int(c) in _PLANE_CATS
+                    for c in _as_resources(at.get('resources'))))
+
+
+def fastest_supply_path(from_bf, to_bf, at, owners):
+    """Shortest travel time, allowing hostile/neutral intermediate cities."""
+    from_bf, to_bf = int(from_bf), int(to_bf)
+    distances = {from_bf: 0.0}
+    previous = {}
+    queue = [(0.0, from_bf)]
+    fac = int(at.get('faction') or 0)
+    while queue:
+        cost, bf = heapq.heappop(queue)
+        if cost != distances[bf]:
+            continue
+        if bf == to_bf:
+            path = []
+            while bf != from_bf:
+                prev, seg = previous[bf]
+                path.append(seg)
+                bf = prev
+            return list(reversed(path))
+        for sl, ap1, ap2, nb in supplyline_adjacency().get(bf, ()):
+            seconds = segment_seconds(bf, nb, at_speed(at), fac, owners)
+            new_cost = cost + seconds
+            if new_cost < distances.get(nb, math.inf):
+                distances[nb] = new_cost
+                previous[nb] = (bf, {'sl_id': sl, 'from_ap': ap1,
+                    'to_ap': ap2, 'from_bf': bf, 'to_bf': nb,
+                    'seconds': seconds})
+                heapq.heappush(queue, (new_cost, nb))
+    return None
+
+
+async def supply_parent(store, at):
+    parent = await store.get_command_node(int(at.get('parent_command_node_id') or 0))
+    if not parent or int(parent.get('state') or 0) >= 3:
+        return None
+    return parent
+
+
+async def start_supply_movement(store, war, at, target_bf,
+                                manual=False, override_move=False, now=None):
+    """Independent supply order; planes use the parent's transport range."""
+    parent = await supply_parent(store, at)
+    cur = at_current_battlefield(at)
+    if not parent or not cur or not target_bf:
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    owners = dict(await store.get_war_cities(war['id']))
+    target_bf = int(target_bf)
+    if manual and int(owners.get(target_bf) or 0) != int(at['faction']):
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    if is_plane_supply(at):
+        from .at_ops import is_airfield
+        tpl = wardb.commandnode_templates().get(int(parent['template_id'])) or {}
+        if tpl.get('convert_to'):
+            tpl = wardb.commandnode_templates().get(int(tpl['convert_to'])) or tpl
+        distance = bf_distance(cur, target_bf)
+        radius = float(tpl.get('transportradius') or 0) / 2
+        if (not is_airfield(target_bf) or distance is None
+                or distance > radius
+                or int(owners.get(target_bf) or 0) != int(at['faction'])):
+            return None, RC_CANNOT_FIND_COMMANDNODE
+        path = [{'sl_id': 0, 'from_ap': 0, 'to_ap': 0,
+                 'from_bf': cur, 'to_bf': target_bf, 'air': True,
+                 'seconds': segment_seconds(cur, target_bf,
+                                            tpl.get('speed') or 1, air=True)}]
+    else:
+        path = fastest_supply_path(cur, target_bf, at, owners)
+        if path is None:
+            return None, RC_CANNOT_FIND_COMMANDNODE
+    if cur == target_bf:
+        data = supply_state(at)
+        data['manual'] = bool(manual)
+        await store.update_command_node(at['id'], supply_state=data)
+        return None, RC_OK
+    active = await store.get_active_movement(at['id'])
+    if active:
+        return None, RC_CANNOT_FIND_COMMANDNODE
+    if override_move:
+        for seg in path:
+            seg['seconds'] = 0
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    mv = await store.create_movement(at['id'], war['id'], path,
+        started_at=now, arrive_at=now + datetime.timedelta(
+            seconds=sum(s['seconds'] for s in path)))
+    data = supply_state(at)
+    data.setdefault('source', 'purchase')
+    data.update(manual=bool(manual), blocked_bf=0, blocked_battle_id=0)
+    data['visited_segment'] = -1
+    fields = {'state': 1, 'supply_state': data}
+    if not is_plane_supply(at):
+        fields.update(map_entity_id=path[0]['sl_id'], map_entity_type=3)
+    await store.update_command_node(at['id'], **fields)
+    return mv, RC_OK
+
+
+def supply_movement_events(at, war_id, mv, caps, segment_index=0):
+    segs = movement_segments(mv)
+    events = [('set', b'CommandNodeWarInstance',
+               msg_commandnode_instance_row(at, war_id, caps))]
+    if segs and segs[0].get('air'):
+        events.append(('set', b'air_transport',
+                       msg_air_transport_row(at, war_id, mv, segs[0])))
+        events.append(('set', b'air_commandnode_base',
+                       msg_air_commandnode_base_row(at, war_id,
+                           at.get('airbase_bf') or segs[0]['from_bf'],
+                           target_bf=segs[-1]['to_bf'])))
+    elif segs:
+        events.extend([
+            ('set', b'transport_commandnode_segment',
+             msg_transport_segment_row(at, war_id, mv, segs[segment_index])),
+            ('set', b'transport_commandnode_destination',
+             msg_transport_destination_row(at, war_id, mv, segs))])
+    return events
 
 
 def bf_in_faction_supply(city_owners, faction, bf_id):
@@ -96,7 +231,9 @@ def _column_delete_events(col):
     CommandnodeTable DELETE 分支按 schema 移除 + OnTheWay 扣减）。"""
     events = [('del', b'CommandNodeWarInstance', col['id']),
               ('del', b'CommandNodeDefinition', col['id']),
-              ('del', b'CommandNodeMorale', col['id'])]
+              ('del', b'CommandNodeMorale', col['id']),
+              ('del', b'air_commandnode_base', col['id']),
+              ('del', b'missionresource', col['id'])]
     for cat in _as_resources(col.get('resources')):
         try:
             events.append(('del', b'armyresource',
@@ -109,6 +246,10 @@ def _column_delete_events(col):
 async def _merge_column_events(store, war_id, col, parent, caps):
     """补给队与父 AT 汇合：资源并入父 AT（按模板编制封顶，超编丢弃）+
     补给队软删（state=3）。返回追加推送事件。"""
+    fresh_col = await store.get_command_node(col['id'])
+    if not fresh_col or int(fresh_col.get('state') or 0) >= 3:
+        return []
+    col = fresh_col
     parent = await store.get_command_node(parent['id']) or parent
     res = {str(k): int(v) for k, v in
            _as_resources(parent.get('resources')).items()}
@@ -127,15 +268,41 @@ async def _merge_column_events(store, war_id, col, parent, caps):
         if add > 0:
             res[str(cat)] = cur + add
             merged[cat] = add
-    await store.update_command_node(parent['id'], resources=res)
-    await store.update_command_node(col['id'], state=3)
-    parent = await store.get_command_node(parent['id'])
+    active = await store.get_active_movement(col['id'])
+    if hasattr(store, 'merge_supply_column'):
+        result = await store.merge_supply_column(col['id'], parent['id'], full)
+        if result is None:
+            return []
+        parent, merged = result
+    else:
+        # DB-free fixtures; the production store uses the locked merge above.
+        await store.update_command_node(parent['id'], resources=res)
+        await store.update_command_node(col['id'], state=3)
+        if active:
+            await store.finish_movement(active['id'], 2)
+        parent = await store.get_command_node(parent['id'])
     events = [('set', b'CommandNodeWarInstance',
                msg_commandnode_instance_row(parent, war_id, caps))]
     if parent:
         for p in msg_armyresource_rows(parent, war_id):
             events.append(('set', b'armyresource', p))
     events.extend(_column_delete_events(col))
+    if active:
+        events.extend(_supply_stop_events(active))
+    if parent and int(parent.get('state') or 0) == 2 and merged:
+        battle_id = next((int(wb['id'])
+            for wb in await store.list_active_war_battles(war_id)
+            if any(int(f.get('at_id') or 0) == int(parent['id'])
+                   for f in wb.get('factions') or [])), 0)
+        async def sync_pool():
+            from matchmaking import add_supply_to_live_mission
+            if battle_id:
+                await add_supply_to_live_mission(battle_id, parent, merged)
+        callbacks = getattr(store, '_rts_after_commit', None)
+        if callbacks is not None:
+            callbacks.append(sync_pool)
+        else:
+            await sync_pool()
     log(f'[war] supply column {col["id"]} merged into AT {parent["id"] if parent else "?"} '
         f'resources={merged}')
     return events
@@ -167,12 +334,13 @@ async def merge_waiting_columns(store, war_id, at, caps):
                 or int(n.get('parent_command_node_id') or 0)
                 != int(at.get('id') or 0)
                 or not is_reserve(n)
-                or int(n.get('airbase_bf') or 0) > 0   # 停驻机队走 remount
+                or (int(n.get('airbase_bf') or 0) > 0
+                    and supply_state(n).get('source') != 'purchase')
                 or int(n.get('state') or 0) >= 3
                 or not n.get('is_deployed')
                 or int(at_current_battlefield(n) or 0) != bf):
             continue
-        if await store.get_active_movement(n['id']):
+        if int(n.get('state') or 0) == 2 or await store.get_active_movement(n['id']):
             continue            # 在途地面队：_arrive_supply_column 处理
         events.extend(await _merge_column_events(store, war_id, n, at, caps))
         at = await store.get_command_node(at['id'])
@@ -187,14 +355,14 @@ async def _arrive_supply_column(store, war_id, col, mv, dest_bf, caps,
     """补给队到达处置（advance_movements 到达分支，替 AT 的落位/占城/
     会战逻辑）：父 AT 在同城 → 汇合并删队；父 AT 挪窝 → 落位后重新寻路
     追击；父 AT 没了 → 就地解散（资源损失，官服口径）。"""
-    dels = [('del', b'transport_commandnode_segment', mv['id']),
-            ('del', b'transport_commandnode_destination', mv['id'])]
+    dels = _supply_stop_events(mv)
     parent = await store.get_command_node(
         int(col.get('parent_command_node_id') or 0))
     # 落位（城市本体）
     await store.update_command_node(
         col['id'], state=0, map_entity_id=int(dest_bf or 0),
-        map_entity_type=MAP_ENTITY_BATTLEFIELD)
+        map_entity_type=MAP_ENTITY_BATTLEFIELD,
+        **({'airbase_bf': int(dest_bf)} if is_plane_supply(col) else {}))
     col = await store.get_command_node(col['id'])
     # 推序（批内 dels-first 派发，_push_kvcs_batch 按 delete-先/set-后
     # 分组，同 tick.py 到达推序）：del segment/destination 信号先派发清
@@ -209,10 +377,19 @@ async def _arrive_supply_column(store, war_id, col, mv, dest_bf, caps,
             f'(parent AT gone)')
         return events
     parent_bf = at_current_battlefield(parent)
+    if (not parent_bf or supply_state(col).get('manual')
+            or is_plane_supply(col)) and parent_bf != dest_bf:
+        events = dels + [('set', b'CommandNodeWarInstance',
+                          msg_commandnode_instance_row(col, war_id, caps))]
+        if is_plane_supply(col):
+            events.append(('set', b'air_commandnode_base',
+                           msg_air_commandnode_base_row(col, war_id, dest_bf)))
+        return events
     if parent_bf and int(parent_bf) != int(dest_bf or 0):
         # 父 AT 已机动 → 追击（拓扑静态，寻路失败则原地待命，由
         # _cleanup_supply_columns 兜底清理）
-        mv2, code = await start_movement(store, col, parent_bf, now=now)
+        war = {'id': war_id}
+        mv2, code = await start_supply_movement(store, war, col, parent_bf, now=now)
         if mv2 is not None:
             events = list(dels)
             col = await store.get_command_node(col['id'])
@@ -258,54 +435,49 @@ def _star_city_ids():
 
 
 def _nearest_supply_city(owners, fac, parent_bf):
-    """父 AT 位置出发 BFS 最近己方在网带⭐**主城**（补给队默认出生点）。
+    """Closest owned star capital connected to our supply network, by travel time."""
 
-    沿补给线拓扑逐跳外扩（途经敌城/中立城/据点只过不停），首个"归属
-    本方、在己方补给网内且为带⭐主城（capital 表登记城）"的城市即最近
-    出发城；跳过父城本身（在网 AT 的补给保持 OnTheWay 出队语义，不因
-    同城瞬并）。无归属数据（owners 空，DB 异常）或全图无候选 → 0
-    （调用方回退阵营首都）。"""
     try:
         fac, parent_bf = int(fac or 0), int(parent_bf or 0)
     except (TypeError, ValueError):
         return 0
     if not parent_bf or not owners:
         return 0
-    cities = _star_city_ids()
-    adj = supplyline_adjacency()
-    seen = {parent_bf}
-    queue = [parent_bf]
-    while queue:
-        cur = queue.pop(0)
-        for edge in adj.get(cur, ()):
-            nb = edge[3]
-            if nb in seen:
-                continue
-            seen.add(nb)
-            try:
-                owned = int(owners.get(nb, 0) or 0) == fac
-            except (TypeError, ValueError):
-                owned = False
-            if (owned and nb in cities
-                    and bf_in_faction_supply(owners, fac, nb)):
-                return nb
-            queue.append(nb)
-    return 0
+    candidates = []
+    reserve = {'faction': fac, 'template_id': reserve_template_id(fac)}
+    for bf in sorted(_star_city_ids()):
+        if int(owners.get(bf) or 0) != fac or not bf_in_faction_supply(owners, fac, bf):
+            continue
+        path = fastest_supply_path(parent_bf, bf, reserve, owners)
+        if path is not None:
+            candidates.append((sum(s['seconds'] for s in path), bf))
+    return min(candidates)[1] if candidates else 0
 
 
-async def column_route(store, war, parent_at, near_capital_bf=0):
-    """补给队路线预检（纯读，不落库不扣款，购买侧拒单用）：确定出生点
-    （f6 己方在网城 → 最近己方在网带⭐主城 → 阵营首都兜底）并按全图
-    补给线拓扑验证可达性。
+def _near_capital_supply_city(owners, fac, capital_bf, parent_bf, parent_at):
+    """Select an owned adjacent city by travel time; fall back to A."""
+    candidates = []
+    reserve = dict(parent_at, template_id=reserve_template_id(fac))
+    for edge in supplyline_adjacency().get(capital_bf, ()):
+        bf = int(edge[3])
+        if int(owners.get(bf) or 0) != int(fac):
+            continue
+        path = fastest_supply_path(bf, parent_bf, reserve, owners)
+        if path is not None:
+            candidates.append((sum(s['seconds'] for s in path), bf))
+    return min(candidates)[1] if candidates else capital_bf
 
-    空军系父 AT（is_air_family_at：飞行中队/伞兵族含落地变体）出生点
-    改为锚定城附近最近的**己方机场**（官服 war2.md「补给只发生在主城
-    附近的机场」），补给队原地等待本体来合并，不验证地面可达（敌后
-    伞兵地面补给线本就到不了）。
 
-    返回 (spawn_bf, parent_bf, ok)：ok=False 表示无出生点（空军系=
-    无己方机场）/无父位置/地面不可达（真·孤岛：整张补给线拓扑无路，
-    官服地图连通理论不达）。"""
+async def column_route(store, war, parent_at, near_capital_bf=0,
+                       resources=None):
+    """Read-only spawn/route validation before spending currency.
+
+    Ground reserves spawn in an owned city adjacent to the nearest supplied
+    star capital (or the capital itself if no usable neighbor exists).
+    Air-family reserves spawn at the nearest owned airport to that capital.
+    Personnel require a ground route; plane-only orders may wait at the airport.
+    Legacy near_capital_bf remains an explicit supplied-city override.
+    """
     fac = int(parent_at.get('faction') or 0)
     try:
         owners = dict(await store.get_war_cities(war['id']))
@@ -317,14 +489,22 @@ async def column_route(store, war, parent_at, near_capital_bf=0):
     if spawn_bf and not bf_in_faction_supply(owners, fac, spawn_bf):
         spawn_bf = 0                    # 非己方在网（敌城/孤城）→ 自选
     if not spawn_bf:
-        spawn_bf = (_nearest_supply_city(owners, fac, parent_bf)
-                    or _faction_capital_bf().get(fac, 0))
+        anchor = (_nearest_supply_city(owners, fac, parent_bf)
+                  or _faction_capital_bf().get(fac, 0))
+        spawn_bf = (anchor if is_air_family_at(parent_at) else
+            _near_capital_supply_city(owners, fac, anchor, parent_bf, parent_at))
     if not spawn_bf or not parent_bf:
         return 0, parent_bf, False
     if is_air_family_at(parent_at):
         # owners 空（存储异常）→ None 回退不查归属就近机场（宁部署不错杀）
         air_bf = nearest_owned_airfield(spawn_bf, owners or None, fac)
-        return (air_bf, parent_bf, True) if air_bf else (0, parent_bf, False)
+        if not air_bf:
+            return 0, parent_bf, False
+        needs_ground_route = any(
+            int(cat) not in _PLANE_CATS and int(count) > 0
+            for cat, count in (resources or {}).items())
+        return air_bf, parent_bf, (not needs_ground_route or
+            find_supplyline_path(air_bf, parent_bf) is not None)
     if spawn_bf == parent_bf:
         return spawn_bf, parent_bf, True
     return spawn_bf, parent_bf, \
@@ -333,22 +513,17 @@ async def column_route(store, war, parent_at, near_capital_bf=0):
 
 async def spawn_supply_column(store, war, parent_at, resources,
                               near_capital_bf=0, now=None):
-    """生成补给队并寻路：最近己方在网带⭐主城出生（官服口径：就近出发
-    沿补给线机动；near_capital_bf=f6 玩家指定出发城优先，须己方在网否则
-    忽略；全图无⭐主城候选回退阵营首都），载 resources（{cat: n}），沿
-    补给线机动到父 AT 所在城市。空军系父 AT（is_air_family_at）改在
-    锚定城附近己方机场出生**原地等待**（不派移动），本体到站由
-    merge_waiting_columns 合并。
+    """Create separate reserves and start personnel/ground-vehicle movement.
 
-    返回 (column, events, error_code)：column=None 且 error_code≠0 为失败
-    （RC_CANNOT_FIND_COMMANDNODE=无出生点或地面不可达（真·孤岛），购买侧
-    column_route 预检已挡、未扣款，理论不达；软删的父 AT 不会到这）。
-    同城（出生点=父 AT 位置）直接汇合不出队。"""
+    Plane reserves wait at their airport. Same-city reserves merge immediately.
+    Route validation failures return an error without creating a reserve.
+    """
     war_id = war['id']
     fac = int(parent_at.get('faction') or 0)
     caps = _faction_capital_bf()
     spawn_bf, parent_bf, ok = await column_route(
-        store, war, parent_at, near_capital_bf=near_capital_bf)
+        store, war, parent_at, near_capital_bf=near_capital_bf,
+        resources=resources)
     if not ok:
         log(f'[war] supply column for AT {parent_at["id"]} unreachable '
             f'(spawn={spawn_bf} parent={parent_bf}), rejected')
@@ -375,10 +550,13 @@ async def spawn_supply_column(store, war, parent_at, resources,
     ]
     for p in msg_armyresource_rows(col, war_id):
         events.append(('set', b'armyresource', p))
-    # 出生城市落位（start_movement 以此为寻路起点）
+    # 出生城市落位，作为增援寻路起点。
     await store.update_command_node(
         col['id'], is_deployed=True, map_entity_id=spawn_bf,
-        map_entity_type=MAP_ENTITY_BATTLEFIELD)
+        map_entity_type=MAP_ENTITY_BATTLEFIELD,
+        supply_state={'source': 'purchase', 'manual': False},
+        airbase_bf=(spawn_bf if resources and
+                    all(int(c) in _PLANE_CATS for c in resources) else 0))
     col = await store.get_command_node(col['id'])
     if spawn_bf == parent_bf:
         events.extend(await _merge_column_events(store, war_id, col,
@@ -390,17 +568,17 @@ async def spawn_supply_column(store, war, parent_at, resources,
                 await store.get_command_node(parent_at['id']))
             events.extend(re_ev)
         return col, events, 0
-    if is_air_family_at(parent_at):
-        # ---- 空军系：补给队在出生机场**原地等待**本体来合并（官服
-        #      「等本体飞过来合并就完成补给」；无飞行员不能自己跑，
-        #      敌后伞兵地面补给线亦不可达）----
+    if is_plane_supply(col):
+        # 飞机/运输机留机场；人员使用下方地面行军分支。
         events.append(('set', b'CommandNodeWarInstance',
                        msg_commandnode_instance_row(col, war_id, caps)))
+        events.append(('set', b'air_commandnode_base',
+                       msg_air_commandnode_base_row(col, war_id, spawn_bf)))
         log(f'[war] air supply column {col["id"]} waiting for AT '
             f'{parent_at["id"]} at airfield bf={spawn_bf} '
             f'resources={dict(resources or {})}')
         return col, events, 0
-    mv, code = await start_movement(store, col, parent_bf, now=now)
+    mv, code = await start_supply_movement(store, war, col, parent_bf, now=now)
     if mv is None and code != RC_OK:
         # column_route 预检已过仍失败（状态异常等）→ 软删拒单，不留滞留行
         log(f'[war] supply column {col["id"]} start_movement failed '
@@ -424,6 +602,262 @@ async def spawn_supply_column(store, war, parent_at, resources,
     return col, events, 0
 
 
+def _supply_stop_events(mv):
+    return [('del', b'transport_commandnode_segment', mv['id']),
+            ('del', b'transport_commandnode_destination', mv['id']),
+            ('del', b'air_transport', mv['id'])]
+
+
+async def _supply_city_blocker(store, war_id, col, bf):
+    """A reserve cannot affect a battle or start one by itself."""
+    for wb in await store.list_active_war_battles(war_id):
+        if (int(wb.get('battle_type') or BATTLE_TYPE_ASSAULT) == BATTLE_TYPE_ASSAULT
+                and int(wb.get('battlefield_id') or 0) == int(bf)):
+            return True, int(wb['id'])
+    nodes = await store.list_war_command_nodes(war_id)
+    hostile = any(not is_reserve(n) and n.get('is_deployed')
+        and int(n.get('state') or 0) < 3
+        and int(n.get('faction') or 0) != int(col['faction'])
+        and at_current_battlefield(n) == bf for n in nodes)
+    return hostile, 0
+
+
+async def _block_supply(store, war, col, bf, bid):
+    data = supply_state(col)
+    data.update(source='purchase', blocked_bf=bf, blocked_battle_id=bid,
+                manual=False, visited_segment=-1)
+    await store.update_command_node(col['id'], state=2,
+        map_entity_id=bf, map_entity_type=MAP_ENTITY_BATTLEFIELD,
+        supply_state=data, **({'airbase_bf': bf} if is_plane_supply(col) else {}))
+    col = await store.get_command_node(col['id'])
+    events = [('set', b'CommandNodeWarInstance', msg_commandnode_instance_row(
+                col, war['id'], _faction_capital_bf()))]
+    if is_plane_supply(col):
+        events.append(('set', b'air_commandnode_base',
+                       msg_air_commandnode_base_row(col, war['id'], bf)))
+    if bid:
+        rec = await store.get_mission_by_battle(bid)
+        if rec:
+            events.append(('set', b'missionresource',
+                           msg_missionresource_row(col, rec['id'], war['id'])))
+    return col, events
+
+
+async def _ground_supply_encircled(store, war_id, col, bf):
+    owners = dict(await store.get_war_cities(war_id))
+    neighbors = {e[3] for e in supplyline_adjacency().get(bf, ())}
+    return not any(int(owners.get(n) or 0) == int(col['faction']) for n in neighbors)
+
+
+async def _block_field_supply(store, war, col, mv, seg, index, wb, now_ms):
+    owners = dict(await store.get_war_cities(war['id']))
+    if not any(int(owners.get(bf) or 0) == int(col['faction'])
+               for bf in (seg['from_bf'], seg['to_bf'])):
+        return await _destroy_supply(store, col)
+    parent = await supply_parent(store, col)
+    if parent and any(int(e.get('at_id') or 0) == parent['id']
+                      for e in wb.get('factions') or []):
+        return await _merge_column_events(store, war['id'], col, parent,
+                                          _faction_capital_bf())
+    data = supply_state(col)
+    data.update(source='purchase', blocked_field_id=int(wb['id']),
+        field_movement_id=mv['id'], field_segment=index,
+        field_frozen_at_ms=max(seg['begin_ms'], min(now_ms, seg['end_ms'] - 1)),
+        field_from_bf=seg['from_bf'], field_to_bf=seg['to_bf'],
+        visited_segment=index - 1, manual=False)
+    await store.update_command_node(col['id'], state=2,
+        map_entity_id=seg['sl_id'], map_entity_type=3, supply_state=data)
+    col = await store.get_command_node(col['id'])
+    events = _supply_stop_events(mv) + [('set', b'CommandNodeWarInstance',
+        msg_commandnode_instance_row(col, war['id'], _faction_capital_bf()))]
+    rec = await store.get_mission_by_battle(wb['id'])
+    if rec:
+        events.append(('set', b'missionresource',
+                       msg_missionresource_row(col, rec['id'], war['id'])))
+    return events
+
+
+async def _check_field_supply(store, war, col, now=None):
+    from .common import _ts_ms
+    data = supply_state(col)
+    wb = await store.get_war_battle(int(data['blocked_field_id']))
+    mv = await store.get_active_movement(col['id'])
+    if wb and int(wb.get('state') or 0) == 0:
+        owners = dict(await store.get_war_cities(war['id']))
+        if not any(int(owners.get(data[key]) or 0) == int(col['faction'])
+                   for key in ('field_from_bf', 'field_to_bf')):
+            return await _destroy_supply(store, col)
+        parent = await supply_parent(store, col)
+        if parent and any(int(e.get('at_id') or 0) == parent['id']
+                          for e in wb.get('factions') or []):
+            return await _merge_column_events(store, war['id'], col, parent,
+                                              _faction_capital_bf())
+        return []
+    # A finished/missing battle releases the reserve before any loss check.
+    now_ms = _ts_ms(now or datetime.datetime.now(datetime.timezone.utc))
+    if mv:
+        await store.shift_movement_started(mv['id'],
+            max(0, now_ms - data['field_frozen_at_ms']) / 1000)
+        mv = await store.get_active_movement(col['id'])
+    data['blocked_field_id'] = 0
+    await store.update_command_node(col['id'], state=1 if mv else 0, supply_state=data)
+    events = [('del', b'missionresource', col['id'])]
+    if mv:
+        events.extend(supply_movement_events(await store.get_command_node(col['id']),
+            war['id'], mv, _faction_capital_bf(), int(data['field_segment'])))
+    return events
+
+
+async def advance_supply_movement(store, war, col, mv, now=None):
+    """Process every crossed node, even when one tick skips several segments."""
+    from .common import _ts_ms
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    segs = movement_segments(mv)
+    if not segs:
+        await store.finish_movement(mv['id'], 1)
+        return []
+    now_ms = _ts_ms(now)
+    caps = _faction_capital_bf()
+    data = supply_state(col)
+    # Record the last visited node so an already passed battle cannot catch
+    # the column from behind on a later tick or after reconnecting.
+    visited = int(data.get('visited_segment', -1))
+    field_battles = {int(wb['battlefield_id']): wb
+        for wb in await store.list_active_war_battles(war['id'])
+        if int(wb.get('battle_type') or BATTLE_TYPE_ASSAULT) != BATTLE_TYPE_ASSAULT}
+    for index, seg in enumerate(segs):
+        if index <= visited or now_ms < seg['begin_ms']:
+            continue
+        wb = field_battles.get(int(seg.get('sl_id') or 0))
+        if wb and _ts_ms(wb.get('started_at')) <= seg['end_ms']:
+            return await _block_field_supply(store, war, col, mv, seg, index, wb, now_ms)
+        if now_ms < seg['end_ms']:
+            continue
+        bf = int(seg['to_bf'])
+        parent = await supply_parent(store, col)
+        blocked, bid = await _supply_city_blocker(store, war['id'], col, bf)
+        if (blocked and bid and not is_plane_supply(col)
+                and await _ground_supply_encircled(store, war['id'], col, bf)):
+            return await _destroy_supply(store, col)
+        if parent and at_current_battlefield(parent) == bf:
+            await store.finish_movement(mv['id'], 1)
+            return (await _merge_column_events(store, war['id'], col, parent, caps)
+                    + _supply_stop_events(mv))
+        if blocked:
+            await store.finish_movement(mv['id'], 2)
+            col, events = await _block_supply(store, war, col, bf, bid)
+            events = _supply_stop_events(mv) + events
+            # The cleanup pass checks encirclement immediately as well.
+            events.extend(await _check_blocked_supply(store, war, col, now))
+            return events
+        data['visited_segment'] = index
+    if now_ms >= segs[-1]['end_ms']:
+        await store.finish_movement(mv['id'], 1)
+        return await _arrive_supply_column(store, war['id'], col, mv,
+                                           segs[-1]['to_bf'], caps, now=now)
+    idx = next(i for i, seg in enumerate(segs) if now_ms < seg['end_ms'])
+    fields = {'supply_state': data}
+    if not segs[0].get('air'):
+        fields.update(map_entity_id=segs[idx]['sl_id'], map_entity_type=3)
+    await store.update_command_node(col['id'], **fields)
+    col = await store.get_command_node(col['id'])
+    events = [('set', b'CommandNodeWarInstance',
+               msg_commandnode_instance_row(col, war['id'], caps))]
+    if not segs[0].get('air'):
+        events.append(('set', b'transport_commandnode_segment',
+            msg_transport_segment_row(col, war['id'], mv, segs[idx])))
+    return events
+
+
+async def check_supply_field_encounters(store, war, now_ms):
+    """Catch reserves when an ordinary AT formed a field battle this tick."""
+    battles = {int(wb['battlefield_id']): wb
+        for wb in await store.list_active_war_battles(war['id'])
+        if int(wb.get('battle_type') or BATTLE_TYPE_ASSAULT) != BATTLE_TYPE_ASSAULT}
+    events = []
+    for mv in await store.list_active_movements(war['id']):
+        col = await store.get_command_node(mv['commandnode_id'])
+        if not col or not is_reserve(col) or int(col.get('state') or 0) != 1:
+            continue
+        segs = movement_segments(mv)
+        for index, seg in enumerate(segs):
+            wb = battles.get(int(seg.get('sl_id') or 0))
+            if wb and seg['begin_ms'] <= now_ms < seg['end_ms']:
+                events.extend(await _block_field_supply(
+                    store, war, col, mv, seg, index, wb, now_ms))
+                break
+    return events
+
+
+async def _destroy_supply(store, col):
+    mv = await store.get_active_movement(col['id'])
+    if mv:
+        await store.finish_movement(mv['id'], 2)
+    await store.update_command_node(col['id'], state=3)
+    return _column_delete_events(col) + (_supply_stop_events(mv) if mv else [])
+
+
+async def _plane_supply_has_airfield(store, war, col, parent):
+    from .at_ops import airfield_bfs
+    tpl = wardb.commandnode_templates().get(int(parent['template_id'])) or {}
+    if tpl.get('convert_to'):
+        tpl = wardb.commandnode_templates().get(int(tpl['convert_to'])) or tpl
+    radius = float(tpl.get('transportradius') or 0) / 2
+    owners = dict(await store.get_war_cities(war['id']))
+    bf = at_current_battlefield(col)
+    return any(int(owners.get(af) or 0) == int(col['faction'])
+        and (distance := bf_distance(bf, af)) is not None and distance <= radius
+        for af in airfield_bfs())
+
+
+async def _check_blocked_supply(store, war, col, now=None):
+    data = supply_state(col)
+    bf = int(data.get('blocked_bf') or 0)
+    if not bf:
+        return []
+    blocked, bid = await _supply_city_blocker(store, war['id'], col, bf)
+    old_bid = int(data.get('blocked_battle_id') or 0)
+    if old_bid and old_bid != bid and not bid:
+        blocked = False  # Release the ended battle before testing encirclement.
+    if blocked and not is_plane_supply(col) and bid:
+        # No friendly retreat route means this blocked supply is surrounded.
+        if await _ground_supply_encircled(store, war['id'], col, bf):
+            return await _destroy_supply(store, col)
+    parent = await supply_parent(store, col)
+    if parent and at_current_battlefield(parent) == bf:
+        return await _merge_column_events(store, war['id'], col, parent,
+                                          _faction_capital_bf())
+    if blocked:
+        if bid != int(data.get('blocked_battle_id') or 0):
+            data['blocked_battle_id'] = bid
+            await store.update_command_node(col['id'], supply_state=data)
+            if bid:
+                rec = await store.get_mission_by_battle(bid)
+                if rec:
+                    return [('del', b'missionresource', col['id']),
+                            ('set', b'missionresource',
+                             msg_missionresource_row(col, rec['id'], war['id']))]
+        return []
+    data.update(blocked_bf=0, blocked_battle_id=0, manual=False, visited_segment=-1)
+    await store.update_command_node(col['id'], state=0, supply_state=data)
+    col = await store.get_command_node(col['id'])
+    parent = await supply_parent(store, col)
+    events = [('del', b'missionresource', col['id']),
+        ('set', b'CommandNodeWarInstance', msg_commandnode_instance_row(
+            col, war['id'], _faction_capital_bf()))]
+    if parent and at_current_battlefield(parent) == bf:
+        events.extend(await _merge_column_events(store, war['id'], col, parent,
+                                                 _faction_capital_bf()))
+    elif parent:
+        mv, _ = await start_supply_movement(store, war, col,
+            at_current_battlefield(parent), now=now)
+        if mv:
+            events.extend(supply_movement_events(
+                await store.get_command_node(col['id']), war['id'], mv,
+                _faction_capital_bf()))
+    return events
+
+
 async def _cleanup_supply_columns(store, war=None):
     """滞留补给队清理（war_tick 兜底）：父 AT 已亡（state>=3/缺失）的
     空闲补给队就地解散；返回推送事件。"""
@@ -438,17 +872,45 @@ async def _cleanup_supply_columns(store, war=None):
         for at in await store.list_war_command_nodes(war['id']):
             if not is_reserve(at) or int(at.get('state') or 0) >= 3:
                 continue
-            if int(at.get('airbase_bf') or 0):
+            if (int(at.get('airbase_bf') or 0)
+                    and supply_state(at).get('source') != 'purchase'):
                 # 空降拆分的运输机队（停驻机场待命）：玩家独立财产，
                 # 不随父 AT 解散而清（官服 war 结束按剩余资源退款）
                 continue
             parent = await store.get_command_node(
                 int(at.get('parent_command_node_id') or 0))
-            if parent and int(parent.get('state') or 0) < 3:
+            if not parent or int(parent.get('state') or 0) >= 3:
+                events.extend(await _destroy_supply(store, at))
                 continue
-            await store.update_command_node(at['id'], state=3)
-            events.extend(_column_delete_events(at))
-            log(f'[war] supply column {at["id"]} dissolved in cleanup')
+            if (is_plane_supply(at) and not await
+                    _plane_supply_has_airfield(store, war, at, parent)):
+                events.extend(await _destroy_supply(store, at))
+                continue
+            if supply_state(at).get('blocked_field_id'):
+                events.extend(await _check_field_supply(store, war, at))
+                continue
+            if supply_state(at).get('blocked_bf'):
+                events.extend(await _check_blocked_supply(store, war, at))
+                continue
+            if await store.get_active_movement(at['id']):
+                continue
+            bf = at_current_battlefield(at)
+            if bf and bf == at_current_battlefield(parent):
+                events.extend(await _merge_column_events(store, war['id'], at,
+                    parent, _faction_capital_bf()))
+                continue
+            blocked, bid = await _supply_city_blocker(store, war['id'], at, bf)
+            if blocked:
+                at, block_events = await _block_supply(store, war, at, bf, bid)
+                events.extend(block_events)
+                events.extend(await _check_blocked_supply(store, war, at))
+            elif not is_plane_supply(at) and not supply_state(at).get('manual'):
+                mv, _ = await start_supply_movement(store, war, at,
+                    at_current_battlefield(parent))
+                if mv:
+                    events.extend(supply_movement_events(
+                        await store.get_command_node(at['id']), war['id'], mv,
+                        _faction_capital_bf()))
         return events
     except Exception as e:
         log(f'[war] cleanup supply columns failed: {e}')
@@ -497,6 +959,39 @@ async def supply_windows(store, war=None):
         return {}
 
 
+async def _deliver_supply_queue(store, war, fid):
+    """Apply at most one valid FIFO order inside the caller's transaction."""
+    delivered, removed, events = [], [], []
+    for row in await store.list_war_supply_queue(war['id'], fid):
+        need, cat = int(row['count']), int(row['category_id'])
+        at = await store.get_command_node(int(row['command_node_id'] or 0))
+        # Invalid orders must not block on stock that they will never consume.
+        if need <= 0 or not at or int(at.get('state') or 0) >= 3:
+            await store.dequeue_war_supply([row['id']])
+            removed.append(int(row['id']))
+            continue
+        stock = {int(r['category_id']): int(r['count'])
+                 for r in await store.list_war_faction_resources(war['id'], fid)}
+        if stock.get(cat, 0) < need:
+            break
+        if bool(row.get('deliver_as_column')):
+            col, events, code = await spawn_supply_column(
+                store, war, at, {cat: need}, near_capital_bf=int(
+                    row.get('near_capital_battlefield_id') or 0))
+            if col is None and code:
+                break
+        else:
+            await store.update_command_node(at['id'],
+                resources=_at_add_resources(at, cat, need))
+        await store.adjust_war_faction_resources(war['id'], fid, {cat: -need})
+        await store.dequeue_war_supply([row['id']])
+        removed.append(int(row['id']))
+        if not row.get('deliver_as_column'):
+            delivered.append(await store.get_command_node(at['id']))
+        break
+    return delivered, removed, events
+
+
 async def supply_queue_tick(store):
     """增援队列推进（每阵营 FIFO，队头阻塞）：war_supply_queue 队头行
     库存足够 → 库存转移（HQ → AT 补编）+ 出队；不足 → 整个阵营本 tick
@@ -519,46 +1014,17 @@ async def supply_queue_tick(store):
         delivered = []              # 交付过的 AT（重取后供推送）
         dequeued_ids = []           # 出队行 id（交付/清理），供 DELETE 行推送
         for fid in (1, 2, 3):
-            q = await store.list_war_supply_queue(war['id'], fid)
-            if not q:
-                continue
-            stock = {int(r['category_id']): int(r['count'])
-                     for r in await store.list_war_faction_resources(
-                         war['id'], fid)}
-            for row in q:           # 队头起逐行判定
-                need = int(row['count'])
-                cat = int(row['category_id'])
-                if need <= 0 or stock.get(cat, 0) < need:
-                    break           # 队头不足：本阵营阻塞
-                at = await store.get_command_node(
-                    int(row['command_node_id'] or 0))
-                if not at or int(at.get('state') or 0) >= 3:
-                    await store.dequeue_war_supply([row['id']])
-                    dequeued_ids.append(int(row['id']))
-                    continue        # AT 没了：出队不退款，继续清理下一行
-                if bool(row.get('deliver_as_column')):
-                    col, events, ecode = await spawn_supply_column(
-                        store, war, at, {cat: need},
-                        near_capital_bf=int(
-                            row.get('near_capital_battlefield_id') or 0))
-                    if col is None and ecode:
-                        break
-                    await store.adjust_war_faction_resources(
-                        war['id'], fid, {cat: -need})
-                    await broadcast_war_events(events, store)
-                else:
-                    await store.adjust_war_faction_resources(
-                        war['id'], fid, {cat: -need})
-                    await store.update_command_node(
-                        at['id'], resources=_at_add_resources(at, cat, need))
-                await store.dequeue_war_supply([row['id']])
-                dequeued_ids.append(int(row['id']))
-                at = await store.get_command_node(at['id'])
-                if not bool(row.get('deliver_as_column')):
-                    delivered.append(at)
-                log(f'[war] supply queue: at={at["id"]} faction={fid} '
-                    f'cat={cat} x{need} delivered from stock')
-                break               # 队头已推进，本阵营下 tick 再看下一行
+            async with rts_scope(store, 'supply', war['id'], fid) as bound:
+                rows, removed, delivery_events = await _deliver_supply_queue(
+                    bound, war, fid)
+            delivered.extend(rows)
+            dequeued_ids.extend(removed)
+            # A failed push must never leave a paid, delivered order pending.
+            try:
+                if delivery_events:
+                    await broadcast_war_events(delivery_events, store)
+            except Exception as e:
+                log(f'[war] supply delivery push failed after commit: {e}')
         if not delivered and not dequeued_ids:
             return
         # ---- 推送：touched AT 重取后推 armyresource/Instance 行 ----
@@ -569,7 +1035,8 @@ async def supply_queue_tick(store):
                            msg_commandnode_instance_row(at, war['id'], caps)))
             for p in msg_armyresource_rows(at, war['id']):
                 events.append(('set', b'armyresource', p))
-        await broadcast_war_events(events, store)
+        if events:
+            await broadcast_war_events(events, store)
         windows = await supply_windows(store, war)
         queue_rows = mm_factions._msg_faction_queue_rows(windows)
         cons = mm_factions._msg_faction_resource_rows(

@@ -9,6 +9,7 @@ import wardb
 from state import log
 from .common import (
     _war_config,
+    rts_scope,
     )
 
 
@@ -53,42 +54,47 @@ async def _next_war_name(store):
 
 
 async def ensure_war(store):
-    """取当前 running 战争；无且 MM_WAR_AUTO_CREATE=1 时自动开战。
-
-    开战流程：create_war（递进名 + config 快照）→ init_war_cities（capital
-    表初始归属）。返回 war dict 或 None（store 不可用 / 不自动开战）。"""
+    """Find or atomically initialize the single running war."""
     if store is None or getattr(store, 'pool', None) is None:
         return None
     try:
-        war = await store.get_active_war()
-        if war is not None:
-            return war
-        if not mm_config.WAR_AUTO_CREATE:
-            return None
-        war_name = await _next_war_name(store)
-        war = await store.create_war(
-            war_name,
-            points_needed_for_victory=effective_points_needed(),
-            config=_war_config())
-        await store.init_war_cities(war['id'], initial_city_owners())
-        # 阵营种子库存 = ArmyResourceProductionTemplate warStartValue
-        # （§3.12.1：步兵 85 万 / 重坦 225……幂等，已有行不覆盖）
-        initial = {}
-        for t in wardb.armyresource_production():
-            v = int(t.get('war_start_value') or 0)
-            if v > 0:
-                initial.setdefault(int(t.get('faction') or 0), {})[
-                    int(t.get('category_id') or 0)] = v
-        if initial:
-            await store.init_war_faction_resources(war['id'], initial)
-        log(f'[war] 新战争开打 id={war["id"]} name={war_name!r} '
-            f'points={war.get("points_needed_for_victory")} '
-            f'cities={len(initial_city_owners())} '
-            f'stock_rows={sum(len(c) for c in initial.values())}')
-        return war
+        current = await store.get_active_war()
+        if current is not None:
+            return current
+        async with rts_scope(store, 'creation') as bound:
+            return await _ensure_war_unlocked(bound)
     except Exception as e:
         log(f'[war] ensure_war failed: {e}')
         return None
+
+
+async def _ensure_war_unlocked(store):
+    war = await store.get_active_war()
+    if war is not None:
+        return war
+    if not mm_config.WAR_AUTO_CREATE:
+        return None
+    war_name = await _next_war_name(store)
+    war = await store.create_war(
+        war_name,
+        points_needed_for_victory=effective_points_needed(),
+        config=_war_config())
+    await store.init_war_cities(war['id'], initial_city_owners())
+    # 阵营种子库存 = ArmyResourceProductionTemplate warStartValue
+    # （§3.12.1：步兵 85 万 / 重坦 225……幂等，已有行不覆盖）
+    initial = {}
+    for t in wardb.armyresource_production():
+        v = int(t.get('war_start_value') or 0)
+        if v > 0:
+            initial.setdefault(int(t.get('faction') or 0), {})[
+                int(t.get('category_id') or 0)] = v
+    if initial:
+        await store.init_war_faction_resources(war['id'], initial)
+    log(f'[war] 新战争开打 id={war["id"]} name={war_name!r} '
+        f'points={war.get("points_needed_for_victory")} '
+        f'cities={len(initial_city_owners())} '
+        f'stock_rows={sum(len(c) for c in initial.values())}')
+    return war
 
 
 async def _broadcast_war_rows(store, war_ids):

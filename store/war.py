@@ -3,7 +3,19 @@
 拆分自 player_store.py（纯移动重构，方法体逐字保留）。
 """
 import json
+import copy
+from contextlib import asynccontextmanager
 from .base import _rowcount
+
+class _TransactionPool:
+    """Keep existing store methods on the outer transaction's connection."""
+    def __init__(self, conn):
+        self.conn = conn
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield self.conn
+
 
 class WarStoreMixin:
     """战争（RTS）域：war/city/command_node/movement/battle/funds/resources/supply。"""
@@ -15,6 +27,33 @@ class WarStoreMixin:
     _WAR_COLUMNS = ('id, name, begintime, endtime, winning_faction_id, '
                     'points_needed_for_victory, sequel_war_id, mapid, state, '
                     'config_json, production_ms')
+
+    @asynccontextmanager
+    async def rts_transaction(self, scope, war_id=0, faction=0):
+        """Serialize the operation and commit all domain writes together."""
+        callbacks = []
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if scope == 'creation':
+                    keys = (-20261012, 0)
+                elif scope == 'production':
+                    keys = (int(war_id), 0)
+                elif scope == 'supply':
+                    # Same lock as purchases, cancellation and queue numbering.
+                    keys = (int(war_id), int(faction))
+                else:
+                    raise ValueError(f'Unknown RTS transaction scope: {scope}')
+                await conn.execute('SELECT pg_advisory_xact_lock($1::int, $2::int)', *keys)
+                bound = copy.copy(self)
+                bound.pool = _TransactionPool(conn)
+                bound._rts_after_commit = callbacks
+                yield bound
+        for callback in callbacks:
+            try:
+                await callback()
+            except Exception as e:
+                from state import log
+                log(f'[war] post-commit sync failed: {e}')
 
     @staticmethod
     def _war_row(row):
@@ -203,13 +242,13 @@ class WarStoreMixin:
                    'general_character_id', 'is_deployed', 'upgrade_level',
                    'owner_player_id', 'faction', 'template_id',
                    'has_gotten_soldier_free', 'has_gotten_vehicle_free',
-                   'parent_command_node_id', 'airbase_bf'}
+                   'parent_command_node_id', 'airbase_bf', 'supply_state'}
         import json as _json
         sets, args = [], []
         for k, v in fields.items():
             if k not in allowed:
                 continue
-            if k == 'resources' and not isinstance(v, str):
+            if k in {'resources', 'supply_state'} and not isinstance(v, str):
                 v = _json.dumps(v or {})
             args.append(v)
             sets.append(f'{k} = ${len(args)}')
@@ -231,6 +270,40 @@ class WarStoreMixin:
                 'UPDATE command_nodes SET state = 3 WHERE id = $1 AND state < 3',
                 int(node_id))
         return _rowcount(n) > 0
+
+    async def merge_supply_column(self, column_id, parent_id, capacities):
+        """Merge once under row locks, including concurrent arrival/cleanup."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    'SELECT * FROM command_nodes WHERE id = ANY($1::bigint[]) '
+                    'ORDER BY id FOR UPDATE', [int(column_id), int(parent_id)])
+                nodes = {int(r['id']): dict(r) for r in rows}
+                col, parent = nodes.get(int(column_id)), nodes.get(int(parent_id))
+                if (not col or not parent or int(col['state']) >= 3
+                        or int(parent['state']) >= 3
+                        or int(col['parent_command_node_id']) != int(parent_id)):
+                    return None
+                def resources(node):
+                    value = node.get('resources') or {}
+                    return json.loads(value) if isinstance(value, str) else dict(value)
+                res = {str(k): int(v) for k, v in resources(parent).items()}
+                merged = {}
+                for cat, count in resources(col).items():
+                    cat, count = int(cat), int(count)
+                    cur = res.get(str(cat), 0)
+                    cap = int(capacities.get(cat) or 0)
+                    add = max(0, min(count, cap - cur)) if cap else max(0, count)
+                    if add:
+                        res[str(cat)] = cur + add
+                        merged[cat] = add
+                await conn.execute('UPDATE command_nodes SET resources=$2 WHERE id=$1',
+                                   int(parent_id), json.dumps(res))
+                await conn.execute('UPDATE command_nodes SET state=3 WHERE id=$1', int(column_id))
+                await conn.execute('UPDATE commandnode_movements SET state=2 '
+                                   'WHERE commandnode_id=$1 AND state=0', int(column_id))
+                parent['resources'] = res
+                return parent, merged
 
     # ---- commandnode_movements ----
 
@@ -305,7 +378,8 @@ class WarStoreMixin:
         async with self.pool.acquire() as conn:
             n = await conn.execute(
                 'UPDATE commandnode_movements SET started_at = '
-                'started_at + make_interval(secs => $2) '
+                'started_at + make_interval(secs => $2), '
+                'arrive_at = arrive_at + make_interval(secs => $2) '
                 'WHERE id = $1 AND state = 0',
                 int(movement_id), float(seconds or 0))
         return _rowcount(n) > 0

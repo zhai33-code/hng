@@ -294,8 +294,9 @@ async def build_warmap_snapshot(store, war=None, player_id=None):
         # 已部署空中半径单位（§10.2 #6/#7）：airbase 行（客户端
         # isAirborneUnit 判定 + 半径规则；基地 = 持久化出发机场 airbase_bf，
         # 未记录（legacy 行）回退当前驻地）
+        from .supply import is_plane_supply, supply_state
         for at in ats:
-            if at.get('is_deployed') and is_radius_unit(at):
+            if at.get('is_deployed') and (is_radius_unit(at) or is_plane_supply(at)):
                 base = int(at.get('airbase_bf') or 0) \
                     or at_current_battlefield(at)
                 rows.append((b'air_commandnode_base',
@@ -326,6 +327,13 @@ async def build_warmap_snapshot(store, war=None, player_id=None):
                     rows.append((b'missionresource',
                                  msg_missionresource_row(
                                      mr_at, mrec['id'], war_id)))
+            for mr_at in ats:
+                if (int(mr_at.get('state') or 0) == 2
+                        and int(supply_state(mr_at).get('blocked_battle_id')
+                                or supply_state(mr_at).get('blocked_field_id') or 0)
+                        == int(wb['id'])):
+                    rows.append((b'missionresource', msg_missionresource_row(
+                        mr_at, mrec['id'], war_id)))
         # 在途空运行（订阅时已起飞的 AT；§3.14 air_transport）
         for mv in await store.list_active_movements(war_id):
             segs = movement_segments(mv)
