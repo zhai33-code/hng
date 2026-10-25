@@ -1,7 +1,7 @@
 SETTINGS_JS = b"""\
 flash_dynhttp="127.0.0.1:15110";
 unique_file_servers="127.0.0.1";
-ircserver="127.0.0.1:6667";
+ircserver="127.0.0.1:16667";
 version="173293";
 releasename="QQ";
 distribution="retoxdistribution";

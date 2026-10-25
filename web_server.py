@@ -146,7 +146,7 @@ SUPPORTED_LOCALES = ('cs', 'de', 'en', 'es', 'fr', 'ja',
 
 # 对外地址统一取 state.PUBLIC_HOST（HNG_PUBLIC_HOST 环境变量 / .env）：
 # flash_dynhttp=客户端连 warserver 的 TCP、unique_file_servers=HTTP 静态资源、
-# account_url=账号页、ircserver=聊天（irc 服务未实现，仅占位）。
+# account_url=账号页、ircserver=聊天（与 irc_server.LISTEN_PORT 一致）。
 SETTINGS_JS = (f"flash_dynhttp=\"{PUBLIC_HOST}:15110\";\n"
                f"unique_file_servers=\"{PUBLIC_HOST}\";\n"
                # 官方格式：语言文件用 locale_<lang> 族（裸文件名，请求 file server 根路径）。
@@ -167,7 +167,7 @@ SETTINGS_JS = (f"flash_dynhttp=\"{PUBLIC_HOST}:15110\";\n"
                "retoxdistribution=\"live\";\n"
                "language=\"en\";\n"
                "releasename=\"QQ\";\n"
-               f"ircserver=\"{PUBLIC_HOST}:6667\";\n"
+               f"ircserver=\"{PUBLIC_HOST}:16667\";\n"
                # 战斗内勋带弹窗：statistics_client.dll GetTotals 统计服务器
                # （swf 将 settings.js 变量转发进 hngsync CMD_RUN_HNG -> hng.exe /R）
                f"statserver=\"{PUBLIC_HOST}\";\n"

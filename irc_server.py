@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""IRC 聊天服务端（asyncio 明文 6667，阶段 D）。
+"""IRC 聊天服务端（asyncio 明文 16667，阶段 D）。
 
 对齐官方 InspIRCd2 定制行为——协议子集、消息格式、numeric 序列均照
 irc-official-transcript.txt（2026-09 实测抓包）复刻，结论见
@@ -42,7 +42,7 @@ except ImportError:          # 独立跑（python irc_server.py）时无游戏�
 
 SERVER_NAME = 'irc.hng-group.com'
 SERVER_VERSION = 'inspircd2'
-LISTEN_PORT = 6667
+LISTEN_PORT = 16667
 MAX_CHANNELS_PER_CLIENT = 30          # 005 MAXCHANNELS=30
 MAX_LINE = 512                        # IRC 标准（含 CRLF）
 REGISTRATION_TIMEOUT = 60             # 秒，PASS/NICK/USER 未齐断开
@@ -197,6 +197,12 @@ class IrcClient:
         return f'{self.nick}!{self.user}@{self.ip}'
 
     async def numeric(self, code, text):
+        # Keep protocol failures visible without recording PASS or chat contents.
+        # In particular, 404 distinguishes an FPS channel that was never joined
+        # from a channel that is absent only in the client's HUD.
+        if code in ('401', '403', '404', '405', '421', '442', '451', '461'):
+            log(f'[IRC] numeric={code} nick={self.nick or "*"!r} '
+                f'user={self.user!r} {text}')
         await self.send(SERVER_NAME, f'{code} {self.nick or "*"} {text}')
 
     async def notice_auth(self, text):
@@ -353,6 +359,8 @@ class IrcClient:
         if trailing and not joined_names:
             joined_names = trailing
         wanted = [c for c in joined_names.split(',') if c]
+        log(f'[IRC] JOIN nick={self.nick!r} user={self.user!r} '
+            f'channels={wanted!r}')
         if not wanted:
             await self.numeric('461', 'JOIN :Not enough parameters')
             return
@@ -393,6 +401,8 @@ class IrcClient:
 
     async def _cmd_part(self, params, trailing):
         wanted = ','.join(params).split(',')
+        log(f'[IRC] PART nick={self.nick!r} user={self.user!r} '
+            f'channels={wanted!r}')
         for chan_name in [c for c in wanted if c]:
             if not chan_name.startswith('#'):
                 chan_name = '#' + chan_name
