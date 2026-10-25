@@ -238,7 +238,7 @@ async def _bundle_deliver_vehicle(sess, writer, pid, char_id, vvt_id, equip_slot
     ammo_rows = []
     parent_vv = _VEHICLE_VARIANT_PARENT.get(int(vvt_id))
     if parent_vv is not None:
-        # 与买车/建号共用的发放函数：每仓按 storageSlots 发满装填；
+        # 与买车/建号共用的发放函数：每仓一份，装备第 1 槽；
         # KVCS 由本函数统一推（须先推 Vehicle 行再弹药行）
         ammo_rows = await grant_default_vehicle_ammo(pid, char_id, vid, parent_vv)
     if sess.soldier_view_cmd is not None:

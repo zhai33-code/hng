@@ -475,6 +475,12 @@ async def handle_join_war_request(sess, writer, cmd_id, req_type, proto):
         except Exception as e:
             log(f'      [views] player refresh after join_war failed: {e}')
 
+    if stored:
+        try:
+            await notify_friends_of(pid)
+        except Exception as e:
+            log(f'      [views] friend refresh after join_war failed: {e}')
+
 
 HANDLERS = {
     'query_war_catalogue_request': handle_query_war_catalogue_request,

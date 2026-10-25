@@ -88,7 +88,7 @@ async def _grant_starting_gear(pid, char_id, gear):
             weapon_info['modifier'] = await STORE.create_weapon_modifier(
                 pid, sm, char_id, w['id'])
 
-    # 2. 赠送载具（坦克兵坦克 / 飞行员侦察机）+ 默认载具弹药（按弹药仓槽数发满）
+    # 2. 赠送载具（坦克兵坦克 / 飞行员侦察机）+ 每仓一份默认载具弹药
     vvt = int(gear.get('vehicle_variant', 0) or 0)
     if vvt:
         v = await STORE.create_vehicle(pid, vvt, char_id)
@@ -97,7 +97,7 @@ async def _grant_starting_gear(pid, char_id, gear):
         vehicle_info = {'row': v, 'ammo': []}
         parent_vv = _VEHICLE_VARIANT_PARENT.get(vvt)
         if parent_vv is not None:
-            # 与买车/礼包发货共用的发放函数：每仓按 storageSlots 发满装填
+            # 与买车/礼包发货共用的发放函数：每仓一份，装备第 1 槽
             vehicle_info['ammo'] = await grant_default_vehicle_ammo(
                 pid, char_id, v['id'], parent_vv)
     return weapon_info, vehicle_info

@@ -37,7 +37,7 @@ from wardb import (
     _UNLOCK_BY_ITEM,
     _UNLOCK_UID_META,
     _VEHICLE_VARIANT_PARENT,
-    _VEHICLE_AMMO_STORAGE_SLOTS,
+    vehicle_ammo_mapping_ids,
     _default_ammo_for,
     _default_vehicle_ammo_for,
     _prog_max,
@@ -407,11 +407,32 @@ async def _char_unlock_bits_for(sess, template, faction, char_id=0):
                     ids |= _UNLOCK_BY_ITEM.get((mapping_id, _E_WEAPON_AMMO_MAPPING), set())
             # 已购载具变体：加回其解锁需求 uid（eVehicle=4 与 eVehiclesVariant=15，
             # 客户端 VehicleUtilities 用 15 判断载具是否解锁），避免已购载具显示锁定
-            for v in await STORE.list_vehicles(pid, _cid):
+            vehicles = await STORE.list_vehicles(pid, _cid)
+            vehicle_parents = {}
+            for v in vehicles:
                 vvid = int(v.get('vehicle_variant_template_id') or 0)
                 if vvid:
                     ids |= _UNLOCK_BY_ITEM.get((vvid, _E_VEHICLE), set())
                     ids |= _UNLOCK_BY_ITEM.get((vvid, _E_VEHICLES_VARIANT), set())
+                parent = _VEHICLE_VARIANT_PARENT.get(vvid)
+                if parent is None:
+                    continue
+                vehicle_parents[int(v['id'])] = parent
+                # 买车即允许使用其默认弹；不因拥有车而解锁高级炮弹。
+                for _storage, at in _default_vehicle_ammo_for(parent):
+                    for mid in vehicle_ammo_mapping_ids(parent, at, default_only=True):
+                        ids |= _UNLOCK_BY_ITEM.get((mid, _E_WEAPON_AMMO_MAPPING), set())
+            # 与步兵弹药一致：已有弹药补回权限，数量和装备状态均不影响解锁。
+            # 只认当前士兵所持载具且模板兼容的行，避免仓库/其他士兵权限泄漏。
+            if vehicle_parents:
+                for a in await STORE.list_vehicle_ammo(pid):
+                    if int(a.get('character_id') or 0) != int(char_id):
+                        continue
+                    parent = vehicle_parents.get(int(a.get('vehicle_id') or 0))
+                    if parent is None:
+                        continue
+                    for mid in vehicle_ammo_mapping_ids(parent, a['ammo_template_id']):
+                        ids |= _UNLOCK_BY_ITEM.get((mid, _E_WEAPON_AMMO_MAPPING), set())
         except Exception as e:
             log(f'[DB] unlock bits load failed: {e}')
     for uid in ids:
@@ -797,66 +818,8 @@ async def _push_stored_soldier_data(sess, writer):
                                               u['vehicle_id'], u['equipped_slot_id'],
                                               u['character_id'], u.get('condition', 100.0),
                                               u.get('auto_repair', 0)))
-    # 为没有弹药的载具补创建默认弹药并装备到对应弹药仓（老账号重启前买的载具；
-    # 客户端 VehicleUpgradeUtilities 用 equippedVehicleAmmoStorageId != 0 判定已装备）。
-    # 默认弹按弹药仓槽数发满：空槽补默认弹带（优先复用该载具未装备的同弹实例），
-    # 已被其他弹药占用的槽不动；多个武器槽可共享同一弹药仓（如 78 号机 6 挺机枪
-    # 共用 storage 116），每仓只填一次，槽数以 VehicleAmmoStorage.storageSlots 为准。
-    v_un = {}
-    for a in v_ammo_list:
-        if not a['equipped_storage_id']:
-            v_un.setdefault((a['vehicle_id'], a['ammo_template_id']), []).append(a)
-    for v in vehicles:
-        parent = _VEHICLE_VARIANT_PARENT.get(int(v['vehicle_variant_template_id']))
-        if parent is None:
-            continue
-        occupied = {a['slot_index'] for a in v_ammo_list
-                    if a['vehicle_id'] == v['id'] and a['equipped_storage_id']}
-        filled_storages = set()
-        for (storage_id, ammo_template_id) in _default_vehicle_ammo_for(parent):
-            if storage_id in filled_storages:
-                continue
-            filled_storages.add(storage_id)
-            for slot_ammo in range(1, _VEHICLE_AMMO_STORAGE_SLOTS.get(int(storage_id), 1) + 1):
-                if slot_ammo in occupied:
-                    continue
-                occupied.add(slot_ammo)
-                row = None
-                reuse = v_un.get((v['id'], ammo_template_id))
-                if reuse:
-                    row = reuse.pop(0)
-                    try:
-                        await STORE.set_vehicle_ammo_equipment(pid, row['id'],
-                                                               storage_id,
-                                                               slot_ammo, True)
-                    except Exception as e:
-                        log(f'[DB] equip default vehicle ammo failed: {e}')
-                else:
-                    try:
-                        row = await STORE.create_vehicle_ammo(pid, ammo_template_id,
-                                                              v['id'], v['character_id'],
-                                                              _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
-                        try:
-                            await STORE.set_vehicle_ammo_equipment(pid, row['id'],
-                                                                   storage_id,
-                                                                   slot_ammo, True)
-                        except Exception as e:
-                            log(f'[DB] equip default vehicle ammo failed: {e}')
-                    except Exception as e:
-                        log(f'[DB] auto-create default vehicle ammo failed: {e}')
-                if row is None:
-                    continue
-                # 同步内存行，末尾全量推送时状态正确
-                row['equipped_storage_id'] = storage_id
-                row['slot_index'] = slot_ammo
-                await _push_kvcs(writer, cmd, b'VehicleAmmo',
-                                 _msg_vehicle_ammo(row['id'], ammo_template_id,
-                                                   v['id'], storage_id, slot_ammo,
-                                                   v['character_id'],
-                                                   row.get('condition', 100.0)))
-                log(f'S->C cmd={cmd:<4} KeyValueChangeSet (VehicleAmmo id={row["id"]} '
-                    f'default ammo filled vehicle {v["id"]}, template={ammo_template_id}, '
-                    f'storage={storage_id}, slot={slot_ammo})')
+    # 回放只读库存与配装。空槽和全部卸装都是有效选择，不能在订阅/重登时
+    # 补默认弹或装备库存弹；初始发放由买车/建号/礼包的显式发货路径负责。
     for a in v_ammo_list:
         await _push_kvcs(writer, cmd, b'VehicleAmmo',
                          _msg_vehicle_ammo(a['id'], a['ammo_template_id'], a['vehicle_id'],

@@ -24,6 +24,7 @@ os.environ.setdefault('HNG_GAME_DIR', r'd:\HnG-test')
 
 import wardb                                          # noqa: E402
 import player_service                                 # noqa: E402
+from protocol import Chunk, pb_parse                    # noqa: E402
 from handlers import shop as shop_handlers             # noqa: E402
 from handlers import vehicles_purchase as vp_handlers  # noqa: E402
 from handlers import weapons_purchase as wp_handlers   # noqa: E402
@@ -39,6 +40,7 @@ def check(label, ok, detail=''):
     else:
         FAIL += 1
         print(f'[FAIL] {label}  {detail}')
+        raise AssertionError(f'{label}: {detail}')
 
 
 # ---------- 测试替身 ----------
@@ -196,6 +198,10 @@ class _FakeStore:
         return [dict(c) for c in self.characters
                 if c['player_id'] == player_id]
 
+    async def get_character(self, player_id, character_id):
+        return next((dict(c) for c in self.characters
+                     if c['player_id'] == player_id and c['id'] == character_id), None)
+
     async def add_booster(self, player_id, template_id, duration_minutes=240,
                           activate_now=False, conn=None, is_ribbon=False):
         self.boosters.append({'player_id': player_id,
@@ -253,6 +259,9 @@ class _FakeStore:
                 if character_id is None
                 or v['character_id'] == character_id]
 
+    async def list_vehicle_ammo(self, player_id):
+        return [dict(a) for a in self.vehicle_ammo]
+
 
 def _with_fakes(store):
     """把 FakeStore 挂到所有发货路径模块的 STORE（shop/player_service/
@@ -297,9 +306,8 @@ def _count(root, tag, nested=False):
 
 
 def _vehicle_ammo_matches(st, detail=False):
-    """每个已创建载具的弹药行数 == 默认弹药仓槽数总和（0 允许）。
-    发放函数 grant_default_vehicle_ammo 每仓按 VehicleAmmoStorage.
-    storageSlots 发满，同一仓多条默认映射只发一份。"""
+    """每个已创建载具的弹药行数 == 独立默认弹药仓数（0 允许）。
+    同一仓多条武器/默认映射只发一份，并装备第 1 槽。"""
     ammo_by_vid = {}
     for a in st.vehicle_ammo:
         ammo_by_vid[a['vehicle_id']] = ammo_by_vid.get(a['vehicle_id'], 0) + 1
@@ -308,9 +316,7 @@ def _vehicle_ammo_matches(st, detail=False):
     for v in st.vehicles:
         parent = wardb._VEHICLE_VARIANT_PARENT.get(
             int(v['vehicle_variant_template_id']))
-        expect = sum(wardb._VEHICLE_AMMO_STORAGE_SLOTS.get(int(s), 1)
-                     for s in {sid for (sid, _at)
-                               in wardb._default_vehicle_ammo_for(parent)}) \
+        expect = len({sid for sid, _at in wardb._default_vehicle_ammo_for(parent)}) \
             if parent is not None else 0
         got = ammo_by_vid.get(v['id'], 0)
         rows.append((v['id'], v['vehicle_variant_template_id'], expect, got))
@@ -720,11 +726,15 @@ def _varint(field, value):
 
 
 def _response_result(sent):
-    """取 BuyStoreBundleResponse 尾部 proto 的 field 1（result）。"""
-    idx = sent.rindex(b'BuyStoreBundleResponse')
-    tail = sent[idx + len(b'BuyStoreBundleResponse'):]
-    i = tail.rindex(b'\x08')
-    return tail[i + 1]
+    """按帧解析响应，不能把后续 character/库存推送中的字节当作结果。"""
+    offset = 0
+    while offset < len(sent):
+        frame, consumed = Chunk.parse(sent[offset:])
+        offset += consumed
+        title = frame.subs[0]
+        if title.data == b'BuyStoreBundleResponse':
+            return pb_parse(title.subs[0].data)[1]
+    raise AssertionError('BuyStoreBundleResponse missing')
 
 
 def test_handler_purchase_flow():
@@ -732,18 +742,26 @@ def test_handler_purchase_flow():
     found = _find_bundle(
         lambda bid, tt, fac, ident, root:
         _count(root, 'weaponvarianttemplate') >= 1
-        and _count(root, 'charactertemplate') == 0)
+        and _count(root, 'charactertemplate') == 0
+        and any(d.get('type') == 'StoreBundle' and d.get('object_id') == bid
+                and int(d.get('credits') or 0) > 0
+                for d in wardb._PRICING_MAP.values()))
     bid, info, root = found
     check('找到一个纯物品礼包做链路测试', bid is not None)
     if bid is None:
         return
     n_b = _count(root, 'ribbonboostertemplate')
+    price_id = next(p for p, d in wardb._PRICING_MAP.items()
+                    if d.get('type') == 'StoreBundle' and d.get('object_id') == bid
+                    and int(d.get('credits') or 0) > 0)
 
     st = _FakeStore()
+    st.characters.append({'id': 55, 'player_id': 77, 'name': 'Owner',
+                          'faction': 1, 'template': 1})
     restore = _with_fakes(st)
     try:
-        # D1: pricingId=0（免扣款路径）→ 发货 + result=1
-        proto = (_varint(1, bid) + _varint(2, 0) + _varint(3, 0)
+        # D1: 匹配礼包的真实价格 + 合法归属角色 → 扣款、发货 + result=1
+        proto = (_varint(1, bid) + _varint(2, price_id) + _varint(3, 0)
                  + _varint(4, 55) + _varint(5, 1))
         sess, writer = _MockSess(), _MockWriter()
         asyncio.run(shop_handlers.handle_buystorebundlerequest(
@@ -758,9 +776,8 @@ def test_handler_purchase_flow():
                   f'boosters={len(st.boosters)}')
 
         # D2: 余额不足（真实 pricing + spend 失败）→ result=56 且不发货
-        price_id = next(p for p, d in wardb._PRICING_MAP.items()
-                        if int(d.get('credits') or 0) > 0)
         st2 = _FakeStore()
+        st2.characters = [dict(st.characters[0])]
         st2.spend_ok = False
         shop_handlers.STORE = st2
         player_service.STORE = st2
@@ -775,7 +792,7 @@ def test_handler_purchase_flow():
               _response_result(writer2.sent) == 56,
               f'result={_response_result(writer2.sent)}')
         check('余额不足不发货（钱货一致）',
-              not st2.weapons and not st2.boosters and not st2.characters,
+              not st2.weapons and not st2.boosters and len(st2.characters) == 1,
               f'weapons={len(st2.weapons)} boosters={len(st2.boosters)}')
         check('扣款尝试发生（spend_currency 被调用）',
               len(st2.spends) == 1, f'spends={st2.spends}')

@@ -456,34 +456,17 @@ _VEHICLE_AMMO_STORAGE_CLIPS = {int(f.get(1, 0)): int(f.get(2, 0) or 1)
 
 # VehicleAmmoStorage f3 = storageSlots（弹药仓槽位数）。勋带页"已拥有"判定用：
 # 客户端 ProgressionOverviewWindowMediator eWeaponAmmoMapping 载具分支按
-# "该角色该载具上此弹药实例数 >= storageSlots" 判定，多槽弹药仓（如
-# storage 2 = 3 槽）买 1 份永远显示可购买；一次购买按槽数发满即
-# "买一次就显示已拥有"。
+# "该角色该载具上此弹药实例数 >= storageSlots" 判定。该阈值仅表示
+# 不再提供补购，不是解锁条件，也不是默认发放数量或必须装备的槽数。
 _VEHICLE_AMMO_STORAGE_SLOTS = {int(f.get(1, 0)): int(f.get(3, 0) or 1)
                                for f in _parse_wardb_table('VehicleAmmoStorage')}
 
-# 客户端 VehicleUtilities.getVehicleWeaponSlotsForWeaponTemplate 同规则：
-# 全表扫 driver+primary 武器槽，同武器模板后出现者覆盖（last wins）→
-# 该武器模板的弹药仓。发实例数按此对齐，确保客户端计数判定能过。
-_WEAPON_STORAGE_BY_TEMPLATE = {}
-for _f in _parse_wardb_table('VehicleWeaponSlot'):
-    if int(_f.get(5, 0)) != 1 or int(_f.get(7, 0)) != 0:
-        continue
-    _WEAPON_STORAGE_BY_TEMPLATE[int(_f.get(3, 0))] = int(_f.get(6, 0))
-
-
-def vehicle_ammo_purchase_count(parent_vehicle_tid, ammo_template_id):
-    """一次购买应创建的载具弹药实例数 = 弹药仓 storageSlots（未知回退 1）。
-    取该载具上能发射此弹药的驾驶员主武器，按客户端全局"武器→弹药仓"
-    规则查槽数；同弹药多武器时取最大，保证勋带页计数判定必过。"""
-    need = 1
-    for (wt, storage) in _VEHICLE_WEAPON_SLOTS.get(int(parent_vehicle_tid), ()):
-        for (_mid, at, _dflt) in _AMMO_MAPPINGS_BY_WEAPON.get(wt, ()):
-            if at == int(ammo_template_id):
-                sid = _WEAPON_STORAGE_BY_TEMPLATE.get(wt, storage)
-                need = max(need, _VEHICLE_AMMO_STORAGE_SLOTS.get(sid, 1))
-                break
-    return need
+def vehicle_ammo_mapping_ids(parent_vehicle_tid, ammo_template_id, *, default_only=False):
+    """此载具驾驶员主武器支持的弹药映射 ID（权限按 mapping，不按弹药模板）。"""
+    return {mid
+            for wt, _storage in _VEHICLE_WEAPON_SLOTS.get(int(parent_vehicle_tid), ())
+            for mid, at, default in _AMMO_MAPPINGS_BY_WEAPON.get(wt, ())
+            if at == int(ammo_template_id) and (not default_only or default)}
 
 
 def vehicle_ammo_spawn_clips(storage_id):
@@ -502,7 +485,7 @@ def _vehicle_supports_ammo(parent_vehicle_tid, ammo_template_id):
 
 def _default_vehicle_ammo_for(parent_vehicle_tid):
     """返回载具基础模板的默认弹药映射列表 [(ammoStorageId, ammoTemplateId), ...]
-    （defaultAmmo=true 的驾驶员主武器弹药，自动补建用）。
+    （defaultAmmo=true 的驾驶员主武器弹药，初始发放用）。
     同一 (storage, ammo) 会经多个武器槽重复命中，先集合去重。"""
     seen = set()
     out = []

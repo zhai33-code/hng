@@ -57,12 +57,16 @@ class SocialGraphMixin:
         - 存在 player_id=我的行 → friendshipInitiatedByMe=true
         收到的待处理邀请：initiated_by_me=false + also_friend=false，
         客户端据此显示在待确认列表。
+        faction 与 player f11 同源：仅取当前战争的显式阵营选择；未选为 0。
+        不能用最新角色阵营：玩家可拥有多个阵营的角色。
         返回 [{id, gamertag, faction, also_friend, initiated_by_me}]。"""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 'SELECT p.id AS pid, p.username, '
-                '       (SELECT faction FROM characters c '
-                '        WHERE c.player_id = p.id ORDER BY c.id DESC LIMIT 1) '
+                '       (SELECT wf.faction FROM player_war_factions wf '
+                '        WHERE wf.player_id = p.id AND wf.war_id = '
+                '          (SELECT id FROM wars WHERE state = 1 '
+                '           ORDER BY id DESC LIMIT 1)) '
                 '   AS faction, '
                 '       BOOL_OR(f.status = 1) AS confirmed, '
                 '       BOOL_OR(f.player_id = $1) AS i_initiated '

@@ -21,14 +21,14 @@ from wardb import (
     _E_VEHICLE,
     _E_VEHICLES_VARIANT,
     _E_VEHICLE_UPGRADE_MAPPING,
+    _E_WEAPON_AMMO_MAPPING,
     _REQ_UNLOCK_BY_ITEM,
     _VEHICLE_UPGRADE_MAXCOND,
     _VEHICLE_UPGRADE_SLOT,
-    _VEHICLE_AMMO_STORAGE_SLOTS,
     _VEHICLE_VARIANT_PARENT,
     _default_vehicle_ammo_for,
     _vehicle_supports_ammo,
-    vehicle_ammo_purchase_count,
+    vehicle_ammo_mapping_ids,
     vehicle_full_condition,
     )
 
@@ -49,18 +49,18 @@ from player_service import (
     _msg_player_for,
     _unlock_need_for_char,
     )
+from .weapons_purchase import _repush_character_unlocks
 
 
 async def grant_default_vehicle_ammo(pid, char_id, vehicle_id, parent_vehicle_tid,
                                      sess=None, writer=None):
     """新车默认弹药发放（购买载具 / 新兵初始载具 / 商店礼包发货共用）。
 
-    每个默认弹药仓按 VehicleAmmoStorage.storageSlots 发满并逐槽装填，
-    新车出厂即满弹带上膛（与"购买弹药一次发满一仓"策略一致）。
+    每个默认弹药仓仅创建一份弹药并装备到第 1 槽；单槽拥有完整载弹量。
     _default_vehicle_ammo_for 已按 (storage, ammo) 去重；同一仓多条默认
-    映射只按首条发满，多个武器槽共享同一弹药仓（如 78 号机 6 挺机枪
-    共用 storage 116）也只发 storageSlots 份。默认弹无勋带页条目，
-    不参与已拥有判定，仅为满弹带上膛。
+    映射只按首条发放，多个武器槽共享同一弹药仓（如 78 号机 6 挺机枪
+    共用 storage 116）也只发一份。storageSlots 是可选装备槽数，
+    勋带页的“已拥有”数量阈值不决定初始发货量。
 
     返回 [(storageId, slot, vehicle_ammo行), ...]；传 sess/writer 且
     soldier_view_cmd 有效时逐条 KVCS 推送（须在 Vehicle 行推送之后调用，
@@ -71,21 +71,20 @@ async def grant_default_vehicle_ammo(pid, char_id, vehicle_id, parent_vehicle_ti
         if int(storage_id) in filled:
             continue
         filled.add(int(storage_id))
-        for slot in range(1, _VEHICLE_AMMO_STORAGE_SLOTS.get(int(storage_id), 1) + 1):
-            va = await STORE.create_vehicle_ammo(
-                pid, ammo_template_id, vehicle_id, char_id,
-                _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
-            await STORE.set_vehicle_ammo_equipment(pid, va['id'], int(storage_id),
-                                                   slot, True)
-            out.append((int(storage_id), slot, va))
-            if sess is not None and writer is not None and sess.soldier_view_cmd is not None:
-                await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo',
-                                 _msg_vehicle_ammo(va['id'], ammo_template_id,
-                                                   vehicle_id, int(storage_id), slot,
-                                                   char_id, va['condition']))
-                log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo '
-                    f'id={va["id"]}, template={ammo_template_id}, '
-                    f'storage={storage_id}, slot={slot})')
+        slot = 1
+        va = await STORE.create_vehicle_ammo(
+            pid, ammo_template_id, vehicle_id, char_id,
+            _AMMO_MAXCOND.get(int(ammo_template_id), 100.0))
+        await STORE.set_vehicle_ammo_equipment(pid, va['id'], int(storage_id), slot, True)
+        out.append((int(storage_id), slot, va))
+        if sess is not None and writer is not None and sess.soldier_view_cmd is not None:
+            await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo',
+                             _msg_vehicle_ammo(va['id'], ammo_template_id,
+                                               vehicle_id, int(storage_id), slot,
+                                               char_id, va['condition']))
+            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo '
+                f'id={va["id"]}, template={ammo_template_id}, '
+                f'storage={storage_id}, slot={slot})')
     return out
 
 
@@ -178,7 +177,11 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
     # 杜绝"载具已扣款、变体不足"的钱货两空）；余额不足返回错误响应，不创建载具
     cost_v, ok_v = await _charge_player_multi(
         sess, [vv_pricing_id, vv_extra_pricing_id], currency,
-        expected=[(vv_template_id, 'VehicleVariantTemplate'),
+        # The shop sends a factory variant id, but its hull/airframe price
+        # belongs to vehicletemplate (the variant's parent). Only the optional
+        # paint/skin is priced as VehicleVariantTemplate.
+        expected=[(_VEHICLE_VARIANT_PARENT.get(int(vv_template_id), 0),
+                   'vehicletemplate'),
                   (vv_extra_template_id, 'VehicleVariantTemplate')])
     if not ok_v:
         resp_proto = pb_int32(1, 56)  # not_enough_credits
@@ -281,7 +284,7 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
     # 2.5 购买载具自动赠送默认弹药并装备到对应弹药仓（weaponAmmoMapping.defaultAmmo=true；
     #     客户端 VehicleUpgradeUtilities.updateVehicleAmmoObject 用
     #     equippedVehicleAmmoStorageId != 0 判定已装备，slotNumber 从 1 开始）。
-    #     默认弹按弹药仓槽数发满，新车出厂即满配。
+    #     每仓只装备一份默认弹，其他槽位由玩家自行配置。
     parent_vv = _VEHICLE_VARIANT_PARENT.get(int(vv_template_id))
     if parent_vv is not None:
         try:
@@ -291,8 +294,8 @@ async def handle_createvehiclevariantrequest(sess, writer, cmd_id, req_type, pro
                     break
         except Exception as e:
             log(f'[DB] reload vehicle char failed: {e}')
-        # 默认弹按弹药仓槽数发满并逐槽装填（公共发放函数与建号/礼包
-        # 发货共用，策略与细节见 grant_default_vehicle_ammo docstring）
+        # 先刷新角色默认弹权限，再推新增弹药（客户端 ADD 会重算勋带状态）。
+        await _repush_character_unlocks(sess, writer, vv_char_id)
         try:
             await grant_default_vehicle_ammo(pid, vv_char_id, vid, parent_vv,
                                              sess, writer)
@@ -469,6 +472,24 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
             f'ammo={va_template_id} not supported)')
         return
 
+    # 与勋带页相同：权限按 weaponAmmoMapping.id 判定，任一兼容映射满足
+    # 即可购买。拥有几份、装备几槽不参与解锁；拒绝必须发生在扣款之前。
+    unlocked = False
+    char_uids = await _char_bits_for(sess, va_char_id)
+    for mapping_id in vehicle_ammo_mapping_ids(parent_tpl, va_template_id):
+        need = await _unlock_need_for_char(
+            sess, va_char_id,
+            _REQ_UNLOCK_BY_ITEM.get((mapping_id, _E_WEAPON_AMMO_MAPPING), set()))
+        if not need or need & char_uids:
+            unlocked = True
+            break
+    if not unlocked:
+        writer.write(build_response(cmd_id, 'CreateVehicleAmmoResponse', pb_int32(1, 0)))
+        await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} CreateVehicleAmmoResponse (rejected: '
+            f'ammo={va_template_id} not unlocked for character={va_char_id})')
+        return
+
     # 扣款；余额不足返回错误响应，不创建弹药
     cost, ok = await _charge_player(
         sess, va_pricing_id, va_currency,
@@ -481,36 +502,18 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
         log(f'S->C cmd={cmd_id:<4} CreateVehicleAmmoResponse (response=56 not_enough) cost={cost}')
         return
 
-    # 持久化载具弹药实例（condition = 模板满耐久）。任一行失败则清理
-    # 已创建的部分行、退款并返回失败，避免半套弹药和会话假 id。
-    # 一次购买按弹药仓槽数发满实例：客户端勋带页判定"已拥有"的条件是
-    # 该载具上此弹药实例数 >= storageSlots（ProgressionOverviewWindowMediator
-    # eWeaponAmmoMapping 载具分支），只发 1 份时多槽弹药仓（如 storage 2 的
-    # 3 槽）永远显示可购买；发满即"买一次就显示已拥有"（只扣一次款）。
+    # 一次购买只创建一份未装备弹药。勋带页在达到仓槽数前允许继续补购，
+    # 不应为了隐藏购买按钮而一次赠送整仓。落库失败退款并返回失败。
     maxcond = _AMMO_MAXCOND.get(int(va_template_id), 100.0)
-    buy_count = vehicle_ammo_purchase_count(parent_tpl, va_template_id) if parent_tpl else 1
-    pid2 = await sess.ensure_player()
-    va_ids = []
-    for _i in range(buy_count):
-        va_id = None
-        if pid2 is not None:
-            try:
-                a = await STORE.create_vehicle_ammo(pid2, va_template_id, va_vehicle_id,
-                                                    va_char_id, maxcond)
-                va_id = a['id']
-            except Exception as e:
-                log(f'[DB] create_vehicle_ammo failed: {e}')
-        if va_id is None:
-            if pid2 is not None and va_ids:
-                try:
-                    await STORE.delete_vehicle_ammo_rows(pid2, va_ids)
-                except Exception as e:
-                    log(f'[DB] cleanup partial vehicle ammo failed: {e}')
-            await _fail_persisted_purchase(
-                sess, writer, cmd_id, 'CreateVehicleAmmoResponse', 1,
-                va_currency, cost)
-            return
-        va_ids.append(va_id)
+    try:
+        a = await STORE.create_vehicle_ammo(pid, va_template_id, va_vehicle_id,
+                                            va_char_id, maxcond)
+    except Exception as e:
+        log(f'[DB] create_vehicle_ammo failed: {e}')
+        await _fail_persisted_purchase(
+            sess, writer, cmd_id, 'CreateVehicleAmmoResponse', 1, va_currency, cost)
+        return
+    va_id = a['id']
 
     # 1. 返回 CreateVehicleAmmoResponse (response=1 ok)，客户端显示购买成功
     resp_proto = pb_int32(1, 1)
@@ -518,17 +521,19 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
     writer.write(resp)
     await writer.drain()
     log(f'S->C cmd={cmd_id:<4} CreateVehicleAmmoResponse (response=1 ok, '
-        f'ammoIds={va_ids}, count={buy_count})')
+        f'ammoId={va_id}, count=1)')
 
-    # 2. 通过 SOLDIER_VIEW 推送全部 VehicleAmmo 实例（客户端 VehicleAmmoTable
+    # 先推角色权限，再推库存 ADD，保证勋带页重算时看到更新后的权限。
+    await _repush_character_unlocks(sess, writer, va_char_id)
+
+    # 2. 通过 SOLDIER_VIEW 推送 VehicleAmmo 实例（客户端 VehicleAmmoTable
     #    识别已购买并触发勋带页刷新，VehicleModificationMediator 显示可装填弹药）
     if sess.soldier_view_cmd is not None:
-        for va_id in va_ids:
-            aproto = _msg_vehicle_ammo(va_id, va_template_id, va_vehicle_id, 0, 0,
-                                       va_char_id, maxcond)
-            await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo', aproto)
-            log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo id={va_id}, '
-                f'template={va_template_id}, vehicle={va_vehicle_id}, condition={maxcond})')
+        aproto = _msg_vehicle_ammo(va_id, va_template_id, va_vehicle_id, 0, 0,
+                                   va_char_id, maxcond)
+        await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo', aproto)
+        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo id={va_id}, '
+            f'template={va_template_id}, vehicle={va_vehicle_id}, condition={maxcond})')
 
     # 3. 推送 player 刷新货币显示
     if sess.playerview_cmd is not None:
