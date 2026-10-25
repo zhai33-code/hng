@@ -1858,6 +1858,12 @@ async def _finish_mission_sessions(mission_id, report_id, earned_chars=None,
     """
     my_pms = [pms for pms, mid in mm_state.PMS_TO_MISSION.items()
               if int(mid or 0) == int(mission_id)]
+    # Remove all finishing players together, including offline players, before
+    # the first lobby view is published. release_match runs only after us.
+    from .squad import release_auto_squad_memberships
+    await release_auto_squad_memberships(
+        mission_id, {int((mm_state.PMS_TO_SESSION.get(p) or {})
+                         .get('player_id', 0) or 0) for p in my_pms})
     ribbon_upgrades = ribbon_upgrades or {}
     # 真实小队整队重置必须先于 PMS DELETE（StatusMediator 在 PMS DELETE 的
     # lobbySignal 里读 squadSession.missionId，非 0 → LOCKED_IN_COMBAT）：

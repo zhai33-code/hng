@@ -58,7 +58,7 @@ class FakeWriter:
 
 
 class FakeStore:
-    """最小 STORE：只实现邀请路径用到的方法。"""
+    """最小 STORE：覆盖邀请及无装备角色的匹配校验。"""
 
     def __init__(self):
         self.next_id = 100
@@ -67,6 +67,17 @@ class FakeStore:
         self.chars = {}           # char_id -> {'id','player_id','name','faction'}
         self.usernames = {}       # player_id -> username
         self.selected_chars = {}  # player_id -> char_id（持久化选中）
+
+    # These fixture characters own no equipment. Matchmaking still queries
+    # each equipment table before accepting them into the queue.
+    async def list_weapons(self, pid):
+        return []
+
+    async def list_vehicles(self, pid):
+        return []
+
+    async def list_vehicle_ammo(self, pid):
+        return []
 
     async def get_squad_for_player(self, pid):
         for s in self.squads.values():

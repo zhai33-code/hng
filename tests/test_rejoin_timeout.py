@@ -26,6 +26,7 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol import pb_message, pb_varint
+from wardb import battlefield_entity_for_gamemap
 
 import matchmaking
 import mm_config
@@ -84,7 +85,8 @@ def seed_mission(mid, players=1):
             'ready': asyncio.Event(), 'seq': 1, 'ttd': False, 'udp': None}
     inst['ready'].set()
     det = {'preset': 10, 'gamemode': 5, 'ai_fill': False,
-           'map_entity_id': mm_state.MISSION_MAP_ENTITY_ID,
+           # preset 10 uses Mill (gamemap 13); resolve its battlefield anchor.
+           'map_entity_id': battlefield_entity_for_gamemap(13),
            'attacker_faction': 3, 'defender_faction': 2,
            'enable_bots': True, 'weather_tod': 2, 'weather_condition': 0,
            'timeofday': None, 'formed_at': time.monotonic(),

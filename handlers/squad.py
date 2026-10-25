@@ -183,6 +183,61 @@ async def _repair_auto_squad_leader(mission_id, squad_id, info):
                 f'{member.get("gamertag")!r} failed: {e}')
 
 
+async def release_auto_squad_memberships(mission_id, player_ids):
+    """Detach departing players before restoring their lobby squad views.
+
+    Only temporary squads in this mission are affected. Mutate every roster
+    before yielding, so a lobby request cannot be captured by an old squad.
+    Persistent squads keep their membership across battles.
+    """
+    mission_id = int(mission_id)
+    player_ids = {int(pid) for pid in player_ids}
+    squads = _MM_MISSION_SQUADS.get(mission_id)
+    if not squads or not player_ids:
+        return
+    updates = []
+    for squad_id, info in list(squads.items()):
+        if int(info.get('squad_db_id', 0) or 0):
+            continue
+        members = list(info.get('members') or [])
+        departed = [m for m in members
+                    if int(m.get('player_id', 0) or 0) in player_ids]
+        if not departed:
+            continue
+        remaining = [m for m in members
+                     if int(m.get('player_id', 0) or 0) not in player_ids]
+        info['members'] = remaining
+        if not remaining:
+            squads.pop(squad_id, None)
+            continue
+        leader_char = int(info.get('leader_char_id', 0) or 0)
+        leader_changed = not any(int(m.get('char_id', 0) or 0) == leader_char
+                                 for m in remaining)
+        if leader_changed:
+            info['leader_char_id'] = int(remaining[0].get('char_id', 0) or 0)
+        updates.append((squad_id, info, departed, remaining, leader_changed))
+    if not squads:
+        _MM_MISSION_SQUADS.pop(mission_id, None)
+    for squad_id, info, departed, remaining, leader_changed in updates:
+        row = (_msg_auto_squad_session(squad_id, info, mission_id)
+               if leader_changed else None)
+        for member in remaining:
+            flash = FLASH_SESSIONS.get(member.get('gamertag') or '')
+            if flash is None or flash.playerview_cmd is None:
+                continue
+            try:
+                for removed in departed:
+                    await _push_kvcs_delete(
+                        flash.writer, flash.playerview_cmd,
+                        b'SquadMemberSession', int(removed['row_id']))
+                if row is not None:
+                    await _push_kvcs(flash.writer, flash.playerview_cmd,
+                                     b'SquadSession', row)
+            except Exception as e:
+                log(f'      [squad] departure sync to '
+                    f'{member.get("gamertag")!r} failed: {e}')
+
+
 async def _push_member_delete_to_session(session, member_row_id):
     """Push a member DELETE to a captured session, including a just-kicked user."""
     if session is None or session.playerview_cmd is None:

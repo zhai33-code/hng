@@ -372,6 +372,13 @@ async def release_player_mission_sessions(pid, writer=None, view_cmd=None,
         if int(s.get('player_id', 0) or 0) == int(pid):
             my_pms.append(_pms)
     if my_pms:
+        # Drop old auto-squad ownership before publishing the solo lobby view.
+        # Other players may still be fighting, so release_match may be far away.
+        from .squad import release_auto_squad_memberships
+        mission_ids = {int(PMS_TO_MISSION[p]) for p in my_pms
+                       if PMS_TO_MISSION.get(p) is not None}
+        for mission_id in mission_ids:
+            await release_auto_squad_memberships(mission_id, {int(pid)})
         pms_id = max(my_pms)          # 最新会话 = 客户端表中的当前行
         if view_cmd is not None:
             # ★ 必须先于 PMS DELETE 推送：PMS DELETE 触发客户端 lobbySignal →
