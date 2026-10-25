@@ -72,7 +72,8 @@ def seed_mission(mid, *, gamemode, preset, attacker=1, defender=2,
             'ready': asyncio.Event(), 'seq': 1, 'ttd': False, 'udp': None}
     inst['ready'].set()
     det = {'preset': preset, 'gamemode': gamemode, 'ai_fill': False,
-           'map_entity_id': mm_state.MISSION_MAP_ENTITY_ID,
+           'map_entity_id': matchmaking.battlefield_entity_for_gamemap(
+               int(matchmaking._load_preset(preset)[3])),
            'attacker_faction': attacker, 'defender_faction': defender,
            'enable_bots': True,
            'weather_tod': 2, 'weather_condition': 0, 'timeofday': None,

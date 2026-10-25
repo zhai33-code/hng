@@ -121,7 +121,8 @@ async def _pick_quickplay_character(pid, characters, selected, gamemode_id,
     return best[0], tuple(item[3] for item in prepared)
 
 
-async def _specified_mission_join_error(req_mission_id, faction, char_cat=0):
+async def _specified_mission_join_error(req_mission_id, faction, char_cat=0,
+                                       char_id=0):
     """指定战局加入（JoinMM f2：好友列表"跟随进入战斗"/战争图点战斗）的
     前置校验：返回错误码（无法加入）或 None（可加入）。
 
@@ -134,6 +135,20 @@ async def _specified_mission_join_error(req_mission_id, faction, char_cat=0):
     2026-09-08 用户报"好友列表加入好友对局排到新对局"根因。
     """
     mid = int(req_mission_id)
+
+    def reject(code, reason, details=None, source='staged'):
+        details = details or {}
+        mode = int(details.get('gamemode', 10 if source == 'war' else 0) or 0)
+        allowed = sorted(mm_config.mode_char_cats(mode) or ())
+        _log(f'JoinMM specified mission rejected: mission={mid} '
+             f'charId={char_id} charCategory={char_cat} faction={faction} '
+             f'gamemode={mode} allowedCategories={allowed} '
+             f'attacker={int(details.get("attacker_faction", 0) or 0)} '
+             f'defender={int(details.get("defender_faction", 0) or 0)} '
+             f'players={len(details.get("players") or ())} '
+             f'source={source} reason={reason} response={code}')
+        return code
+
     wrec = None
     try:
         wrec = await state.STORE.get_mission_record(mid)
@@ -143,11 +158,11 @@ async def _specified_mission_join_error(req_mission_id, faction, char_cat=0):
         # war 会战 record：state 2/3（已结算）→ 43；阵营非交战双方 → 62
         # （原 1b-1 war 分支静默 return：回 ok 但无事发生，玩家永卡匹配中）
         if int(wrec.get('state', 0) or 0) in (2, 3):
-            return 43
+            return reject(43, 'mission_ended', wrec, source='war')
         w_atk = int(wrec.get('attacker_faction', 0) or 0)
         w_dfd = int(wrec.get('defender_faction', 0) or 0)
         if w_atk > 0 and w_dfd > 0 and faction not in (w_atk, w_dfd):
-            return 62
+            return reject(62, 'faction_not_in_battle', wrec, source='war')
         # state=1（战斗中）但局内会话已清：war 会战仍可重新排队再开战斗
         # 服（1b-1 war 路由有对应分支，_start_match 按 battle_id 复用
         # record），不拦。战斗服结算收尾的瞬时窗口由 _start_match 内
@@ -159,21 +174,23 @@ async def _specified_mission_join_error(req_mission_id, faction, char_cat=0):
     det = _MM_MISSION_DETAILS.get(mid)
     if (det is None or 'preset' not in det
             or COMBAT_INSTANCES.get(mid) is None):
-        return 43                       # 局不存在 / 已结束
+        return reject(43, 'mission_unavailable', det)
     atk = int(det.get('attacker_faction', 0) or 0)
     dfd = int(det.get('defender_faction', 0) or 0)
-    if atk <= 0 or dfd <= 0 or faction not in (atk, dfd):
-        return 62                       # 士兵阵营不在该局攻防两方
+    if atk <= 0 or dfd <= 0:
+        return reject(62, 'invalid_battle_factions', det)
+    if faction not in (atk, dfd):
+        return reject(62, 'faction_not_in_battle', det)
     # ★ 兵种准入（官方 GamemodesMediator 矩阵，见 mm_config.MODE_CHAR_CATS）：
     #   好友跟随不得绕过 tile 限制（坦克兵跟不进侦察局）。类别 0（未知
     #   模板）不拦。与阵营不符同款 62（客户端清跟随态）。
     allowed = mm_config.mode_char_cats(int(det.get('gamemode', 0) or 0))
     if allowed and int(char_cat or 0) and int(char_cat) not in allowed:
-        return 62
+        return reject(62, 'character_category_not_allowed', det)
     max_p = int(mm_config.gamemode_cfg(
         int(det.get('gamemode', 0) or 0)).get('max_players', 18))
     if len(det.get('players') or ()) >= max_p:
-        return 227                      # 局满
+        return reject(227, 'mission_full', det)
     return None
 
 
@@ -423,7 +440,7 @@ async def _handle_join(sess, writer, cmd_id, proto):
     #   该局攻防两方时玩家被排进另一场新局（2026-09-08 好友跟随失效根因）。
     if req_mission_id:
         join_err = await _specified_mission_join_error(
-            req_mission_id, faction, char_cat)
+            req_mission_id, faction, char_cat, char_id=char_id)
         if join_err is not None:
             resp = build_response(cmd_id, 'JoinMatchMakingResponse',
                                   pb_int32(1, join_err))

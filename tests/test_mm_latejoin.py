@@ -38,6 +38,15 @@ def check(label, ok, detail=''):
     print(f'[{"PASS" if ok else "FAIL"}] {label}{("  " + detail) if detail else ""}')
 
 
+class EmptyEquipment:
+    """These routing fixtures represent characters with no equipped items."""
+    async def list_weapons(self, player_id):
+        return []
+
+    async def list_vehicles(self, player_id):
+        return []
+
+
 class FakeWriter:
     def __init__(self):
         self.data = b''
@@ -56,7 +65,8 @@ def seed_mission(mid, *, gamemode=5, preset=10, attacker=3, defender=2,
             'ready': asyncio.Event(), 'seq': 1, 'ttd': False, 'udp': None}
     inst['ready'].set()
     det = {'preset': preset, 'gamemode': gamemode, 'ai_fill': False,
-           'map_entity_id': mm_state.MISSION_MAP_ENTITY_ID,
+           'map_entity_id': matchmaking.battlefield_entity_for_gamemap(
+               int(matchmaking._load_preset(preset)[3])),
            'attacker_faction': attacker, 'defender_faction': defender,
            'enable_bots': True,
            'weather_tod': 2, 'weather_condition': 0, 'timeofday': None,
@@ -406,7 +416,7 @@ def main():
         old_enqueue = mm_handler._enqueue_squad
         old_store = state.STORE
 
-        class Store12:
+        class Store12(EmptyEquipment):
             async def list_characters(self, p):
                 return [{'id': 42, 'faction': 3, 'name': 'Rejoiner2',
                          'combat_xp': 0, 'template': 1}]
@@ -633,7 +643,7 @@ def main():
         # ---- 15. 指定战局加入校验（好友跟随：_specified_mission_join_error）----
         # 修复前：JoinMM 一律回 ok，指定局阵营不符/不存在/满员时静默落入
         # 普通撮合 → 玩家被排进另一场新局（好友跟随失效根因）。
-        class Store15:
+        class Store15(EmptyEquipment):
             def __init__(self, war_recs=None, fail_get=False):
                 self.war_recs = war_recs or {}
                 self.fail_get = fail_get
@@ -792,7 +802,7 @@ def main():
         # 响应前点"加入战局"→ JoinMM.missionId=battleId。服务端查不到
         # mission record 时按 battle id 解析回真实 missionId 进 war 桶；
         # 解析不到（无此会战 mission）则维持原值照旧 43，不落普通池。
-        class Store16d:
+        class Store16d(EmptyEquipment):
             _WAR = {'id': 900202, 'battle_id': 7, 'state': 0,
                     'gamemode': 10, 'preset': 10, 'map_id': 9,
                     'attacker_faction': 1, 'defender_faction': 3,

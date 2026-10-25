@@ -592,6 +592,38 @@ def vehicle_parent_template_id(variant_template_id):
     vid = int(variant_template_id or 0)
     return _VEHICLE_VARIANT_PARENT.get(vid, 0) or vid
 
+
+# ItemInfoOverlayMediator.itemCanBeUnlocked calls canCharacterUnlockItem with
+# checkUnlockable=true. This tests class/faction availability, not ribbon XP.
+_VEHICLE_DEPOT_UNLOCKABLE = {}
+for _f in _parse_wardb_table('progressionUnlock'):
+    if (int(_f.get(7, 0)) == _E_VEHICLE
+            and bool(_f.get(10, 0)) and bool(_f.get(11, 0))):
+        _VEHICLE_DEPOT_UNLOCKABLE.setdefault(int(_f.get(8, 0)), []).append(
+            (int(_f.get(3, 0)), int(_f.get(4, 0))))
+
+
+def vehicle_depot_is_free(variant_template_id, faction, character_template,
+                          equipped_in_slot):
+    """Server-side equivalent of the vehicle overlay's free-transfer rules.
+
+    Unknown templates or missing static data fail closed. Incompatible owned
+    vehicles can be returned for free; a vehicle with no price can also be
+    returned when unequipped. Client isFree alone never authorizes a waiver.
+    """
+    variant = int(variant_template_id or 0)
+    parent = _VEHICLE_VARIANT_PARENT.get(variant, 0)
+    if not parent or not _PRICING_MAP or not _VEHICLE_DEPOT_UNLOCKABLE:
+        return False
+    compatible = any(
+        (not ft or ft == int(faction))
+        and (not ct or ct == int(character_template))
+        for ft, ct in _VEHICLE_DEPOT_UNLOCKABLE.get(variant, ()))
+    priced = any(p['type'] == 'vehicletemplate'
+                 and int(p['object_id']) == parent
+                 for p in _PRICING_MAP.values())
+    return not compatible or (not priced and not int(equipped_in_slot or 0))
+
 # VirtualCurrencyType：1=Credits 2=Warfunds 3=Gold 4=Tickets
 _CUR_KEY = {1: 'credits', 2: 'warfunds', 3: 'gold'}
 _CUR_NAME = {1: 'Credits', 2: 'Warfunds', 3: 'Gold', 4: 'Tickets'}

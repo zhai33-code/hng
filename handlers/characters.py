@@ -28,6 +28,9 @@ from wardb import (
     _mod_usable_by_class,
     _rank_from_combat_xp,
     daily_bonus_template_for,
+    _VEHICLE_VARIANT_PARENT,
+    vehicle_depot_is_free,
+    _PRICING_MAP,
     )
 
 from messages import (
@@ -54,6 +57,7 @@ from player_service import (
     _push_player_refresh,
     _refund_player_charge,
     _weapon_template_id,
+    _pricing_matches,
     )
 
 
@@ -728,7 +732,7 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
         sd_tab = f.get(6, b'')
         if isinstance(sd_tab, bytes):
             sd_tab = sd_tab.decode('utf-8', 'replace')
-        sd_is_free = bool(f.get(7, 1))
+        sd_is_free = bool(f.get(7, 0))
         log(f'      SendItemToDepot: itemType={sd_item_type}, objectId={sd_object_id}, '
             f'pricingId={sd_pricing_id}, tab={sd_tab!r}, isFree={sd_is_free}')
     except Exception as e:
@@ -771,23 +775,59 @@ async def handle_senditemtodepotrequest(sess, writer, cmd_id, req_type, proto):
     # setTransferPrice 的 finalGoldFractionPrice(0.5)/finalCreditFractionPrice(0.5)
     # 一致；此前扣全价，确认框显示半价、实际扣款翻倍）
     cost = 0
-    if cur_char is not None and int(sd_pricing_id or 0) <= 0:
+    # Whole vehicles are priced by their parent vehicletemplate, while detached
+    # skins (itemType=10) are priced by VehicleVariantTemplate.
+    price_types = {
+        1: 'weapontemplate', 2: 'vehicletemplate',
+        3: 'UniformPartTemplate', 4: 'UniformVariantTemplate',
+        5: 'WeaponModifierTemplate', 6: 'ammotemplate',
+        7: 'WeaponVariantTemplate', 8: 'vehicleupgradetemplate',
+        9: 'ammotemplate', 10: 'VehicleVariantTemplate',
+        42: 'TracerEffectTemplate',
+    }
+    pricing_object = (_VEHICLE_VARIANT_PARENT.get(int(item_template or 0))
+                      if int(sd_item_type) == 2 else item_template)
+    free_transfer = False
+    if cur_char and int(sd_item_type) == 2 and sd_is_free:
+        try:
+            vehicle = await STORE.get_vehicle(pid, int(sd_object_id))
+            character = next((ch for ch in await STORE.list_characters(pid)
+                              if int(ch['id']) == int(cur_char)), None)
+            if (vehicle is not None and character is not None
+                    and int(vehicle['character_id']) == int(cur_char)
+                    and int(vehicle['vehicle_variant_template_id']) == int(item_template)):
+                free_transfer = vehicle_depot_is_free(
+                    item_template, character['faction'], character['template'],
+                    vehicle['equipped_in_slot'])
+        except Exception as e:
+            log(f'[DB] vehicle depot free eligibility failed: {e}')
+        if not free_transfer:
+            writer.write(build_response(
+                cmd_id, 'SendItemToDepotResponse', pb_int32(1, 239)))
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} SendItemToDepotResponse '
+                f'(response=239 invalid free transfer)')
+            return
+    if cur_char is None or pricing_object is None:
         writer.write(build_response(
             cmd_id, 'SendItemToDepotResponse', pb_int32(1, 0)))
         await writer.drain()
+        log(f'S->C cmd={cmd_id:<4} SendItemToDepotResponse '
+            f'(response=0 item unavailable)')
         return
-    if cur_char is not None:
-        price_types = {
-            1: 'weapontemplate', 2: 'VehicleVariantTemplate',
-            3: 'UniformPartTemplate', 4: 'UniformVariantTemplate',
-            5: 'WeaponModifierTemplate', 6: 'ammotemplate',
-            7: 'WeaponVariantTemplate', 8: 'vehicleupgradetemplate',
-            9: 'ammotemplate', 10: 'VehicleVariantTemplate',
-            42: 'TracerEffectTemplate',
-        }
+    if not free_transfer:
+        price = _PRICING_MAP.get(int(sd_pricing_id or 0))
+        if (int(sd_item_type) not in price_types or not _pricing_matches(
+                price, pricing_object, price_types.get(int(sd_item_type)))):
+            writer.write(build_response(
+                cmd_id, 'SendItemToDepotResponse', pb_int32(1, 252)))
+            await writer.drain()
+            log(f'S->C cmd={cmd_id:<4} SendItemToDepotResponse '
+                f'(response=252 pricing mismatch)')
+            return
         cost, ok = await _charge_player(
             sess, sd_pricing_id, sd_currency, fraction=0.5,
-            expected_object_id=item_template,
+            expected_object_id=pricing_object,
             expected_types=price_types.get(int(sd_item_type)))
         if not ok:
             # 余额不足 response 码按支付货币映射（客户端 handleSendItemToDepotRequest

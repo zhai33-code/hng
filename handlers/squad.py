@@ -1558,7 +1558,10 @@ async def handle_set_squad_matchmaking_flag(sess, writer, cmd_id, req_type,
             log(f'      [DB] set_squad_flag failed: {e}')
             code = RC_SQUAD_NOT_FOUND
 
-    if code == RC_OK:
+    if code == RC_OK and not in_memory:
+        # Only persisted squads have DB rows to synchronize. Solo/auto squads
+        # have already been acknowledged above; querying their 63-bit row IDs
+        # here overflows the int32 squads primary key.
         # ★绝不回推整队行集（2026-09-09 闪烁风暴根因）：客户端每条
         #   SquadMemberSession SET → onSquadMemberSessionChange:586 →
         #   evaluatePlayerFactions:1061 → squadMatchMakingFilterUpdateSignal
