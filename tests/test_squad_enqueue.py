@@ -15,7 +15,7 @@
   4. 双方 _MM_QUEUES 排队上下文建立（mission_id=0、squad_db_id 正确）
   5. 双方入池且 group_key 相同（整队原子）、char_cat 按模板正确解析
      （template 1=步兵→1、4=伞兵→4，即触发事故的那次调用）
-  6. DB 状态推进：成员 status=3 ×2 + set_squad_flag(squad, True)
+  6. DB 状态推进：成员 status=3 ×2，保留战争模式筛选
   7. 整队 SquadSession 行重推（push_squad_rows_to_all_members）
 """
 import asyncio
@@ -157,9 +157,9 @@ def main():
                   f'lead.cat={getattr(e_lead, "char_cat", None)} '
                   f'mate.cat={getattr(e_mate, "char_cat", None)}')
 
-            check('6. DB 状态推进（成员 status=3 ×2 + set_squad_flag True）',
+            check('6. DB 状态推进（成员 status=3 ×2，战争筛选不变）',
                   sorted(store.member_updates) == [(86011, 3), (86012, 3)]
-                  and store.flag_updates == [(SQUAD_ID, True)],
+                  and store.flag_updates == [],
                   f'members={store.member_updates} flag={store.flag_updates}')
 
             check('7. 整队 SquadSession 行重推（push_squad_rows_to_all_members）',
@@ -335,6 +335,9 @@ def main():
 
     old_tfa2 = matchmaking._try_form_all
     matchmaking._try_form_all = fake_tfa
+    # Isolate the normal-preparation case from .env's solo-test setting.
+    original_skip_prep = mm_config.WAR_SKIP_PREP
+    mm_config.WAR_SKIP_PREP = False
     # 攻守双方各一（不门控必成局的配置，确保拦下的是门控而非阵营规则）
     eg1 = mm_pool.QueueEntry(player_id=LEAD_PID, char_id=LEAD_CHAR,
                              faction=1, gamemode_id=10, battle_id=77)
@@ -373,6 +376,7 @@ def main():
               77 not in matchmaking._WAR_BATTLE_READY)
     finally:
         matchmaking._try_form_all = old_tfa2
+        mm_config.WAR_SKIP_PREP = original_skip_prep
         matchmaking._WAR_BATTLE_READY.pop(77, None)
         for pid in (LEAD_PID, MATE_PID):
             _MM_QUEUES.pop(pid, None)

@@ -1362,7 +1362,7 @@ async def _revive_own_membership(squad_db_id, pid):
 async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
                          req_mission_id):
     """全队入池：每名在线成员建排队上下文 + PMM 行；DB 置 Ready +
-    小队 matchmaking_flag；整队 KVCS 行推给全体（跨会话）。"""
+    整队 KVCS 行推给全体（跨会话），不改变战争模式筛选。"""
     if not members:
         return                      # 无可参战成员（如自己已 InBattle）
     # ★ 兵种准入过滤（官方矩阵 mm_config.MODE_CHAR_CATS）：小队整队
@@ -1505,7 +1505,6 @@ async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
     try:
         for m in members:
             await state.STORE.update_squad_member(m['id'], status=3)
-        await state.STORE.set_squad_flag(squad_id, True)
     except Exception as e:
         _log(f'      [DB] squad enqueue status updates failed: {e}')
     from handlers.squad import push_squad_rows_to_all_members
@@ -1521,7 +1520,7 @@ async def _enqueue_squad(squad, members, gamemode_id, staged_presets,
 
 
 async def reset_real_squad_to_lobby(squad_db_id, exclude_pids=(),
-                                    push_rows=True):
+                                    push_rows=True, player_ids=None):
     """整队回 InLobby（DB 状态 + 向在线成员推整队行 mission=0）。
 
     战局结束（combat._finish_mission_sessions）/ 放弃（mission abandon）/
@@ -1531,25 +1530,33 @@ async def reset_real_squad_to_lobby(squad_db_id, exclude_pids=(),
     → 队长自动重发 SetSquadMatchMakingFlagRequest，见 handlers/squad.py
     handle_set_squad_matchmaking_flag 注释），且立即被 DELETE 覆盖——
     纯害无益，跳过推送只落 DB。"""
+    # player_ids scopes an individual departure; None restores the whole squad.
     if state.STORE is None or not squad_db_id:
         return
+    returning = None if player_ids is None else {int(p) for p in player_ids}
     try:
-        await state.STORE.set_squad_flag(int(squad_db_id), False)
         members = await state.STORE.list_squad_members(int(squad_db_id))
         for m in members:
+            if int(m.get('status', 0) or 0) == 1:
+                continue  # Returning to the lobby does not accept invitations.
+            if returning is not None and int(m['player_id']) not in returning:
+                continue
             await state.STORE.update_squad_member(m['id'], status=2)
+            m['status'] = 2
     except Exception as e:
         _log(f'      [DB] reset_real_squad_to_lobby failed: {e}')
         return
     if not push_rows:
         return
-    from handlers.squad import _online_member_sessions, push_squad_rows_to_writer
+    from handlers.squad import (
+        _online_member_sessions, _squad_view_mission_id, push_squad_rows_to_writer)
     for s in _online_member_sessions(members):
         if int(s.player_id or 0) in exclude_pids:
             continue
         try:
             await push_squad_rows_to_writer(
-                s.writer, s.playerview_cmd, int(squad_db_id), 0,
+                s.writer, s.playerview_cmd, int(squad_db_id),
+                _squad_view_mission_id(members, s.player_id),
                 viewer_pid=s.player_id, viewer_name=s.username)
         except Exception as e:
             _log(f'      squad reset push to {s.username!r} failed: {e}')
@@ -1569,7 +1576,10 @@ async def _cancel_squad_queue(squad_db_id, exclude_pids=(), push_rows=True):
     for m in members:
         mpid = int(m['player_id'])
         q = _MM_QUEUES.get(mpid)
-        if q is None or q.get('mission_id'):
+        if (int(m.get('status', 0) or 0) == 1
+                or q is None or q.get('mission_id')
+                or int((q.get('ctx') or {}).get('squad_db_id') or 0)
+                != int(squad_db_id)):
             continue                     # 不在排队 / 已成局不动
         _cleanup_queued_player(mpid)
         POOL.remove(mpid)

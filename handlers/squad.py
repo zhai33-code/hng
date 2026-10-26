@@ -72,6 +72,7 @@ from player_service import (
 from messages import _push_kvcs
 from matchmaking import (
     _cancel_squad_queue,
+    _find_player_active_mission,
     _msg_auto_squad_session,
     _push_kvcs_delete,
     _try_form_all,
@@ -130,13 +131,15 @@ def _player_is_leader(squad, members, player_id):
 
 def _squad_is_locked(squad, members):
     """Member/customization mutations are forbidden while queued or in combat."""
-    if bool((squad or {}).get('matchmaking_flag')):
-        return True
+    # matchmaking_flag is SquadSession.f12 (matchMakeWarMissionFlag), a
+    # client-selected mode filter. Selecting war missions in the lobby must
+    # not block accepting invitations or changing InLobby/Ready status.
     for member in members or ():
+        if int(member.get('status', 0) or 0) == ST_INVITE_PENDING:
+            continue  # An invitee's independent solo queue is not this squad.
         if int(member.get('status', 0) or 0) == ST_IN_COMBAT:
             return True
-        # matchmaking_flag can be changed by a client request while the
-        # authoritative queue entry is still alive; the queue registry wins.
+        # Only the authoritative queue registry establishes matchmaking locks.
         if int(member.get('player_id', 0) or 0) in _MM_QUEUES:
             return True
     return False
@@ -144,6 +147,17 @@ def _squad_is_locked(squad, members):
 
 def _player_in_matchmaking(player_id):
     return int(player_id or 0) in _MM_QUEUES
+
+
+def _squad_view_mission_id(members, player_id):
+    """Keep an in-combat viewer's mission when another member returns to lobby."""
+    member = next((m for m in members if int(m['player_id'])
+                   == int(player_id or 0)), None)
+    if member is None or int(member.get('status', 0) or 0) != ST_IN_COMBAT:
+        return 0
+    queue = _MM_QUEUES.get(int(player_id)) or {}
+    return int(queue.get('mission_id') or
+               _find_player_active_mission(player_id) or 0)
 
 
 def _auto_squad_leader(info):
@@ -441,7 +455,7 @@ def _online_member_sessions(members):
     return out
 
 
-async def push_squad_rows_to_all_members(squad_id, mission_id=0):
+async def push_squad_rows_to_all_members(squad_id, mission_id=None):
     """向全体在线成员的 Flash 连接推送整队 KVCS 行（跨会话同步）。
 
     邀请接受/踢人/改名/排队/进战局等任何整队数据变化后调用，
@@ -458,7 +472,13 @@ async def push_squad_rows_to_all_members(squad_id, mission_id=0):
         return
     for s in _online_member_sessions(members):
         try:
-            await push_squad_rows(s, s.writer, squad_id, mission_id)
+            viewer_mission = mission_id
+            if viewer_mission is None:
+                viewer_pid = getattr(s, 'player_id', 0) or next(
+                    (m['player_id'] for m in members
+                     if m.get('gamertag') == getattr(s, 'username', None)), 0)
+                viewer_mission = _squad_view_mission_id(members, viewer_pid)
+            await push_squad_rows(s, s.writer, squad_id, viewer_mission)
         except Exception as e:
             log(f'      [squad] push to {s.username!r} failed: {e}')
 
@@ -933,6 +953,9 @@ async def handle_remove_squad_member(sess, writer, cmd_id, req_type, proto):
         await delete_squad_member_row_everywhere(member_row, removed_squad_id)
         if target_session is not None and target_session is not sess:
             await _push_member_delete_to_session(target_session, member_row)
+        # Slots are assigned from roster order. Compact all surviving rows
+        # before a later invite reuses the old last slot.
+        await push_squad_rows_to_all_members(removed_squad_id)
 
     resp = build_response(cmd_id, 'RemoveSquadMemberResponse',
                           pb_int32(1, code))
@@ -1316,7 +1339,9 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
                         or int(mem.get('status', 0) or 0) !=
                         ST_INVITE_PENDING):
                     code = RC_SQUAD_SLOT_NOT_FOUND
-                elif has_accepted and _squad_is_locked(squad, members):
+                elif has_accepted and (
+                        _squad_is_locked(squad, members)
+                        or _player_in_matchmaking(pid)):
                     code = RC_SQUAD_IN_LOCKED_STATE
 
             if code == RC_OK and has_accepted:
@@ -1404,6 +1429,7 @@ async def handle_squad_respond_to_invite(sess, writer, cmd_id, req_type, proto):
             # 队长的待确认列表实时移除该行
             await delete_squad_member_row_everywhere(member_row,
                                                      declined_squad_id)
+            await push_squad_rows_to_all_members(declined_squad_id)
 
     resp = build_response(cmd_id, 'SquadRespondToInviteResponse',
                           pb_int32(1, code))
@@ -1597,6 +1623,8 @@ async def handle_set_squad_matchmaking_flag(sess, writer, cmd_id, req_type,
                         await _push_kvcs(
                             s.writer, s.playerview_cmd, b'SquadSession',
                             _msg_squad_session(squad, members,
+                                               mission_id=_squad_view_mission_id(
+                                                   members, getattr(s, 'player_id', 0)),
                                                viewer_faction=viewer_faction))
                         log(f'S->C cmd={s.playerview_cmd:<4} KeyValueChangeSet '
                             f'(SquadSession id={squad_session_id} flag sync '
@@ -1650,6 +1678,9 @@ async def handle_set_squad_member_status(sess, writer, cmd_id, req_type,
                 if (squad is None or me is None
                         or int(me['player_id']) != int(pid)):
                     code = RC_PLAYER_NOT_OWNER
+                elif int(me.get('status', 0) or 0) == ST_INVITE_PENDING:
+                    # Only SquadRespondToInvite may establish membership.
+                    code = RC_SQUAD_SLOT_NOT_FOUND
                 elif _squad_is_locked(squad, members):
                     code = RC_SQUAD_IN_LOCKED_STATE
 

@@ -79,7 +79,8 @@ async def handle_setvehiclevariantrequest(sess, writer, cmd_id, req_type, proto)
             if int(sv_variant_id) == 0:
                 valid = True
             else:
-                for vv in await STORE.list_vehicle_variants(pid):
+                owned_variants = await STORE.list_vehicle_variants(pid)
+                for vv in owned_variants:
                     if int(vv['id']) != int(sv_variant_id):
                         continue
                     if int(vv['vehicle_id']) == int(sv_vehicle_id):
@@ -93,6 +94,27 @@ async def handle_setvehiclevariantrequest(sess, writer, cmd_id, req_type, proto)
                         if skin_parent is not None and skin_parent == veh_parent:
                             valid = True
                             depot_row = vv
+                    # The client getVariantId() returns the first instance of a
+                    # template across the account, even when another vehicle owns
+                    # that row. Resolve to this vehicle's purchased copy only;
+                    # never transfer the requested row or grant an unowned skin.
+                    if (not valid and v is not None
+                            and int(vv['vehicle_id']) != 0):
+                        skin_tid = int(vv['vehicle_variant_template_id'])
+                        skin_parent = _VEHICLE_VARIANT_PARENT.get(skin_tid)
+                        veh_parent = _VEHICLE_VARIANT_PARENT.get(
+                            int(v['vehicle_variant_template_id']))
+                        if skin_parent is not None and skin_parent == veh_parent:
+                            local_copy = next((row for row in owned_variants
+                                if int(row['vehicle_id']) == int(sv_vehicle_id)
+                                and int(row['vehicle_variant_template_id']) == skin_tid), None)
+                            if local_copy is not None:
+                                requested_id = sv_variant_id
+                                sv_variant_id = int(local_copy['id'])
+                                valid = True
+                                log(f'      SetVehicleVariant resolved client instance: '
+                                    f'requested={requested_id}, resolved={sv_variant_id}, '
+                                    f'vehicle={sv_vehicle_id}, template={skin_tid}')
                     break
         except Exception as e:
             log(f'[DB] vehicle variant ownership check failed: {e}')

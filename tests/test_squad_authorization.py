@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from protocol import Chunk, pb_varint
+from protocol import Chunk, pb_parse, pb_varint
 import handlers.squad as squad_mod
 import matchmaking
 import state
@@ -222,7 +222,25 @@ async def main():
               revived and store.members[3]['status'] == 2)
         store.members[3]['status'] = 1
 
+        # f12 selects war missions; it is not the authoritative queue state.
         store.squad['matchmaking_flag'] = True
+        row = pb_parse(squad_mod._msg_squad_session(
+            store.squad, list(store.members.values())))
+        check('选择战争模式不会下发小队锁定',
+              row[12] == 1 and row[20] == 0 and row[21] == 0)
+        code, _ = await invoke(handle_set_squad_member_status, member,
+                               pb_varint(1, 2) + pb_varint(3, 3))
+        check('选择战争模式后队员仍可准备',
+              code == RC_OK and store.members[2]['status'] == 3)
+        code, _ = await invoke(handle_set_squad_member_status, member,
+                               pb_varint(1, 2) + pb_varint(3, 2))
+        check('未排队时队员可取消准备',
+              code == RC_OK and store.members[2]['status'] == 2)
+
+        _MM_QUEUES[2] = {'pmm_id': 77, 'mission_id': 0, 'ctx': {}}
+        row = pb_parse(squad_mod._msg_squad_session(
+            store.squad, list(store.members.values())))
+        check('实际排队时下发小队锁定', row[20] == 1 and row[21] == 1)
         code, _ = await invoke(handle_squad_respond_to_invite, pending,
                                pb_varint(1, 3) + pb_varint(2, 1))
         check('小队锁定时不能接受邀请',
@@ -232,14 +250,19 @@ async def main():
                                pb_varint(1, 3) + pb_varint(2, 0))
         check('小队锁定时仍可拒绝邀请',
               code == RC_OK and 3 not in store.members)
+        _MM_QUEUES.pop(2, None)
+        row = pb_parse(squad_mod._msg_squad_session(
+            store.squad, list(store.members.values())))
+        check('撤队后战争选项保留也会解除锁定',
+              row[12] == 1 and row[20] == 0 and row[21] == 0)
         store.squad['matchmaking_flag'] = False
 
-        store.squad['matchmaking_flag'] = True
+        store.members[2]['status'] = 4
         code, _ = await invoke(handle_remove_squad_member, leader,
                                pb_varint(1, 2))
-        check('排队锁定期间不能踢人',
+        check('战斗锁定期间不能踢人',
               code == RC_SQUAD_IN_LOCKED_STATE and 2 in store.members)
-        store.squad['matchmaking_flag'] = False
+        store.members[2]['status'] = 2
 
         _MM_QUEUES[2] = {'pmm_id': 77, 'mission_id': 0, 'ctx': {}}
         code, _ = await invoke(handle_remove_squad_member, leader,

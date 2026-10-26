@@ -511,10 +511,24 @@ async def handle_swapheadrequest(sess, writer, cmd_id, req_type, proto):
         sh_pricing_id = 0
         sh_currency = 0
 
-    # 购买头（有定价且非默认头）先扣款
+    # 先确认角色归属，避免扣款或创建部件后才发现目标无效。
+    pid = await sess.ensure_player()
+    try:
+        character = (await STORE.get_character(pid, int(sh_char_id))
+                     if pid is not None and sh_char_id else None)
+    except Exception as e:
+        log(f'[DB] lookup character before head swap failed: {e}')
+        character = None
+    if character is None:
+        writer.write(build_response(cmd_id, 'SwapHeadResponse', pb_int32(1, 0)))
+        await writer.drain()
+        return
+
+    # AppearanceWindowMediator.onOKClick 免费保存时不带 pricingId。
+    # 与 character.eHeadSwapType=0 的下发契约一致；只有付费请求才走扣款。
     head_swap_type = 1 if sh_pricing_id else 0  # 0=eFree 1=eNeedPayment
     cost = 0
-    if sh_head_template:
+    if sh_head_template and sh_pricing_id:
         cost, ok = await _charge_player(
             sess, sh_pricing_id, sh_currency,
             expected_object_id=sh_head_template,
@@ -528,13 +542,12 @@ async def handle_swapheadrequest(sess, writer, cmd_id, req_type, proto):
                 f'(response=56 not_enough) cost={cost}')
             return
 
-    pid = await sess.ensure_player()
     head_instance_id = 0
     if pid is not None and sh_char_id:
         try:
             if not sh_head_template:
                 # 换回默认头：清 head_id
-                await STORE.swap_character_head(pid, int(sh_char_id), 0)
+                updated = await STORE.swap_character_head(pid, int(sh_char_id), 0)
             else:
                 # 已有同模板头实例则复用，否则创建 UniformPart(eHead=0) 实例
                 head_instance_id = 0
@@ -557,7 +570,9 @@ async def handle_swapheadrequest(sess, writer, cmd_id, req_type, proto):
                 # 不是 uniform_parts 行实例 id：客户端 getUniformPartIdsEquipped 直接
                 # UniformPartTemplateTable.getFromId(character.headId)，实例 id 查不到
                 # 返回 null → #1009 空引用崩溃。
-                await STORE.swap_character_head(pid, int(sh_char_id), int(sh_head_template))
+                updated = await STORE.swap_character_head(pid, int(sh_char_id), int(sh_head_template))
+            if not updated:
+                raise RuntimeError('character head was not persisted')
         except Exception as e:
             log(f'[DB] swap head failed: {e}')
             await _refund_player_charge(sess, sh_currency, cost)

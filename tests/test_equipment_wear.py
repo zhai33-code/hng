@@ -11,6 +11,8 @@
    - 载具武器发数双报（裸模板 + 载具<<16|模板）同帧去重
    - 无 type6 数据的局/角色整体跳过磨损（2026-09-08 1000093
      "带了手雷没用也扣维护费"事故——估算算法对 0 发玩家按满额扣费）
+4. 2026-10-26：载具系列改读PlayerBattleResult逐实例耐久状态；角色出生数
+   不再用于扣载具耐久，同模板载具不再共享弹药发数。type6只计武器系列。
 
 分五部分：
 A. wardb 磨损静态表（纯单测，无需 DB）
@@ -23,6 +25,7 @@ import asyncio
 import os
 import sys
 import time
+import struct
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -146,6 +149,7 @@ def test_wardb_vehicle_ammo_weapon_templates():
 # ---------- B. type6 用量累积/取走 ----------
 
 def _usage_cleanup():
+    combat_handlers._VEHICLE_CONDITION_REPORTS_DONE.clear()
     statistics_server._BATTLE_USAGE.clear()
     statistics_server._BATTLE_USAGE_KEYS.clear()
     statistics_server._BATTLE_USAGE_DONE.clear()
@@ -398,11 +402,11 @@ def _build_loadout():
     mE wE 上的配件                    → 不扣
     aA wA 的在膛弹药（slot 1）        → 按发扣
     aR wA 的储备弹药（slot 0）        → 不扣
-    vA 已装备载具                     → 满耐久 - 出生数 3
+    vA 已装备载具                     → 无逐实例结算状态，不由出生数扣损
     vR 仓库载具（slot 0）             → 不扣
-    uA vA 槽位 5 上的升级             → 满耐久 - 3
+    uA vA 槽位 5 上的升级             → 无逐实例结算状态，不由出生数扣损
     uR vA 上未装备的升级（slot 0）    → 不扣
-    va vA 弹药仓 2 的载具弹药         → 按载具主武器发数扣
+    va vA 弹药仓 2 的载具弹药         → 无逐实例结算状态，不由模板发数扣损
     """
     st = _WearStore()
     wt = _weapon_template(wear=True)              # 可磨损武器模板（wA）
@@ -493,15 +497,13 @@ def test_apply_equipment_wear_math_and_skips():
     # 在膛弹药按发扣（2000 发扣 500）；储备不扣
     assert a[301] == 2000.0 - 500, a[301]
     assert a[302] == 500.0
-    # 载具按实际出生数：vmax - 1.0*3；仓库载具不扣
-    assert v[401] == p['vmax'] - 3.0, v[401]
+    # 角色出生数不能定位实际使用的车辆，载具系列单独按结算状态扣损
+    assert v[401] == p['vmax'], v[401]
     assert v[402] == p['vmax']
     # 升级同载具规则；未入槽不扣
-    assert u[501] == 97.0, u[501]
+    assert u[501] == 100.0, u[501]
     assert u[502] == 100.0
-    # 载具弹药按该载具主武器实际发数扣
-    vrate = wardb.ammo_wear_params(p['vat'])[1]
-    assert va[601] == p['vamax'] - vrate * p['vshots'], va[601]
+    assert va[601] == p['vamax'], va[601]
 
 
 def test_apply_equipment_wear_zero_usage_never_charges():
@@ -570,7 +572,7 @@ def test_apply_equipment_wear_worn_not_negative():
     finally:
         combat_handlers.STORE = old
     assert st.weapons[0]['condition'] == 0.0
-    assert st.vehicles[0]['condition'] == 0.0
+    assert st.vehicles[0]['condition'] == 2.0
 
 
 # ---------- C2. 战后自动维修（autoRepair 扣费 + 修复满耐久）----------
@@ -654,7 +656,7 @@ def test_autorepair_missing_pricing_repairs_free():
 
 
 def test_autorepair_vehicle_gold():
-    """载具 autoRepair=2(Gold)：按实际出生数磨损比例扣 Gold 修复到满耐久。"""
+    """载具autoRepair=2：按战斗服逐实例报告的损耗扣Gold修复。"""
     st, p = _build_loadout()
     vt = st.vehicles[0]['vehicle_variant_template_id']
     base = wardb.repair_base_price('VehicleMaxConditionRepair',
@@ -664,11 +666,14 @@ def test_autorepair_vehicle_gold():
     st.balances[(1, 'gold')] = 10 ** 9
     old = combat_handlers.STORE
     combat_handlers.STORE = st
+    _usage_cleanup()
     try:
-        asyncio.run(combat_handlers._apply_equipment_wear(
-            {(1, 11): 900}, p['usage']))
+        raw = _condition_status(10, 401, p['vmax'], p['vmax'] - 3)
+        asyncio.run(combat_handlers._apply_vehicle_condition_reports(
+            [(1, combat_handlers._split_fields(raw))], (100003, 100003)))
     finally:
         combat_handlers.STORE = old
+        _usage_cleanup()
     expect_cost = max(1, int(base * 3 / p['vmax']))
     assert st.vehicles[0]['condition'] == p['vmax'], '应修复到满耐久'
     assert (1, 'gold', expect_cost) in st.spent, st.spent
@@ -735,12 +740,19 @@ def _msg(field, payload):
             return bytes(out) + payload
 
 
-def _earnings_proto(mission_id=100003, char_id=11, time_active=900):
+def _condition_status(field, item_id, initial, final):
+    return _msg(field, _varint(1, item_id)
+                + bytes([2 << 3 | 5]) + struct.pack('<f', final)
+                + bytes([3 << 3 | 5]) + struct.pack('<f', initial))
+
+
+def _earnings_proto(mission_id=100003, char_id=11, time_active=900,
+                    vehicle_statuses=b''):
     """AnnounceBattleFieldEarningsRequest：单玩家单角色。"""
     # CharacterBattleResult{f1 charId, f7 timeActive}
     char_result = _varint(1, char_id) + _varint(7, time_active)
     # PlayerBattleResult{f1 playerId=1, f6 repeated char}
-    pbr = _varint(1, 1) + _msg(6, char_result)
+    pbr = _varint(1, 1) + _msg(6, char_result) + vehicle_statuses
     # BattleReportCharacter{f1 charId}（is_bot 名单按 BattleReport 判定）
     br_char = _varint(1, char_id)
     # BattleReportPlayer{f1 playerId=1, f10 isBot=0, f11 repeated char}
@@ -754,7 +766,7 @@ def _earnings_proto(mission_id=100003, char_id=11, time_active=900):
 
 def test_settlement_path_applies_wear():
     """AnnounceBattleFieldEarnings + type6 用量（session 尾数=missionId）→
-    按实际发数/出生数受损；重复结算不二次计损（usage 取走即删）。
+    武器按实际发数、载具按逐实例状态受损；重复结算不二次计损。
 
     顺带验证：结算响应仍先行发出（磨损异常不得拖垮结算链路）。"""
     st, p = _build_loadout()
@@ -762,6 +774,9 @@ def test_settlement_path_applies_wear():
     combat_handlers.STORE = st
     _usage_cleanup()
     try:
+        # 角色出生3次，但该车实际报告只损耗2点，不能按角色总出生数扣。
+        proto = _earnings_proto(vehicle_statuses=
+            _condition_status(10, 401, p['vmax'], p['vmax'] - 2))
         # type6 上报（结算前同秒到达）：session 730433917100003 → mission 100003
         statistics_server._accumulate_battle_usage(
             730433917100003,
@@ -770,21 +785,21 @@ def test_settlement_path_applies_wear():
         writer = _MockWriter()
         asyncio.run(combat_handlers.handle_announce_battlefield_earnings(
             _MockSess(), writer, 200,
-            'AnnounceBattleFieldEarningsRequest', _earnings_proto()))
+            'AnnounceBattleFieldEarningsRequest', proto))
         assert b'AnnounceBattleFieldEarningsResponse' in writer.sent, '响应先行'
         wp = p['wp']
         w = {x['id']: x['condition'] for x in st.weapons}
         assert w[101] == 1.0 - wp[1] * 500, \
             f'结算未按实际发数扣武器磨损: {w[101]}'
-        assert st.vehicles[0]['condition'] == p['vmax'] - 3.0, \
-            f'结算未按实际出生数扣载具磨损: {st.vehicles[0]["condition"]}'
+        assert st.vehicles[0]['condition'] == p['vmax'] - 2.0, \
+            f'结算未按逐车报告扣损: {st.vehicles[0]["condition"]}'
         # 重复结算：usage 已被取走 → 不再计损
         asyncio.run(combat_handlers.handle_announce_battlefield_earnings(
             _MockSess(), _MockWriter(), 201,
-            'AnnounceBattleFieldEarningsRequest', _earnings_proto()))
+            'AnnounceBattleFieldEarningsRequest', proto))
         w2 = {x['id']: x['condition'] for x in st.weapons}
         assert w2[101] == 1.0 - wp[1] * 500, '重复结算不应二次计损'
-        assert st.vehicles[0]['condition'] == p['vmax'] - 3.0, \
+        assert st.vehicles[0]['condition'] == p['vmax'] - 2.0, \
             '重复结算不应二次计损（载具）'
     finally:
         combat_handlers.STORE = old
@@ -916,9 +931,19 @@ def test_db_normalize_create_and_wear():
                     'SELECT condition FROM vehicles WHERE id = $1', vrow['id']))
                 vfull = wardb.vehicle_full_condition(
                     vrow['vehicle_variant_template_id'])
-                assert vcond == vfull - 2.0, \
-                    f'载具磨损 {vcond} != 预期 {vfull - 2.0}'
-                print(f'  PASS  战后载具磨损（{vrow["id"]}: {vfull} -> {vcond}，2 次出生）')
+                assert vcond == vfull, '缺逐车状态不能以角色出生数扣损'
+                _usage_cleanup()
+                combat_handlers.STORE = st
+                try:
+                    raw = _condition_status(10, vrow['id'], vfull, vfull - 2)
+                    await combat_handlers._apply_vehicle_condition_reports(
+                        [(pid, combat_handlers._split_fields(raw))], (9999999, 999999))
+                finally:
+                    combat_handlers.STORE = old
+                    _usage_cleanup()
+                vcond = float(await conn.fetchval(
+                    'SELECT condition FROM vehicles WHERE id = $1', vrow['id']))
+                assert vcond == vfull - 2, '逐实例报告必须正常扣损'
         finally:
             try:
                 await conn.execute('ROLLBACK')

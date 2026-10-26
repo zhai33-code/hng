@@ -380,6 +380,15 @@ async def release_player_mission_sessions(pid, writer=None, view_cmd=None,
         for mission_id in mission_ids:
             await release_auto_squad_memberships(mission_id, {int(pid)})
         pms_id = max(my_pms)          # 最新会话 = 客户端表中的当前行
+        # Persist single-player departures even for offline releases.
+        real_squads = {int((PMS_TO_SESSION.get(p) or {}).get('squad_db_id') or 0)
+                       for p in my_pms} - {0}
+        for squad_db_id in real_squads:
+            try:
+                await reset_real_squad_to_lobby(
+                    squad_db_id, player_ids={int(pid)})
+            except Exception as e:
+                log(f'      [mission] real squad reset failed: {e}')
         if view_cmd is not None:
             # ★ 必须先于 PMS DELETE 推送：PMS DELETE 触发客户端 lobbySignal →
             #   StatusMediator.onLobbySignalUpdates 读 squadSession.missionId
@@ -387,22 +396,6 @@ async def release_player_mission_sessions(pid, writer=None, view_cmd=None,
             #    missionId=0 → isOwnedByPlayer → BASE_STATE；非零则
             #    LOCKED_IN_COMBAT，null 则 TypeError #1009 卡 processing）
             solo = _SOLO_SQUADS.get(int(pid)) if pid is not None else None
-            # 真实小队成员放弃：整队回 InLobby（mission=0 行先于 PMS DELETE，
-            # 同 solo 重置的 StatusMediator 前置要求）
-            squad_db_id = 0
-            for _p in my_pms:
-                _s = PMS_TO_SESSION.get(_p) or {}
-                if int(_s.get('player_id', 0) or 0) == int(pid or 0):
-                    squad_db_id = int(_s.get('squad_db_id', 0) or 0)
-                    if squad_db_id:
-                        break
-            if squad_db_id:
-                try:
-                    await reset_real_squad_to_lobby(squad_db_id)
-                    log(f'S->C (SquadSession mission=0 + members InLobby '
-                        f'★real squad {squad_db_id} reset before PMS delete)')
-                except Exception as e:
-                    log(f'      [mission] real squad reset failed: {e}')
             if solo is not None:
                 try:
                     solo['mission_id'] = 0

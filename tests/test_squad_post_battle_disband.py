@@ -214,3 +214,35 @@ def test_new_persistent_squad_after_exit_is_not_shadowed(roster, monkeypatch):
         assert [m['player_id'] for m in (
             mm_state._MM_MISSION_SQUADS[MID][SID]['members'])] == [2]
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('online', [False, True])
+@pytest.mark.parametrize('pid', [2, 11])
+def test_persistent_departure_restores_only_leaver(roster, monkeypatch, online, pid):
+    from test_squad_authorization import Store
+    store = Store()
+    store.squad['leader_character_id'] = 25
+    store.members = {
+        1: Store._member(1, 2, 'Leader', 25, 4),
+        2: Store._member(2, 11, 'Member', 31, 4)}
+    monkeypatch.setattr(state, 'STORE', store)
+    monkeypatch.setattr(squad, 'STORE', store)
+    for player_id in (2, 11):
+        roster[player_id].player_id = player_id
+        mm_state.PMS_TO_SESSION[80000 + player_id]['squad_db_id'] = 10
+        mm_state._MM_QUEUES[player_id] = {
+            'mission_id': MID, 'ctx': {'squad_db_id': 10}}
+    mm_state._SOLO_SQUADS.clear()
+    if not online:
+        state.FLASH_SESSIONS.pop('Leader' if pid == 2 else 'Member')
+    session = roster[pid]
+    asyncio.run(mission.release_player_mission_sessions(
+        pid, session.writer if online else None,
+        session.playerview_cmd if online else None))
+    statuses = {m['player_id']: m['status'] for m in store.members.values()}
+    other_pid = 11 if pid == 2 else 2
+    assert statuses == {pid: 2, other_pid: 4}
+    assert _session_fields(roster[other_pid].writer)[-1][17] == MID
+    assert mm_state._MM_QUEUES[other_pid]['mission_id'] == MID
+    if online:
+        assert _session_fields(session.writer)[-1][17] == 0
