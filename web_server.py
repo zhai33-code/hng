@@ -585,8 +585,9 @@ def _handle_register_api(handler):
     if not username or not password:
         _json_reply(handler, {'error': '用户名和密码不能为空'}, 400)
         return
-    if not re.fullmatch(r'[A-Za-z0-9_\-.]{2,24}', username):
-        _json_reply(handler, {'error': '用户名需为 2-24 位字母/数字/_-. 组合'}, 400)
+    # 客户端 LoginModel.checkStandaloneUsername 要求登录名至少 4 位。
+    if not re.fullmatch(r'[A-Za-z0-9_\-.]{4,24}', username):
+        _json_reply(handler, {'error': '用户名需为 4-24 位字母/数字/_-. 组合'}, 400)
         return
     # cheat 门控封禁：客户端 ApplicationPlayer::PreInit 对昵称做
     # "reto.*" / "[admin]*" 通配匹配，命中即解锁控制台 + cheat 选项。
@@ -682,8 +683,9 @@ def _handle_import_api(handler):
     if not username or not password:
         _json_reply(handler, {'error': '用户名和密码不能为空'}, 400)
         return
-    if not re.fullmatch(r'[A-Za-z0-9_\-.]{2,24}', username):
-        _json_reply(handler, {'error': '用户名需为 2-24 位字母/数字/_-. 组合'}, 400)
+    # 客户端 LoginModel.checkStandaloneUsername 要求登录名至少 4 位。
+    if not re.fullmatch(r'[A-Za-z0-9_\-.]{4,24}', username):
+        _json_reply(handler, {'error': '用户名需为 4-24 位字母/数字/_-. 组合'}, 400)
         return
     low = username.lower()
     if low.startswith(('reto.', '[admin]')):

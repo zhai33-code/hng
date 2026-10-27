@@ -34,7 +34,7 @@
     <el-form-item prop="username" label="新用户名">
       <el-input
         v-model="form.username"
-        placeholder="2-24 位字母 / 数字 / _ - . 组合"
+        placeholder="4-24 位字母 / 数字 / _ - . 组合"
         maxlength="24"
         autocomplete="username"
         :disabled="loading"
@@ -220,7 +220,7 @@ const rules: FormRules = {
   ],
   username: [
     { required: true, message: '请输入新用户名', trigger: 'blur' },
-    { pattern: /^[A-Za-z0-9_\-.]{2,24}$/, message: '2-24 位字母/数字/_-. 组合', trigger: 'blur' },
+    { pattern: /^[A-Za-z0-9_\-.]{4,24}$/, message: '4-24 位字母/数字/_-. 组合', trigger: 'blur' },
   ],
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },

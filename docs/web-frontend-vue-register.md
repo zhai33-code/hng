@@ -26,7 +26,7 @@ web/
 - `settings.js` 的 `account_url = http://{PUBLIC_HOST}/account`（客户端"账号"链接入口）。
 - 建号入口 `STORE.create_player(username, password)`：`ON CONFLICT DO NOTHING`，已存在返回 None（[player_store.py:699](file:///Volumes/ZHITAI/Users/zhouchenminkun/Desktop/dev-projects/hng-re/hng-re/player_store.py#L699)）。
 - **官方视觉素材可直接复用**：客户端 GAME_DIR 已带 `images/Soldier/`（士兵立绘 150+）、`images/Campaign/`（战场地图图）、`images/Membership/`（jpg 宣传图）、`images/Rank/`（军衔），且 80 端口静态回退已可直接访问（如 `/images/Soldier/1.png`）——注册页无需额外图片资产。
-- 现有安全约束（必须完整保留）：64KB Content-Length 上限、用户名 `2-24` 位 `[A-Za-z0-9_\-.]`、`reto.`/`[admin]` 保留前缀拒绝（记日志、对外固定话术）、密码 4-64 位、DB 错误细节不外泄、静态敏感扩展名 404、日志走 `state.log()`（[HH:MM:SS] 前缀 + 按天滚动）。
+- 现有安全约束（必须完整保留）：64KB Content-Length 上限、用户名 `4-24` 位 `[A-Za-z0-9_\-.]`、`reto.`/`[admin]` 保留前缀拒绝（记日志、对外固定话术）、密码 6-64 位、DB 错误细节不外泄、静态敏感扩展名 404、日志走 `state.log()`（[HH:MM:SS] 前缀 + 按天滚动）。
 - 部署形态：Windows 云服务器 `git pull` + `admin_restart_server.ps1` 重启，**服务器无 Node 环境** → 构建产物 `web/dist` 提交入库。
 - 数据库：PostgreSQL（players/characters/battle_reports/mission_records 等表，asyncpg 连接池）。
 
