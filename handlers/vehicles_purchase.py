@@ -523,6 +523,52 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
         return
     va_id = a['id']
 
+    # ★ 2026-10-28 关键兼容修复（客户端 Error #1009 真因，反编译确认）：
+    #   客户端 VehicleModificationMediator.ammoPurchaseResponse() 的实现是：
+    #     if (response == ok) purchaseSignal.dispatch(VEHICLE_AMMO,
+    #                                this._selectedUpgrade.upgradeTemplateId, 0);
+    #   this._selectedUpgrade **没有 null 检查**（同一文件里 onUpgradeSelectionChange
+    #   有检查，这里漏了）。而 _selectedUpgrade 只在「当前载具存在 isEquipped 的
+    #   升级件/弹药」时才被赋值；弹药侧 isEquipped = equippedVehicleAmmoStorageId
+    #   不等于 0。若该载具手上没有任何已装备的弹药，列表里就没有可选中项，
+    #   _selectedUpgrade 保持 null → 买弹药返回 ok 时当场抛 Error #1009，
+    #   改装窗口卡死、拖拽失效。
+    #   规避：先查该载具是否已有「已装备」的弹药/升级件；没有的话把新买的这发
+    #   自动装进它的默认弹药仓（KVCS 先于 Response 送达，客户端重建列表后就有
+    #   isEquipped 项，_selectedUpgrade 不再是 null）。
+    async def _vehicle_has_equipped_item(player_id, vehicle_id):
+        try:
+            for _a in await STORE.list_vehicle_ammo(player_id):
+                if (int(_a['vehicle_id'] or 0) == int(vehicle_id)
+                        and int(_a['equipped_storage_id'] or 0) != 0):
+                    return True
+            for _u in await STORE.list_vehicle_upgrades(player_id):
+                if (int(_u['vehicle_id'] or 0) == int(vehicle_id)
+                        and int(_u['equipped_slot_id'] or 0) != 0):
+                    return True
+        except Exception as _e:
+            log(f'[DB] equipped-item probe failed: {_e}')
+        return False
+
+    va_auto_storage = 0
+    va_auto_slot = 0
+    try:
+        if not await _vehicle_has_equipped_item(pid, va_vehicle_id):
+            for (_sid, _tid) in _default_vehicle_ammo_for(parent_tpl):
+                if int(_tid) == int(va_template_id):
+                    va_auto_storage = int(_sid)
+                    break
+            if va_auto_storage:
+                await STORE.set_vehicle_ammo_equipment(
+                    pid, va_id, va_auto_storage, 1, True, va_vehicle_id)
+                va_auto_slot = 1
+                log(f'      [compat] 载具 {va_vehicle_id} 无已装备弹药，新弹药 '
+                    f'id={va_id} 自动装到仓 {va_auto_storage} 槽 1（规避客户端 #1009）')
+    except Exception as _e:
+        log(f'[DB] auto-equip new ammo failed: {_e}')
+        va_auto_storage = 0
+        va_auto_slot = 0
+
     # ★ 2026-10-28 关键顺序修复（客户端 Error #1009 真因）：
     #   客户端 VehicleModificationMediator.ammoPurchaseResponse() 在收到
     #   CreateVehicleAmmoResponse 时会去 VehicleAmmoTable 里找这发新弹药；
@@ -534,11 +580,13 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
 
     # 1. 先通过 SOLDIER_VIEW 推送 VehicleAmmo 实例（同一 TCP 连接，顺序有保证）
     if sess.soldier_view_cmd is not None:
-        aproto = _msg_vehicle_ammo(va_id, va_template_id, va_vehicle_id, 0, 0,
-                                   0, maxcond)
+        aproto = _msg_vehicle_ammo(va_id, va_template_id, va_vehicle_id,
+                                   va_auto_storage, va_auto_slot,
+                                   va_char_id if va_auto_storage else 0, maxcond)
         await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo', aproto)
         log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo id={va_id}, '
-            f'template={va_template_id}, vehicle={va_vehicle_id}, condition={maxcond})')
+            f'template={va_template_id}, vehicle={va_vehicle_id}, '
+            f'storage={va_auto_storage}, slot={va_auto_slot}, condition={maxcond})')
 
     # 2. 再返回 CreateVehicleAmmoResponse (response=1 ok)，客户端显示购买成功
     resp_proto = pb_int32(1, 1)
