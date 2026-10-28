@@ -22,6 +22,7 @@ from wardb import (
     _CUR_NAME,
     _VEHICLE_UPGRADE_MAXCOND,
     _VEHICLE_VARIANT_PARENT,
+    _vehicle_supports_ammo,
     ammo_wear_params,
     vehicle_full_condition,
     vehicle_upgrade_wear_params,
@@ -411,10 +412,45 @@ async def handle_setvehicleammorequest(sess, writer, cmd_id, req_type, proto):
 
     affected = []
     pid = await sess.ensure_player()
-    if pid is not None:
+    ammo_denied = False
+    if pid is not None and sa_do_equip and sa_vehicle_id and sa_ammo_id:
+        # ★ 2026-10-28 适配性准入（取代原先的「实例归属独占」）：
+        #   用户实测期望是「相同炮弹类型可共享」—— 同一种炮弹只要能装到这辆车上
+        #   就应该能用（潘兴与 M36B1 共用 90mm AP T33 是合理的），
+        #   不同口径/不适配的弹药才该被拒。
+        #   判定走 WarDatabase：载具 variant → parent vehicle template，
+        #   再用 _vehicle_supports_ammo 看该弹药模板是否给它用。
         try:
-            # vehicleId 一并传入：弹药带归属（vehicle_ammo.vehicle_id）时，
-            # 只允许装回原载具（潘兴的炮弹不能给 M36B1），校验在 store 层做
+            _veh = None
+            for _v in await STORE.list_vehicles(pid):
+                if int(_v['id']) == int(sa_vehicle_id):
+                    _veh = _v
+                    break
+            _ammo = None
+            for _a in await STORE.list_vehicle_ammo(pid):
+                if int(_a['id']) == int(sa_ammo_id):
+                    _ammo = _a
+                    break
+            if _veh is None or _ammo is None:
+                ammo_denied = True
+                log(f'      SetVehicleAmmo: denied (vehicle {sa_vehicle_id} or '
+                    f'ammo {sa_ammo_id} not owned)')
+            else:
+                _parent = _VEHICLE_VARIANT_PARENT.get(
+                    int(_veh['vehicle_variant_template_id']))
+                if _parent is None or not _vehicle_supports_ammo(
+                        int(_parent), int(_ammo['ammo_template_id'])):
+                    ammo_denied = True
+                    log(f'      SetVehicleAmmo: denied (ammo template '
+                        f'{_ammo["ammo_template_id"]} not mountable on vehicle '
+                        f'{sa_vehicle_id} / parent template {_parent})')
+        except Exception as e:
+            log(f'[DB] vehicle ammo fit check failed: {e}')
+
+    if pid is not None and not ammo_denied:
+        try:
+            # vehicleId 一并传入：装备时把 vehicle_id 绑到目标载具，
+            # 卸下时清 0（客户端按 vehicleId == 0 || == 当前载具 过滤显示）
             affected = await STORE.set_vehicle_ammo_equipment(pid, sa_ammo_id,
                                                               sa_storage_id,
                                                               sa_slot_index, sa_do_equip,

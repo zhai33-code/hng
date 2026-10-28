@@ -264,13 +264,12 @@ class EquipmentVehiclesMixin:
         """装备（do_equip=true）或卸下（false）载具弹药。装备时先清空同载具同仓同槽位
         的其他弹药（互斥：一个弹药仓槽位只能装一件）。返回受影响弹药行列表。
 
-        ★ 2026-10-28 归属校验（用户实测需求）：弹药属于某辆具体载具实例，
-        不能因为模板相同就在不同载具之间串用（潘兴的炮弹不能给 M36B1）。
-        - 归属记在 `owner_vehicle_id`（永久，退仓/指派都不清）；
-          `vehicle_id` 是当前绑定，退仓后会清 0，仅用于显示。
-        - 有归属且请求带了 vehicleId 时，两者必须一致，否则拒绝
-          （返回空列表，响应 response=0）。
-        - 兼容：owner_vehicle_id=0（2026-10-28 之前的历史行）不做限制。
+        ★ 2026-10-28 归属语义最终定案（用户实测反馈）：
+        **按弹药类型共享**，不按实例独占。同一种炮弹只要能装到这辆车上就该能装
+        （潘兴和 M36B1 都用 90mm AP T33，那就都该能用这发）。适配性校验在
+        handlers/vehicles.py 的 handle_setvehicleammorequest 里用 WarDatabase 的
+        _vehicle_supports_ammo 做（按载具 parent template 判定），这里不再拦。
+        `owner_vehicle_id` 只作为「原来是谁的」参考信息保留，不参与准入。
         """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -281,12 +280,8 @@ class EquipmentVehiclesMixin:
                     ammo_id, player_id)
                 if row is None:
                     return []
-                # ---- 归属校验：有归属的弹药只能装回原载具 ----
-                owner_vehicle = int(row.get('owner_vehicle_id') or 0)
                 req_vehicle = int(vehicle_id or 0)
-                if do_equip and owner_vehicle != 0 and req_vehicle != 0 \
-                        and owner_vehicle != req_vehicle:
-                    return []
+                owner_vehicle = int(row.get('owner_vehicle_id') or 0)
                 affected = [dict(row)]
                 # ★ 2026-10-28 关键修复：装备时必须把 vehicle_id 指向目标载具。
                 #   原实现只更新 equipped_storage_id / slot_index，vehicle_id 一直

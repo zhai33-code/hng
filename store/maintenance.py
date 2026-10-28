@@ -280,19 +280,20 @@ class MaintenanceMixin:
                     'WHERE vehicle_id = $1 AND player_id = $2',
                     int(item_id), int(player_id))
                 # 弹药不随载具指派（同改造语义；兜底脱离挂靠，防幽灵弹药）
-                # ★ 2026-10-28 修复（三步一并）：
-                #   1) character_id 一并清 0：否则产生「挂角色、无所属载具」的
-                #      孤儿行，客户端按角色渲染到该角色每一辆载具上，表现为
-                #      每辆坦克都多一份相同弹药。
-                #   2) vehicle_id 清 0：让弹药回到补给站弹药栏独立显示、可单独
-                #      搬运（保留 vehicle_id 会让弹药跟随载具，载具被取出后
-                #      弹药在补给站"消失"，用户实测反馈）。
-                #   3) owner_vehicle_id **不动**：它是永久归属，装备时用它校验
-                #      「只能装回原载具」（潘兴的炮弹不能塞给 M36B1）。
+                # ★ 2026-10-28 第三次修正（依据客户端源码）：
+                #   反编译 VehicleModificationMediator.setupAmmoList 确认过滤条件是
+                #     characterId == selectedCharacterId
+                #     且 (vehicleId == 0 || vehicleId == 当前载具)
+                #   也就是说：
+                #   - vehicleId=0 的弹药会被**所有**适配该模板的载具都列出来
+                #     （用户反馈「不属于这辆车的炮弹也显示，很占位置」）；
+                #   - characterId=0 的弹药直接不可见（用户反馈「买了被吞」）。
+                #   所以退仓/指派时只清「装备状态」（storage/slot），
+                #   vehicle_id 与 character_id 都保留 → 弹药始终只出现在它自己的
+                #   载具页签里，且随时可见。owner_vehicle_id 作为兜底归属不动。
                 await conn.execute(
-                    'UPDATE vehicle_ammo SET character_id = 0, vehicle_id = 0, '
-                    'equipped_storage_id = 0 WHERE vehicle_id = $1 '
-                    'AND player_id = $2',
+                    'UPDATE vehicle_ammo SET equipped_storage_id = 0, slot_index = 0 '
+                    'WHERE vehicle_id = $1 AND player_id = $2',
                     int(item_id), int(player_id))
                 # 皮肤不随载具指派（同改造语义；兜底脱离挂靠）+
                 # vehicles.variant_id 反向引用复位（载具不得指向留仓皮肤）
@@ -380,13 +381,16 @@ class MaintenanceMixin:
                     'UPDATE weapon_ammo SET character_id = 0, weapon_id = 0 '
                     'WHERE weapon_id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
-                # 配件随武器退仓并解绑（weapon_id 一并清 0 → 独立仓库配件，
-                # 可与武器分别发回士兵；2026-09-13 改造：此前只清 character_id
-                # 保留挂靠，出库指派时配件被武器无差别带走。兵种限制不因此
-                # 丢失——挂接时点 setweaponmodifierrequest 按 _mod_usable_by_class
-                # 校验）
+                # 配件随武器退仓并解绑（weapon_id 清 0 → 独立仓库配件）
+                # ★ 2026-10-28 修正：只清 weapon_id，**保留 character_id**。
+                #   客户端 WeaponModifierUtilities.getModWithTemplateIdOwnedForWeapon
+                #   的候选条件 = characterId == selectedCharacterId 且
+                #   (weaponId == 目标武器 || weaponId == 0)。把 character_id 清 0
+                #   会让配件从所有角色界面消失 —— 用户反馈「相同配件没法共享」。
+                #   保留角色后，同一配件在该角色名下所有兼容武器之间都能自由挂接
+                #   （挂到另一把时会自动从原枪移走，独占语义不变）。
                 await conn.execute(
-                    'UPDATE weapon_modifiers SET character_id = 0, weapon_id = 0 '
+                    'UPDATE weapon_modifiers SET weapon_id = 0 '
                     'WHERE weapon_id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
                 # 皮肤随武器退仓并解绑（weapon_id 清 0 → 独立仓库皮肤）+
@@ -470,8 +474,10 @@ class MaintenanceMixin:
         返回受影响行数（0 = 容器上没有可卸下的升级件/皮肤）。"""
         if int(item_type or 0) == 1:
             async with self.pool.acquire() as conn:
+                # ★ 2026-10-28：只清 weapon_id，保留 character_id（同退仓路径）。
+                #   清掉角色归属会让配件在客户端界面消失，无法再挂到别的枪上。
                 n = await conn.execute(
-                    'UPDATE weapon_modifiers SET weapon_id = 0, character_id = 0 '
+                    'UPDATE weapon_modifiers SET weapon_id = 0 '
                     'WHERE weapon_id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
             return _rowcount(n)
