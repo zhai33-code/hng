@@ -1,0 +1,5 @@
+# server/（管理后端 Python）与 web 根的忽略项
+__pycache__/
+*.pyc
+.admin_secret
+admin_stderr.log

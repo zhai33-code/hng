@@ -1,0 +1,71 @@
+{
+  // 常用运维动作：Ctrl+Shift+B 或命令面板 "Tasks: Run Task"
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "一键启动（PG + 游戏服 + 自检）",
+      "type": "shell",
+      "command": "powershell -ExecutionPolicy Bypass -File .\\tmp\\run_all.ps1",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "重启游戏服（WMI 拉起，SSH/终端断开不受影响）",
+      "type": "shell",
+      "command": "powershell -ExecutionPolicy Bypass -File .\\admin_restart_server.ps1",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "启动管理后台 :8080",
+      "type": "shell",
+      "command": "powershell -ExecutionPolicy Bypass -File .\\web\\start_admin.ps1",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "停止游戏服（释放 80 / 15110）",
+      "type": "shell",
+      "command": "Get-NetTCPConnection -LocalPort 80,15110 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      "label": "停止数据库",
+      "type": "shell",
+      "command": "powershell -ExecutionPolicy Bypass -File .\\tmp\\pg_stop.ps1",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "查看日志（tail -f 游戏服）",
+      "type": "shell",
+      "command": "Get-Content .\\logs\\realtest_game.log -Wait -Tail 40",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "isBackground": true,
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      "label": "前端构建（pnpm build）",
+      "type": "shell",
+      "command": "& 'C:\\Users\\16977\\AppData\\Local\\Microsoft\\WinGet\\Packages\\OpenJS.NodeJS.LTS_Microsoft.Winget.Source_8wekyb3d8bbwe\\node-v24.20.0-win-x64\\corepack.cmd' pnpm build",
+      "options": { "cwd": "${workspaceFolder}/web/frontend" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      "label": "部署到线上服务器（带备份，需输 SSH 密码）",
+      "type": "shell",
+      "command": "& 'E:\\git\\git-bash.exe' -c \"cd /e/HnG-test && bash tmp/deploy_with_backup.sh\"",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    }
+  ]
+}

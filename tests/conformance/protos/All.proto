@@ -1,0 +1,10 @@
+// vendored from Heroes-and-Generals-community-project (MIT)
+// packages/hagcp-network-client/src/protos/All.proto
+// converted: syntax/proto2 header, required -> optional (wire equal)
+
+syntax = "proto2";
+
+import "HnG_States.proto";
+import "statrequests.proto";
+import "netsysmessages.proto";
+import "Common.proto";

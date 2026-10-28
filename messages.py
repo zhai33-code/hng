@@ -1,0 +1,594 @@
+# -*- coding: utf-8 -*-
+"""游戏状态消息构建层：HnG_States.* proto 构建函数（_msg_*）+ KVCS 推送助手。
+
+除 _push_kvcs（writer I/O）外全部为纯函数；依赖 protocol 的 pb 编码原语与
+wardb 的静态数据（弹药满耐久/勋带等级阈值/解锁位图长度）。
+被 handlers 各域模块与 realtest_server 复用。
+"""
+import struct
+import time
+
+from protocol import (
+    Chunk, build_zipchunk,
+    pb_string, pb_int32, pb_int64, pb_uint32, pb_float, pb_message, pb_packed_bool, pb_bool,
+)
+from state import CURRENT_PID, log
+from wardb import _prog_max, _AMMO_MAXCOND, _RIBBON_LEVEL_XP, _ribbon_level_from_xp
+
+# zipchunk 压缩阈值（B）：组好的 main 帧字节数 ≥ 阈值且 allow_zip 时整体
+# gzip 走 zipchunk 包装（客户端 Chunk.as:94-103 契约）；小帧 gzip 头/尾
+# 开销不划算保持明文。置 0 = 全量关闭（全明文，一键回滚开关）。
+ZIP_THRESHOLD = 1024
+
+
+def _cur_pid():
+    """当前会话的数据库 player_id（客户端按它过滤自己拥有的行）。"""
+    return int(CURRENT_PID.get() or 0)
+
+
+# ---- war_catalogue 构建（用于 query_war_catalogue_response）----
+def _msg_war_catalogue_faction(fid, ftid, tag):
+    raise RuntimeError('war catalogue factions must come from war_campaign/DB')
+
+
+def _msg_war_catalogue():
+    raise RuntimeError('war catalogue rows must come from war_campaign/DB')
+
+
+def _msg_character(name='Soldier', faction=1, template=1, rank=0, char_id=0,
+                   unlock_bits=None, combat_badge_0=0, combat_badge_1=0,
+                   stat_update_ts=0, uniform_variant_id=0, headgear_id=0,
+                   marked_deleted=0, previous_template=0, head_id=0,
+                   head_swap_type=0, is_on_leave=0):
+    """构建 HnG_States.character proto，用于 SOLDIER_VIEW 推送"""
+    m = b''
+    m += pb_int64(1, char_id)               # id（数据库 characters.id）
+    m += pb_string(2, name)                # name
+    m += pb_int64(3, _cur_pid())           # playerid（客户端按 currentPlayer.id 过滤）
+    m += pb_int64(4, template)             # charactertemplateid (从 pack 解析)
+    m += pb_int64(5, faction)              # factiontemplateid (从 pack 解析)
+    m += pb_int64(10, combat_badge_0)      # combatbadgeslot0
+    m += pb_int64(11, combat_badge_1)      # combatbadgeslot1
+    m += pb_int32(13, rank)                # rank (由 combat_xp 经 ExperienceLevels 阈值推导)
+    m += pb_int32(14, marked_deleted)      # markedDeleted（软删标记，DeleteCharacterRequest 后置 1）
+    m += pb_int32(15, 0)                   # firstBloodStatus
+    # specialCharacterFlag (field 16): 飞行员/伞兵/将军是官方特殊角色
+    # （客户端 setupRankUnlocks 等按特殊角色渲染军衔树），其余职业为普通角色
+    m += pb_int32(16, 1 if int(template) in (2, 4, 7) else 0)
+    m += pb_int64(17, uniform_variant_id)  # uniformVariantId（装备的军服迷彩变体实例 id）
+    m += pb_int64(18, headgear_id)         # headgearId（装备的头盔实例 id，UniformPart.id）
+    m += pb_int64(19, previous_template)   # previousCharacterTemplateId（兵种切换前的旧模板）
+    # statUpdateTimeStamp (field 20): 变化时客户端 CharacterModel.checkStatsWasUpdated
+    # 会重新请求 RequestReadCharacterStats → attributes 刷新（勋带等级/进度条/按钮恢复）。
+    # 购买勋带等级后必须传新时间戳，否则客户端看不到进度更新。
+    m += pb_int64(20, stat_update_ts)
+    # unlockBits (field 21): repeated bool, 位索引 = progressionUnlock.id
+    # 由 _char_unlock_bits_for 生成：默认解锁序列 + 已购物品解锁需求
+    if unlock_bits is None:
+        unlock_bits = [False] * (_prog_max + 1)
+    m += pb_packed_bool(21, unlock_bits)
+    # headId (field 22): UniformPartTemplate 模板 id（faction3 可选 0/89/90），
+    # 不是 UniformPart 实例 id——客户端 UniformPartTemplateTable.getFromId(f22)
+    # 按模板表查询，实例 id 会查不到 → getUniformPartIdsEquipped #1009 崩溃
+    m += pb_int64(22, head_id)             # 0=默认头
+    m += pb_int32(23, head_swap_type)      # eHeadSwapType（0=eFree 1=eNeedPayment）
+    m += pb_int32(24, is_on_leave)         # isOnLeave（SetCharacterActiveStatusRequest）
+    return m
+
+
+def _msg_weapon(wid, name, template_id, char_id, container_id=0, container_slot=0,
+                variant_id=0, clip_count=0, auto_repair=0, condition=100.0):
+    """构建 HnG_States.weapon proto（玩家武器实例），用于 SOLDIER_VIEW 推送。
+
+    clipCount f14：三态弹夹选择（负=最少 / 0=默认 / 正=最大，weapon KVCS 必填）。"""
+    m = b''
+    m += pb_int64(1, wid)                  # id
+    m += pb_string(2, name)                # name
+    m += pb_int64(3, template_id)          # weapontemplateid
+    m += pb_int64(4, _cur_pid())           # playerid（客户端按 currentPlayer.id 过滤）
+    m += pb_int64(5, char_id)              # characterId (0 = 仓库)
+    m += pb_int32(6, 0)                    # posx
+    m += pb_int32(7, 0)                    # posy
+    m += pb_string(8, '')                  # decals
+    m += pb_string(9, '')                  # containerType
+    m += pb_int64(10, container_id)        # containerId (装备时 = character.id)
+    m += pb_int32(11, container_slot)      # containerSlot (1-4; 0 = 未装备)
+    m += pb_float(12, condition)           # condition
+    m += pb_int32(13, auto_repair)         # autoRepair（SetWeaponAutoRepairRequest）
+    m += pb_int32(14, int(clip_count))     # clipCount（三态弹夹选择）
+    m += pb_int64(15, variant_id)          # equippedWeaponVariantId
+    return m
+
+
+def _msg_weapon_modifier(mid, template_id, char_id, weapon_id, auto_repair=0,
+                         condition=1.0):
+    """构建 HnG_States.WeaponModifier proto（武器配件实例），用于 SOLDIER_VIEW 推送。
+
+    condition 量纲是 0~1 分数（WeaponModifierTemplate.maxCondition 全表=1.0），
+    满=1.0；推 100.0 会被客户端算出负的损坏比例 → Math.max(1,…) = 1 块钱维修费。"""
+    m = b''
+    m += pb_int64(1, mid)              # id
+    m += pb_int64(2, template_id)      # templateId
+    m += pb_int64(3, _cur_pid())       # playerId
+    m += pb_int64(4, char_id)          # characterId
+    m += pb_int64(5, weapon_id)        # weaponId
+    m += pb_float(6, condition)        # condition
+    m += pb_int32(7, auto_repair)      # autoRepair（SetWeaponModiferAutoRepairRequest）
+    return m
+
+
+def _msg_weapon_ammo(aid, ammo_template_id, char_id, weapon_id, slot_index=0,
+                     condition=None, auto_repair=0):
+    """构建 HnG_States.WeaponAmmo proto（武器弹药实例），用于 SOLDIER_VIEW 推送"""
+    if condition is None:
+        condition = _AMMO_MAXCOND.get(int(ammo_template_id), 100.0)
+    m = b''
+    m += pb_int64(1, aid)                  # id
+    m += pb_int64(2, ammo_template_id)     # ammoTemplateId
+    m += pb_int64(3, _cur_pid())           # playerId
+    m += pb_int64(4, char_id)              # characterId
+    m += pb_int64(5, weapon_id)            # weaponId
+    m += pb_int32(6, slot_index)           # equippedAmmoSlotIndex (0=未装备)
+    m += pb_float(7, condition)            # condition（新弹药=模板 maxCondition 满耐久）
+    m += pb_int32(8, auto_repair)          # autoRepair（SetWeaponAmmoAutoRepairRequest）
+    return m
+
+
+async def _push_kvcs(writer, view_cmd, table_name, proto_data):
+    """通过已订阅视图的 cmd_id 推送 KeyValueChangeSet 表数据（单行）"""
+    data_chunk = Chunk(proto_data)
+    table_chunk = Chunk(table_name, [data_chunk])
+    action_chunk = Chunk(b'set', [table_chunk])
+    title_chunk = Chunk(b'KeyValueChangeSet', [action_chunk])
+    main = Chunk(struct.pack('<i', view_cmd), [title_chunk])
+    writer.write(main.write(b''))
+    await writer.drain()
+    log(f'      [kvcs] set {table_name.decode()} via cmd={view_cmd} '
+        f'{len(proto_data)}B')
+
+
+async def _push_kvcs_delete(writer, view_cmd, table_name, row_id):
+    """通过已订阅视图的 cmd_id 推送 KeyValueChangeSet delete 行
+    （行内容为 8 字节 little-endian 行 id，与 matchmaking 战局清理一致）"""
+    id_chunk = Chunk(struct.pack('<q', int(row_id)))
+    table_chunk = Chunk(table_name, [id_chunk])
+    action_chunk = Chunk(b'delete', [table_chunk])
+    title_chunk = Chunk(b'KeyValueChangeSet', [action_chunk])
+    main = Chunk(struct.pack('<i', view_cmd), [title_chunk])
+    writer.write(main.write(b''))
+    await writer.drain()
+    log(f'      [kvcs] del {table_name.decode()} row={int(row_id)} '
+        f'via cmd={view_cmd}')
+
+
+async def _push_kvcs_batch(writer, view_cmd, events, preserve_order=False,
+                           allow_zip=True):
+    """将一组 ('set',table,proto)/('del',table,id) 打包进单个
+    KeyValueChangeSet 消息推送：delete/set 各一个 action 块（delete 在前），
+    表块按行重复（客户端 updateTablesFromChangeset 对 changeset.subChunks
+    逐 action×逐表×取首行）。客户端先应用批内全部行、再按行应用顺序
+    FIFO 派发表更新信号（publishPendingTableUpdates）——delete 块在前
+    意味着 del 信号（如 segment 删除触发 commandnodeStoppedMoving 清
+    moving）先派发，set 信号（如 instance 更新的 updatedWarInstance 重钉，
+    要求 !moving）后派发。批内派发时读到的是整批应用后的最终表状态
+    （如 type 已=1，不会误触补给线重钉），但信号处理器查的 schema/组件
+    级标志（moving）由前序信号设置——跨行原子语义必须整批单消息且
+    del 先 set 后，否则漏掉城市重钉。
+
+    preserve_order=True：保序模式，只合并"相邻同 kind"事件为一个
+    action 块（客户端 subChunks 逐 action 块顺序解析，天然支持
+    del/set 交错多块），批内派发时序严格 = 事件顺序。到达推序
+    del segment → set instance → del destination 等交错序列必须走
+    此模式：onDestinationUpdates 重算 AT 列表 status=location，要求
+    instance（location 更新为新城市）先于 destination del 派发，
+    否则 status 按在途旧值（补给线=""）冻结、交战中 AT 无后续事件
+    自愈 → 部队列表不显示所在城市名（2026-09-15 修复）。
+
+    allow_zip（2026-09-17 P1）：main 帧字节数 ≥ ZIP_THRESHOLD 时整体
+    gzip 走 zipchunk 包装（单 zipchunk 只装 1 个内层完整帧，客户端
+    parseData 只解析第一棵 Chunk 树；压缩后反而更大则回退明文）。
+    combat 连接（hng.exe/ZServer wardatacomm）禁用——调用侧拿会话
+    is_combat_server 显式传 False（官方 warserver 从不给专用服发
+    KVCS，ZServer 堆曾因乱推崩溃）。"""
+    def _row_chunk(kind, table_name, payload):
+        if kind == 'set':
+            return Chunk(table_name, [Chunk(payload)])
+        return Chunk(table_name,
+                     [Chunk(struct.pack('<q', int(payload)))])
+
+    if preserve_order:
+        groups = []                      # [(kind, [table chunks])]
+        for ev in events:
+            if not groups or groups[-1][0] != ev[0]:
+                groups.append((ev[0], []))
+            groups[-1][1].append(_row_chunk(*ev))
+    else:
+        sets = []
+        dels = []
+        for ev in events:
+            (sets if ev[0] == 'set' else dels).append(_row_chunk(*ev))
+        groups = ([('del', dels)] if dels else []) + \
+                 ([('set', sets)] if sets else [])
+    actions = [Chunk(b'delete' if kind == 'del' else b'set', chunks)
+               for kind, chunks in groups]
+    title_chunk = Chunk(b'KeyValueChangeSet', actions)
+    main = Chunk(struct.pack('<i', view_cmd), [title_chunk])
+    frame = main.write(b'')
+    n_set = sum(1 for e in events if e[0] == 'set')
+    n_del = len(events) - n_set
+    if allow_zip and ZIP_THRESHOLD > 0 and len(frame) >= ZIP_THRESHOLD:
+        zframe = build_zipchunk(frame)
+        if len(zframe) < len(frame):
+            writer.write(zframe)
+            await writer.drain()
+            log(f'      [kvcs] batch {n_set} set / {n_del} del '
+                f'via cmd={view_cmd} zip {len(frame)}B→{len(zframe)}B')
+            return
+    writer.write(frame)
+    await writer.drain()
+    log(f'      [kvcs] batch {n_set} set / {n_del} del '
+        f'via cmd={view_cmd}')
+
+
+def _msg_store_campaign(campaign_id, ctype):
+    """构建 HnG_States.StoreCampaign proto（商店战役/折扣条目）。
+    activeFromTime/activeToTime 为 Zulu 格式 YYYYMMDDHHmmss（GMT），
+    客户端 TimeUtilities.convertZuluTimeToMilliseconds 解析；须覆盖当前服务器时间，
+    否则 checkIfCampaignShouldBeShownInCurrent 过滤掉，轮播仍为空。"""
+    m = b''
+    m += pb_int64(1, campaign_id)             # id
+    m += pb_int32(2, ctype)                   # type: 1=eDiscount 2=eCampaign
+    m += pb_string(3, str(campaign_id))       # assetIdentifier → campaignAssetId → images/Campaign/<id>.png
+    m += pb_string(4, '')                     # callToAction
+    m += pb_string(5, '')                     # iconType
+    m += pb_string(6, '20260816000000')       # activeFromTime
+    m += pb_string(7, '20990101000000')       # activeToTime
+    m += pb_string(8, f'Campaign {campaign_id}')
+    m += pb_int32(9, 0)                       # countdownHours
+    return m
+
+
+def _msg_weapon_variant(variant_id, char_id, weapon_id, variant_template_id):
+    """构建 HnG_States.WeaponVariant proto（武器皮肤实例）"""
+    m = b''
+    m += pb_int64(1, variant_id)              # id
+    m += pb_int64(2, _cur_pid())              # playerId
+    m += pb_int64(3, char_id)                 # characterId
+    m += pb_int64(4, weapon_id)               # weaponId
+    m += pb_int64(5, variant_template_id)     # weaponVariantTemplateId
+    return m
+
+
+def _msg_vehicle(vid, vehicle_variant_template_id, char_id, equipped_in_slot=0, variant_id=0,
+                 auto_repair=0, condition=100.0):
+    """构建 HnG_States.Vehicle proto（玩家载具实例），用于 SOLDIER_VIEW 推送。
+    表名注册为 'Vehicle'（VehicleTable.xmlTag），与武器 'weapon' 不同注意大小写。"""
+    m = b''
+    m += pb_int64(1, vid)                        # id
+    m += pb_int64(3, vehicle_variant_template_id)  # vehicleVariantTemplateId
+    m += pb_int64(4, _cur_pid())                  # playerId
+    m += pb_int64(5, char_id)                    # characterId
+    m += pb_int64(6, equipped_in_slot)           # equippedInSlot
+    m += pb_float(7, condition)                  # condition
+    m += pb_int32(8, auto_repair)                # autoRepair（SetVehicleAutoRepairRequest）
+    m += pb_int64(9, variant_id)                 # equippedVehicleVariantId（装备的皮肤实例 id）
+    return m
+
+
+def _msg_vehicle_variant(vid, char_id, vehicle_id, variant_template_id):
+    """构建 HnG_States.VehicleVariant proto（载具皮肤实例），用于 SOLDIER_VIEW 推送。
+    表名注册为 'VehicleVariant'（VehicleVariantTable.xmlTag）。"""
+    m = b''
+    m += pb_int64(1, vid)                       # id
+    m += pb_int64(2, _cur_pid())                # playerId
+    m += pb_int64(3, char_id)                   # characterId
+    m += pb_int64(4, vehicle_id)                # vehicleId
+    m += pb_int64(5, variant_template_id)       # vehicleVariantTemplateId
+    return m
+
+
+def _msg_vehicle_upgrade(uid, upgrade_template_id, vehicle_id, slot_id, char_id,
+                         condition=100.0, auto_repair=0):
+    """构建 HnG_States.VehicleUpgrade proto（载具升级/补给箱实例），用于 SOLDIER_VIEW 推送。
+    表名注册为 'VehicleUpgrade'（VehicleUpgradeTable.xmlTag）。"""
+    m = b''
+    m += pb_int64(1, uid)                       # id
+    m += pb_int64(2, upgrade_template_id)       # vehicleUpgradeTemplateId
+    m += pb_int64(3, vehicle_id)                # vehicleId
+    m += pb_int64(4, slot_id)                # equippedVehicleUpgradeSlotId (0=未装备)
+    m += pb_int64(5, _cur_pid())             # playerId
+    m += pb_int64(6, char_id)                   # characterId
+    m += pb_float(7, condition)                 # condition
+    m += pb_int32(8, auto_repair)               # autoRepair（SetVehicleUpgradeAutoRepairRequest）
+    return m
+
+
+def _msg_vehicle_ammo(aid, ammo_template_id, vehicle_id, storage_id, slot_index,
+                      char_id, condition=100.0, auto_repair=0):
+    """构建 HnG_States.VehicleAmmo proto（载具弹药实例），用于 SOLDIER_VIEW 推送。
+    表名注册为 'VehicleAmmo'（VehicleAmmoTable.xmlTag）。"""
+    m = b''
+    m += pb_int64(1, aid)                       # id
+    m += pb_int64(2, ammo_template_id)          # ammoTemplateId
+    m += pb_int64(3, vehicle_id)                # vehicleId
+    m += pb_int64(4, storage_id)                # equippedVehicleAmmoStorageId (0=未装备)
+    m += pb_int32(5, slot_index)               # equippedAmmoSlotIndex (0=未装备)
+    m += pb_int64(6, _cur_pid())                # playerId
+    m += pb_int64(7, char_id)                   # characterId
+    m += pb_float(8, condition)                 # condition
+    m += pb_int32(9, auto_repair)               # autoRepair（SetVehicleAmmoAutoRepairRequest）
+    return m
+
+
+def _msg_uniform_variant(vid, template_id, char_id):
+    """构建 HnG_States.UniformVariant proto（军服迷彩变体实例），用于 SOLDIER_VIEW 推送。
+    表名注册为 'UniformVariant'（UniformVariantTable.xmlTag）。"""
+    m = b''
+    m += pb_int64(1, vid)                       # id
+    m += pb_int64(2, _cur_pid())                # playerId
+    m += pb_int64(3, char_id)                   # characterId
+    m += pb_int64(4, template_id)               # uniformVariantTemplateId
+    return m
+
+
+def _msg_uniform_part(pid2, char_id, template_id, part_type):
+    """构建 HnG_States.UniformPart proto（头盔/军装部件实例），用于 SOLDIER_VIEW 推送。
+    表名注册为 'UniformPart'（UniformPartTable.xmlTag）。"""
+    m = b''
+    m += pb_int64(1, pid2)                 # id
+    m += pb_int64(2, _cur_pid())           # playerId
+    m += pb_int64(3, char_id)              # characterId
+    m += pb_int64(4, template_id)          # uniformPartTemplateId
+    m += pb_int32(5, part_type)            # uniformPartType (EUniformPartType: eHelmet=1)
+    return m
+
+
+def _msg_tracer_effect(tid, template_id, char_id, weapon_id, is_equipped=False):
+    """构建 HnG_States.TracerEffect proto（曳光弹效果实例），用于 SOLDIER_VIEW 推送。
+    表名注册为 'TracerEffect'（TracerEffectTable.xmlTag）。
+    官方模型：characterId=0 即仓库在库（TracerEffectUtilities.getTracerEffectsInDepot），
+    装备=行绑定 weaponId 且 isEquipped 置位。"""
+    m = b''
+    m += pb_int64(1, tid)                  # id
+    m += pb_int64(2, template_id)          # tracerEffectTemplateId
+    m += pb_int64(3, _cur_pid())           # playerId
+    m += pb_int64(4, char_id)              # characterId
+    m += pb_int64(5, weapon_id)            # weaponId
+    m += pb_bool(6, bool(is_equipped))     # isEquipped
+    return m
+
+
+def _msg_depot_new_item(row_id, player_id, new_item_str):
+    """构建 HnG_States.DepotNewItem proto（仓库"新物品"通知行）。
+
+    newItem f3 字符串格式（客户端 DepotNewItemTable.updateDictionary 解析）：
+    "tab_id1,id2|tab2_id3"——竖线分 tab，下划线分隔 tab 名与逗号串联的物品 id。
+    客户端 checkIsItemNew(tab, id) 据此点亮仓库红点；SetDepotItemViewed 后
+    服务端重推该行即消点。"""
+    m = b''
+    m += pb_int64(1, row_id)                 # id
+    m += pb_int64(2, player_id)              # playerId
+    m += pb_string(3, new_item_str)          # newItem
+    return m
+
+
+def _msg_ribbon(ribbon_template_id, total_xp):
+    """构建 statrequests.Ribbon proto（武器勋带进度）。
+    currentValue=累计XP, currentLevel=XP 推导等级, nextValue=下一级阈值。
+    客户端 getProgressionPercentages 用 currentValue/nextLevel.value 计算进度。"""
+    lv = _ribbon_level_from_xp(total_xp)
+    next_xp = _RIBBON_LEVEL_XP.get(lv + 1, _RIBBON_LEVEL_XP.get(lv, 0))
+    m = b''
+    m += pb_int64(1, ribbon_template_id)   # ribbonTemplateId
+    m += pb_int32(2, int(total_xp))        # currentValue (累计XP)
+    m += pb_int32(3, lv)                   # currentLevel (XP 推导)
+    m += pb_int32(4, next_xp)              # nextValue (下一级阈值)
+    return m
+
+
+def _msg_unlock_notification(notif_id, player_id, char_id, unlock_uid,
+                             ribbon_id, ribbon_level):
+    """构建 HnG_States.UnlockNotification proto（解锁通知行，2026-09-17
+    补齐——此前服务端从不推该表，解锁弹窗/面包屑角标/已读回执三件套
+    全哑：回执 handler 一直在等一条永远不会来的通知）。
+
+    客户端消费（UnlockNotificationModel.as）：
+    - 行 ADD/UPDATE → UnlockNotificationTable.newNotifications 非空 →
+      按 progressionUnlockId 查静态 ProgressionUnlockTable.unlockItemType
+      弹对应解锁窗（武器/载具/战斗徽章/指挥点/弹药/改装/军服共 12 种）；
+      玩家点掉/自动清理 → RespondToUnlockNotificationRequest 回执 →
+      服务端推 delete 行（handlers/misc.py）；
+    - 已拥有的武器/载具类行客户端 checkIfWeaponIsOwned 自清不弹，
+      eCharacterType 类 clearNotification 自清——按"解锁资格达成"语义
+      推送即可，无需服务端甄别物品类型。
+    unlockTimestamp 仅 debug 输出，Zulu 格式（YYYYMMDDHHMMSSZ）即可。"""
+    m = pb_int64(1, int(notif_id))             # id
+    m += pb_int64(2, int(player_id))           # playerId
+    m += pb_int64(3, int(char_id))             # characterId
+    m += pb_int64(4, int(unlock_uid))          # progressionUnlockId
+    m += pb_int64(5, int(ribbon_id))           # ribbonTemplateId（解锁来源勋带）
+    m += pb_int64(6, int(ribbon_level))        # ribbonLevel（达成等级）
+    m += pb_string(7, time.strftime(           # unlockTimestamp
+        '%Y%m%d%H%M%S', time.gmtime()) + 'Z')
+    m += pb_int32(8, 0)                        # notificationResponse（未读）
+    m += pb_bool(9, False)                     # markedForDelete
+    return m
+
+
+# ---------------------------------------------------------------------------
+# CharacterStats 标量字段（f1-f48）→ character_stats 键。
+# 键序 = 优先级：type-6 统计上报落库的 WIRE 名（statistics_server.py
+# WIRE_STAT_NAMES）优先，战斗结算 legacy 键（combat.py）回落。
+# f35 characterXp 单独走 characters.combat_xp，不在此表。
+# game_server（hng.exe 路径）与 handlers/characters.py（Flash 菜单路径）
+# 共用 —— 菜单统计界面（击杀/死亡/游玩时间/武器击杀）读的就是后者。
+# ---------------------------------------------------------------------------
+_CS_SCALAR_KEYS = {
+    1: ('PlayerScore', 'score'),
+    2: ('PlayerKills', 'kills'),
+    3: ('PlayerDeaths', 'deaths'),
+    4: ('PlayerSuicides',),
+    5: ('PlayerSpawns',),
+    6: ('PlayerBestMultiKill',),
+    7: ('PlayerSaviorKills',),
+    8: ('PlayerRunDistance',),
+    9: ('PlayerWalkDistance',),
+    10: ('PlayerSprintDistance',),
+    11: ('PlayerSwimDistance',),
+    12: ('PlayerCrouchDistance',),
+    13: ('PlayerTimeOnFoot',),
+    14: ('PlayerTimePlayed', 'time_active'),
+    15: ('PlayerTimeCrouched',),
+    16: ('PlayerParachuteTime',),
+    17: ('PlayerParachuteFreefallTime',),
+    18: ('PlayerParachuteFreefallDist',),
+    19: ('PlayerParachuteSpawns',),
+    20: ('PlayerParachuteEscape',),
+    21: ('PlayerSessionsPlayed',),
+    22: ('PlayerDamageDealt', 'player_damage'),
+    23: ('PlayerParachuteJumpsSuccessfull',),
+    24: ('PlayerFreefallJumps',),
+    25: ('PlayerTeamKills',),
+    26: ('PlayerRevengeKills',),
+    27: ('PlayerTeamScoreboard_3_4_5',),
+    28: ('PlayerTeamScoreboard_2',),
+    29: ('PlayerTeamScoreboard_1',),
+    30: ('PlayerScoreboard_1',),
+    31: ('PlayerBattlesWithoutDying',),
+    32: ('PlayerNrOfMultiKill',),
+    33: ('PlayerNrOfBattleWith1000ShotsFired',),
+    34: ('PlayerNrOfBattleWithKillSameEnemy4Times',),
+    37: ('PlayerNrOfBattleInfantryKillXArmor',),
+    38: ('PlayerNrOfBattleArmorKillXArmor',),
+    39: ('PlayerNrOfBattlePlaneKillXArmor',),
+    40: ('PlayerNrOfBattleInfantryKillXInfantry',),
+    41: ('PlayerNrOfBattleArmorKillXInfantry',),
+    42: ('PlayerNrOfBattlePlaneKillXInfantry',),
+    43: ('PlayerNrOfBattleXSaviorKills',),
+    44: ('PlayerNrOfBattleXRevengeKills',),
+    45: ('PlayerNrOfBattleXHeadshots',),
+    46: ('PlayerNrOfBattleXKnifeKills',),
+    47: ('PlayerNrOfBattleXGrenadeKills',),
+    48: ('PlayerNrOfBattleXPistolKills',),
+}
+
+# WeaponStats f2-f18 / VehicleStats f2-f7 / GameModeStats f2-f15
+# → 维度键后缀名（statistics_server._stat_db_key 写入的 w<id>/v<id>/gm<id> 前缀）
+_WEAPON_FIELDS = {
+    2: 'WeaponShotsFired', 3: 'WeaponHeadShots', 4: 'WeaponHits',
+    5: 'WeaponKills', 6: 'WeaponKilled', 7: 'WeaponTimeSpent',
+    8: 'WeaponPlayerKills', 9: 'WeaponMostHitsInARow',
+    10: 'WeaponDamageToPlayers', 11: 'WeaponDamageCloseRange',
+    12: 'WeaponDamageMidLowRange', 13: 'WeaponDamageMidHighRange',
+    14: 'WeaponDamageFarRange', 15: 'WeaponKillsCloseRange',
+    16: 'WeaponKillsMidLowRange', 17: 'WeaponKillsMidHighRange',
+    18: 'WeaponKillsFarRange',
+}
+_VEHICLE_FIELDS = {
+    2: 'VehicleDestroyed', 3: 'VehicleLost', 4: 'VehicleDistDriven',
+    5: 'VehicleDistDrivenWPassanger', 6: 'VehicleTimeSpent',
+    7: 'VehicleDamageDealt',
+}
+_GAMEMODE_FIELDS = {
+    2: 'GamemodeCPCaptures', 3: 'GamemodeCPAssists',
+    4: 'GamemodeCPTotalInfluence', 5: 'GamemodeResourcesCaptured',
+    6: 'GamemodeResourcesTotalInfluence', 7: 'GamemodeKillAnEnemyCapturing',
+    8: 'GamemodeKilledWhileCapturing', 9: 'GamemodeCPNotSpotted',
+    10: 'GamemodeKillAnEnemyWhileCapturing', 11: 'GamemodeAssaultAttackerWon',
+    12: 'GamemodeAssaultDefenderWon', 13: 'GamemodeAssaultBattles',
+    14: 'GamemodeSkirmishBattlesWon', 15: 'GamemodeSkirmishBattles',
+}
+
+
+def _group_dim_stats(stats, prefix):
+    """按 'w'/'v'/'gm' 前缀把 character_stats 键分组 → {维度id: {名: 值}}。
+
+    键格式见 statistics_server._stat_db_key（'w<id>/<Name>' 等）；
+    'wv<id>_<id>/'（武器×载具段）不以纯数字跟斜杠 → isdigit 过滤掉。
+    """
+    groups = {}
+    plen = len(prefix)
+    for key, val in stats.items():
+        if not key.startswith(prefix):
+            continue
+        sid, _, name = key[plen:].partition('/')
+        if not name or not sid.isdigit():
+            continue
+        groups.setdefault(int(sid), {})[name] = val
+    return groups
+
+
+def character_stats_payload(cstats, combat_xp=0):
+    """构建 CharacterStats（ResponseReadCharacterStatsEntry.f2）payload。
+
+    cstats = character_stats 全量键值（STORE.get_stats；type-6 统计上报经
+    statistics_server 落库的 WIRE 名 + w/v/gm 维度前缀键）。回填全部统计：
+    f1-f48 标量（WIRE 名优先、legacy 结算键回落）、f50/f51/f53 载具/武器/
+    模式维度数组；f35 characterXp ← combat_xp（characters 表，客户端
+    Global.characterExperience["combat"] 军衔进度条）。
+    game_server（hng.exe 路径）与 _msg_character_stats_entry（Flash 菜单
+    路径）共用，避免两份字段映射漂移。"""
+    cstats = cstats or {}
+    stats = b''
+    for field_num in range(1, 50):  # fields 1-49 (skip 36, which is missing in proto)
+        if field_num == 36:
+            continue
+        if field_num == 35:
+            stats += pb_int32(field_num, int(combat_xp))
+            continue
+        val = 0
+        for key in _CS_SCALAR_KEYS.get(field_num, ()):
+            if key in cstats:
+                val = int(cstats[key])
+                break
+        stats += pb_int32(field_num, val)
+    # f50 vehicleStatistics / f51 weaponStatistics / f53 gamemodeStatistics
+    for vid, grp in sorted(_group_dim_stats(cstats, 'v').items()):
+        m = pb_int32(1, vid)
+        for fn, name in _VEHICLE_FIELDS.items():
+            m += pb_int32(fn, int(grp.get(name, 0) or 0))
+        stats += pb_message(50, m)
+    for wid, grp in sorted(_group_dim_stats(cstats, 'w').items()):
+        m = pb_int32(1, wid)
+        for fn, name in _WEAPON_FIELDS.items():
+            m += pb_int32(fn, int(grp.get(name, 0) or 0))
+        stats += pb_message(51, m)
+    # f53 gamemodeStatistics：客户端 PlayerStatsMediator.setGameModeStats 只接受
+    # gameMode==0 的条目，非 0 一律丢弃（"Gamemode stats not taken"）。战斗端
+    # 上报时占领类统计走 gm0、击杀占领中敌人等走实际模式 id（gm1…），若按
+    # 原样分组回发，后者在界面上永远缺失 → 合并所有 gm 组为一条 gameMode=0
+    # （实测两组键集合不相交，按名求和不会重复计数）。
+    gm_merged = {}
+    for grp in _group_dim_stats(cstats, 'gm').values():
+        for name, val in grp.items():
+            gm_merged[name] = gm_merged.get(name, 0) + (val or 0)
+    if gm_merged:
+        m = pb_int32(1, 0)
+        for fn, name in _GAMEMODE_FIELDS.items():
+            m += pb_int32(fn, int(gm_merged.get(name, 0) or 0))
+        stats += pb_message(53, m)
+    stats += pb_string(56, '')  # key (required string)
+    return stats
+
+
+def _msg_character_stats_entry(char_id, ribbons, combat_xp=0, cstats=None):
+    """构建 statrequests.ResponseReadCharacterStatsEntry proto：
+    characterId=1, alltimeCharacterStatistics=2, attributes=3 (repeated Ribbon)。
+    统计字段构建委托 character_stats_payload（见其 docstring）。"""
+    stats = character_stats_payload(cstats, combat_xp)
+    m = b''
+    m += pb_int64(1, char_id)          # characterId
+    m += pb_message(2, stats)          # alltimeCharacterStatistics
+    for (rid, lv) in ribbons:
+        m += pb_message(3, _msg_ribbon(rid, lv))  # attributes (repeated Ribbon)
+    return m
+
+
+def msg_query_war_catalogue_response():
+    """无活动战争时的合法空目录；不再返回抓包的 Demo War。"""
+    return pb_int64(2, 0)                      # bonusId (required)
+
+
+# ---- war 消息（用于 KeyValueChangeSet 中的 "war" 表数据）----
+def _msg_war():
+    raise RuntimeError('war rows must come from war_campaign/DB')

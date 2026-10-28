@@ -1,0 +1,15 @@
+# HnG 私服 Python 依赖（Python 3.11+）
+# 安装：python -m pip install -r requirements.txt
+asyncpg==0.31.0
+PyJWT==2.13.0
+cryptography==50.0.0
+# 管理端（web/server/，FastAPI 独立进程）
+fastapi==0.129.0
+uvicorn==0.35.0
+# 注册页滑动验证码（register_captcha.py；Pillow/numpy 为 pi-captcha 传递依赖）
+pi-captcha==0.0.1
+Pillow==12.3.0
+numpy==2.5.2
+# 以下为 cryptography 的传递依赖（正常 pip install 会自动带上，列出仅供离线环境参考）
+cffi==2.1.1
+pycparser==3.0

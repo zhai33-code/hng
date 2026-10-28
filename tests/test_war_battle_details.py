@@ -1,0 +1,287 @@
+# -*- coding: utf-8 -*-
+"""战争图城市点击 → 战局详情链路回归（2026-09-08）。
+
+客户端有会战城市点击 → GetMissionDetailsRequest{f1=0, f2=battleId}
+（HandleWarBattleCommand 恒发 missionId=0）。此前服务端只读 f1 →
+恒查不到 → 回 43 → MissionDetailsWindow 秒关（用户报"点不开城市详情"）。
+
+测试注入 state.STORE 验证 f2 分支（参照 test_battlepass.py 注入模式）。
+"""
+
+import asyncio
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import state
+import mm_handler
+from protocol import pb_int32, pb_parse, build_response, pb_message
+
+
+class FakeWriter:
+    def __init__(self):
+        self.buf = b''
+
+    def write(self, data):
+        self.buf += data
+
+    async def drain(self):
+        pass
+
+
+class FakeSess:
+    def __init__(self):
+        self.player_id = 42
+
+
+class FakeBattleStore:
+    """get_mission_by_battle / get_mission_record 的最小 mock。"""
+
+    def __init__(self, by_battle=None, by_mid=None, battles=None, nodes=None):
+        self.by_battle = by_battle or {}
+        self.by_mid = by_mid or {}
+        self.battles = battles or {}
+        self.nodes = nodes or {}
+
+    async def get_mission_by_battle(self, battle_id, states=(0, 1)):
+        return self.by_battle.get(int(battle_id))
+
+    async def get_mission_record(self, mid):
+        return self.by_mid.get(int(mid))
+
+    async def get_war_battle(self, battle_id):
+        return self.battles.get(int(battle_id))
+
+    async def get_command_nodes_by_ids(self, ids):
+        return [self.nodes[int(i)] for i in ids if int(i) in self.nodes]
+
+
+async def _call(proto):
+    """调 _handle_mission_details 返回 (writer, 响应解析结果)。"""
+    w = FakeWriter()
+    sess = FakeSess()
+    await mm_handler._handle_mission_details(sess, w, 900, proto)
+    # build_response 的响应体在 frame 里；pb 解析 write 的字节提取 proto
+    # （响应 = frame 头 + GetMissionDetailsResponse proto；直接用
+    # mm_handler 的回退路径验证：43 = resp proto 第一字段）
+    return w
+
+
+def _is_not_found(writer):
+    """响应是否 mission_not_found(43)：pb_int32(1, 43) 编码 = b'\\x08\\x2b'。
+
+    （frame 头干扰 varint 扫描，改用字节序列判定。）"""
+    return b'\x08\x2b' in writer.buf
+
+
+async def main():
+    ok = 0
+    fail = 0
+
+    def check(name, cond, detail=''):
+        nonlocal ok, fail
+        if cond:
+            ok += 1
+            print(f'  PASS {name}')
+        else:
+            fail += 1
+            print(f'  FAIL {name} {detail}')
+
+    rec = {'id': 4242, 'name': 'war battle', 'preset': 3, 'state': 1,
+           'attacker_faction': 1, 'defender_faction': 2,
+           'owner_player_id': 42, 'map_entity_id': 20, 'battle_id': 77}
+
+    # T1: f1=0 + f2=battleId → 按 battle 反查 record → 成功响应（≠43）
+    orig_store = state.STORE
+    wb = {'id': 77, 'war_id': 1, 'battle_type': 1, 'battlefield_id': 20,
+          'started_at': None,
+          'factions': [{'faction': 1, 'at_id': 901}, {'faction': 2, 'at_id': 902}]}
+    # at1 用 JSON 字符串（真实 DB command_nodes.resources 口径，曾致
+    # HANDLER-ERR 'str' object has no attribute 'items'）；at2 用 dict
+    at1 = {'id': 901, 'template_id': 104, 'state': 0, 'faction': 1,
+           'owner_player_id': 42, 'name': 'Inf A',
+           'resources': '{"1": 90}'}
+    at2 = {'id': 902, 'template_id': 204, 'state': 0, 'faction': 2,
+           'owner_player_id': 43, 'name': 'Inf B',
+           'resources': {1: 120}}
+    state.STORE = FakeBattleStore(
+        by_battle={77: rec}, battles={77: wb}, nodes={901: at1, 902: at2})
+    # 拦截渲染捕获 (mission_id, details)
+    calls = []
+    orig_render = mm_handler._msg_mission_details_response_multi
+
+    def _cap(mid_arg, det_arg, zulu_arg):
+        calls.append((mid_arg, det_arg))
+        return orig_render(mid_arg, det_arg, zulu_arg)
+
+    mm_handler._msg_mission_details_response_multi = _cap
+    try:
+        w = await _call(pb_int32(1, 0) + pb_int32(2, 77))
+        check('T1 城市点击链（f1=0,f2=battleId）非 mission_not_found',
+              not _is_not_found(w))
+        check('T1b missionId 回填 == record.id（修复 1：非 0）',
+              calls and calls[0][0] == 4242,
+              f'calls={[(m, d.get("war_pending")) for m, d in calls]}')
+        det = calls[0][1] if calls else {}
+        check('T1c f5 资源 = roster 实际存量（非 FALLBACK 432/60/24）',
+              det.get('war_counts') == {1: {1: 90}, 2: {1: 120}},
+              f'counts={det.get("war_counts")}')
+        check('T1d f4 名单 = 真实 AT（非写死步兵名单）',
+              det.get('war_at_rows') == {1: [at1], 2: [at2]},
+              f'ats={det.get("war_at_rows")}')
+        check('T1e entity = battle 行口径（城战 bf/1）',
+              det.get('entity_id') == 20 and det.get('entity_type') == 1,
+              f'ent={det.get("entity_id")}/{det.get("entity_type")}')
+        # T1g: war_pending 简报必须建成 force_pool war rec（2026-09-15 修复：
+        # _build_war_rec 漏 await → rec 永不建 → 简报回退随机线+兵力堆单点）
+        import force_pool as _fp
+        check('T1g pending 简报建成 war rec（分线/红线数据源）',
+              _fp.mission_factions(4242) == (1, 2),
+              f'factions={_fp.mission_factions(4242)}')
+        _fp.release(4242)
+
+        # T1f: 成局后复用 live det（真实 players 名单，mid 路由生效）；
+        #      渲染层 copy 合并排队玩家，不改 live det 本体（桶空时名单不变）
+        live_det = {'battle_id': 77, 'preset': 3, 'players':
+                    [{'player_id': 42, 'gamertag': 'p1', 'faction': 1}],
+                    'attacker_faction': 1, 'defender_faction': 2,
+                    'map_entity_id': 20}
+        mm_handler._MM_MISSION_DETAILS[4242] = live_det
+        calls.clear()
+        w = await _call(pb_int32(1, 0) + pb_int32(2, 77))
+        check('T1f 成局后复用 live det + mid 路由',
+              calls and calls[0][0] == 4242
+              and calls[0][1].get('players') == live_det['players']
+              and calls[0][1] is not live_det,
+              f'calls={[(m, d.get("players")) for m, d in calls]}')
+        del mm_handler._MM_MISSION_DETAILS[4242]
+
+        # T6: war_pending（攻守未凑齐、局未成）players = 会战桶排队名单
+        #     ——玩家点"加入战斗"后重开据点详情应看到自己名字
+        #     （含跨会战不串 + 出池收缩；solo / 小队同口径，POOl.war_bucket）
+        import mm_pool
+        entry = mm_pool.QueueEntry(player_id=42, char_id=7, faction=1,
+                                   gamemode_id=10, battle_id=77)
+        e3 = mm_pool.QueueEntry(player_id=44, char_id=8, faction=1,
+                                gamemode_id=10, battle_id=99)
+        mm_handler.POOL.enqueue(entry)
+        mm_handler.POOL.enqueue(e3)
+        orig_q44 = mm_handler._MM_QUEUES.get(44)
+        mm_handler._MM_QUEUES[42] = {
+            'pmm_id': 1, 'mission_id': 0, 'gamemode': 10,
+            'ctx': {'gamertag': 'WarHero'}}
+        try:
+            calls.clear()
+            w = await _call(pb_int32(1, 0) + pb_int32(2, 77))
+            det = calls[0][1] if calls else {}
+            check('T6 war_pending players = 会战排队名单（加入战斗即可见）',
+                  [p['gamertag'] for p in det.get('players') or []]
+                  == ['WarHero'],
+                  f'players={det.get("players")}')
+            check('T6b 响应 f3 参战方含排队玩家名', b'WarHero' in w.buf)
+            check('T6c 跨会战不串（battle_id=99 不入 77 名单）',
+                  all(p['player_id'] != 44
+                      for p in det.get('players') or []))
+            # 出池（成局/取消）→ 名单自动收缩
+            mm_handler.POOL.remove(42)
+            calls.clear()
+            await _call(pb_int32(1, 0) + pb_int32(2, 77))
+            det = calls[0][1] if calls else {}
+            check('T6d 出池后名单收缩为空',
+                  det.get('players') == [], f'players={det.get("players")}')
+        finally:
+            mm_handler.POOL.remove(42)
+            mm_handler.POOL.remove(44)
+            mm_handler._MM_QUEUES.pop(42, None)
+            if orig_q44 is None:
+                mm_handler._MM_QUEUES.pop(44, None)
+            else:
+                mm_handler._MM_QUEUES[44] = orig_q44
+
+        # T7: 开打中 + 排队中并集（live det players ∪ war 桶，按 player_id
+        #     去重）——排队或开打，参与者都应出现在据点简报名单里
+        live_det = {'battle_id': 77, 'preset': 3, 'players':
+                    [{'player_id': 42, 'gamertag': 'p1', 'faction': 1}],
+                    'attacker_faction': 1, 'defender_faction': 2,
+                    'map_entity_id': 20}
+        mm_handler._MM_MISSION_DETAILS[4242] = live_det
+        mm_handler.POOL.enqueue(mm_pool.QueueEntry(
+            player_id=43, char_id=9, faction=2, gamemode_id=10,
+            battle_id=77))
+        mm_handler._MM_QUEUES[43] = {'pmm_id': 2, 'mission_id': 0,
+                                     'gamemode': 10,
+                                     'ctx': {'gamertag': 'QueuedOne'}}
+        try:
+            calls.clear()
+            w = await _call(pb_int32(1, 0) + pb_int32(2, 77))
+            det = calls[0][1] if calls else {}
+            check('T7 开打中简报名单 = 在局 + 排队并集',
+                  [p['gamertag'] for p in det.get('players') or []]
+                  == ['p1', 'QueuedOne'],
+                  f'players={det.get("players")}')
+            check('T7b 响应 f3 参战方同时含在局与排队玩家名',
+                  b'p1' in w.buf and b'QueuedOne' in w.buf)
+            check('T7c live det 本体不被渲染合并污染',
+                  live_det['players'] == [{'player_id': 42, 'gamertag': 'p1',
+                                           'faction': 1}])
+        finally:
+            del mm_handler._MM_MISSION_DETAILS[4242]
+            mm_handler.POOL.remove(43)
+            mm_handler._MM_QUEUES.pop(43, None)
+    finally:
+        mm_handler._msg_mission_details_response_multi = orig_render
+        state.STORE = orig_store
+
+    # T4: 野外遭遇局（battle_type=3）→ MissionInfo f5=sl id / f6=3（§三.5 B1）
+    from handlers.mission import _msg_mission_info_from_record
+    from war_campaign.common import battle_map_entity
+    wb_f = {'id': 78, 'battle_type': 3, 'battlefield_id': 555}
+    ent = battle_map_entity(wb_f)
+    rec_f = {'id': 5000, 'preset': 10, 'state': 0,
+             'attacker_faction': 1, 'defender_faction': 2,
+             'map_entity_id': 20, 'battle_id': 78}
+    parsed = pb_parse(_msg_mission_info_from_record(rec_f, 'z', entity=ent))
+    check('T4 野外局 f5=sl id / f6=3（客户端拼"城市名-字母"）',
+          parsed[5] == 555 and parsed[6] == 3,
+          f'f5={parsed.get(5)} f6={parsed.get(6)}')
+    # 城战 / 无 entity 回退 record.map_entity_id / 1
+    parsed2 = pb_parse(_msg_mission_info_from_record(rec_f, 'z'))
+    check('T4b 无 entity 回退 record map_entity_id/1',
+          parsed2[5] == 20 and parsed2[6] == 1)
+
+    # T5: _at_composition 池口径 = AT 实际存量优先（修复 3）
+    from matchmaking import _at_composition
+    import force_pool
+    comp = _at_composition({'template_id': 104, 'resources': {1: 33, 4: 10}})
+    check('T5 池编制随 AT 实际存量（非模板满编）',
+          comp == {1: 33, 4: 10}, f'comp={comp}')
+    comp2 = _at_composition({'template_id': 104, 'resources': {}})
+    full = force_pool.composition_for_template(104)
+    check('T5b resources 缺省回退模板满编', comp2 == full,
+          f'comp2={comp2} full={full}')
+
+    # T2: f1=0 + f2=0 + 无匹配 → 43（维持原语义）
+    state.STORE = FakeBattleStore()
+    try:
+        w = await _call(pb_int32(1, 0))
+        check('T2 空请求维持 43', _is_not_found(w))
+    finally:
+        state.STORE = orig_store
+
+    # T3: f1=0 + f2=battleId 但 battle 无 record → 43
+    state.STORE = FakeBattleStore()
+    try:
+        w = await _call(pb_int32(1, 0) + pb_int32(2, 999))
+        check('T3 battle 无关联 record → 43', _is_not_found(w))
+    finally:
+        state.STORE = orig_store
+
+    print(f'\n==== war_battle_details 回归：{ok}/{ok + fail} PASS ====')
+    if fail:
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

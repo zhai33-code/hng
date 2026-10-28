@@ -1,0 +1,368 @@
+// 管理端布局样式（HnG 军事风格：深底 + 橄榄绿 + 描金字）
+@use '../../styles/vars' as *;
+
+// 与 hng-theme.scss 的 .hng-stencil 同款（跨编译单元无法 @extend，本地复制）
+%stencil {
+  font-weight: 900;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: $hng-gold;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.8), 0 0 22px rgba(232, 212, 139, 0.25);
+}
+
+.admin-layout {
+  display: flex;
+  min-height: 100vh;
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(107, 122, 56, 0.12), transparent),
+    $hng-bg-deep;
+}
+
+// ---- 侧边栏 ----
+.admin-aside {
+  width: 220px;
+  flex-shrink: 0;
+  background: linear-gradient(180deg, #20241a 0%, #171a11 100%);
+  border-right: 1px solid #3a3e2e;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 0;
+}
+
+.admin-brand {
+  padding: 4px 20px 18px;
+  border-bottom: 1px solid #2c3023;
+  margin-bottom: 12px;
+
+  .brand-title {
+    @extend %stencil;
+    font-size: 19px;
+    display: block;
+  }
+
+  .brand-sub {
+    display: block;
+    margin-top: 4px;
+    font-size: 11px;
+    letter-spacing: 0.3em;
+    color: $hng-text-dim;
+    text-transform: uppercase;
+  }
+}
+
+.admin-menu {
+  flex: 1;
+  border-right: none !important;
+  background: transparent !important;
+  --el-menu-bg-color: transparent;
+  --el-menu-item-height: 44px;
+  --el-menu-hover-bg-color: #2a2e1f;
+
+  :deep(.el-menu-item) {
+    color: #b5af9a;
+    letter-spacing: 0.06em;
+
+    &.is-active {
+      color: $hng-gold;
+      background: #2a2e1f;
+      border-right: 2px solid $hng-olive;
+    }
+  }
+}
+
+.admin-user {
+  padding: 12px 20px 0;
+  border-top: 1px solid #2c3023;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: $hng-text-dim;
+  font-size: 13px;
+}
+
+// ---- 主区 ----
+.admin-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.admin-header {
+  height: 56px;
+  padding: 0 28px;
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid #2c3023;
+  background: rgba(25, 28, 18, 0.6);
+  backdrop-filter: blur(4px);
+
+  .page-title {
+    @extend %stencil;
+    font-size: 15px;
+  }
+}
+
+.admin-body {
+  flex: 1;
+  padding: 24px 28px 40px;
+}
+
+// ---- 通用面板 / 卡片 ----
+.panel {
+  background: $hng-bg-panel;
+  border: 1px solid #3a3e2e;
+  border-radius: 6px;
+  padding: 18px 20px;
+}
+
+.stat-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+  margin-bottom: 20px;
+
+  .stat {
+    @extend .panel;
+    padding: 16px 18px;
+
+    .label {
+      font-size: 12px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: $hng-text-dim;
+    }
+
+    .value {
+      font-size: 26px;
+      font-weight: 800;
+      color: $hng-gold;
+      margin-top: 6px;
+      overflow-wrap: anywhere;
+
+      // 大金额自适应：位数越多字号越小，防止撑破卡片
+      &.num {
+        font-variant-numeric: tabular-nums;
+
+        &.long {
+          font-size: 20px;
+        }
+      }
+    }
+  }
+}
+
+.toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+// 面板内表格：贴圆角裁剪，修复表头背景溢出导致的错位观感
+.panel .el-table {
+  --el-table-header-bg-color: #23261b;
+}
+
+.panel .el-table .el-table__inner-wrapper::before {
+  display: none; // 底部冗余边线，与 panel 边框叠加显得错位
+}
+
+.pager {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+// ---- 登录页 ----
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(1000px 500px at 50% -20%, rgba(107, 122, 56, 0.18), transparent),
+    $hng-bg-deep;
+
+  .login-card {
+    @extend .panel;
+    width: 380px;
+    padding: 34px 36px;
+
+    .login-title {
+      @extend %stencil;
+      font-size: 22px;
+      text-align: center;
+      display: block;
+      margin-bottom: 26px;
+    }
+  }
+}
+
+// ---- 装备明细 ----
+.gear-section {
+  margin-bottom: 22px;
+
+  .section-title {
+    @extend %stencil;
+    font-size: 13px;
+    display: block;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #2c3023;
+  }
+}
+
+// 装备卡列表：多列网格自适应换行（武器 3 列起 / 载具 2 列起）
+.gear-list {
+  display: grid;
+  gap: 10px;
+
+  // 武器（竖卡：图上字下）
+  &.weapons {
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  }
+
+  // 载具（图 190px + 文字，卡片较宽）
+  &.vehicles {
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  }
+}
+
+.gear-card {
+  @extend .panel;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 0;
+  padding: 12px 14px;
+  overflow: hidden;
+
+  .gear-icon {
+    width: 48px;
+    height: 48px;
+    flex-shrink: 0;
+    object-fit: contain;
+    background: #14170e;
+    border: 1px solid #33362a;
+    border-radius: 4px;
+  }
+
+  .gear-main {
+    flex: 1;
+    min-width: 0;
+
+    .gear-name {
+      font-weight: 700;
+      color: $hng-text;
+      overflow-wrap: anywhere;
+    }
+
+    .gear-meta {
+      margin-top: 2px;
+      font-size: 12px;
+      color: $hng-text-dim;
+    }
+
+    .gear-parts {
+      margin-top: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+
+      .part-tag {
+        font-size: 12px;
+        padding: 2px 8px;
+        background: #22251a;
+        border: 1px solid #33362a;
+        border-radius: 3px;
+        color: #b5af9a;
+        // 窄卡内长名（弹药等）允许折行，防截断
+        max-width: 100%;
+        overflow-wrap: anywhere;
+        white-space: normal;
+      }
+    }
+  }
+}
+
+.rank-badge {
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+// 战斗徽章（CombatBadges/{id}.png）——图标在上、文字在下
+.badges {
+  display: flex;
+  gap: 14px;
+}
+
+.badge-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 88px;
+
+  .combat-badge {
+    width: 48px;
+    height: 48px;
+    object-fit: contain;
+    flex-shrink: 0;
+  }
+
+  // 名字区固定两行高度：名称长短不再影响行与行之间的对齐
+  .badge-name {
+    font-size: 11px;
+    line-height: 1.35;
+    height: 30px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    color: #9a947e;
+    text-align: center;
+    word-break: break-word;
+    overflow: hidden;
+  }
+}
+
+// 响应式：窄屏收起侧栏为横向菜单
+@media (max-width: 860px) {
+  .admin-layout {
+    flex-direction: column;
+  }
+
+  .admin-aside {
+    width: 100%;
+    flex-direction: row;
+    align-items: center;
+    padding: 8px 0;
+    border-right: none;
+    border-bottom: 1px solid #3a3e2e;
+  }
+
+  .admin-brand {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding: 0 16px;
+  }
+
+  .admin-menu {
+    flex-direction: row !important;
+    border-bottom: none !important;
+
+    :deep(.el-menu-item.is-active) {
+      border-right: none;
+      border-bottom: 2px solid $hng-olive;
+    }
+  }
+
+  .admin-user {
+    border-top: none;
+    padding: 0 16px;
+  }
+}

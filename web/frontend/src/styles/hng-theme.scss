@@ -1,0 +1,147 @@
+// 全局主题（入口 main.ts 导入一次）：Element Plus 变量覆盖 + 公共类
+@use './vars' as *;
+
+:root {
+  // Element Plus 主题变量覆盖
+  --el-color-primary: #{$hng-olive};
+  --el-color-primary-light-3: #6d6224;
+  --el-color-primary-light-5: #6d6224;
+  --el-color-primary-light-7: #4a4318;
+  --el-color-primary-light-8: #383312;
+  --el-color-primary-light-9: #26220d;
+  --el-color-primary-dark-2: #{$hng-olive-hover};
+  --el-color-success: #{$hng-green};
+  --el-color-danger: #{$hng-red};
+  --el-bg-base: #{$hng-bg-panel};
+  --el-bg-overlay: #23261b;
+  --el-border-color: #3a3e2e;
+  --el-border-color-light: #33362a;
+  --el-text-color-primary: #{$hng-text};
+  --el-text-color-regular: #b5af9a;
+  --el-text-color-secondary: #{$hng-text-dim};
+  --el-fill-color-blank: #191c12;
+  --el-fill-color-light: #22251a;
+  --el-font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+  // el-table 专用变量（默认白底，必须显式覆盖）
+  --el-table-bg-color: #191c12;
+  --el-table-tr-bg-color: #191c12;
+  --el-table-header-bg-color: #23261b;
+  --el-table-header-text-color: #{$hng-gold};
+  --el-table-text-color: #{$hng-text};
+  --el-table-border-color: #33362a;
+  --el-table-border: 1px solid #33362a;
+  --el-table-row-hover-bg-color: #2a2e1f;
+  --el-table-expanded-cell-bg-color: #22251a;
+
+  // 弹层/分页/表单等常用组件兜底
+  --el-bg-color: #191c12;
+  --el-fill-color: #22251a;
+  --el-disabled-bg-color: #22251a;
+  --el-disabled-text-color: #6b6a5a;
+
+  // 其他常用组件
+  --el-card-bg-color: #{$hng-bg-panel};
+  --el-pagination-bg-color: transparent;
+  --el-pagination-button-bg-color: #22251a;
+  --el-pagination-hover-color: #{$hng-gold};
+  --el-tag-bg-color: #2a2e1f;
+  --el-tag-text-color: #{$hng-text};
+  --el-descriptions-item-bordered-label-background: #23261b;
+
+  // 下拉选择（el-select 触发器 + el-select-dropdown 弹层 + el-option 悬停）
+  --el-select-border-color-hover: #{$hng-olive};
+  --el-select-item-hover-bg-color: #2a2e1f;
+  --el-select-item-selected-bg-color: #31351f;
+  --el-select-item-selected-text-color: #{$hng-gold};
+  --el-fill-color-light: #22251a;
+  --el-border-color-light: #33362a;
+  --el-text-color-placeholder: #6b6a5a;
+}
+
+// 弹层兜底：teleport 到 body 的下拉/弹窗（el-select-dropdown / el-picker-panel 等）
+.el-popper.is-light,
+.el-select__popper.el-popper {
+  background: #23261b !important;
+  border-color: #3a3e2e !important;
+}
+.el-popper.is-light > .el-popper__arrow::before {
+  background: #23261b !important;
+  border-color: #3a3e2e !important;
+}
+.el-select-dropdown__item.is-hovering {
+  background: #2a2e1f;
+}
+
+// el-select 2.x 触发器（新版 DOM 结构不再走 --el-fill-color-blank，必须直打）
+.el-select__wrapper {
+  background-color: #191c12;
+  box-shadow: 0 0 0 1px #3a3e2e inset;
+
+  &:hover {
+    box-shadow: 0 0 0 1px rgba(200, 185, 138, 0.5) inset;
+  }
+
+  &.is-focused {
+    box-shadow: 0 0 0 1px #{$hng-olive} inset;
+  }
+}
+
+// el-table 数字列/通用单元格溢出保护
+.el-table {
+  .cell {
+    word-break: break-word;
+  }
+}
+
+// el-loading 遮罩（默认白底 rgba(255,255,255,.9)）
+.el-loading-mask {
+  background-color: rgba(20, 22, 15, 0.75);
+
+  .el-loading-spinner {
+    .path {
+      stroke: $hng-gold;
+    }
+
+    .el-loading-text {
+      color: $hng-text;
+    }
+  }
+}
+
+// stencil 军事标题
+.hng-stencil {
+  font-weight: 900;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: $hng-gold;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.8), 0 0 22px rgba(232, 212, 139, 0.25);
+}
+
+// 斜切角按钮质感（叠加在 el-button 上）
+.hng-btn {
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  clip-path: polygon(0 0, calc(100% - 8px) 0, 100% 8px, 100% 100%, 8px 100%, 0 calc(100% - 8px));
+}
+
+// 全局滚动条
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #3a3e2e;
+  border-radius: 5px;
+}
+::-webkit-scrollbar-track {
+  background: #191c12;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  color: $hng-text;
+}

@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 日志
+*.log
+client_logs.txt
+
+# 临时脚本与产物（约定存放于 tmp/）
+tmp/
+
+# zig 编译缓存与调试符号（eos_stub.dll/lib 保留，可用 eos_stub.c 重建）
+.zigcache/
+*.pdb
+
+# 证书（首次运行 eos_fake_backend.py 自动生成，用 eos_fake_setup.ps1 装入系统）
+certs/
+
+# 环境变量（真实部署配置，模板见 .env.example）
+.env
+.env.production
+
+# 历史日志（按天轮转产物）
+realtest_game.log.*.log
+
+# fs 同步 CAS 大文件（部署产物：改动过的客户端文件以 sha256-size_flag 命名放入，
+# 不入库，可从客户端原文件重新生成）
+cas/
+
+
+plink.exe
+
+# ---- 2026-10-28 本机部署产物（体积巨大 / 含密钥 / 与运行环境绑定，绝不入库）----
+# 便携 PostgreSQL 二进制 + 数据目录（几 GB，且含玩家数据）
+_setup/
+# 独立战斗服工作目录（从客户端拷出，含 patched player.dll、_packed 联接、日志）
+combat-server/
+# 客户端静态资源与地图（数十 GB，来自客户端安装包）
+WarDatabase/
+images/
+texts/
+_packed/
+# 运行日志目录（含按天轮转文件）
+logs/
+# hngsync 同步缓存
+synccache/
+# 二进制备份副本（客户端/战斗服里的 dll 本来就不在本仓库树内，
+# 这里只忽略"打补丁时留下的副本"，不要用 *.dll 全局忽略——
+# 仓库自带 eos/eos_stub.dll 会被误伤）
+*.bak_*
+*.orig_backup
+*.ddrive84mb
+*.dll.orig
+*.exe.orig
+# 临时产物目录（SWF 补丁包 143MB、证据包等）
+out/
+# 前端依赖与构建产物（pnpm install / pnpm build 生成，部署时单独发布）
+web/frontend/node_modules/
+web/frontend/dist/
+web/server/__pycache__/

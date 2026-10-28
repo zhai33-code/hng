@@ -1,0 +1,50 @@
+{
+  // 调试配置：F5 直接起服务端（改 bug 时下断点用）
+  // 注意：游戏服会独占 80 / 15110 / 15115 / 16667 / 20201 端口，
+  //      调试前先停掉已经在跑的那份（task: "停止游戏服"）。
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "游戏服 realtest_server.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/realtest_server.py",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "args": []
+    },
+    {
+      "name": "管理后台 web/server",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "server.main",
+      "cwd": "${workspaceFolder}/web",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/web"
+      }
+    },
+    {
+      "name": "当前文件",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    }
+  ]
+}

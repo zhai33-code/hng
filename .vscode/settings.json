@@ -1,0 +1,73 @@
+{
+  // HnG 私服本地开发配置（随仓库入库，团队共享）
+  "python.defaultInterpreterPath": "E:\\HnG-test\\.venv\\Scripts\\python.exe",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": [
+    "E:\\HnG-test"
+  ],
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "python.testing.pytestEnabled": false,
+  "python.testing.unittestEnabled": false,
+
+  // 文件与编辑器
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+  "files.autoGuessEncoding": false,
+  "files.trimTrailingWhitespace": false,
+  "files.insertFinalNewline": false,
+  "editor.tabSize": 4,
+  "editor.insertSpaces": true,
+  "editor.rulers": [100],
+  "editor.renderWhitespace": "selection",
+  "[markdown]": {
+    "editor.tabSize": 2,
+    "files.trimTrailingWhitespace": false
+  },
+  "[json]": {
+    "editor.tabSize": 2
+  },
+
+  // 搜索/监视排除：这些是本机运行产物，几十 GB，扫进来会卡
+  "search.exclude": {
+    "_setup/**": true,
+    "combat-server/**": true,
+    "WarDatabase/**": true,
+    "images/**": true,
+    "_packed/**": true,
+    "texts/**": true,
+    "logs/**": true,
+    "tmp/**": true,
+    "out/**": true,
+    "certs/**": true,
+    "cas/**": true,
+    "synccache/**": true,
+    ".venv/**": true,
+    "**/__pycache__": true,
+    "web/frontend/node_modules/**": true,
+    "web/frontend/dist/**": true
+  },
+  "files.watcherExclude": {
+    "_setup/**": true,
+    "combat-server/**": true,
+    "WarDatabase/**": true,
+    "_packed/**": true,
+    "logs/**": true,
+    "tmp/**": true,
+    "out/**": true,
+    ".venv/**": true,
+    "**/__pycache__": true,
+    "web/frontend/node_modules/**": true,
+    "web/frontend/dist/**": true
+  },
+  "files.associations": {
+    "*.fst": "plaintext"
+  },
+
+  // Git
+  "git.autofetch": false,
+  "git.confirmSync": true,
+  "git.enableSmartCommit": false,
+
+  // 终端默认用 PowerShell
+  "terminal.integrated.defaultProfile.windows": "PowerShell"
+}
