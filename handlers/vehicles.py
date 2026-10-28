@@ -396,8 +396,10 @@ async def handle_setvehicleammorequest(sess, writer, cmd_id, req_type, proto):
     sa_storage_id = 0
     sa_slot_index = 0
     sa_do_equip = True
+    sa_vehicle_id = 0
     try:
         f = pb_parse(proto)
+        sa_vehicle_id = f.get(1, 0)
         sa_ammo_id = f.get(2, 0)
         sa_storage_id = f.get(3, 0)
         sa_slot_index = f.get(4, 0)
@@ -411,9 +413,12 @@ async def handle_setvehicleammorequest(sess, writer, cmd_id, req_type, proto):
     pid = await sess.ensure_player()
     if pid is not None:
         try:
+            # vehicleId 一并传入：弹药带归属（vehicle_ammo.vehicle_id）时，
+            # 只允许装回原载具（潘兴的炮弹不能给 M36B1），校验在 store 层做
             affected = await STORE.set_vehicle_ammo_equipment(pid, sa_ammo_id,
                                                               sa_storage_id,
-                                                              sa_slot_index, sa_do_equip)
+                                                              sa_slot_index, sa_do_equip,
+                                                              sa_vehicle_id)
         except Exception as e:
             log(f'[DB] set_vehicle_ammo_equipment failed: {e}')
 

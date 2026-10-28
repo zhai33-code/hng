@@ -280,15 +280,17 @@ class MaintenanceMixin:
                     'WHERE vehicle_id = $1 AND player_id = $2',
                     int(item_id), int(player_id))
                 # 弹药不随载具指派（同改造语义；兜底脱离挂靠，防幽灵弹药）
-                # ★ 2026-10-28 修复：同上，character_id 必须一并清 0。
-                #   原来的 'SET vehicle_id = 0, equipped_storage_id = 0' 漏了
-                #   character_id，弹药留在角色名下但失去载具归属 → 客户端把
-                #   VehicleAmmo(vehicleId=0, characterId=N) 渲染到该角色的每辆
-                #   坦克，出现「潘兴和 M36B1 各有一份相同弹药」的重复显示，
-                #   且再次装备时会再叠一份。slot_index 保留（重新指派后恢复
-                #   装备位），与退仓路径一致。
+                # ★ 2026-10-28 修复（两处）：
+                #   1) character_id 必须一并清 0，否则产生「vehicle_id=0 但
+                #      character_id=N」的孤儿行，客户端会把它渲染到该角色的
+                #      每一辆载具上，表现为每辆坦克都多一份相同弹药。
+                #   2) vehicle_id **保留不清**。弹药属于具体载具实例（潘兴的
+                #      炮弹只能给潘兴），清掉归属就变成通用件，任何载具都能装，
+                #      与官方行为不符（用户实测反馈）。归属保留后，装备时由
+                #      set_vehicle_ammo_equipment 校验「只能装回原载具」。
+                #   equipped_storage_id 清零 = 回到仓库/未装备状态。
                 await conn.execute(
-                    'UPDATE vehicle_ammo SET character_id = 0, vehicle_id = 0, '
+                    'UPDATE vehicle_ammo SET character_id = 0, '
                     'equipped_storage_id = 0 WHERE vehicle_id = $1 '
                     'AND player_id = $2',
                     int(item_id), int(player_id))
@@ -410,11 +412,15 @@ class MaintenanceMixin:
                     'UPDATE vehicle_upgrades SET character_id = 0, vehicle_id = 0 '
                     'WHERE vehicle_id = $1 AND player_id = $2',
                     int(object_id), int(player_id))
-                # 弹药随载具退仓并解绑（vehicle_id/equipped_storage_id 一并
-                # 清 0 → 独立仓库弹药，可与载具分别发回士兵，对齐武器配件
-                # 2026-09-13 改造；slot_index 保留，重新指派后可恢复装备位）
+                # 弹药随载具退仓：character_id / equipped_storage_id 清 0
+                # （回到未装备状态），但 **vehicle_id 保留**。
+                # ★ 2026-10-28 修复：原来把 vehicle_id 也清 0，弹药降级成
+                #   「通用库存件」，任何载具都能装（潘兴的炮弹能塞给 M36B1），
+                #   与官方行为不符（用户实测反馈）。保留归属后，退回补给站再
+                #   取回时仍只认原载具；越界装备由 set_vehicle_ammo_equipment
+                #   的归属校验拦住。slot_index 保留，重新指派后恢复装备位。
                 await conn.execute(
-                    'UPDATE vehicle_ammo SET character_id = 0, vehicle_id = 0, '
+                    'UPDATE vehicle_ammo SET character_id = 0, '
                     'equipped_storage_id = 0 WHERE vehicle_id = $1 '
                     'AND player_id = $2',
                     int(object_id), int(player_id))

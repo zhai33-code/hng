@@ -255,9 +255,17 @@ class EquipmentVehiclesMixin:
             return dict(row)
 
     async def set_vehicle_ammo_equipment(self, player_id, ammo_id, storage_id,
-                                         slot_index, do_equip):
+                                         slot_index, do_equip, vehicle_id=0):
         """装备（do_equip=true）或卸下（false）载具弹药。装备时先清空同载具同仓同槽位
-        的其他弹药（互斥：一个弹药仓槽位只能装一件）。返回受影响弹药行列表。"""
+        的其他弹药（互斥：一个弹药仓槽位只能装一件）。返回受影响弹药行列表。
+
+        ★ 2026-10-28 归属校验（用户实测需求）：弹药属于某辆具体载具实例
+        （`vehicle_ammo.vehicle_id`），不能因为模板相同就在不同载具之间串用。
+        - 弹药带归属（`vehicle_id != 0`）时，只允许装回**同一辆**载具；
+          请求里的 vehicleId 与之不符 → 拒绝（返回空列表，响应 response=0）。
+        - 弹药无归属（`vehicle_id == 0`，历史遗留的通用库存件）时保持旧行为，
+          不额外限制，避免把存量数据卡死。
+        """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -266,6 +274,12 @@ class EquipmentVehiclesMixin:
                     'FROM vehicle_ammo WHERE id = $1 AND player_id = $2',
                     ammo_id, player_id)
                 if row is None:
+                    return []
+                # ---- 归属校验：有归属的弹药只能装回原载具 ----
+                owner_vehicle = int(row['vehicle_id'] or 0)
+                req_vehicle = int(vehicle_id or 0)
+                if do_equip and owner_vehicle != 0 and req_vehicle != 0 \
+                        and owner_vehicle != req_vehicle:
                     return []
                 affected = [dict(row)]
                 if do_equip:
