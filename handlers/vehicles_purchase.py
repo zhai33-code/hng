@@ -504,10 +504,18 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
 
     # 一次购买只创建一份未装备弹药。勋带页在达到仓槽数前允许继续补购，
     # 不应为了隐藏购买按钮而一次赠送整仓。落库失败退款并返回失败。
+    # ★ 2026-10-28 修复客户端 Error #1009（购买后卡住、无法拖拽）：
+    #   character_id 必须传 0（未装备，纯库存件）。原来传的是载具的
+    #   character_id，于是推送出 VehicleAmmo(vehicleId=X, storageId=0,
+    #   slotIndex=0, characterId=2) 这种自相矛盾的行——客户端认定它「挂在
+    #   角色身上」就去查 slot 0 的装备槽，查不到 → 空引用 → UI 卡死。
+    #   对比 grant_default_vehicle_ammo：那里买完立刻 set_vehicle_ammo_equipment
+    #   自动装备（storage/slot 非 0），所以不报错；单独买弹药走的是「进库存、
+    #   由玩家自己拖进槽位」的路径，character_id 应为 0。
     maxcond = _AMMO_MAXCOND.get(int(va_template_id), 100.0)
     try:
         a = await STORE.create_vehicle_ammo(pid, va_template_id, va_vehicle_id,
-                                            va_char_id, maxcond)
+                                            0, maxcond)
     except Exception as e:
         log(f'[DB] create_vehicle_ammo failed: {e}')
         await _fail_persisted_purchase(
@@ -528,9 +536,11 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
 
     # 2. 通过 SOLDIER_VIEW 推送 VehicleAmmo 实例（客户端 VehicleAmmoTable
     #    识别已购买并触发勋带页刷新，VehicleModificationMediator 显示可装填弹药）
+    #    characterId 同样必须为 0（未装备），与落库值保持一致，
+    #    否则客户端拿到「char 非 0 + slot 0」的组合会抛 Error #1009。
     if sess.soldier_view_cmd is not None:
         aproto = _msg_vehicle_ammo(va_id, va_template_id, va_vehicle_id, 0, 0,
-                                   va_char_id, maxcond)
+                                   0, maxcond)
         await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo', aproto)
         log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo id={va_id}, '
             f'template={va_template_id}, vehicle={va_vehicle_id}, condition={maxcond})')
