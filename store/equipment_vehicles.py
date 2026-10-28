@@ -288,29 +288,40 @@ class EquipmentVehiclesMixin:
                         and owner_vehicle != req_vehicle:
                     return []
                 affected = [dict(row)]
+                # ★ 2026-10-28 关键修复：装备时必须把 vehicle_id 指向目标载具。
+                #   原实现只更新 equipped_storage_id / slot_index，vehicle_id 一直
+                #   停在 0，导致「装上去了但客户端关联不到载具」——UI 显示错乱，
+                #   拆下来又像没装上，整体看起来像「弹药在两辆车之间共用」。
+                #   卸下时把 vehicle_id 一并清 0（回到 Depot 独立状态）。
+                target_vehicle = req_vehicle or owner_vehicle
                 if do_equip:
-                    # 同载具同仓同槽位被挤掉的弹药先清槽（互斥）
+                    # 同载具同仓同槽位被挤掉的弹药先清槽（互斥），
+                    # 用目标载具 id 匹配（原来的 row['vehicle_id'] 在 Depot 件上是 0，
+                    # 互斥查询会落空）
                     cleared = await conn.fetch(
                         'SELECT id, ammo_template_id, vehicle_id, character_id, equipped_storage_id, '
                         'slot_index, condition '
                         'FROM vehicle_ammo WHERE player_id = $1 AND vehicle_id = $2 '
                         'AND equipped_storage_id = $3 AND slot_index = $4 AND id != $5',
-                        player_id, row['vehicle_id'], storage_id, slot_index, ammo_id)
+                        player_id, target_vehicle, storage_id, slot_index, ammo_id)
                     await conn.execute(
                         'UPDATE vehicle_ammo SET equipped_storage_id = 0, slot_index = 0 '
                         'WHERE player_id = $1 AND vehicle_id = $2 '
                         'AND equipped_storage_id = $3 AND slot_index = $4 AND id != $5',
-                        player_id, row['vehicle_id'], storage_id, slot_index, ammo_id)
+                        player_id, target_vehicle, storage_id, slot_index, ammo_id)
                     for c in cleared:
                         cd = dict(c)
                         cd['equipped_storage_id'] = 0
                         cd['slot_index'] = 0
                         affected.append(cd)
+                new_vehicle = target_vehicle if do_equip else 0
                 new_storage = storage_id if do_equip else 0
                 new_slot = slot_index if do_equip else 0
                 await conn.execute(
-                    'UPDATE vehicle_ammo SET equipped_storage_id = $1, slot_index = $2 '
-                    'WHERE id = $3', new_storage, new_slot, ammo_id)
+                    'UPDATE vehicle_ammo SET vehicle_id = $1, equipped_storage_id = $2, '
+                    'slot_index = $3 WHERE id = $4',
+                    new_vehicle, new_storage, new_slot, ammo_id)
+                affected[0]['vehicle_id'] = new_vehicle
                 affected[0]['equipped_storage_id'] = new_storage
                 affected[0]['slot_index'] = new_slot
             return affected
