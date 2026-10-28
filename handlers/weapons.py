@@ -296,6 +296,7 @@ async def handle_setweaponammorequest(sess, writer, cmd_id, req_type, proto):
     new_slot = slot_index if do_equip else 0
     pid = await sess.ensure_player()
     updated = False
+    target_weapon_id = 0      # ★ 用于精准推送：只重推同一把武器上被清槽的弹药
     if pid is not None:
         try:
             # 装备时先清空同武器其他弹药槽（互斥：一枪只装一发弹药），
@@ -307,6 +308,7 @@ async def handle_setweaponammorequest(sess, writer, cmd_id, req_type, proto):
                     break
             if do_equip:
                 if target is not None:
+                    target_weapon_id = int(target['weapon_id'] or 0)
                     await STORE.clear_weapon_ammo_slots(pid, target['weapon_id'], ammo_id)
             if target is not None:
                 await STORE.update_weapon_ammo_slot(pid, ammo_id, new_slot)
@@ -334,8 +336,12 @@ async def handle_setweaponammorequest(sess, writer, cmd_id, req_type, proto):
                         await _push_kvcs(writer, sess.soldier_view_cmd, b'WeaponAmmo', aproto)
                         log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
                             f'(WeaponAmmo id={a["id"]} re-pushed, slot={a["slot_index"]})')
-                    elif do_equip:
-                        # 被清槽的其他弹药也重推，客户端才能及时取消 isEquipped
+                    elif do_equip and int(a['weapon_id'] or 0) == target_weapon_id:
+                        # ★ 2026-10-28 修复：只重推**同一把武器**上被清槽的弹药。
+                        #   原来对 list_weapon_ammo 返回的【全部】弹药都推
+                        #   "slot cleared to 0"，于是一次装弹会把其他枪的弹药
+                        #   在客户端全部标成「未装备」（数据库其实没变），
+                        #   界面上表现为别的武器弹药全消失、看起来像共享错乱。
                         aproto = _msg_weapon_ammo(a['id'], a['ammo_template_id'],
                                                   a['character_id'], a['weapon_id'], a['slot_index'],
                                                   a.get('condition', 100.0))
