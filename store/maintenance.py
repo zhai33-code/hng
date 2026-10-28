@@ -270,20 +270,33 @@ class MaintenanceMixin:
                     int(item_id), int(player_id), int(character_id))
                 # 升级不随载具指派（2026-09-13 改造：入库即解绑，可与载具
                 # 分别发回士兵；兜底脱离挂靠防幽灵升级件）
+                # ★ 2026-10-28 修复：character_id 必须一并清 0，否则升级件变成
+                #   「挂着角色、却没有所属载具」的孤儿行（vehicle_id=0 但
+                #   character_id 仍是原角色）。客户端把这种行按角色渲染到该
+                #   角色的**每一辆**载具上，表现为每辆坦克都多出一份相同配件。
+                #   与下方"退仓"路径（SET character_id = 0, vehicle_id = 0）对齐。
                 await conn.execute(
-                    'UPDATE vehicle_upgrades SET vehicle_id = 0 '
+                    'UPDATE vehicle_upgrades SET character_id = 0, vehicle_id = 0 '
                     'WHERE vehicle_id = $1 AND player_id = $2',
                     int(item_id), int(player_id))
                 # 弹药不随载具指派（同改造语义；兜底脱离挂靠，防幽灵弹药）
+                # ★ 2026-10-28 修复：同上，character_id 必须一并清 0。
+                #   原来的 'SET vehicle_id = 0, equipped_storage_id = 0' 漏了
+                #   character_id，弹药留在角色名下但失去载具归属 → 客户端把
+                #   VehicleAmmo(vehicleId=0, characterId=N) 渲染到该角色的每辆
+                #   坦克，出现「潘兴和 M36B1 各有一份相同弹药」的重复显示，
+                #   且再次装备时会再叠一份。slot_index 保留（重新指派后恢复
+                #   装备位），与退仓路径一致。
                 await conn.execute(
-                    'UPDATE vehicle_ammo SET vehicle_id = 0, '
+                    'UPDATE vehicle_ammo SET character_id = 0, vehicle_id = 0, '
                     'equipped_storage_id = 0 WHERE vehicle_id = $1 '
                     'AND player_id = $2',
                     int(item_id), int(player_id))
                 # 皮肤不随载具指派（同改造语义；兜底脱离挂靠）+
                 # vehicles.variant_id 反向引用复位（载具不得指向留仓皮肤）
+                # ★ 2026-10-28 修复：character_id 同步清 0（同上升级/弹药）
                 await conn.execute(
-                    'UPDATE vehicle_variants SET vehicle_id = 0 '
+                    'UPDATE vehicle_variants SET character_id = 0, vehicle_id = 0 '
                     'WHERE vehicle_id = $1 AND player_id = $2',
                     int(item_id), int(player_id))
                 await conn.execute(
