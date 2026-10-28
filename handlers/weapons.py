@@ -281,15 +281,18 @@ async def handle_setweaponammorequest(sess, writer, cmd_id, req_type, proto):
     # 装备/卸下弹药请求
     # SetWeaponAmmoRequest { int64 weaponId=1; int64 weaponAmmoId=2; int32 slotIndex=3; bool doEquip=4; }
     # SetWeaponAmmoResponse { int32 response = 1; }
+    weapon_id = 0
     ammo_id = 0
     do_equip = True
     slot_index = 1
     try:
         f = pb_parse(proto)
+        weapon_id = f.get(1, 0)          # ★ 目标武器实例 id（原来没读这个字段）
         ammo_id = f.get(2, 0)
         slot_index = f.get(3, 1)
         do_equip = bool(f.get(4, 1))
-        log(f'      SetWeaponAmmo: ammoId={ammo_id}, slotIndex={slot_index}, doEquip={do_equip}')
+        log(f'      SetWeaponAmmo: weaponId={weapon_id}, ammoId={ammo_id}, '
+            f'slotIndex={slot_index}, doEquip={do_equip}')
     except Exception as e:
         log(f'      SetWeaponAmmo parse error: {e}')
 
@@ -308,10 +311,15 @@ async def handle_setweaponammorequest(sess, writer, cmd_id, req_type, proto):
                     break
             if do_equip:
                 if target is not None:
-                    target_weapon_id = int(target['weapon_id'] or 0)
-                    await STORE.clear_weapon_ammo_slots(pid, target['weapon_id'], ammo_id)
+                    # 互斥清槽按【目标武器】算（原来用 target['weapon_id']，
+                    # 跨武器装弹时会清错对象）
+                    target_weapon_id = int(weapon_id or target['weapon_id'] or 0)
+                    await STORE.clear_weapon_ammo_slots(pid, target_weapon_id, ammo_id)
             if target is not None:
-                await STORE.update_weapon_ammo_slot(pid, ammo_id, new_slot)
+                # weapon_id 传入 → 弹药重绑定到目标武器（跨枪复用同型号弹药）
+                await STORE.update_weapon_ammo_slot(
+                    pid, ammo_id, new_slot,
+                    int(weapon_id) if (do_equip and weapon_id) else None)
                 updated = True
         except Exception as e:
             log(f'[DB] update_weapon_ammo_slot failed: {e}')

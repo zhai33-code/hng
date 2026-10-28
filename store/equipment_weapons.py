@@ -278,12 +278,30 @@ class EquipmentWeaponsMixin:
                 player_id, ammo_template_id, character_id, weapon_id, slot_index, condition)
             return dict(row)
 
-    async def update_weapon_ammo_slot(self, player_id, ammo_id, slot_index):
-        """装备（slot>0）或卸下（slot=0）弹药。"""
+    async def update_weapon_ammo_slot(self, player_id, ammo_id, slot_index,
+                                      weapon_id=None):
+        """装备（slot>0）或卸下（slot=0）弹药。
+
+        ★ 2026-10-28 修复「假共享」：客户端
+        WeaponModifierUtilities.getAvailableAmmoForWeaponAmmoMapping 的判定是
+          characterId == 选中角色 && ammo.weaponId == 当前武器
+        而这里原来只写 slot_index，**从不更新 weapon_id**。于是同一发弹药
+        在 A 枪上装好后切到同型号的 B 枪，客户端按 weaponId 查不到它 →
+        显示「需要购买」；点装备时服务端也只改 slot，下次还是查不到，
+        表现就是「假共享 → 点一下卡顿 → 让你买」。
+        传入 weapon_id 时同步把弹药重绑定到这把枪（跨武器复用同型号弹药）。
+        """
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                'UPDATE weapon_ammo SET slot_index = $1 '
-                'WHERE id = $2 AND player_id = $3', slot_index, ammo_id, player_id)
+            if weapon_id:
+                await conn.execute(
+                    'UPDATE weapon_ammo SET slot_index = $1, weapon_id = $2 '
+                    'WHERE id = $3 AND player_id = $4',
+                    slot_index, int(weapon_id), ammo_id, player_id)
+            else:
+                await conn.execute(
+                    'UPDATE weapon_ammo SET slot_index = $1 '
+                    'WHERE id = $2 AND player_id = $3',
+                    slot_index, ammo_id, player_id)
 
     async def clear_weapon_ammo_slots(self, player_id, weapon_id, exclude_ammo_id):
         """清空指定武器上除 exclude_ammo_id 外所有弹药的槽位（互斥装备）。"""
