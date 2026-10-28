@@ -243,15 +243,20 @@ class EquipmentVehiclesMixin:
 
     async def create_vehicle_ammo(self, player_id, ammo_template_id, vehicle_id,
                                   character_id, condition):
-        """创建载具弹药实例（购买），返回含新 id 的 dict。"""
+        """创建载具弹药实例（购买），返回含新 id 的 dict。
+
+        ★ 2026-10-28：owner_vehicle_id 与 vehicle_id 同时写入。前者是永久归属
+        （退仓/指派都不清，装备时校验「只能装回原载具」），后者是当前绑定
+        （退仓时清 0，让弹药在补给站弹药栏独立显示）。"""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 'INSERT INTO vehicle_ammo (player_id, ammo_template_id, vehicle_id, character_id, '
-                'equipped_storage_id, slot_index, condition) '
-                'VALUES ($1, $2, $3, $4, 0, 0, $5) '
-                'RETURNING id, ammo_template_id, vehicle_id, character_id, equipped_storage_id, '
-                'slot_index, condition, spawn_clip_count',
-                player_id, ammo_template_id, vehicle_id, character_id, condition)
+                'equipped_storage_id, slot_index, condition, owner_vehicle_id) '
+                'VALUES ($1, $2, $3, $4, 0, 0, $5, $6) '
+                'RETURNING id, ammo_template_id, vehicle_id, owner_vehicle_id, character_id, '
+                'equipped_storage_id, slot_index, condition, spawn_clip_count',
+                player_id, ammo_template_id, vehicle_id, character_id, condition,
+                int(vehicle_id or 0))
             return dict(row)
 
     async def set_vehicle_ammo_equipment(self, player_id, ammo_id, storage_id,
@@ -259,24 +264,25 @@ class EquipmentVehiclesMixin:
         """装备（do_equip=true）或卸下（false）载具弹药。装备时先清空同载具同仓同槽位
         的其他弹药（互斥：一个弹药仓槽位只能装一件）。返回受影响弹药行列表。
 
-        ★ 2026-10-28 归属校验（用户实测需求）：弹药属于某辆具体载具实例
-        （`vehicle_ammo.vehicle_id`），不能因为模板相同就在不同载具之间串用。
-        - 弹药带归属（`vehicle_id != 0`）时，只允许装回**同一辆**载具；
-          请求里的 vehicleId 与之不符 → 拒绝（返回空列表，响应 response=0）。
-        - 弹药无归属（`vehicle_id == 0`，历史遗留的通用库存件）时保持旧行为，
-          不额外限制，避免把存量数据卡死。
+        ★ 2026-10-28 归属校验（用户实测需求）：弹药属于某辆具体载具实例，
+        不能因为模板相同就在不同载具之间串用（潘兴的炮弹不能给 M36B1）。
+        - 归属记在 `owner_vehicle_id`（永久，退仓/指派都不清）；
+          `vehicle_id` 是当前绑定，退仓后会清 0，仅用于显示。
+        - 有归属且请求带了 vehicleId 时，两者必须一致，否则拒绝
+          （返回空列表，响应 response=0）。
+        - 兼容：owner_vehicle_id=0（2026-10-28 之前的历史行）不做限制。
         """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    'SELECT id, ammo_template_id, vehicle_id, character_id, equipped_storage_id, '
-                    'slot_index, condition '
+                    'SELECT id, ammo_template_id, vehicle_id, owner_vehicle_id, character_id, '
+                    'equipped_storage_id, slot_index, condition '
                     'FROM vehicle_ammo WHERE id = $1 AND player_id = $2',
                     ammo_id, player_id)
                 if row is None:
                     return []
                 # ---- 归属校验：有归属的弹药只能装回原载具 ----
-                owner_vehicle = int(row['vehicle_id'] or 0)
+                owner_vehicle = int(row.get('owner_vehicle_id') or 0)
                 req_vehicle = int(vehicle_id or 0)
                 if do_equip and owner_vehicle != 0 and req_vehicle != 0 \
                         and owner_vehicle != req_vehicle:

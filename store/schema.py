@@ -224,6 +224,13 @@ ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS condition DOUBLE PRECISION NOT NUL
 -- （回放锚点 T-38=21 / Yak-9D=1 / R-Z=1），下发时由
 -- wardb.vehicle_ammo_spawn_clips(equipped_storage_id) 推导，本列仅存档不参与下发
 ALTER TABLE vehicle_ammo ADD COLUMN IF NOT EXISTS spawn_clip_count INT NOT NULL DEFAULT 1;
+-- 弹药永久归属（2026-10-28）：vehicle_id 会随「退仓 / 指派角色」清 0，
+-- 目的是让弹药在补给站弹药栏里独立显示、可单独搬运；但弹药本身属于某辆
+-- 具体载具实例（潘兴的炮弹只能给潘兴，M36B1 用不了，哪怕模板相同）。
+-- owner_vehicle_id 在购买时记下归属，之后不再变化，装备时用它校验越界。
+ALTER TABLE vehicle_ammo ADD COLUMN IF NOT EXISTS owner_vehicle_id BIGINT NOT NULL DEFAULT 0;
+UPDATE vehicle_ammo SET owner_vehicle_id = vehicle_id
+ WHERE owner_vehicle_id = 0 AND vehicle_id != 0;
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS squad_points INT NOT NULL DEFAULT 0;
 ALTER TABLE characters ADD COLUMN IF NOT EXISTS receive_daily_bonus BOOLEAN NOT NULL DEFAULT TRUE;
 -- 每日首战 +50% XP：真实资格源（结算 consume_daily_bonus 消费时写入）。
