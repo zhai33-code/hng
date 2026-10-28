@@ -523,7 +523,24 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
         return
     va_id = a['id']
 
-    # 1. 返回 CreateVehicleAmmoResponse (response=1 ok)，客户端显示购买成功
+    # ★ 2026-10-28 关键顺序修复（客户端 Error #1009 真因）：
+    #   客户端 VehicleModificationMediator.ammoPurchaseResponse() 在收到
+    #   CreateVehicleAmmoResponse 时会去 VehicleAmmoTable 里找这发新弹药；
+    #   如果此时 KVCS 还没到达，查表得到 null → 访问属性抛 Error #1009，
+    #   弹窗崩掉、界面卡死无法拖拽（实测堆栈：
+    #   TypeError: Error #1009 at VehicleModificationMediator/ammoPurchaseResponse）。
+    #   所以必须 **先推 VehicleAmmo 行，再发 Response**，让响应到达时表里已有数据。
+    #   （va_char_id 仍用于解锁校验与角色权限推送。）
+
+    # 1. 先通过 SOLDIER_VIEW 推送 VehicleAmmo 实例（同一 TCP 连接，顺序有保证）
+    if sess.soldier_view_cmd is not None:
+        aproto = _msg_vehicle_ammo(va_id, va_template_id, va_vehicle_id, 0, 0,
+                                   0, maxcond)
+        await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo', aproto)
+        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo id={va_id}, '
+            f'template={va_template_id}, vehicle={va_vehicle_id}, condition={maxcond})')
+
+    # 2. 再返回 CreateVehicleAmmoResponse (response=1 ok)，客户端显示购买成功
     resp_proto = pb_int32(1, 1)
     resp = build_response(cmd_id, 'CreateVehicleAmmoResponse', resp_proto)
     writer.write(resp)
@@ -531,19 +548,8 @@ async def handle_createvehicleammorequest(sess, writer, cmd_id, req_type, proto)
     log(f'S->C cmd={cmd_id:<4} CreateVehicleAmmoResponse (response=1 ok, '
         f'ammoId={va_id}, count=1)')
 
-    # 先推角色权限，再推库存 ADD，保证勋带页重算时看到更新后的权限。
+    # 3. 推角色权限（勋带页重算时看到更新后的权限）
     await _repush_character_unlocks(sess, writer, va_char_id)
-
-    # 2. 通过 SOLDIER_VIEW 推送 VehicleAmmo 实例（客户端 VehicleAmmoTable
-    #    识别已购买并触发勋带页刷新，VehicleModificationMediator 显示可装填弹药）
-    #    characterId 同样必须为 0（未装备），与落库值保持一致，
-    #    否则客户端拿到「char 非 0 + slot 0」的组合会抛 Error #1009。
-    if sess.soldier_view_cmd is not None:
-        aproto = _msg_vehicle_ammo(va_id, va_template_id, va_vehicle_id, 0, 0,
-                                   0, maxcond)
-        await _push_kvcs(writer, sess.soldier_view_cmd, b'VehicleAmmo', aproto)
-        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet (VehicleAmmo id={va_id}, '
-            f'template={va_template_id}, vehicle={va_vehicle_id}, condition={maxcond})')
 
     # 3. 推送 player 刷新货币显示
     if sess.playerview_cmd is not None:
