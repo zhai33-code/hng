@@ -441,28 +441,16 @@ async def handle_setvehicleammorequest(sess, writer, cmd_id, req_type, proto):
                 f'(VehicleAmmo id={a["id"]}, storage={a["equipped_storage_id"]}, '
                 f'slot={a["slot_index"]})')
 
-        # ★ 2026-10-28 归属校验被拒时的 UI 回滚：
-        #   客户端 onSetVehicleAmmoResponse 收到 response=0 只弹错误，不会把
-        #   刚拖上去的弹药搬回原位（它没有本地回滚），于是界面上看着「装上了」
-        #   ——也就是用户报告的「可以共用炮弹」其实是 UI 假象，数据库里没变。
-        #   这里把该弹药的**数据库真实状态**再推一次，强制客户端刷新回正确位置。
-        if not affected and sa_do_equip and pid is not None and sa_ammo_id:
-            try:
-                for a in await STORE.list_vehicle_ammo(pid):
-                    if int(a['id']) == int(sa_ammo_id):
-                        rollback_proto = _msg_vehicle_ammo(
-                            a['id'], a['ammo_template_id'], a['vehicle_id'],
-                            a['equipped_storage_id'], a['slot_index'],
-                            a['character_id'], a.get('condition', 100.0))
-                        await _push_kvcs(writer, sess.soldier_view_cmd,
-                                         b'VehicleAmmo', rollback_proto)
-                        log(f'S->C cmd={sess.soldier_view_cmd:<4} KeyValueChangeSet '
-                            f'(VehicleAmmo id={a["id"]} ROLLBACK after deny, '
-                            f'vehicle={a["vehicle_id"]}, storage={a["equipped_storage_id"]}, '
-                            f'slot={a["slot_index"]})')
-                        break
-            except Exception as e:
-                log(f'[DB] rollback push failed: {e}')
+        # ★ 2026-10-28 撤销「拒绝后回滚推送」：
+        #   客户端 VehicleModificationMediator.onVehicleAmmoUpdates() 在处理
+        #   VehicleAmmo 的 UPDATE 时会直接读 this._currentVehicle.id /
+        #   .characterId，没有 null 判断：
+        #     VehicleUpgradeUtilities.updateVehicleAmmoObject(..., this._currentVehicle.id, ...)
+        #   只要收到 UPDATE 而这时改装窗口没选中载具（刚打开、已关闭、或在 Depot
+        #   页签操作），就抛 Error #1009，整个 mediator 崩掉、界面卡死拖不动。
+        #   上一版为了消除「UI 不回滚」而额外多推一条 UPDATE，等于把崩溃面
+        #   扩大了，故撤回：被拒时只靠 SetVehicleAmmoResponse(response=0) 让
+        #   客户端弹错误提示，不再额外推 KVCS。
 
     # 生涯军令 32 eEquipVehicleCustomAmmo（equipped_storage_id 状态推导）+ 推行刷新
     if pid is not None and sa_do_equip:
